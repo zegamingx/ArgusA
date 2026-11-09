@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  release:
+    # Also support releases created or corrected through the GitHub UI.
+    # The version validation below still requires v<MAJOR>.<MINOR>.<PATCH>.
+    types:
+      - published
+      - edited
 
 permissions:
   contents: write
