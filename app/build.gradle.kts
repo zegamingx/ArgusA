@@ -9,6 +9,9 @@ plugins {
     alias(libs.plugins.secrets)
 }
 
+// Use the project-provided debug key when available; otherwise retain AGP's default debug signer.
+val debugKeystoreFile = rootProject.file("debug.keystore")
+
 android {
     namespace = "com.argus.agi"
     compileSdk { version = release(37) }
@@ -55,10 +58,12 @@ android {
             keyPassword = System.getenv("KEY_PASSWORD")
         }
         create("debugConfig") {
-            storeFile = file("${rootDir}/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+            if (debugKeystoreFile.isFile) {
+                storeFile = debugKeystoreFile
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
         }
     }
 
@@ -75,9 +80,11 @@ android {
             signingConfig = signingConfigs.getByName("release")
         }
         debug {
-            // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
-            // AI Studio.
-            signingConfig = signingConfigs.getByName("debugConfig")
+            // Preserve the project signing key for AI Studio when it is supplied.
+            // On clean clones without debug.keystore, keep AGP's built-in debug signing configuration.
+            if (debugKeystoreFile.isFile) {
+                signingConfig = signingConfigs.getByName("debugConfig")
+            }
         }
     }
 
