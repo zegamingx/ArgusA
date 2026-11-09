@@ -23,8 +23,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -65,6 +63,8 @@ import com.argus.agi.ui.theme.ArgusWarning
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
+import androidx.compose.ui.res.painterResource
+import com.argus.agi.R
 
 /**
  * Representasi simpul neuron dalam koordinat 3D bola kortikal otak.
@@ -467,7 +467,7 @@ fun NeuronBrain3DCard(
                         border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCyanPrimary.copy(alpha = 0.5f))
                     ) {
                         Icon(
-                            imageVector = Icons.Default.RestartAlt,
+                            painter = painterResource(R.drawable.ic_symbol_restart_alt),
                             contentDescription = null,
                             modifier = Modifier.size(14.dp)
                         )
