@@ -34,16 +34,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.OpenInNew
-import androidx.compose.material.icons.automirrored.filled.ScreenShare
-import androidx.compose.material.icons.filled.CameraAlt
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.DeveloperBoard
-import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -87,6 +77,8 @@ import com.argus.agi.ui.theme.ArgusTextPrimary
 import com.argus.agi.ui.theme.ArgusTextSecondary
 import com.argus.agi.ui.theme.ArgusWarning
 import java.util.Locale
+import androidx.compose.ui.res.painterResource
+import com.argus.agi.R
 
 @Composable
 fun PerceptionScreen(viewModel: ArgusViewModel) {
@@ -151,7 +143,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = Icons.Default.CameraAlt,
+                                painter = painterResource(R.drawable.ic_symbol_photo_camera),
                                 contentDescription = "Camera",
                                 tint = if (isCameraActive) ArgusCyanPrimary else ArgusTextMuted,
                                 modifier = Modifier.size(22.dp)
@@ -186,7 +178,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Icon(
-                                imageVector = if (isCameraExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                painter = if (isCameraExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                                 contentDescription = "Toggle",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(20.dp)
@@ -236,7 +228,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                                 ) {
                                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                         Icon(
-                                            imageVector = Icons.Default.CameraAlt,
+                                            painter = painterResource(R.drawable.ic_symbol_photo_camera),
                                             contentDescription = null,
                                             tint = ArgusTextMuted,
                                             modifier = Modifier.size(28.dp)
@@ -296,7 +288,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = Icons.AutoMirrored.Filled.ScreenShare,
+                                painter = painterResource(R.drawable.ic_symbol_screen_share),
                                 contentDescription = "Screen",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(22.dp)
@@ -326,7 +318,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                             }
                             Spacer(modifier = Modifier.width(6.dp))
                             Icon(
-                                imageVector = if (isScreenExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                painter = if (isScreenExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                                 contentDescription = "Toggle",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(20.dp)
@@ -367,7 +359,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                                         .testTag("enable_accessibility_button")
                                 ) {
                                     Icon(
-                                        imageVector = Icons.AutoMirrored.Filled.OpenInNew,
+                                        painter = painterResource(R.drawable.ic_symbol_open_in_new),
                                         contentDescription = null,
                                         modifier = Modifier.size(16.dp)
                                     )
@@ -381,7 +373,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                             } else {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Icon(
-                                        imageVector = Icons.Default.CheckCircle,
+                                        painter = painterResource(R.drawable.ic_symbol_check_circle),
                                         contentDescription = null,
                                         tint = ArgusSuccess,
                                         modifier = Modifier.size(16.dp)
@@ -420,7 +412,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = Icons.Default.DeveloperBoard,
+                                painter = painterResource(R.drawable.ic_symbol_developer_board),
                                 contentDescription = "SoC",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(22.dp)
@@ -435,7 +427,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                         }
 
                         Icon(
-                            imageVector = if (isHardwareExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            painter = if (isHardwareExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                             contentDescription = "Toggle",
                             tint = ArgusCyanPrimary,
                             modifier = Modifier.size(20.dp)
@@ -487,7 +479,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Mic,
+                                painter = painterResource(R.drawable.ic_symbol_mic),
                                 contentDescription = "Audio Voice",
                                 tint = if (isAcousticActive || isListening) ArgusCyanPrimary else ArgusTextMuted,
                                 modifier = Modifier.size(20.dp)
@@ -524,7 +516,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                         Spacer(modifier = Modifier.width(6.dp))
 
                         Icon(
-                            imageVector = if (isAudioExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            painter = if (isAudioExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                             contentDescription = "Expand",
                             tint = ArgusTextMuted
                         )
@@ -600,7 +592,7 @@ fun CameraViewfinder(onLuminanceUpdate: (Float) -> Unit) {
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Icon(
-                    imageVector = Icons.Default.CameraAlt,
+                    painter = painterResource(R.drawable.ic_symbol_photo_camera),
                     contentDescription = null,
                     tint = ArgusCyanPrimary,
                     modifier = Modifier.size(32.dp)
