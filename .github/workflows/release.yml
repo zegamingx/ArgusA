@@ -45,13 +45,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cli_path="/usr/local/bin/android"
+          download_path="${RUNNER_TEMP}/android-cli"
           curl --fail --silent --show-error --location \
             "https://dl.google.com/android/cli/latest/linux_x86_64/android" \
-            --output "${cli_path}"
-          sudo chmod 0755 "${cli_path}"
-          test "$("${cli_path}" --version)" = "1.0.16625370"
-          "${cli_path}" --version
+            --output "${download_path}"
+          chmod 0755 "${download_path}"
+          sudo install -m 0755 "${download_path}" /usr/local/bin/android
+          test "$(/usr/local/bin/android --version)" = "1.0.16625370"
+          /usr/local/bin/android --version
 
       - name: Install Android SDK Platform and Build Tools
         shell: bash
