@@ -11,7 +11,7 @@ plugins {
 
 android {
     namespace = "com.argus.agi"
-    compileSdk { version = release(36) { minorApiLevel = 1 } }
+    compileSdk { version = release(37) }
 
     val versionPropsFile = rootProject.file("version.properties")
     val versionProps = Properties()
