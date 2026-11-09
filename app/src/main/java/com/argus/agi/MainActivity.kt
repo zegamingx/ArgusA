@@ -72,12 +72,12 @@ val ArgusScreen.label: String
         ArgusScreen.SETTINGS -> "Skill & Privasi"
     }
 
-val ArgusScreen.icon: ImageVector
+val ArgusScreen.iconRes: Int
     get() = when (this) {
-        ArgusScreen.CHAT -> painterResource(R.drawable.ic_symbol_chat)
-        ArgusScreen.NEURAL_CORE -> painterResource(R.drawable.ic_symbol_memory)
-        ArgusScreen.PERCEPTION -> painterResource(R.drawable.ic_symbol_visibility)
-        ArgusScreen.SETTINGS -> painterResource(R.drawable.ic_symbol_tune)
+        ArgusScreen.CHAT -> R.drawable.ic_symbol_chat
+        ArgusScreen.NEURAL_CORE -> R.drawable.ic_symbol_memory
+        ArgusScreen.PERCEPTION -> R.drawable.ic_symbol_visibility
+        ArgusScreen.SETTINGS -> R.drawable.ic_symbol_tune
     }
 
 class MainActivity : ComponentActivity() {
