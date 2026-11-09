@@ -27,10 +27,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Error
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -79,6 +75,8 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.random.Random
+import androidx.compose.ui.res.painterResource
+import com.argus.agi.R
 
 @Composable
 fun GenesisBootScreen(
@@ -266,7 +264,7 @@ fun GenesisBootScreen(
                         Column(modifier = Modifier.padding(14.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(
-                                    imageVector = Icons.Default.Error,
+                                    painter = painterResource(R.drawable.ic_symbol_error),
                                     contentDescription = null,
                                     tint = errorColor,
                                     modifier = Modifier.size(18.dp)
@@ -401,13 +399,13 @@ fun GenesisBootScreen(
                                 ) {
                                     when {
                                         isDone -> Icon(
-                                            imageVector = Icons.Default.CheckCircle,
+                                            painter = painterResource(R.drawable.ic_symbol_check_circle),
                                             contentDescription = "Done",
                                             tint = ArgusSuccess,
                                             modifier = Modifier.size(15.dp)
                                         )
                                         isFailurePoint -> Icon(
-                                            imageVector = Icons.Default.Error,
+                                            painter = painterResource(R.drawable.ic_symbol_error),
                                             contentDescription = "Failed",
                                             tint = errorColor,
                                             modifier = Modifier.size(15.dp)
@@ -502,7 +500,7 @@ fun GenesisBootScreen(
                             .testTag("retry_genesis_button")
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Refresh,
+                            painter = painterResource(R.drawable.ic_symbol_refresh),
                             contentDescription = null,
                             modifier = Modifier.size(18.dp)
                         )
@@ -531,7 +529,7 @@ fun GenesisBootScreen(
                                 .testTag("enter_terminal_button")
                         ) {
                             Icon(
-                                imageVector = Icons.Default.CheckCircle,
+                                painter = painterResource(R.drawable.ic_symbol_check_circle),
                                 contentDescription = null,
                                 modifier = Modifier.size(18.dp)
                             )
