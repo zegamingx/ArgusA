@@ -55,6 +55,7 @@ android {
             storeFile = file(keystorePath)
             storePassword = System.getenv("STORE_PASSWORD")
             keyAlias = "upload"
+            storeType = "PKCS12"
             keyPassword = System.getenv("KEY_PASSWORD")
         }
         create("debugConfig") {
