@@ -16,3 +16,7 @@
 local.properties
 .env
 debug.keystore
+
+# Generated release signing material; never commit signing keys.
+/signing/
+*.p12
