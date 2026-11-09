@@ -16,7 +16,7 @@ android {
     }
 
     val versionProperties = Properties().apply {
-        versionFile.inputStream().use(::load)
+        versionFile.inputStream().use { stream -> load(stream) }
     }
 
     fun readVersion(key: String): Int =
@@ -74,7 +74,6 @@ android {
 
     buildFeatures {
         compose = true
-        buildConfig = true
     }
 
     testOptions {
