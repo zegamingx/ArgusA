@@ -20,11 +20,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBars
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.Chat
-import androidx.compose.material.icons.filled.Memory
-import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -40,7 +35,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -61,6 +55,7 @@ import com.argus.agi.ui.theme.ArgusDarkBg
 import com.argus.agi.ui.theme.ArgusSurface
 import com.argus.agi.ui.theme.ArgusTextMuted
 import com.argus.agi.ui.theme.ArgusTheme
+import androidx.compose.ui.res.painterResource
 
 enum class ArgusScreen {
     CHAT,
@@ -79,10 +74,10 @@ val ArgusScreen.label: String
 
 val ArgusScreen.icon: ImageVector
     get() = when (this) {
-        ArgusScreen.CHAT -> Icons.AutoMirrored.Filled.Chat
-        ArgusScreen.NEURAL_CORE -> Icons.Default.Memory
-        ArgusScreen.PERCEPTION -> Icons.Default.Visibility
-        ArgusScreen.SETTINGS -> Icons.Default.Tune
+        ArgusScreen.CHAT -> painterResource(R.drawable.ic_symbol_chat)
+        ArgusScreen.NEURAL_CORE -> painterResource(R.drawable.ic_symbol_memory)
+        ArgusScreen.PERCEPTION -> painterResource(R.drawable.ic_symbol_visibility)
+        ArgusScreen.SETTINGS -> painterResource(R.drawable.ic_symbol_tune)
     }
 
 class MainActivity : ComponentActivity() {
@@ -179,7 +174,7 @@ fun MainScreen(viewModel: ArgusViewModel) {
                             onClick = { currentScreen = screen },
                             icon = {
                                 Icon(
-                                    imageVector = screen.icon,
+                                    painter = painterResource(screen.iconRes),
                                     contentDescription = screen.label
                                 )
                             },
