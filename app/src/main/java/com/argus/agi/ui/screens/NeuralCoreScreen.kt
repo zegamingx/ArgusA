@@ -24,17 +24,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.ErrorOutline
-import androidx.compose.material.icons.filled.HourglassTop
-import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.Memory
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Psychology
-import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -84,6 +73,8 @@ import com.argus.agi.ui.theme.ArgusWarning
 import java.text.NumberFormat
 import java.util.Locale
 import kotlin.math.min
+import androidx.compose.ui.res.painterResource
+import com.argus.agi.R
 
 @Composable
 fun NeuralCoreScreen(viewModel: ArgusViewModel) {
@@ -192,7 +183,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = Icons.Default.Memory,
+                                painter = painterResource(R.drawable.ic_symbol_memory),
                                 contentDescription = "Core",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(24.dp)
@@ -221,7 +212,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             }
                             Spacer(modifier = Modifier.width(8.dp))
                             Icon(
-                                imageVector = if (isSpecExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                painter = if (isSpecExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                                 contentDescription = "Toggle",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(20.dp)
@@ -297,7 +288,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = Icons.Default.Psychology,
+                                painter = painterResource(R.drawable.ic_symbol_psychology),
                                 contentDescription = "AGI",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(24.dp)
@@ -319,7 +310,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                         }
 
                         Icon(
-                            imageVector = if (isAgiExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            painter = if (isAgiExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                             contentDescription = "Toggle",
                             tint = ArgusCyanPrimary,
                             modifier = Modifier.size(20.dp)
@@ -454,7 +445,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                                 modifier = Modifier.testTag("toggle_training_button")
                             ) {
                                 Icon(
-                                    imageVector = if (isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                    painter = if (isPaused) painterResource(R.drawable.ic_symbol_play_arrow) else painterResource(R.drawable.ic_symbol_pause),
                                     contentDescription = null,
                                     modifier = Modifier.size(16.dp)
                                 )
@@ -467,7 +458,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             }
                             Spacer(modifier = Modifier.width(6.dp))
                             Icon(
-                                imageVector = if (isTrainingExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                painter = if (isTrainingExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                                 contentDescription = "Toggle",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(20.dp)
@@ -592,7 +583,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = Icons.Default.Speed,
+                                painter = painterResource(R.drawable.ic_symbol_speed),
                                 contentDescription = "Benchmark",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(22.dp)
@@ -633,7 +624,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             }
                             Spacer(modifier = Modifier.width(6.dp))
                             Icon(
-                                imageVector = if (isBenchmarkExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                painter = if (isBenchmarkExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                                 contentDescription = "Toggle",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(20.dp)
@@ -704,7 +695,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                     fontWeight = FontWeight.Bold
                 )
                 Icon(
-                    imageVector = if (isQueueExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    painter = if (isQueueExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                     contentDescription = "Toggle Antrean",
                     tint = ArgusCyanPrimary,
                     modifier = Modifier.size(20.dp)
@@ -1120,7 +1111,7 @@ fun QueuedItemCard(item: TrainingData) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                imageVector = Icons.Default.HourglassTop,
+                painter = painterResource(R.drawable.ic_symbol_hourglass_top),
                 contentDescription = "Queued",
                 tint = ArgusWarning,
                 modifier = Modifier.size(18.dp)
@@ -1156,7 +1147,7 @@ fun CompletedItemCard(item: TrainingData) {
         ) {
             val isFailed = item.status == TrainingStatus.FAILED
             Icon(
-                imageVector = if (isFailed) Icons.Default.ErrorOutline else Icons.Default.CheckCircle,
+                painter = if (isFailed) painterResource(R.drawable.ic_symbol_error) else painterResource(R.drawable.ic_symbol_check_circle),
                 contentDescription = if (isFailed) "Gagal" else "Selesai",
                 tint = if (isFailed) ArgusError else ArgusSuccess,
                 modifier = Modifier.size(18.dp)
