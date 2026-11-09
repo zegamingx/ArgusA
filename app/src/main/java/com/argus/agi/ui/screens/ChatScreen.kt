@@ -660,6 +660,7 @@ fun ChatMessageItem(
 ) {
     val context = LocalContext.current
     val clipboard = LocalClipboard.current
+    val clipboardScope = rememberCoroutineScope()
 
     var isThinkingExpanded by remember { mutableStateOf(false) }
     var isLongTextExpanded by remember { mutableStateOf(false) }
