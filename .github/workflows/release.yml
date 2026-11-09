@@ -1,0 +1,106 @@
+name: Tagged Android Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: argus-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Lint, test, build and publish APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK 37
+        run: sdkmanager "platforms;android-37" "build-tools;37.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Verify tag matches application version
+        shell: bash
+        run: |
+          set -euo pipefail
+          major="$(awk -F= '$1 == "VERSION_MAJOR" { print $2 }' version.properties)"
+          minor="$(awk -F= '$1 == "VERSION_MINOR" { print $2 }' version.properties)"
+          patch="$(awk -F= '$1 == "VERSION_PATCH" { print $2 }' version.properties)"
+          expected_tag="v${major}.${minor}.${patch}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match version.properties (${expected_tag})."
+            exit 1
+          fi
+
+      - name: Prepare release signing key
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASSWORD_SECRET: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD_SECRET: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KEYSTORE_BASE64}" || -z "${STORE_PASSWORD_SECRET}" || -z "${KEY_PASSWORD_SECRET}" ]]; then
+            echo "::error::Configure KEYSTORE_BASE64, STORE_PASSWORD and KEY_PASSWORD in GitHub Actions secrets before publishing a signed release."
+            exit 1
+          fi
+
+          keystore_path="${RUNNER_TEMP}/argus-upload-key.jks"
+          printf '%s' "${KEYSTORE_BASE64}" | base64 --decode > "${keystore_path}"
+          test -s "${keystore_path}"
+
+          {
+            echo "KEYSTORE_PATH=${keystore_path}"
+            echo "STORE_PASSWORD=${STORE_PASSWORD_SECRET}"
+            echo "KEY_PASSWORD=${KEY_PASSWORD_SECRET}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Verify Gradle Wrapper
+        run: ./gradlew --version
+
+      - name: Run lint, unit tests and release build
+        run: >
+          ./gradlew
+          --no-daemon
+          --stacktrace
+          clean
+          :app:lintRelease
+          :app:testReleaseUnitTest
+          :app:assembleRelease
+
+      - name: Publish APK to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_path="app/build/outputs/apk/release/app-release.apk"
+          test -s "${apk_path}"
+
+          release_apk="ARGUS-${GITHUB_REF_NAME}.apk"
+          cp "${apk_path}" "${release_apk}"
+
+          gh release create "${GITHUB_REF_NAME}" "${release_apk}" \
+            --title "Argus ${GITHUB_REF_NAME}" \
+            --generate-notes
