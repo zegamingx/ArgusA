@@ -47,7 +47,7 @@ jobs:
           set -euo pipefail
           cli_path="/usr/local/bin/android"
           curl --fail --silent --show-error --location \
-            "https://dl.google.com/android/cli/1.0.16625370/linux_x86_64/android" \
+            "https://dl.google.com/android/cli/latest/linux_x86_64/android" \
             --output "${cli_path}"
           sudo chmod 0755 "${cli_path}"
           test "$("${cli_path}" --version)" = "1.0.16625370"
