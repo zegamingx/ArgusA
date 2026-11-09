@@ -34,13 +34,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.BatteryAlert
-import androidx.compose.material.icons.filled.BatteryChargingFull
-import androidx.compose.material.icons.filled.Extension
-import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
@@ -78,6 +71,8 @@ import com.argus.agi.ui.theme.ArgusTextMuted
 import com.argus.agi.ui.theme.ArgusTextPrimary
 import com.argus.agi.ui.theme.ArgusTextSecondary
 import com.argus.agi.ui.theme.ArgusWarning
+import androidx.compose.ui.res.painterResource
+import com.argus.agi.R
 
 @Composable
 fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
@@ -146,7 +141,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = if (isIgnoringOpt) Icons.Default.BatteryChargingFull else Icons.Default.BatteryAlert,
+                                painter = if (isIgnoringOpt) painterResource(R.drawable.ic_symbol_battery_charging_full) else painterResource(R.drawable.ic_symbol_battery_alert),
                                 contentDescription = "Battery",
                                 tint = if (isIgnoringOpt) ArgusSuccess else ArgusWarning,
                                 modifier = Modifier.size(22.dp)
@@ -176,7 +171,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                             }
                             Spacer(modifier = Modifier.width(6.dp))
                             Icon(
-                                imageVector = if (isBatteryExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                painter = if (isBatteryExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                                 contentDescription = "Toggle",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(20.dp)
@@ -252,7 +247,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = Icons.Default.Extension,
+                                painter = painterResource(R.drawable.ic_symbol_extension),
                                 contentDescription = "Skills",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(22.dp)
@@ -267,7 +262,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                         }
 
                         Icon(
-                            imageVector = if (isSkillsExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            painter = if (isSkillsExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                             contentDescription = "Toggle",
                             tint = ArgusCyanPrimary,
                             modifier = Modifier.size(20.dp)
@@ -433,7 +428,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = Icons.Default.VisibilityOff,
+                                painter = painterResource(R.drawable.ic_symbol_visibility_off),
                                 contentDescription = "Exclude",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(22.dp)
@@ -463,7 +458,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                             }
                             Spacer(modifier = Modifier.width(6.dp))
                             Icon(
-                                imageVector = if (isExcludeAppsExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                painter = if (isExcludeAppsExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                                 contentDescription = "Toggle",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(20.dp)
@@ -664,7 +659,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                             fontWeight = FontWeight.Bold
                         )
                         Icon(
-                            imageVector = if (isWorldModelExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            painter = if (isWorldModelExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                             contentDescription = "Toggle",
                             tint = ArgusCyanPrimary,
                             modifier = Modifier.size(20.dp)
