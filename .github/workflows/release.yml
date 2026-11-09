@@ -41,15 +41,45 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+      - name: Install pinned Android CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli_path="/usr/local/bin/android"
+          curl --fail --silent --show-error --location \
+            "https://dl.google.com/android/cli/1.0.16625370/linux_x86_64/android" \
+            --output "${cli_path}"
+          sudo chmod 0755 "${cli_path}"
+          test "$("${cli_path}" --version)" = "1.0.16625370"
+          "${cli_path}" --version
 
       - name: Install Android SDK Platform and Build Tools
         shell: bash
         run: |
           set -euo pipefail
-          android sdk install platforms/android-37 --canary
-          android sdk install build-tools/36.0.0
+          sdk_root="${RUNNER_TEMP}/android-sdk"
+          mkdir -p "${sdk_root}"
+          echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
+          echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
+
+          set +o pipefail
+          yes | /usr/local/bin/android --sdk="${sdk_root}" sdk install platforms/android-37 --canary
+          install_status=${PIPESTATUS[1]}
+          set -o pipefail
+          if [[ "${install_status}" -ne 0 ]]; then
+            exit "${install_status}"
+          fi
+
+          set +o pipefail
+          yes | /usr/local/bin/android --sdk="${sdk_root}" sdk install build-tools/36.0.0 platform-tools
+          install_status=${PIPESTATUS[1]}
+          set -o pipefail
+          if [[ "${install_status}" -ne 0 ]]; then
+            exit "${install_status}"
+          fi
+
+          test -x "${sdk_root}/build-tools/36.0.0/apksigner"
+          test -x "${sdk_root}/platform-tools/adb"
 
       - name: Resolve and validate release version
         shell: bash
@@ -138,7 +168,7 @@ jobs:
             --stacktrace \
             clean \
             :app:lintRelease \
-            :app:testReleaseUnitTest \
+            :app:testDebugUnitTest \
             :app:assembleRelease
 
       - name: Verify APK signature matches Argus signing identity
