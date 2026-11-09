@@ -169,7 +169,9 @@ jobs:
 
       - name: Run lint, unit tests and release build
         run: |
-          ./gradlew \
+          # The hosted runner exports a legacy ANDROID_SDK_ROOT that points
+          # to its preinstalled SDK. Use one SDK path via ANDROID_HOME only.
+          env -u ANDROID_SDK_ROOT ./gradlew \
             --no-daemon \
             --stacktrace \
             clean \
