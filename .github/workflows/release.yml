@@ -192,3 +192,9 @@ jobs:
           fi
 
           echo "Published ${release_apk} to ${RELEASE_TAG}."
+
+          # Remove the previous misnamed debug-preview release after the real
+          # versioned release has been published successfully.
+          if gh release view "Release" >/dev/null 2>&1; then
+            gh release delete "Release" --yes --cleanup-tag
+          fi
