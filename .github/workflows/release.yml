@@ -63,20 +63,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Reuse the hosted runner SDK. Its Android package metadata and
-          # accepted licenses are already present; expose one canonical path.
+          # Reuse the hosted runner SDK and expose a single canonical path.
           sdk_root="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
           mkdir -p "${sdk_root}"
           echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
           echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
 
-          # The --canary option must precede the package path. It includes
-          # stable, beta and canary packages, including the API 37 platform.
+          # Android 17/API 37 is published as android-37.0. AGP resolves
+          # compileSdk 37 through the legacy android-37 directory name.
           /usr/local/bin/android --no-metrics --sdk="${sdk_root}" \
-            sdk install --canary platforms/android-37
+            sdk install --canary platforms/android-37.0
 
           /usr/local/bin/android --no-metrics --sdk="${sdk_root}" \
             sdk install build-tools/36.0.0 platform-tools
+
+          test -s "${sdk_root}/platforms/android-37.0/android.jar"
+
+          if [[ ! -e "${sdk_root}/platforms/android-37" ]]; then
+            ln -s android-37.0 "${sdk_root}/platforms/android-37"
+          fi
 
           test -s "${sdk_root}/platforms/android-37/android.jar"
           test -x "${sdk_root}/build-tools/36.0.0/apksigner"
