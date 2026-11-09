@@ -50,7 +50,12 @@ jobs:
         uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
 
       - name: Install Android SDK Platform and Build Tools
-        run: sdkmanager "platforms;android-37" "build-tools;36.0.0"
+        run: |
+          set -euo pipefail
+          # API 37 is currently distributed on the preview/canary SDK channel.
+          # The Android CLI is the supported replacement for deprecated sdkmanager.
+          android sdk install platforms/android-37 --canary
+          android sdk install build-tools/36.0.0
 
       - name: Resolve and validate release version
         shell: bash
@@ -62,7 +67,8 @@ jobs:
               release_tag="${GITHUB_REF_NAME}"
               ;;
             refs/heads/build/*)
-              release_tag="${GITHUB_REF_NAME#build/}"
+              build_ref="${GITHUB_REF_NAME#build/}"
+              release_tag="${build_ref%%/*}"
               ;;
             *)
               echo "::error::Unsupported release ref: ${GITHUB_REF}"
