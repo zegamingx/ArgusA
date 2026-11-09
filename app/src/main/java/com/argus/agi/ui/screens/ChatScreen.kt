@@ -1,5 +1,6 @@
 package com.argus.agi.ui.screens
 
+import android.content.ClipData
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -38,22 +39,6 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.AttachFile
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.ContentPaste
-import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.MicOff
-import androidx.compose.material.icons.filled.Psychology
-import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.VideoLibrary
-import androidx.compose.material.icons.filled.VolumeOff
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -74,11 +59,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -99,12 +84,15 @@ import com.argus.agi.ui.theme.ArgusTextMuted
 import com.argus.agi.ui.theme.ArgusTextPrimary
 import com.argus.agi.ui.theme.ArgusTextSecondary
 import com.argus.agi.ui.theme.ArgusWarning
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(viewModel: ArgusViewModel) {
     val context = LocalContext.current
-    val clipboardManager = LocalClipboardManager.current
+    val clipboard = LocalClipboard.current
+    val clipboardScope = rememberCoroutineScope()
 
     val messages by viewModel.messages.collectAsState()
     val isGenerating by viewModel.isGenerating.collectAsState()
@@ -229,7 +217,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         }
                         Spacer(modifier = Modifier.width(6.dp))
                         Icon(
-                            imageVector = if (isHeaderExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            painter = if (isHeaderExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                             contentDescription = if (isHeaderExpanded) "Ciutkan Header" else "Perluas Header",
                             tint = ArgusCyanPrimary,
                             modifier = Modifier.size(20.dp)
@@ -265,7 +253,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Icon(
-                                    imageVector = if (isAutoSpeak) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
+                                    painter = if (isAutoSpeak) painterResource(R.drawable.ic_symbol_volume_up) else painterResource(R.drawable.ic_symbol_volume_off),
                                     contentDescription = "Auto Speak",
                                     tint = if (isAutoSpeak) ArgusCyanPrimary else ArgusTextMuted,
                                     modifier = Modifier.size(13.dp)
@@ -447,7 +435,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Mic,
+                            painter = painterResource(R.drawable.ic_symbol_mic),
                             contentDescription = null,
                             tint = ArgusWarning,
                             modifier = Modifier.size(16.dp)
@@ -482,7 +470,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            imageVector = Icons.Default.VolumeUp,
+                            painter = painterResource(R.drawable.ic_symbol_volume_up),
                             contentDescription = null,
                             tint = ArgusCyanPrimary,
                             modifier = Modifier.size(16.dp)
@@ -499,7 +487,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                             modifier = Modifier.size(26.dp)
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Stop,
+                                painter = painterResource(R.drawable.ic_symbol_stop),
                                 contentDescription = "Hentikan",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(16.dp)
@@ -520,7 +508,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         modifier = Modifier.size(38.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.AttachFile,
+                            painter = painterResource(R.drawable.ic_symbol_attach_file),
                             contentDescription = "Import Dokumen / ZIP",
                             tint = ArgusCyanPrimary
                         )
@@ -536,7 +524,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         modifier = Modifier.size(38.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.VideoLibrary,
+                            painter = painterResource(R.drawable.ic_symbol_video_library),
                             contentDescription = "Import Gambar / Video",
                             tint = ArgusBlueAccent
                         )
@@ -556,18 +544,25 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                             if (inputText.isEmpty()) {
                                 IconButton(
                                     onClick = {
-                                        val clipText = clipboardManager.getText()?.text
-                                        if (!clipText.isNullOrBlank()) {
-                                            inputText = clipText
-                                            Toast.makeText(context, "Teks ditempel dari clipboard", Toast.LENGTH_SHORT).show()
-                                        } else {
-                                            Toast.makeText(context, "Clipboard kosong", Toast.LENGTH_SHORT).show()
+                                        clipboardScope.launch {
+                                            val clipText = clipboard.getClipEntry()
+                                                ?.clipData
+                                                ?.takeIf { it.itemCount > 0 }
+                                                ?.getItemAt(0)
+                                                ?.coerceToText(context)
+                                                ?.toString()
+                                            if (!clipText.isNullOrBlank()) {
+                                                inputText = clipText
+                                                Toast.makeText(context, "Teks ditempel dari clipboard", Toast.LENGTH_SHORT).show()
+                                            } else {
+                                                Toast.makeText(context, "Clipboard kosong", Toast.LENGTH_SHORT).show()
+                                            }
                                         }
                                     },
                                     modifier = Modifier.size(30.dp)
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.ContentPaste,
+                                        painter = painterResource(R.drawable.ic_symbol_content_paste),
                                         contentDescription = "Tempel Clipboard",
                                         tint = ArgusTextMuted,
                                         modifier = Modifier.size(16.dp)
@@ -622,7 +617,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                             .background(if (isListening) ArgusWarning else ArgusSurfaceVariant.copy(alpha = 0.8f))
                     ) {
                         Icon(
-                            imageVector = if (isListening) Icons.Default.MicOff else Icons.Default.Mic,
+                            painter = if (isListening) painterResource(R.drawable.ic_symbol_mic_off) else painterResource(R.drawable.ic_symbol_mic),
                             contentDescription = "Bicara Offline",
                             tint = if (isListening) ArgusDarkBg else ArgusCyanPrimary,
                             modifier = Modifier.size(18.dp)
@@ -646,7 +641,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                             .testTag("send_button")
                     ) {
                         Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Send,
+                            painter = painterResource(R.drawable.ic_symbol_send),
                             contentDescription = "Kirim",
                             tint = ArgusDarkBg,
                             modifier = Modifier.size(20.dp)
@@ -664,7 +659,7 @@ fun ChatMessageItem(
     onSpeak: ((String) -> Unit)? = null
 ) {
     val context = LocalContext.current
-    val clipboardManager = LocalClipboardManager.current
+    val clipboard = LocalClipboard.current
 
     var isThinkingExpanded by remember { mutableStateOf(false) }
     var isLongTextExpanded by remember { mutableStateOf(false) }
@@ -738,7 +733,7 @@ fun ChatMessageItem(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            imageVector = Icons.Default.AttachFile,
+                            painter = painterResource(R.drawable.ic_symbol_attach_file),
                             contentDescription = "File",
                             tint = ArgusCyanPrimary,
                             modifier = Modifier.size(18.dp)
@@ -765,7 +760,7 @@ fun ChatMessageItem(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Psychology,
+                            painter = painterResource(R.drawable.ic_symbol_psychology),
                             contentDescription = "Reasoning",
                             tint = ArgusCyanGlow,
                             modifier = Modifier.size(16.dp)
@@ -778,7 +773,7 @@ fun ChatMessageItem(
                             modifier = Modifier.weight(1f)
                         )
                         Icon(
-                            imageVector = if (isThinkingExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                            painter = if (isThinkingExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
                             contentDescription = "Toggle",
                             tint = ArgusCyanGlow,
                             modifier = Modifier.size(16.dp)
@@ -847,7 +842,7 @@ fun ChatMessageItem(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
-                                imageVector = Icons.Default.VolumeUp,
+                                painter = painterResource(R.drawable.ic_symbol_volume_up),
                                 contentDescription = "Bicara Offline",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(13.dp)
@@ -867,7 +862,11 @@ fun ChatMessageItem(
                             .clip(RoundedCornerShape(6.dp))
                             .background(ArgusDarkBg.copy(alpha = 0.4f))
                             .clickable {
-                                clipboardManager.setText(AnnotatedString(msg.text))
+                                clipboardScope.launch {
+                                    clipboard.setClipEntry(
+                                        ClipEntry(ClipData.newPlainText("Argus message", msg.text))
+                                    )
+                                }
                                 isCopied = true
                                 Toast.makeText(context, "Pesan disalin ke clipboard", Toast.LENGTH_SHORT).show()
                             }
@@ -875,7 +874,7 @@ fun ChatMessageItem(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            imageVector = if (isCopied) Icons.Default.Check else Icons.Default.ContentCopy,
+                            painter = if (isCopied) painterResource(R.drawable.ic_symbol_check) else painterResource(R.drawable.ic_symbol_content_copy),
                             contentDescription = "Salin pesan",
                             tint = if (isCopied) ArgusSuccess else ArgusTextMuted,
                             modifier = Modifier.size(13.dp)
