@@ -63,9 +63,15 @@ jobs:
             exit 1
           fi
 
-          keystore_path="${RUNNER_TEMP}/argus-upload-key.jks"
+          keystore_path="${RUNNER_TEMP}/my-upload-key.jks"
           printf '%s' "${KEYSTORE_BASE64}" | base64 --decode > "${keystore_path}"
           test -s "${keystore_path}"
+
+          # This must be the project's release keystore: my-upload-key.jks.
+          # Its configured Gradle key alias is "upload". The AI Studio debug
+          # keystore is intentionally not used by this release workflow.
+          keytool -list -keystore "${keystore_path}" \
+            -storepass "${STORE_PASSWORD_SECRET}" -alias upload >/dev/null
 
           {
             echo "KEYSTORE_PATH=${keystore_path}"
