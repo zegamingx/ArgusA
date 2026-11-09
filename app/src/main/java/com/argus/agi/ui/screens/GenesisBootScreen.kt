@@ -43,12 +43,17 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.testTag
@@ -68,9 +73,12 @@ import com.argus.agi.ui.theme.ArgusSurfaceVariant
 import com.argus.agi.ui.theme.ArgusTextMuted
 import com.argus.agi.ui.theme.ArgusTextPrimary
 import com.argus.agi.ui.theme.ArgusTextSecondary
+import kotlinx.coroutines.delay
 import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.random.Random
 
 @Composable
 fun GenesisBootScreen(
@@ -79,7 +87,6 @@ fun GenesisBootScreen(
 ) {
     val genesisState by viewModel.genesisState.collectAsState()
 
-    // Warna yang dipakai di dalam Canvas (non-@Composable context) harus di-extract disini
     val errorColor = MaterialTheme.colorScheme.error
     val errorContainerColor = MaterialTheme.colorScheme.errorContainer
     val onErrorContainerColor = MaterialTheme.colorScheme.onErrorContainer
@@ -92,7 +99,6 @@ fun GenesisBootScreen(
         genesisState.isComplete
     )
 
-    // Fallback trigger jika state masih IDLE (biasanya ViewModel.init sudah memicu)
     LaunchedEffect(genesisState.stage) {
         if (genesisState.stage == GenesisLifecycleStage.IDLE) {
             viewModel.retryGenesis()
@@ -127,6 +133,15 @@ fun GenesisBootScreen(
         label = "progress_smooth"
     )
 
+    val eyeOpen = (genesisState.progress * 1.4f).coerceIn(0.08f, 1f)
+
+    // Transisi mata ke neuron, 0 = mata full, 1 = neuron full
+    val neuronAlpha by animateFloatAsState(
+        targetValue = if (isReady) 1f else 0f,
+        animationSpec = tween(800, easing = FastOutSlowInEasing),
+        label = "neuron_alpha"
+    )
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -134,47 +149,8 @@ fun GenesisBootScreen(
             .padding(16.dp),
         contentAlignment = Alignment.Center
     ) {
-        // Background grid + scan line
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val w = size.width
-            val h = size.height
-            val step = 40.dp.toPx()
-            var x = 0f
-            while (x < w) {
-                drawLine(
-                    color = ArgusCyanPrimary.copy(alpha = 0.05f),
-                    start = Offset(x, 0f),
-                    end = Offset(x, h),
-                    strokeWidth = 1f
-                )
-                x += step
-            }
-            var y = 0f
-            while (y < h) {
-                drawLine(
-                    color = ArgusCyanPrimary.copy(alpha = 0.05f),
-                    start = Offset(0f, y),
-                    end = Offset(w, y),
-                    strokeWidth = 1f
-                )
-                y += step
-            }
-            val currentScanY = scanY * h
-            drawLine(
-                brush = Brush.horizontalGradient(
-                    colors = listOf(
-                        Color.Transparent,
-                        ArgusCyanPrimary.copy(alpha = 0.6f),
-                        ArgusCyanGlow,
-                        ArgusCyanPrimary.copy(alpha = 0.6f),
-                        Color.Transparent
-                    )
-                ),
-                start = Offset(0f, currentScanY),
-                end = Offset(w, currentScanY),
-                strokeWidth = 2.dp.toPx()
-            )
-        }
+        BackgroundGrid()
+        ScanLineOverlay(scanY = scanY)
 
         LazyColumn(
             modifier = Modifier
@@ -196,7 +172,7 @@ fun GenesisBootScreen(
                 )
                 Text(
                     text = if (isFailed) "GENESIS INTERRUPTED"
-                    else "ARGUS GENESIS — FIRST-LAUNCH LIFECYCLE",
+                    else "ARGUS GENESIS - FIRST-LAUNCH LIFECYCLE",
                     style = MaterialTheme.typography.labelSmall,
                     color = if (isFailed) errorColor else ArgusCyanGlow,
                     letterSpacing = 1.5.sp,
@@ -211,11 +187,12 @@ fun GenesisBootScreen(
                 )
             }
 
-            // 2. HUD Canvas
+            // 2. EYE HUD + TRANSISI KE NEURON
             item {
                 Box(
                     modifier = Modifier
-                        .size(190.dp)
+                        .fillMaxWidth()
+                        .height(210.dp)
                         .clip(RoundedCornerShape(20.dp))
                         .background(ArgusSurface.copy(alpha = 0.7f))
                         .border(
@@ -225,90 +202,30 @@ fun GenesisBootScreen(
                         ),
                     contentAlignment = Alignment.Center
                 ) {
-                    Canvas(modifier = Modifier.fillMaxSize()) {
-                        val cx = size.width / 2f
-                        val cy = size.height / 2f
+                    // Lapisan mata, memudar pas neuron muncul
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .alpha(1f - neuronAlpha)
+                    ) {
+                        ArgusEyeCanvas(
+                            eyeOpen = eyeOpen,
+                            isReady = false,
+                            isFailed = isFailed,
+                            scanY = scanY,
+                            orbPulse = orbPulse
+                        )
+                    }
 
-                        if (!isReady && !isFailed) {
-                            val numBranches = 14
-                            val branchLength = size.width * 0.38f
-                            for (i in 0 until numBranches) {
-                                val angleRad = Math.toRadians((i * (360.0 / numBranches)) + 15.0)
-                                val endX = cx + (branchLength * cos(angleRad)).toFloat()
-                                val endY = cy + (branchLength * sin(angleRad)).toFloat()
-                                drawLine(
-                                    color = ArgusCyanPrimary.copy(alpha = 0.6f),
-                                    start = Offset(cx, cy),
-                                    end = Offset(endX, endY),
-                                    strokeWidth = 2.dp.toPx(),
-                                    cap = StrokeCap.Round
-                                )
-                                drawCircle(
-                                    color = ArgusCyanGlow,
-                                    radius = 4.dp.toPx(),
-                                    center = Offset(endX, endY)
-                                )
-                            }
-                            drawCircle(ArgusCyanPrimary, 10.dp.toPx(), Offset(cx, cy))
-                            drawCircle(Color.White, 5.dp.toPx(), Offset(cx, cy))
-                        } else if (isFailed) {
-                            drawCircle(
-                                color = errorColor.copy(alpha = 0.4f),
-                                radius = 40.dp.toPx(),
-                                center = Offset(cx, cy),
-                                style = Stroke(width = 2.dp.toPx())
-                            )
-                            val r = 18.dp.toPx()
-                            drawLine(
-                                errorColor,
-                                Offset(cx - r, cy - r), Offset(cx + r, cy + r),
-                                strokeWidth = 3.dp.toPx()
-                            )
-                            drawLine(
-                                errorColor,
-                                Offset(cx + r, cy - r), Offset(cx - r, cy + r),
-                                strokeWidth = 3.dp.toPx()
-                            )
-                        } else {
-                            val baseR = 40.dp.toPx() * orbPulse
-                            drawCircle(
-                                ArgusCyanPrimary.copy(alpha = 0.2f),
-                                baseR * 1.6f, Offset(cx, cy),
-                                style = Stroke(width = 2.dp.toPx())
-                            )
-                            drawCircle(
-                                ArgusCyanPrimary.copy(alpha = 0.4f),
-                                baseR * 1.3f, Offset(cx, cy),
-                                style = Stroke(width = 2.5.dp.toPx())
-                            )
-                            drawCircle(
-                                brush = Brush.radialGradient(
-                                    colors = listOf(
-                                        Color.White, ArgusCyanGlow,
-                                        ArgusCyanPrimary, Color.Transparent
-                                    ),
-                                    center = Offset(cx, cy),
-                                    radius = baseR
-                                ),
-                                radius = baseR,
-                                center = Offset(cx, cy)
-                            )
+                    // Lapisan neuron, muncul pas isReady
+                    if (neuronAlpha > 0.02f) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .alpha(neuronAlpha)
+                        ) {
+                            ArgusNeuronNetwork()
                         }
-
-                        // Corner brackets
-                        val bLen = 14.dp.toPx()
-                        val bPad = 10.dp.toPx()
-                        val bColor = if (isFailed) errorColor.copy(alpha = 0.8f)
-                        else ArgusCyanPrimary.copy(alpha = 0.8f)
-                        val bW = 2.dp.toPx()
-                        drawLine(bColor, Offset(bPad, bPad), Offset(bPad + bLen, bPad), bW)
-                        drawLine(bColor, Offset(bPad, bPad), Offset(bPad, bPad + bLen), bW)
-                        drawLine(bColor, Offset(size.width - bPad, bPad), Offset(size.width - bPad - bLen, bPad), bW)
-                        drawLine(bColor, Offset(size.width - bPad, bPad), Offset(size.width - bPad, bPad + bLen), bW)
-                        drawLine(bColor, Offset(bPad, size.height - bPad), Offset(bPad + bLen, size.height - bPad), bW)
-                        drawLine(bColor, Offset(bPad, size.height - bPad), Offset(bPad, size.height - bPad - bLen), bW)
-                        drawLine(bColor, Offset(size.width - bPad, size.height - bPad), Offset(size.width - bPad - bLen, size.height - bPad), bW)
-                        drawLine(bColor, Offset(size.width - bPad, size.height - bPad), Offset(size.width - bPad, size.height - bPad - bLen), bW)
                     }
 
                     Box(
@@ -322,8 +239,8 @@ fun GenesisBootScreen(
                         Text(
                             text = when {
                                 isFailed -> "GENESIS FAILED"
-                                isReady -> "ORIGIN READY"
-                                else -> "SYNTHESIZING CORE"
+                                isReady -> "ARGUS GENESIS MODEL - ORIGIN READY"
+                                else -> "SYNTHESIZING CORE - ${(animatedProgress * 100).toInt()}%"
                             },
                             style = MaterialTheme.typography.labelSmall,
                             color = if (isFailed) errorColor else ArgusCyanGlow,
@@ -628,10 +545,244 @@ fun GenesisBootScreen(
                         }
                     }
                     else -> {
-                        // Genesis sedang berjalan — tidak ada tombol
+                        // Genesis sedang berjalan, tidak ada tombol
                     }
                 }
                 Spacer(modifier = Modifier.height(16.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun BackgroundGrid() {
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val w = size.width
+        val h = size.height
+        val step = 60.dp.toPx()
+        var x = 0f
+        while (x < w) {
+            drawLine(
+                color = ArgusCyanPrimary.copy(alpha = 0.03f),
+                start = Offset(x, 0f),
+                end = Offset(x, h),
+                strokeWidth = 1f
+            )
+            x += step
+        }
+        var y = 0f
+        while (y < h) {
+            drawLine(
+                color = ArgusCyanPrimary.copy(alpha = 0.03f),
+                start = Offset(0f, y),
+                end = Offset(w, y),
+                strokeWidth = 1f
+            )
+            y += step
+        }
+    }
+}
+
+@Composable
+private fun ScanLineOverlay(scanY: Float) {
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val w = size.width
+        val h = size.height
+        val currentScanY = scanY * h
+        drawLine(
+            brush = Brush.horizontalGradient(
+                colors = listOf(
+                    Color.Transparent,
+                    ArgusCyanPrimary.copy(alpha = 0.6f),
+                    ArgusCyanGlow,
+                    ArgusCyanPrimary.copy(alpha = 0.6f),
+                    Color.Transparent
+                )
+            ),
+            start = Offset(0f, currentScanY),
+            end = Offset(w, currentScanY),
+            strokeWidth = 2.dp.toPx()
+        )
+    }
+}
+
+@Composable
+private fun ArgusEyeCanvas(
+    eyeOpen: Float,
+    isReady: Boolean,
+    isFailed: Boolean,
+    scanY: Float,
+    orbPulse: Float
+) {
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val w = size.width
+        val h = size.height
+        val cx = w / 2f
+        val cy = h / 2f
+        val eyeW = w * 0.78f
+        val eyeH = (eyeW * 0.32f) * eyeOpen
+
+        if (!isReady && !isFailed) {
+            for (i in 0 until 10) {
+                val angleRad = Math.toRadians((i * 36.0) + 10.0)
+                val sx = cx + (eyeW * 0.58f * cos(angleRad)).toFloat()
+                val sy = cy + (eyeH * 2.4f * sin(angleRad)).toFloat()
+                val ex = cx + (eyeW * 0.68f * cos(angleRad)).toFloat()
+                val ey = cy + (eyeH * 3.1f * sin(angleRad)).toFloat()
+                drawLine(
+                    ArgusCyanPrimary.copy(alpha = 0.5f),
+                    Offset(sx, sy), Offset(ex, ey),
+                    strokeWidth = 2f
+                )
+                drawCircle(ArgusCyanGlow, 3f, Offset(ex, ey))
+            }
+        }
+
+        if (isFailed) {
+            val r = 32.dp.toPx()
+            drawCircle(
+                color = Color.Red.copy(alpha = 0.3f),
+                radius = 55.dp.toPx(),
+                center = Offset(cx, cy),
+                style = Stroke(width = 2.dp.toPx())
+            )
+            drawLine(Color.Red, Offset(cx - r, cy - r), Offset(cx + r, cy + r), strokeWidth = 4f)
+            drawLine(Color.Red, Offset(cx + r, cy - r), Offset(cx - r, cy + r), strokeWidth = 4f)
+            return@Canvas
+        }
+
+        val eyePath = Path().apply {
+            moveTo(cx - eyeW / 2, cy)
+            quadraticTo(cx, cy - eyeH * 2.2f, cx + eyeW / 2, cy)
+            quadraticTo(cx, cy + eyeH * 2.2f, cx - eyeW / 2, cy)
+            close()
+        }
+        drawPath(eyePath, Color(0xFF0B1A3A))
+        drawPath(eyePath, ArgusCyanPrimary, style = Stroke(width = 3f))
+
+        if (eyeOpen > 0.3f) {
+            val irisR = eyeH * 1.1f * if (isReady) orbPulse else 1f
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(Color.White, ArgusCyanGlow, ArgusCyanPrimary, Color.Transparent),
+                    center = Offset(cx, cy),
+                    radius = irisR
+                ),
+                radius = irisR,
+                center = Offset(cx, cy)
+            )
+            drawCircle(Color(0xFF020617), radius = irisR * 0.32f, center = Offset(cx, cy))
+            drawCircle(Color.White, radius = irisR * 0.1f, center = Offset(cx, cy))
+        }
+
+        if (!isReady) {
+            val scanInsideY = cy - eyeH + (eyeH * 2f) * scanY
+            drawLine(
+                ArgusCyanGlow,
+                Offset(cx - eyeW / 2, scanInsideY),
+                Offset(cx + eyeW / 2, scanInsideY),
+                strokeWidth = 3f,
+                cap = StrokeCap.Round
+            )
+        }
+    }
+}
+
+// Jaring neuron versi lite, kayak akhir video lu
+private data class NeuronDot(var x: Float, var y: Float, var vx: Float, var vy: Float)
+
+@Composable
+private fun ArgusNeuronNetwork() {
+    var dots by remember {
+        mutableStateOf(
+            List(38) {
+                NeuronDot(
+                    x = Random.nextFloat(),
+                    y = Random.nextFloat(),
+                    vx = (Random.nextFloat() - 0.5f) * 0.008f,
+                    vy = (Random.nextFloat() - 0.5f) * 0.008f
+                )
+            }
+        )
+    }
+
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val w = size.width
+            val h = size.height
+
+            // Garis antar titik yang deket
+            for (i in dots.indices) {
+                for (j in i + 1 until dots.size) {
+                    val dx = (dots[i].x - dots[j].x) * w
+                    val dy = (dots[i].y - dots[j].y) * h
+                    val dist = sqrt(dx * dx + dy * dy)
+                    if (dist < 200f) {
+                        drawLine(
+                            ArgusCyanPrimary.copy(alpha = 0.25f),
+                            Offset(dots[i].x * w, dots[i].y * h),
+                            Offset(dots[j].x * w, dots[j].y * h),
+                            strokeWidth = 1f
+                        )
+                    }
+                }
+            }
+            // Titiknya
+            dots.forEach {
+                drawCircle(
+                    ArgusCyanGlow,
+                    radius = 5f,
+                    center = Offset(it.x * w, it.y * h)
+                )
+            }
+            // Pusat terang di tengah, bekas pupil mata
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        Color.White.copy(alpha = 0.9f),
+                        ArgusCyanGlow.copy(alpha = 0.5f),
+                        Color.Transparent
+                    ),
+                    center = Offset(w / 2f, h / 2f),
+                    radius = 90f
+                ),
+                radius = 90f,
+                center = Offset(w / 2f, h / 2f)
+            )
+        }
+
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = "Argus Genesis Model",
+                color = Color.White,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace
+            )
+            Text(
+                text = "NEURAL NETWORK ONLINE",
+                color = ArgusCyanGlow,
+                fontSize = 9.sp,
+                fontFamily = FontFamily.Monospace,
+                letterSpacing = 1.5.sp
+            )
+        }
+    }
+
+    // Gerakin titik, 30fps aja biar enteng
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(33)
+            dots = dots.map {
+                var nx = it.x + it.vx
+                var ny = it.y + it.vy
+                var nvx = it.vx
+                var nvy = it.vy
+                if (nx < 0f || nx > 1f) nvx = -nvx
+                if (ny < 0f || ny > 1f) nvy = -nvy
+                nx = nx.coerceIn(0f, 1f)
+                ny = ny.coerceIn(0f, 1f)
+                NeuronDot(nx, ny, nvx, nvy)
             }
         }
     }
