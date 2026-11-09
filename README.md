@@ -33,4 +33,4 @@ The private repository keeps the CI signing-key backup in the private GitHub Rel
 
 ## Compatibility note
 
-The standalone signing identity is separate from the legacy AI Studio upload key. APKs signed with the standalone key cannot update installations signed by a different certificate. Keep the existing installation until its data has been safely exported or backed up before switching.
+The standalone signing identity is separate from the legacy upload key. APKs signed with the standalone key cannot update installations signed by a different certificate. Keep the existing installation until its data has been safely exported or backed up before switching.
