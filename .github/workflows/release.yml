@@ -51,8 +51,17 @@ jobs:
             --output "${download_path}"
           chmod 0755 "${download_path}"
           sudo install -m 0755 "${download_path}" /usr/local/bin/android
-          test "$(/usr/local/bin/android --version)" = "1.0.16625370"
-          /usr/local/bin/android --version
+          set +o pipefail
+          yes | /usr/local/bin/android --no-metrics --version
+          cli_status=${PIPESTATUS[1]}
+          set -o pipefail
+          if [[ "${cli_status}" -ne 0 ]]; then
+            exit "${cli_status}"
+          fi
+
+          version="$(/usr/local/bin/android --no-metrics --version | tail -n 1)"
+          test "${version}" = "1.0.16625370"
+          echo "Android CLI ${version} is ready."
 
       - name: Install Android SDK Platform and Build Tools
         shell: bash
@@ -64,7 +73,7 @@ jobs:
           echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
 
           set +o pipefail
-          yes | /usr/local/bin/android --sdk="${sdk_root}" sdk install platforms/android-37 --canary
+          yes | /usr/local/bin/android --no-metrics --sdk="${sdk_root}" sdk install platforms/android-37 --canary
           install_status=${PIPESTATUS[1]}
           set -o pipefail
           if [[ "${install_status}" -ne 0 ]]; then
@@ -72,7 +81,7 @@ jobs:
           fi
 
           set +o pipefail
-          yes | /usr/local/bin/android --sdk="${sdk_root}" sdk install build-tools/36.0.0 platform-tools
+          yes | /usr/local/bin/android --no-metrics --sdk="${sdk_root}" sdk install build-tools/36.0.0 platform-tools
           install_status=${PIPESTATUS[1]}
           set -o pipefail
           if [[ "${install_status}" -ne 0 ]]; then
