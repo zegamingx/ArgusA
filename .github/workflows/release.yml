@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: argus-release-${{ github.event.release.tag_name || github.ref_name }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build-release:
@@ -41,51 +41,34 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      - name: Install Android CLI
+      - name: Verify runner Android SDK
         shell: bash
         run: |
           set -euo pipefail
-          download_path="${RUNNER_TEMP}/android-cli"
-          curl --fail --silent --show-error --location \
-            "https://dl.google.com/android/cli/latest/linux_x86_64/android" \
-            --output "${download_path}"
-          chmod 0755 "${download_path}"
-          sudo install -m 0755 "${download_path}" /usr/local/bin/android
-
-          version="$(/usr/local/bin/android --no-metrics --version | tail -n 1)"
-          if [[ ! "${version}" =~ ^1\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Unexpected Android CLI version: ${version}"
-            exit 1
-          fi
-          echo "Android CLI ${version} is ready."
-
-      - name: Install Android SDK Platform and Build Tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Reuse the hosted runner SDK and expose a single canonical path.
-          sdk_root="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
-          mkdir -p "${sdk_root}"
+          # Ubuntu 24.04 hosted images provide Android API 37.0, Build Tools
+          # 36.0.0 and Platform Tools. Reuse them instead of downloading SDK
+          # packages during every CI run.
+          sdk_root="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
           echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
 
-          # Android 17/API 37 is published as android-37.0. AGP resolves
-          # compileSdk 37 through the legacy android-37 directory name.
-          /usr/local/bin/android --no-metrics --sdk="${sdk_root}" \
-            sdk install --canary platforms/android-37.0
-
-          /usr/local/bin/android --no-metrics --sdk="${sdk_root}" \
-            sdk install build-tools/36.0.0 platform-tools
-
           test -s "${sdk_root}/platforms/android-37.0/android.jar"
-
-          if [[ ! -e "${sdk_root}/platforms/android-37" ]]; then
-            ln -s android-37.0 "${sdk_root}/platforms/android-37"
-          fi
-
-          test -s "${sdk_root}/platforms/android-37/android.jar"
           test -x "${sdk_root}/build-tools/36.0.0/apksigner"
           test -x "${sdk_root}/platform-tools/adb"
+
+          # Android 17/API 37 is installed as android-37.0, while AGP 9.1
+          # looks up compileSdk 37 using the android-37 directory name.
+          platform_alias="${sdk_root}/platforms/android-37"
+          if [[ ! -s "${platform_alias}/android.jar" ]]; then
+            if [[ -e "${platform_alias}" && ! -L "${platform_alias}" ]]; then
+              echo "::error::Unexpected existing SDK directory: ${platform_alias}"
+              exit 1
+            fi
+            ln -sfn android-37.0 "${platform_alias}"
+          fi
+
+          test -s "${platform_alias}/android.jar"
+          echo "Android SDK ready: API 37.0, Build Tools 36.0.0."
 
       - name: Resolve and validate release version
         shell: bash
