@@ -63,27 +63,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sdk_root="${RUNNER_TEMP}/android-sdk"
+          # Reuse the hosted runner SDK. Its Android package metadata and
+          # accepted licenses are already present; expose one canonical path.
+          sdk_root="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
           mkdir -p "${sdk_root}"
           echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
           echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
 
-          set +o pipefail
-          yes | /usr/local/bin/android --no-metrics --sdk="${sdk_root}" sdk install platforms/android-37 --canary
-          install_status=${PIPESTATUS[1]}
-          set -o pipefail
-          if [[ "${install_status}" -ne 0 ]]; then
-            exit "${install_status}"
-          fi
+          # The --canary option must precede the package path. It includes
+          # stable, beta and canary packages, including the API 37 platform.
+          /usr/local/bin/android --no-metrics --sdk="${sdk_root}" \
+            sdk install --canary platforms/android-37
 
-          set +o pipefail
-          yes | /usr/local/bin/android --no-metrics --sdk="${sdk_root}" sdk install build-tools/36.0.0 platform-tools
-          install_status=${PIPESTATUS[1]}
-          set -o pipefail
-          if [[ "${install_status}" -ne 0 ]]; then
-            exit "${install_status}"
-          fi
+          /usr/local/bin/android --no-metrics --sdk="${sdk_root}" \
+            sdk install build-tools/36.0.0 platform-tools
 
+          test -s "${sdk_root}/platforms/android-37/android.jar"
           test -x "${sdk_root}/build-tools/36.0.0/apksigner"
           test -x "${sdk_root}/platform-tools/adb"
 
