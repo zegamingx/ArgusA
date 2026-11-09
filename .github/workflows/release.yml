@@ -2,6 +2,8 @@ name: Tagged Android Release
 
 on:
   push:
+    branches:
+      - "build/*"
     tags:
       - "v*"
   release:
