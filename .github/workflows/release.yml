@@ -2,16 +2,8 @@ name: Tagged Android Release
 
 on:
   push:
-    branches:
-      - "build/*"
     tags:
       - "v*"
-  release:
-    # Support releases created or corrected through the GitHub UI.
-    types:
-      - published
-      - edited
-  create:
 
 permissions:
   contents: write
@@ -22,21 +14,12 @@ concurrency:
 
 jobs:
   build-release:
-    # A temporary build/* branch lets us start the release through the GitHub
-    # connector even when a tag/ref creation operation is not available.
-    # Ordinary branch creation events are ignored.
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'release' ||
-      (github.event_name == 'create' &&
-       github.event.ref_type == 'branch' &&
-       startsWith(github.event.ref, 'build/v'))
-    name: Lint, test, build and publish APK
+    name: Lint, test, sign and publish APK
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     steps:
-      - name: Checkout release source
+      - name: Checkout tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -52,10 +35,10 @@ jobs:
         uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
 
       - name: Install Android SDK Platform and Build Tools
+        shell: bash
         run: |
           set -euo pipefail
-          # API 37 is currently distributed on the preview/canary SDK channel.
-          # The Android CLI is the supported replacement for deprecated sdkmanager.
+          # Android API 37 is distributed through the preview/canary SDK channel.
           android sdk install platforms/android-37 --canary
           android sdk install build-tools/36.0.0
 
@@ -64,77 +47,51 @@ jobs:
         run: |
           set -euo pipefail
 
-          case "${GITHUB_REF}" in
-            refs/tags/*)
-              release_tag="${GITHUB_REF_NAME}"
-              ;;
-            refs/heads/build/*)
-              build_ref="${GITHUB_REF_NAME#build/}"
-              release_tag="${build_ref%%/*}"
-              ;;
-            *)
-              echo "::error::Unsupported release ref: ${GITHUB_REF}"
-              exit 1
-              ;;
-          esac
-
+          release_tag="${GITHUB_REF_NAME}"
           major="$(awk -F= '$1 == "VERSION_MAJOR" { print $2 }' version.properties)"
           minor="$(awk -F= '$1 == "VERSION_MINOR" { print $2 }' version.properties)"
           patch="$(awk -F= '$1 == "VERSION_PATCH" { print $2 }' version.properties)"
           expected_tag="v${major}.${minor}.${patch}"
 
           if [[ "${release_tag}" != "${expected_tag}" ]]; then
-            echo "::error::Release tag ${release_tag} does not match version.properties (${expected_tag})."
+            echo "::error::Tag ${release_tag} does not match version.properties (${expected_tag})."
             exit 1
           fi
 
           echo "RELEASE_TAG=${release_tag}" >> "${GITHUB_ENV}"
-          echo "Building release ${release_tag} from ${GITHUB_SHA}"
+          echo "Building ${release_tag} from ${GITHUB_SHA}"
 
-      - name: Prepare release signing key
-        id: signing
+      - name: Validate existing release keystore
         shell: bash
         env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          STORE_PASSWORD_SECRET: ${{ secrets.STORE_PASSWORD }}
-          KEY_PASSWORD_SECRET: ${{ secrets.KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
-          if [[ -z "${KEYSTORE_BASE64}" && -z "${STORE_PASSWORD_SECRET}" && -z "${KEY_PASSWORD_SECRET}" ]]; then
-            echo "::warning::Release signing secrets are not configured. Building an installable debug-signed preview APK; this is not a production release."
-            echo "build_mode=debug-preview" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          if [[ -z "${KEYSTORE_BASE64}" || -z "${STORE_PASSWORD_SECRET}" || -z "${KEY_PASSWORD_SECRET}" ]]; then
-            echo "::error::Release signing secrets are incomplete. Configure all three secrets or leave all three empty for a debug preview."
+          keystore_path="${GITHUB_WORKSPACE}/my-upload-key.jks"
+          if [[ ! -s "${keystore_path}" ]]; then
+            echo "::error::The existing my-upload-key.jks was not found in the tagged source."
             exit 1
           fi
 
-          keystore_path="${RUNNER_TEMP}/my-upload-key.jks"
-          printf '%s' "${KEYSTORE_BASE64}" | base64 --decode > "${keystore_path}"
-          test -s "${keystore_path}"
+          if [[ -z "${STORE_PASSWORD}" || -z "${KEY_PASSWORD}" ]]; then
+            echo "::error::Configure STORE_PASSWORD and KEY_PASSWORD in GitHub Actions secrets. The workflow will not fall back to a debug key."
+            exit 1
+          fi
 
-          # Release signing must use the project's existing my-upload-key.jks.
-          # The AI Studio debug key is never used for a production release.
-          keytool -list -keystore "${keystore_path}" \
-            -storepass "${STORE_PASSWORD_SECRET}" -alias upload >/dev/null
+          # The supplied .jks file is PKCS#12 encoded and uses the existing upload alias.
+          keytool -list -storetype PKCS12 -keystore "${keystore_path}" \
+            -storepass "${STORE_PASSWORD}" -alias upload >/dev/null
 
-          {
-            echo "KEYSTORE_PATH=${keystore_path}"
-            echo "STORE_PASSWORD=${STORE_PASSWORD_SECRET}"
-            echo "KEY_PASSWORD=${KEY_PASSWORD_SECRET}"
-          } >> "${GITHUB_ENV}"
-
-          echo "build_mode=release" >> "${GITHUB_OUTPUT}"
-
-      - name: Verify Gradle Wrapper
-        run: ./gradlew --version
-
-      - name: Run lint, unit tests and build
-        if: steps.signing.outputs.build_mode == 'release'
+      - name: Run lint, unit tests and release build
+        shell: bash
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
+          set -euo pipefail
           ./gradlew \
             --no-daemon \
             --stacktrace \
@@ -143,58 +100,55 @@ jobs:
             :app:testReleaseUnitTest \
             :app:assembleRelease
 
-      - name: Run lint, unit tests and debug preview build
-        if: steps.signing.outputs.build_mode == 'debug-preview'
-        run: |
-          ./gradlew \
-            --no-daemon \
-            --stacktrace \
-            clean \
-            :app:lintDebug \
-            :app:testDebugUnitTest \
-            :app:assembleDebug
-
-      - name: Verify signed APK
+      - name: Verify APK signature matches upload keystore
         shell: bash
         env:
-          BUILD_MODE: ${{ steps.signing.outputs.build_mode }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
         run: |
           set -euo pipefail
-          if [[ "${BUILD_MODE}" == "release" ]]; then
-            apk_path="app/build/outputs/apk/release/app-release.apk"
-          else
-            apk_path="app/build/outputs/apk/debug/app-debug.apk"
-          fi
-          test -s "${apk_path}"
-          "${ANDROID_HOME}/build-tools/36.0.0/apksigner" verify --verbose --print-certs "${apk_path}"
 
-      - name: Publish APK to GitHub Release
+          apk_path="app/build/outputs/apk/release/app-release.apk"
+          keystore_path="${GITHUB_WORKSPACE}/my-upload-key.jks"
+          test -s "${apk_path}"
+
+          "${ANDROID_HOME}/build-tools/36.0.0/apksigner" \
+            verify --verbose --print-certs "${apk_path}" >/tmp/apksigner-report.txt
+
+          expected_fingerprint="$(
+            keytool -list -v -storetype PKCS12 -keystore "${keystore_path}" \
+              -storepass "${STORE_PASSWORD}" -alias upload 2>/dev/null |
+              awk -F': ' '/SHA256:/{print $2; exit}' |
+              tr -d '[:space:]:' | tr '[:upper:]' '[:lower:]'
+          )"
+          actual_fingerprint="$(
+            awk -F': ' '/Signer #1 certificate SHA-256 digest:/{print $2; exit}' \
+              /tmp/apksigner-report.txt |
+              tr -d '[:space:]:' | tr '[:upper:]' '[:lower:]'
+          )"
+
+          if [[ -z "${expected_fingerprint}" || "${expected_fingerprint}" != "${actual_fingerprint}" ]]; then
+            echo "::error::APK signer does not match the existing upload certificate."
+            exit 1
+          fi
+
+          echo "APK signature verified against alias 'upload'."
+
+      - name: Publish signed APK to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          BUILD_MODE: ${{ steps.signing.outputs.build_mode }}
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ "${BUILD_MODE}" == "release" ]]; then
-            apk_path="app/build/outputs/apk/release/app-release.apk"
-            release_apk="ARGUS-${RELEASE_TAG}.apk"
-            cp "${apk_path}" "${release_apk}"
+          apk_path="app/build/outputs/apk/release/app-release.apk"
+          release_apk="ARGUS-${RELEASE_TAG}.apk"
+          cp "${apk_path}" "${release_apk}"
 
-            if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-              gh release upload "${RELEASE_TAG}" "${release_apk}" --clobber
-            else
-              gh release create "${RELEASE_TAG}" "${release_apk}" \
-                --target "${GITHUB_SHA}" \
-                --title "Argus ${RELEASE_TAG}" \
-                --generate-notes
-            fi
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${release_apk}" --clobber
           else
-            apk_path="app/build/outputs/apk/debug/app-debug.apk"
-            release_apk="ARGUS-${RELEASE_TAG}-DEBUG-PREVIEW.apk"
-            cp "${apk_path}" "${release_apk}"
-
-            # Attach the debug-signed preview to the existing prerelease,
-            # never to a stable semver release.
-            gh release upload "Release" "${release_apk}" --clobber
+            gh release create "${RELEASE_TAG}" "${release_apk}" \
+              --target "${GITHUB_SHA}" \
+              --title "Argus ${RELEASE_TAG}" \
+              --generate-notes
           fi
