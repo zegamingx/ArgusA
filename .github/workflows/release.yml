@@ -92,6 +92,7 @@ jobs:
           echo "Building release ${release_tag} from ${GITHUB_SHA}"
 
       - name: Prepare release signing key
+        id: signing
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -99,8 +100,15 @@ jobs:
           KEY_PASSWORD_SECRET: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
+
+          if [[ -z "${KEYSTORE_BASE64}" && -z "${STORE_PASSWORD_SECRET}" && -z "${KEY_PASSWORD_SECRET}" ]]; then
+            echo "::warning::Release signing secrets are not configured. Building an installable debug-signed preview APK; this is not a production release."
+            echo "build_mode=debug-preview" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
           if [[ -z "${KEYSTORE_BASE64}" || -z "${STORE_PASSWORD_SECRET}" || -z "${KEY_PASSWORD_SECRET}" ]]; then
-            echo "::error::Configure KEYSTORE_BASE64, STORE_PASSWORD and KEY_PASSWORD in GitHub Actions secrets before publishing a signed release."
+            echo "::error::Release signing secrets are incomplete. Configure all three secrets or leave all three empty for a debug preview."
             exit 1
           fi
 
@@ -108,8 +116,8 @@ jobs:
           printf '%s' "${KEYSTORE_BASE64}" | base64 --decode > "${keystore_path}"
           test -s "${keystore_path}"
 
-          # Use the project's release key only. The AI Studio debug key is
-          # intentionally excluded from release signing.
+          # Release signing must use the project's existing my-upload-key.jks.
+          # The AI Studio debug key is never used for a production release.
           keytool -list -keystore "${keystore_path}" \
             -storepass "${STORE_PASSWORD_SECRET}" -alias upload >/dev/null
 
@@ -119,10 +127,13 @@ jobs:
             echo "KEY_PASSWORD=${KEY_PASSWORD_SECRET}"
           } >> "${GITHUB_ENV}"
 
+          echo "build_mode=release" >> "${GITHUB_OUTPUT}"
+
       - name: Verify Gradle Wrapper
         run: ./gradlew --version
 
-      - name: Run lint, unit tests and release build
+      - name: Run lint, unit tests and build
+        if: steps.signing.outputs.build_mode == 'release'
         run: |
           ./gradlew \
             --no-daemon \
@@ -132,33 +143,58 @@ jobs:
             :app:testReleaseUnitTest \
             :app:assembleRelease
 
-      - name: Verify signed release APK
+      - name: Run lint, unit tests and debug preview build
+        if: steps.signing.outputs.build_mode == 'debug-preview'
+        run: |
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            clean \
+            :app:lintDebug \
+            :app:testDebugUnitTest \
+            :app:assembleDebug
+
+      - name: Verify signed APK
         shell: bash
+        env:
+          BUILD_MODE: ${{ steps.signing.outputs.build_mode }}
         run: |
           set -euo pipefail
-          apk_path="app/build/outputs/apk/release/app-release.apk"
+          if [[ "${BUILD_MODE}" == "release" ]]; then
+            apk_path="app/build/outputs/apk/release/app-release.apk"
+          else
+            apk_path="app/build/outputs/apk/debug/app-debug.apk"
+          fi
           test -s "${apk_path}"
           "${ANDROID_HOME}/build-tools/36.0.0/apksigner" verify --verbose --print-certs "${apk_path}"
 
       - name: Publish APK to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          BUILD_MODE: ${{ steps.signing.outputs.build_mode }}
         shell: bash
         run: |
           set -euo pipefail
-          apk_path="app/build/outputs/apk/release/app-release.apk"
-          test -s "${apk_path}"
 
-          release_apk="ARGUS-${RELEASE_TAG}.apk"
-          cp "${apk_path}" "${release_apk}"
+          if [[ "${BUILD_MODE}" == "release" ]]; then
+            apk_path="app/build/outputs/apk/release/app-release.apk"
+            release_apk="ARGUS-${RELEASE_TAG}.apk"
+            cp "${apk_path}" "${release_apk}"
 
-          # A release can be pre-created in the GitHub UI. Upload to it when
-          # present; otherwise create the semver tag and release at this SHA.
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" "${release_apk}" --clobber
+            if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+              gh release upload "${RELEASE_TAG}" "${release_apk}" --clobber
+            else
+              gh release create "${RELEASE_TAG}" "${release_apk}" \
+                --target "${GITHUB_SHA}" \
+                --title "Argus ${RELEASE_TAG}" \
+                --generate-notes
+            fi
           else
-            gh release create "${RELEASE_TAG}" "${release_apk}" \
-              --target "${GITHUB_SHA}" \
-              --title "Argus ${RELEASE_TAG}" \
-              --generate-notes
+            apk_path="app/build/outputs/apk/debug/app-debug.apk"
+            release_apk="ARGUS-${RELEASE_TAG}-DEBUG-PREVIEW.apk"
+            cp "${apk_path}" "${release_apk}"
+
+            # Attach the debug-signed preview to the existing prerelease,
+            # never to a stable semver release.
+            gh release upload "Release" "${release_apk}" --clobber
           fi
