@@ -86,6 +86,14 @@ jobs:
           :app:testReleaseUnitTest
           :app:assembleRelease
 
+      - name: Verify signed release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_path="app/build/outputs/apk/release/app-release.apk"
+          test -s "${apk_path}"
+          "${ANDROID_HOME}/build-tools/36.0.0/apksigner" verify --verbose --print-certs "${apk_path}"
+
       - name: Publish APK to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -99,5 +107,6 @@ jobs:
           cp "${apk_path}" "${release_apk}"
 
           gh release create "${GITHUB_REF_NAME}" "${release_apk}" \
+            --verify-tag \
             --title "Argus ${GITHUB_REF_NAME}" \
             --generate-notes
