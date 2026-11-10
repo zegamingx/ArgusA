@@ -373,7 +373,7 @@ internal fun isPubliclyRoutableAddress(address: InetAddress): Boolean {
 
     // Global unicast currently occupies 2000::/3. This excludes ULA,
     // link-local, multicast, unspecified, loopback, and IPv4-compatible ranges.
-    if (first and 0xE0 != 0x20) return false
+    if ((first and 0xE0) != 0x20) return false
 
     // Documentation prefix 2001:db8::/32 is not globally routable.
     if (first == 0x20 && second == 0x01 &&
