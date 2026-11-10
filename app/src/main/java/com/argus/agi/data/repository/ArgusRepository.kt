@@ -96,11 +96,34 @@ class ArgusRepository(
     }
 
     suspend fun saveTrainingItem(item: TrainingData) = withContext(Dispatchers.IO) {
-        trainingQueueDao.insertItem(item.toEntity())
+        db.withTransaction {
+            validateTrainingDocumentReferences(listOf(item))
+            trainingQueueDao.insertItem(item.toEntity())
+        }
     }
 
     suspend fun saveTrainingItems(items: List<TrainingData>) = withContext(Dispatchers.IO) {
-        trainingQueueDao.insertItems(items.map { it.toEntity() })
+        db.withTransaction {
+            validateTrainingDocumentReferences(items)
+            trainingQueueDao.insertItems(items.map { it.toEntity() })
+        }
+    }
+
+    /**
+     * A persisted queue row may reference a retained TRAIN document only.
+     * Validation documents are never eligible for optimizer updates, even if a caller
+     * bypasses TrainingManager and writes directly through the repository.
+     */
+    private suspend fun validateTrainingDocumentReferences(items: List<TrainingData>) {
+        items.mapNotNull { it.documentId }.distinct().forEach { documentId ->
+            val document = corpusDao.getDocument(documentId)
+                ?: throw IllegalArgumentException(
+                    "Training queue references an unknown corpus document: $documentId"
+                )
+            require(document.datasetSplit == "TRAIN") {
+                "Validation-only corpus documents cannot be inserted into the training queue."
+            }
+        }
     }
 
     suspend fun markTrainingCompleted(id: String, loss: Float, durationMs: Long) = withContext(Dispatchers.IO) {
