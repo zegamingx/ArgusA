@@ -1014,7 +1014,9 @@ class TrainingManager(
         when (operation) {
             is QueuePersistenceOperation.Clear -> {
                 repo?.let { repository ->
-                    runCatching { repository.clearPendingQueue() }
+                    runCatching {
+                        repository.clearPendingQueueAndMarkInterruptedCorpusDocumentsPartial()
+                    }
                         .onFailure { error ->
                             Log.e(TAG, "Failed to clear persisted training queue", error)
                         }
