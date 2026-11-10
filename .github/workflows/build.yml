@@ -91,12 +91,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p signing
-          gh release download argus-signing-key             --repo "${GITHUB_REPOSITORY}"             --pattern "ARGUS-RELEASE-KEY.p12"             --dir signing
+          gh release download argus-signing-key --repo "${GITHUB_REPOSITORY}" --pattern "ARGUS-RELEASE-KEY.p12" --dir signing
 
           mv "signing/ARGUS-RELEASE-KEY.p12" "signing/argus-release.p12"
           test -s "signing/argus-release.p12"
-
-          keytool -list -storetype PKCS12             -keystore "signing/argus-release.p12"             -storepass "" -alias upload >/dev/null
+          keytool -list -storetype PKCS12 -keystore "signing/argus-release.p12" -storepass "" -alias upload >/dev/null
 
           echo "KEYSTORE_PATH=${GITHUB_WORKSPACE}/signing/argus-release.p12" >> "${GITHUB_ENV}"
           echo "STORE_PASSWORD=" >> "${GITHUB_ENV}"
@@ -107,8 +106,7 @@ jobs:
         run: ./gradlew --version
 
       - name: Run release lint, unit tests and APK build
-        run: |
-          env -u ANDROID_SDK_ROOT ./gradlew             --no-daemon             --no-configuration-cache             --stacktrace             clean             :app:lintRelease             :app:testReleaseUnitTest             :app:assembleRelease
+        run: env -u ANDROID_SDK_ROOT ./gradlew --no-daemon --no-configuration-cache --stacktrace clean :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
 
       - name: Verify APK signature and prepare checksums
         shell: bash
@@ -117,15 +115,15 @@ jobs:
           apk_path="app/build/outputs/apk/release/app-release.apk"
           test -s "${apk_path}"
 
-          "${ANDROID_HOME}/build-tools/36.0.0/apksigner"             verify --verbose --print-certs "${apk_path}" > /tmp/apksigner-report.txt
+          "${ANDROID_HOME}/build-tools/36.0.0/apksigner" verify --verbose --print-certs "${apk_path}" > /tmp/apksigner-report.txt
 
           expected_fingerprint="$(
-            keytool -list -v -storetype PKCS12               -keystore "${KEYSTORE_PATH}" -storepass "" -alias upload 2>/dev/null |
+            keytool -list -v -storetype PKCS12 -keystore "${KEYSTORE_PATH}" -storepass "" -alias upload 2>/dev/null |
               awk -F': ' '/SHA256:/{print $2; exit}' |
               tr -d '[:space:]:' | tr '[:upper:]' '[:lower:]'
           )"
           actual_fingerprint="$(
-            awk -F': ' '/Signer #1 certificate SHA-256 digest:/{print $2; exit}'               /tmp/apksigner-report.txt |
+            awk -F': ' '/Signer #1 certificate SHA-256 digest:/{print $2; exit}' /tmp/apksigner-report.txt |
               tr -d '[:space:]:' | tr '[:upper:]' '[:lower:]'
           )"
 
@@ -136,10 +134,7 @@ jobs:
 
           mkdir -p dist
           cp "${apk_path}" "dist/ARGUS-v${VERSION_NAME}.apk"
-          (
-            cd dist
-            sha256sum "ARGUS-v${VERSION_NAME}.apk" > "ARGUS-v${VERSION_NAME}.apk.sha256"
-          )
+          (cd dist && sha256sum "ARGUS-v${VERSION_NAME}.apk" > "ARGUS-v${VERSION_NAME}.apk.sha256")
           echo "APK signature verified against the persistent Argus upload certificate."
 
       - name: Upload signed APK artifact
