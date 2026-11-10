@@ -533,7 +533,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                             HardwareSpecRow(label = "Text-to-Speech", value = if (isSpeaking) "Speaking" else "Ready (device TTS engine)")
                             HardwareSpecRow(label = "Speech Recognition", value = if (isListening) "Listening..." else "Ready (offline preferred; system fallback)")
                             HardwareSpecRow(label = "Ambient Noise Level", value = if (isAcousticActive) String.format(Locale.US, "%.1f dB SPL", ambientDb) else "Sensor Off")
-                            HardwareSpecRow(label = "Speech Service", value = "Device service; offline recognition is preferred when supported")
+                            HardwareSpecRow(label = "Speech Service", value = "Device speech service; network fallback may be used when offline recognition is unavailable")
                         }
                     }
                 }

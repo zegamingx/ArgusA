@@ -562,12 +562,12 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                 }
                             }
 
-                            if (actionClickResult != null) {
+                            actionClickResult?.let { result ->
                                 Spacer(modifier = Modifier.height(6.dp))
                                 Text(
-                                    text = actionClickResult!!,
+                                    text = result,
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = if (actionClickResult!!.startsWith("Success")) ArgusSuccess else ArgusWarning,
+                                    color = if (result.startsWith("Success")) ArgusSuccess else ArgusWarning,
                                     fontFamily = FontFamily.Monospace
                                 )
                             }
