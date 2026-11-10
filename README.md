@@ -69,8 +69,11 @@ Training currently uses causal next-token cross-entropy, full-parameter backprop
 Current limitations:
 
 - The tokenizer uses a fixed seed vocabulary and deterministic Unicode fallback. A learned BPE/Unigram tokenizer is not implemented.
-- A document-level replay API exists, but corpus-level shuffle scheduling, replay policies, and automatic held-out corpus management are not implemented yet.
-- The validation APIs require the caller to supply held-out text; they do not create a train/validation split automatically.
+- Corpus documents use a document-level TRAIN or VALIDATION split. Validation documents retain one normalized source-text payload, create no training chunks, never enter the training queue, and cannot be replayed into training.
+- Held-out evaluation uses evaluateValidationCorpus, aggregates cross-entropy by the exact number of scored next-token targets, and computes perplexity without updating model weights or optimizer state.
+- A content fingerprint cannot exist in both splits. Importing identical source text into the opposite split is rejected to prevent train/validation leakage.
+- Split selection is explicit through TrainingManager.importValidationDocument; the app does not randomly split chunks or automatically choose held-out documents. The caller must select representative validation documents before training.
+- Corpus-level shuffle scheduling and replay policies are not implemented yet.
 - NPU/APU and Vulkan may be detected for device information, but the current training implementation executes through Kotlin CPU operations. Detection is not accelerator dispatch.
 - This pipeline is not yet validated as scalable from-random-initialization pretraining or general intelligence training.
 
