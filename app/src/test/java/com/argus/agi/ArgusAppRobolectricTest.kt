@@ -354,7 +354,7 @@ class ArgusAppRobolectricTest {
         val sample = (
             "This is held-out validation text. It must be measured without updating " +
                 "the Argus neural weights, optimizer moments, tokenizer, or training step."
-            ).repeat(3)
+            ).repeat(25)
 
         assertTrue("Checkpoint must be written before evaluation", engine.saveCheckpoint())
         val checkpointFile = java.io.File(context.filesDir, "argus_model_weights.bin")
