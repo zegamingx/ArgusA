@@ -62,6 +62,8 @@ class ArticleExtractor(
         // Resolve once through the guarded resolver used by OkHttp itself. This prevents
         // a second DNS lookup from changing a previously validated public address.
         val guardedClient = client.newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
             .dns { hostname ->
                 val addresses = try {
                     dns.lookup(hostname)
