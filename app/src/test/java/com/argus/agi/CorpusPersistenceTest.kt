@@ -45,6 +45,7 @@ class CorpusPersistenceTest {
                 )
             )
             val sample = "Argus learns local language"
+            val lossOnlyEvaluation = engine.evaluateLoss(sample)
             val parameterGroups = listOf(
                 "wHead",
                 "wEmbed",
@@ -64,6 +65,12 @@ class CorpusPersistenceTest {
                     parameterName = parameterName,
                     parameterIndex = -1,
                     epsilon = 1e-2f
+                )
+                assertEquals(
+                    "Loss-only evaluation must match the loss used by full backprop.",
+                    lossOnlyEvaluation,
+                    result.meanLoss,
+                    1e-5f
                 )
                 val magnitude = maxOf(
                     kotlin.math.abs(result.analyticalGradient),
