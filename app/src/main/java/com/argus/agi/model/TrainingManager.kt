@@ -23,7 +23,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
@@ -627,86 +626,90 @@ class TrainingManager(
         policy: CorpusReplayPolicy = CorpusReplayPolicy.INTERLEAVED_DOCUMENTS,
         maxDocuments: Int = MAX_CORPUS_REPLAY_DOCUMENTS,
         maxQueuedChunks: Int = DEFAULT_MAX_CORPUS_REPLAY_CHUNKS
-    ): CorpusReplayResult = corpusSchedulingMutex.withLock {
-        require(maxDocuments in 1..MAX_CORPUS_REPLAY_DOCUMENTS) {
-            "maxDocuments must be in 1..$MAX_CORPUS_REPLAY_DOCUMENTS."
-        }
-        require(maxQueuedChunks in 1..MAX_CORPUS_REPLAY_CHUNKS) {
-            "maxQueuedChunks must be in 1..$MAX_CORPUS_REPLAY_CHUNKS."
-        }
-        require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
-            "epochs must be in 1..$MAX_DOCUMENT_EPOCHS."
-        }
-        if (closed) {
-            return@withLock CorpusReplayResult(0, 0, epochs, seed, policy)
-        }
+    ): CorpusReplayResult {
+        corpusSchedulingMutex.lock()
+        try {
+            require(maxDocuments in 1..MAX_CORPUS_REPLAY_DOCUMENTS) {
+                "maxDocuments must be in 1..$MAX_CORPUS_REPLAY_DOCUMENTS."
+            }
+            require(maxQueuedChunks in 1..MAX_CORPUS_REPLAY_CHUNKS) {
+                "maxQueuedChunks must be in 1..$MAX_CORPUS_REPLAY_CHUNKS."
+            }
+            require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
+                "epochs must be in 1..$MAX_DOCUMENT_EPOCHS."
+            }
+            if (closed) {
+                return CorpusReplayResult(0, 0, epochs, seed, policy)
+            }
 
-        val activeRepository = requireNotNull(repo) {
-            "Local corpus storage is unavailable; corpus replay cannot be scheduled."
-        }
-        val documents = activeRepository.getTrainingCorpusDocuments(maxDocuments)
-        if (documents.isEmpty()) {
-            return@withLock CorpusReplayResult(0, 0, epochs, seed, policy)
-        }
+            val activeRepository = requireNotNull(repo) {
+                "Local corpus storage is unavailable; corpus replay cannot be scheduled."
+            }
+            val documents = activeRepository.getTrainingCorpusDocuments(maxDocuments)
+            if (documents.isEmpty()) {
+                return CorpusReplayResult(0, 0, epochs, seed, policy)
+            }
 
-        val requestedChunkCount = documents.sumOf { it.chunkCount.toLong() } * epochs.toLong()
-        require(requestedChunkCount <= maxQueuedChunks.toLong()) {
-            "Corpus replay requires $requestedChunkCount queue items, exceeding the configured limit of $maxQueuedChunks. Reduce epochs or import fewer documents per replay."
-        }
+            val requestedChunkCount = documents.sumOf { it.chunkCount.toLong() } * epochs.toLong()
+            require(requestedChunkCount <= maxQueuedChunks.toLong()) {
+                "Corpus replay requires $requestedChunkCount queue items, exceeding the configured limit of $maxQueuedChunks. Reduce epochs or import fewer documents per replay."
+            }
 
-        val sources = documents.map { document ->
-            CorpusReplaySource(
-                document = document,
-                chunks = activeRepository.getCorpusChunks(document.id)
+            val sources = documents.map { document ->
+                CorpusReplaySource(
+                    document = document,
+                    chunks = activeRepository.getCorpusChunks(document.id)
+                )
+            }
+            return enqueueCorpusReplay(
+                sources = sources,
+                epochs = epochs,
+                seed = seed,
+                policy = policy,
+                maxQueuedChunks = maxQueuedChunks
             )
+        } finally {
+            corpusSchedulingMutex.unlock()
         }
-        enqueueCorpusReplay(
-            sources = sources,
-            epochs = epochs,
-            seed = seed,
-            policy = policy,
-            maxQueuedChunks = maxQueuedChunks
-        )
     }
 
-    /**
-     * Re-enqueues one retained document without re-reading the original source.
-     * Existing callers retain sequential replay by default. A seeded policy may also
-     * be selected without changing the stored chunk order.
-     */
     suspend fun replayCorpusDocument(
         documentId: String,
         epochs: Int = 1,
         seed: Long = 0L,
         policy: CorpusReplayPolicy = CorpusReplayPolicy.SEQUENTIAL_DOCUMENTS,
         maxQueuedChunks: Int = DEFAULT_MAX_CORPUS_REPLAY_CHUNKS
-    ): Int = corpusSchedulingMutex.withLock {
-        require(maxQueuedChunks in 1..MAX_CORPUS_REPLAY_CHUNKS) {
-            "maxQueuedChunks must be in 1..$MAX_CORPUS_REPLAY_CHUNKS."
-        }
-        if (closed) return@withLock 0
+    ): Int {
+        corpusSchedulingMutex.lock()
+        try {
+            require(maxQueuedChunks in 1..MAX_CORPUS_REPLAY_CHUNKS) {
+                "maxQueuedChunks must be in 1..$MAX_CORPUS_REPLAY_CHUNKS."
+            }
+            if (closed) return 0
 
-        val activeRepository = requireNotNull(repo) {
-            "Local corpus storage is unavailable; corpus replay cannot be scheduled."
-        }
-        val document = activeRepository.getCorpusDocument(documentId)
-            ?: return@withLock 0
-        require(document.datasetSplit == "TRAIN") {
-            "Validation-only documents cannot be replayed into the training queue."
-        }
+            val activeRepository = requireNotNull(repo) {
+                "Local corpus storage is unavailable; corpus replay cannot be scheduled."
+            }
+            val document = activeRepository.getCorpusDocument(documentId) ?: return 0
+            require(document.datasetSplit == "TRAIN") {
+                "Validation-only documents cannot be replayed into the training queue."
+            }
 
-        val source = CorpusReplaySource(
-            document = document,
-            chunks = activeRepository.getCorpusChunks(documentId)
-        )
-        val result = enqueueCorpusReplay(
-            sources = listOf(source),
-            epochs = epochs,
-            seed = seed,
-            policy = policy,
-            maxQueuedChunks = maxQueuedChunks
-        )
-        result.scheduledChunkCount
+            val source = CorpusReplaySource(
+                document = document,
+                chunks = activeRepository.getCorpusChunks(documentId)
+            )
+            val result = enqueueCorpusReplay(
+                sources = listOf(source),
+                epochs = epochs,
+                seed = seed,
+                policy = policy,
+                maxQueuedChunks = maxQueuedChunks
+            )
+            return result.scheduledChunkCount
+        } finally {
+            corpusSchedulingMutex.unlock()
+        }
     }
 
     private suspend fun enqueueCorpusReplay(
