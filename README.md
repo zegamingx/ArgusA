@@ -4,7 +4,9 @@ Argus is a native Android application built with Kotlin and Jetpack Compose.
 
 ## Requirements
 
-- JDK 17
+- JDK 21
+- Android NDK r30 (30.0.16248370)
+- CMake 3.22.1
 - Android SDK Platform 37
 - Android SDK Build Tools 36.0.0
 - Gradle Wrapper (repository-pinned)
@@ -31,6 +33,35 @@ Publishing a versioned GitHub Release (for example, `v1.0.7`) runs release lint,
 
 The private repository keeps the CI signing-key backup in the private GitHub Release named `argus-signing-key`. Repository access therefore also grants access to the app-signing identity. Keep this repository private and restrict collaborator access. Never redistribute the signing-key asset.
 
+## Vulkan training backend
+
+The native training module is built with Android NDK r30 and CMake 3.22.1 for
+arm64-v8a, armeabi-v7a, and x86_64. It uses the NDK-bundled glslc compiler to
+compile the AdamW and batched-linear compute shaders to SPIR-V during the native build.
+
+When a compatible Vulkan GPU and compute queue are available, sufficiently large
+matrix products in batched Q/K/V projections, attention output projection, SwiGLU,
+the output head, output-head backward, attention output-projection backward,
+SwiGLU backward, batched attention backward, and Q/K/V weight-gradient accumulation
+can run through Vulkan Compute. The three Q/K/V input-gradient products used by
+embedding backpropagation are also batched through Vulkan. The fused AdamW update
+runs on Vulkan for workloads with at least 49,152 optimizer elements. Attention
+score generation, softmax, the softmax-Jacobian reduction, layer normalization,
+low-rank LoRA gradient accumulation, token-ID embedding scatter, and global
+gradient-norm reduction remain in Kotlin. This is an incremental GPU training
+path, not a fully GPU-resident training graph.
+
+Vulkan is declared as an optional device feature. Devices without a compatible
+Vulkan driver, compute queue, shader pipeline, suitable storage memory, or
+sufficiently large optimizer workload use the existing Kotlin CPU optimizer.
+The CPU path preserves the same AdamW update and remains the required fallback.
+NPU/APU detection is informational only; no vendor-specific NPU training
+runtime is currently integrated.
+
+The CI pull-request workflow builds the native library and verifies that the
+APK contains the configured ABI libraries. Main/release workflows use JDK 21
+and the pinned NDK/CMake versions before packaging.
+
 ## Background training service
 
 The foreground service uses the `specialUse` type alone on Android 14 (API 34) and later for the ongoing user-visible local compute workload. Android 13 (API 33) uses the legacy `dataSync` compatibility type because `specialUse` did not exist on that platform. The manifest retains both declarations for this version split and supplies the required `specialUse` subtype explanation. Google Play still reviews the declared `specialUse` use case; declaring it does not guarantee policy approval.
@@ -39,7 +70,9 @@ The foreground service uses the `specialUse` type alone on Android 14 (API 34) a
 
 ### Web retrieval
 
-- Web Search returns result titles, snippets, provider names, and actual destination URLs. Explicit requests such as `/web <query>`, `cari web <query>`, and `carikan <query> di internet` invoke the registered Web Search skill independently of the local model's confidence score.
+- Web Search queries the general web first through DuckDuckGo's HTML result endpoint. Wikipedia OpenSearch is consulted only as a supplementary/fallback provider and does not outrank general web results.
+- Search results return titles, snippets, provider names, and actual destination URLs. Explicit requests such as `/web <query>`, `cari web <query>`, and `carikan <query> di internet` invoke the registered Web Search skill independently of the local model's confidence score.
+- Google Custom Search JSON API is closed to new customers, and existing customers must migrate by January 1, 2027. Argus does not scrape Google's consumer result pages or rely on undocumented Google endpoints. A future Google-backed provider requires an eligible legacy API configuration or a supported Google replacement.
 - Article extraction fetches a selected page and records its canonical URL, publisher, domain, publication date (when present), language, extracted character count, and SHA-256 digest.
 - Search snippets and unresolved user queries are not inserted into training.
 - A web article is shown in a review preview and is queued only after the user acknowledges that they have the rights or permission to use it. Both `TrainingManager` and the repository persistence boundary enforce this rule for text, stream, and validation imports: web sources with `UNVERIFIED` rights status are rejected before corpus storage.
@@ -87,7 +120,7 @@ Current limitations:
 - Corpus replay rejects documents that already have queued or active training work, preventing accidental duplicate scheduling. A completed or cleared corpus can be replayed again using the same seed.
 - Replay is bounded to 500 documents per scheduling request. Its default chunk limit is estimated from the current app heap (using a conservative 4 KiB per queue item) and capped at 4,096; callers may configure a larger limit up to the 50,000-item hard ceiling. Requests exceeding the configured limit are rejected before queue insertion.
 - `replayCorpusDocument` remains available for one-document replay and defaults to sequential chunk order.
-- NPU/APU and Vulkan may be detected for device information, but the current training implementation executes through Kotlin CPU operations. Detection is not accelerator dispatch.
+- Vulkan executes eligible batched forward/backward matrix products and AdamW updates after native numerical self-checks. Attention score generation, softmax, layer normalization, QKV/LoRA gradient accumulation, and global gradient-norm reduction remain Kotlin operations. NPU/APU hardware detection is informational only; no vendor-specific NPU/APU training runtime is integrated.
 - This pipeline is not yet validated as scalable from-random-initialization pretraining or general intelligence training.
 
 ## Compatibility note

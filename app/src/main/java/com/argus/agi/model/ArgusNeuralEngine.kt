@@ -123,6 +123,9 @@ class ArgusNeuralEngine private constructor(
     val maxSeqLen = config.maxSeqLen
     val loraRank = config.loraRank
     val isFullTrainingEnabled = config.isFullTrainingEnabled
+
+    val optimizerBackend: String
+        get() = VulkanTrainingBackend.currentBackend
     private val scale = 1.0f / sqrt(headDim.toFloat())
 
     private var vocabCap = max(tokenizer.vocabSize + 32, 160)
@@ -872,9 +875,19 @@ class ArgusNeuralEngine private constructor(
 
         for (t in 0 until seqLen) {
             computeTokenEmbedAndPos(seq[t], t, embedScale, x[t])
-            computeLinearWithLora(x[t], wQ, loraQa, loraQb, dModel, dModel, loraRank, mQ[t], q[t])
-            computeLinear(x[t], wK, dModel, dModel, k[t])
-            computeLinearWithLora(x[t], wV, loraVa, loraVb, dModel, dModel, loraRank, mV[t], v[t])
+        }
+
+        computeBatchedLinear(
+            inputs = arrayOf(x, x, x),
+            weights = arrayOf(wQ, wK, wV),
+            outputs = arrayOf(q, k, v),
+            inputColumns = dModel,
+            outputColumns = dModel
+        )
+
+        for (t in 0 until seqLen) {
+            addLoraProjection(x[t], loraQa, loraQb, dModel, dModel, loraRank, mQ[t], q[t])
+            addLoraProjection(x[t], loraVa, loraVb, dModel, dModel, loraRank, mV[t], v[t])
         }
 
         val attnWeights = attnWeightsCache
@@ -904,32 +917,37 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
-        val projBuf = FloatArray(dModel)
-        val downBuf = FloatArray(dModel)
+        computeLinearBatch(attnOut, wO, dModel, dModel, h1PreLN)
         for (t in 0 until seqLen) {
-            computeLinear(attnOut[t], wO, dModel, dModel, projBuf)
-            for (d in 0 until dModel) h1PreLN[t][d] = x[t][d] + projBuf[d]
+            for (d in 0 until dModel) h1PreLN[t][d] += x[t][d]
             System.arraycopy(h1PreLN[t], 0, h1[t], 0, dModel)
             layerNormInPlace(h1[t], dModel)
+        }
 
-            computeLinear(h1[t], wGate, dModel, dFf, gate[t])
-            computeLinear(h1[t], wUp, dModel, dFf, up[t])
+        computeLinearBatch(h1, wGate, dModel, dFf, gate)
+        computeLinearBatch(h1, wUp, dModel, dFf, up)
+        for (t in 0 until seqLen) {
             for (d in 0 until dFf) {
                 val sig = 1.0f / (1.0f + exp(-gate[t][d]))
                 act[t][d] = (gate[t][d] * sig) * up[t][d]
             }
-            computeLinear(act[t], wDown, dFf, dModel, downBuf)
-            for (d in 0 until dModel) h2PreLN[t][d] = h1[t][d] + downBuf[d]
+        }
+
+        computeLinearBatch(act, wDown, dFf, dModel, h2PreLN)
+        for (t in 0 until seqLen) {
+            for (d in 0 until dModel) h2PreLN[t][d] += h1[t][d]
             System.arraycopy(h2PreLN[t], 0, h2[t], 0, dModel)
             layerNormInPlace(h2[t], dModel)
-
-            for (vIdx in 0 until currentVocab) {
-                var sum = 0f
-                val wOff = vIdx * dModel
-                for (d in 0 until dModel) sum += h2[t][d] * wHead[wOff + d]
-                logits[t][vIdx] = sum
-            }
         }
+
+        computeLinearBatch(
+            inputs = h2,
+            weights = wHead,
+            inputColumns = dModel,
+            outputColumns = currentVocab,
+            outputs = logits,
+            transposeWeights = true
+        )
 
         // ============================ BACKWARD ============================
         // Loss-only evaluation exits before allocating gradient or backpropagation buffers.
@@ -964,6 +982,7 @@ class ArgusNeuralEngine private constructor(
         val gradLoraVa = FloatArray(dModel * loraRank)
         val gradLoraVb = FloatArray(loraRank * dModel)
 
+        val dLogits = Array(seqLen) { FloatArray(currentVocab) }
         val dL_dh2PostLN = Array(seqLen) { FloatArray(dModel) }
         val dL_dh2PreLN = Array(seqLen) { FloatArray(dModel) }
         val dL_dh1PostLN = Array(seqLen) { FloatArray(dModel) }
@@ -1001,131 +1020,345 @@ class ArgusNeuralEngine private constructor(
             for (vocabIndex in 0 until currentVocab) {
                 val probability = exp(logitRow[vocabIndex] - maxLogit) * inverseSumExp
                 val gradient = if (vocabIndex == target) probability - 1f else probability
-                val weightOffset = vocabIndex * dModel
-                for (dimension in 0 until dModel) {
-                    gradWHead[weightOffset + dimension] += gradient * h2[t][dimension]
-                    // Backpropagate using the unmodified output-head weights.
-                    dL_dh2PostLN[t][dimension] +=
-                        gradient * wHead[weightOffset + dimension]
-                }
+                dLogits[t][vocabIndex] = gradient
             }
+        }
+
+        // Output-head backward is two matrix products:
+        // dHidden = dLogits × WHead and dWHead = transpose(dLogits) × hidden.
+        computeLinearBatch(
+            inputs = dLogits,
+            weights = wHead,
+            inputColumns = currentVocab,
+            outputColumns = dModel,
+            outputs = dL_dh2PostLN
+        )
+
+        val dLogitsByVocab = Array(currentVocab) { vocabIndex ->
+            FloatArray(seqLen) { timeIndex -> dLogits[timeIndex][vocabIndex] }
+        }
+        val hiddenRows = flattenRows(h2)
+        val gradWHeadRows = Array(currentVocab) { FloatArray(dModel) }
+        computeLinearBatch(
+            inputs = dLogitsByVocab,
+            weights = hiddenRows,
+            inputColumns = seqLen,
+            outputColumns = dModel,
+            outputs = gradWHeadRows
+        )
+        for (vocabIndex in 0 until currentVocab) {
+            System.arraycopy(
+                gradWHeadRows[vocabIndex],
+                0,
+                gradWHead,
+                vocabIndex * dModel,
+                dModel
+            )
         }
 
         // (2) SwiGLU MLP & Residual Backward
+        // The final sequence row has no next-token target, so its backward buffers
+        // remain zero. Keeping it in the batch preserves the original t < seqLen - 1
+        // gradient-accumulation boundary.
         for (t in 0 until seqLen - 1) {
             layerNormBackward(dL_dh2PostLN[t], h2PreLN[t], dL_dh2PreLN[t], dModel)
+        }
 
-            // Akumulasi gradien wDown: act[t] x dL_dh2PreLN[t]
-            for (r in 0 until dFf) {
-                val actVal = act[t][r]
-                val rOff = r * dModel
-                for (c in 0 until dModel) {
-                    gradWDown[rOff + c] += actVal * dL_dh2PreLN[t][c]
-                }
-            }
+        // dAct = dL_dh2PreLN × transpose(wDown).
+        val dActRows = Array(seqLen) { FloatArray(dFf) }
+        computeLinearBatch(
+            inputs = dL_dh2PreLN,
+            weights = wDown,
+            inputColumns = dModel,
+            outputColumns = dFf,
+            outputs = dActRows,
+            transposeWeights = true
+        )
 
-            val dAct = FloatArray(dFf)
-            for (r in 0 until dFf) {
-                var sum = 0f
-                val rOff = r * dModel
-                for (c in 0 until dModel) sum += dL_dh2PreLN[t][c] * wDown[rOff + c]
-                dAct[r] = sum
-            }
-
-            for (d in 0 until dFf) {
-                val sig = 1.0f / (1.0f + exp(-gate[t][d]))
-                val swish = gate[t][d] * sig
-                val dUp = dAct[d] * swish
-                val dSwish = dAct[d] * up[t][d]
-                val dGate = dSwish * (sig * (1f + gate[t][d] * (1f - sig)))
-
-                for (c in 0 until dModel) {
-                    gradWUp[c * dFf + d] += h1[t][c] * dUp
-                    gradWGate[c * dFf + d] += h1[t][c] * dGate
-                    dL_dh1PostLN[t][c] += dGate * wGate[c * dFf + d] + dUp * wUp[c * dFf + d]
-                }
-            }
-            for (c in 0 until dModel) dL_dh1PostLN[t][c] += dL_dh2PreLN[t][c]
-            layerNormBackward(dL_dh1PostLN[t], h1PreLN[t], dL_dh1PreLN[t], dModel)
-
-            // Akumulasi gradien wO
-            for (r in 0 until dModel) {
-                val aVal = attnOut[t][r]
-                val rOff = r * dModel
-                for (c in 0 until dModel) {
-                    gradWO[rOff + c] += aVal * dL_dh1PreLN[t][c]
-                }
-            }
-
-            for (r in 0 until dModel) {
-                var sum = 0f
-                for (c in 0 until dModel) sum += dL_dh1PreLN[t][c] * wO[r * dModel + c]
-                dL_dattnOut[t][r] = sum
+        val dUpRows = Array(seqLen) { FloatArray(dFf) }
+        val dGateRows = Array(seqLen) { FloatArray(dFf) }
+        for (t in 0 until seqLen - 1) {
+            for (dimension in 0 until dFf) {
+                val sigmoid = 1.0f / (1.0f + exp(-gate[t][dimension]))
+                val swish = gate[t][dimension] * sigmoid
+                val dActValue = dActRows[t][dimension]
+                dUpRows[t][dimension] = dActValue * swish
+                val dSwish = dActValue * up[t][dimension]
+                dGateRows[t][dimension] =
+                    dSwish * (sigmoid * (1f + gate[t][dimension] * (1f - sigmoid)))
             }
         }
 
-        // (3) Causal Attention Softmax Backward
-        for (h in 0 until nHeads) {
-            val hOff = h * headDim
-            for (j in 0 until seqLen) {
-                for (d in 0 until headDim) {
-                    var sum = 0f
-                    for (i in j until seqLen) sum += attnWeights[h][i][j] * dL_dattnOut[i][hOff + d]
-                    dV[j][hOff + d] += sum
+        // Accumulate all three FFN weight gradients as batched matrix products.
+        // gradWDown = transpose(act) × dL_dh2PreLN.
+        val actTransposed = transposeRows(act)
+        val gradWDownRows = Array(dFf) { FloatArray(dModel) }
+        computeLinearBatch(
+            inputs = actTransposed,
+            weights = flattenRows(dL_dh2PreLN),
+            inputColumns = seqLen,
+            outputColumns = dModel,
+            outputs = gradWDownRows
+        )
+        for (row in gradWDownRows.indices) {
+            System.arraycopy(gradWDownRows[row], 0, gradWDown, row * dModel, dModel)
+        }
+
+        // gradWUp = transpose(h1) × dUp; gradWGate = transpose(h1) × dGate.
+        val h1Transposed = transposeRows(h1)
+        val gradWUpRows = Array(dModel) { FloatArray(dFf) }
+        computeLinearBatch(
+            inputs = h1Transposed,
+            weights = flattenRows(dUpRows),
+            inputColumns = seqLen,
+            outputColumns = dFf,
+            outputs = gradWUpRows
+        )
+        for (row in gradWUpRows.indices) {
+            System.arraycopy(gradWUpRows[row], 0, gradWUp, row * dFf, dFf)
+        }
+
+        val gradWGateRows = Array(dModel) { FloatArray(dFf) }
+        computeLinearBatch(
+            inputs = h1Transposed,
+            weights = flattenRows(dGateRows),
+            inputColumns = seqLen,
+            outputColumns = dFf,
+            outputs = gradWGateRows
+        )
+        for (row in gradWGateRows.indices) {
+            System.arraycopy(gradWGateRows[row], 0, gradWGate, row * dFf, dFf)
+        }
+
+        // Propagate dGate and dUp through their corresponding FFN projections.
+        val dHiddenFromGate = Array(seqLen) { FloatArray(dModel) }
+        computeLinearBatch(
+            inputs = dGateRows,
+            weights = wGate,
+            inputColumns = dFf,
+            outputColumns = dModel,
+            outputs = dHiddenFromGate,
+            transposeWeights = true
+        )
+
+        val dHiddenFromUp = Array(seqLen) { FloatArray(dModel) }
+        computeLinearBatch(
+            inputs = dUpRows,
+            weights = wUp,
+            inputColumns = dFf,
+            outputColumns = dModel,
+            outputs = dHiddenFromUp,
+            transposeWeights = true
+        )
+
+        for (t in 0 until seqLen - 1) {
+            for (dimension in 0 until dModel) {
+                dL_dh1PostLN[t][dimension] =
+                    dHiddenFromGate[t][dimension] +
+                    dHiddenFromUp[t][dimension] +
+                    dL_dh2PreLN[t][dimension]
+            }
+            layerNormBackward(dL_dh1PostLN[t], h1PreLN[t], dL_dh1PreLN[t], dModel)
+        }
+
+        val attentionBackwardRows = seqLen - 1
+        val attentionOutputRows = Array(attentionBackwardRows) { row -> attnOut[row] }
+        val outputProjectionGradientRows =
+            Array(attentionBackwardRows) { row -> dL_dh1PreLN[row] }
+
+        val gradWORows = Array(dModel) { FloatArray(dModel) }
+        computeLinearBatch(
+            inputs = transposeRows(attentionOutputRows),
+            weights = flattenRows(outputProjectionGradientRows),
+            inputColumns = attentionBackwardRows,
+            outputColumns = dModel,
+            outputs = gradWORows
+        )
+        System.arraycopy(flattenRows(gradWORows), 0, gradWO, 0, gradWO.size)
+
+        val attentionInputGradientRows =
+            Array(attentionBackwardRows) { FloatArray(dModel) }
+        computeLinearBatch(
+            inputs = outputProjectionGradientRows,
+            weights = wO,
+            inputColumns = dModel,
+            outputColumns = dModel,
+            outputs = attentionInputGradientRows,
+            transposeWeights = true
+        )
+        for (time in 0 until attentionBackwardRows) {
+            System.arraycopy(
+                attentionInputGradientRows[time],
+                0,
+                dL_dattnOut[time],
+                0,
+                dModel
+            )
+        }
+
+        // (3) Causal attention backward. Independent heads are processed as a batch,
+        // avoiding one queue submission and synchronization for every individual head.
+        val attentionGradientByHead = Array(nHeads) { head ->
+            val headOffset = head * headDim
+            Array(seqLen) { time ->
+                FloatArray(headDim) { dimension ->
+                    dL_dattnOut[time][headOffset + dimension]
                 }
             }
-            val dW = FloatArray(seqLen)
-            for (i in 0 until seqLen) {
-                for (j in 0..i) {
-                    var dot = 0f
-                    for (d in 0 until headDim) dot += dL_dattnOut[i][hOff + d] * v[j][hOff + d]
-                    dW[j] = dot
-                }
-                var sumWdW = 0f
-                for (j in 0..i) sumWdW += attnWeights[h][i][j] * dW[j]
-                for (j in 0..i) {
-                    val dScore = attnWeights[h][i][j] * (dW[j] - sumWdW) * scale
-                    for (d in 0 until headDim) {
-                        dQ[i][hOff + d] += dScore * k[j][hOff + d]
-                        dK[j][hOff + d] += dScore * q[i][hOff + d]
+        }
+        val queryRowsByHead = Array(nHeads) { head ->
+            val headOffset = head * headDim
+            Array(seqLen) { time ->
+                FloatArray(headDim) { dimension -> q[time][headOffset + dimension] }
+            }
+        }
+        val keyRowsByHead = Array(nHeads) { head ->
+            val headOffset = head * headDim
+            Array(seqLen) { time ->
+                FloatArray(headDim) { dimension -> k[time][headOffset + dimension] }
+            }
+        }
+        val valueRowsByHead = Array(nHeads) { head ->
+            val headOffset = head * headDim
+            Array(seqLen) { time ->
+                FloatArray(headDim) { dimension -> v[time][headOffset + dimension] }
+            }
+        }
+
+        // dV = transpose(P) × dAttention. P is lower triangular.
+        val transposedAttentionByHead = Array(nHeads) { head ->
+            Array(seqLen) { keyIndex ->
+                FloatArray(seqLen) { queryIndex ->
+                    if (queryIndex >= keyIndex) {
+                        attnWeights[head][queryIndex][keyIndex]
+                    } else {
+                        0f
                     }
                 }
             }
         }
+        val dValueByHead = Array(nHeads) { Array(seqLen) { FloatArray(headDim) } }
+        computeBatchedLinear(
+            inputs = transposedAttentionByHead,
+            weights = Array(nHeads) { head -> flattenRows(attentionGradientByHead[head]) },
+            outputs = dValueByHead,
+            inputColumns = seqLen,
+            outputColumns = headDim
+        )
 
-        // (4) Attention Projection & LoRA Gradient Accumulation
-        for (t in 0 until seqLen - 1) {
-            // wQ, wK, wV
-            for (r in 0 until dModel) {
-                val xVal = x[t][r]
-                val rOff = r * dModel
-                for (c in 0 until dModel) {
-                    gradWQ[rOff + c] += xVal * dQ[t][c]
-                    gradWK[rOff + c] += xVal * dK[t][c]
-                    gradWV[rOff + c] += xVal * dV[t][c]
+        // dW = dAttention × transpose(V); the causal mask is applied below.
+        val dWeightsByHead = Array(nHeads) { Array(seqLen) { FloatArray(seqLen) } }
+        computeBatchedLinear(
+            inputs = attentionGradientByHead,
+            weights = Array(nHeads) { head -> flattenRows(valueRowsByHead[head]) },
+            outputs = dWeightsByHead,
+            inputColumns = headDim,
+            outputColumns = seqLen,
+            transposeWeights = true
+        )
+
+        val dScoreByHead = Array(nHeads) { Array(seqLen) { FloatArray(seqLen) } }
+        for (head in 0 until nHeads) {
+            for (queryIndex in 0 until seqLen) {
+                var weightedGradient = 0f
+                for (keyIndex in 0..queryIndex) {
+                    weightedGradient +=
+                        attnWeights[head][queryIndex][keyIndex] *
+                        dWeightsByHead[head][queryIndex][keyIndex]
+                }
+                for (keyIndex in 0..queryIndex) {
+                    dScoreByHead[head][queryIndex][keyIndex] =
+                        attnWeights[head][queryIndex][keyIndex] *
+                        (dWeightsByHead[head][queryIndex][keyIndex] - weightedGradient) *
+                        scale
                 }
             }
+        }
 
-            // LoRA Q
-            for (r in 0 until loraRank) {
-                val mqVal = mQ[t][r]
-                for (c in 0 until dModel) gradLoraQb[r * dModel + c] += mqVal * dQ[t][c]
-            }
-            for (c in 0 until loraRank) {
-                var sum = 0f
-                for (j in 0 until dModel) sum += dQ[t][j] * loraQb[c * dModel + j]
-                for (d in 0 until dModel) gradLoraQa[d * loraRank + c] += x[t][d] * sum
-            }
+        // dQ = dScore × K; dK = transpose(dScore) × Q.
+        val dQueryByHead = Array(nHeads) { Array(seqLen) { FloatArray(headDim) } }
+        computeBatchedLinear(
+            inputs = dScoreByHead,
+            weights = Array(nHeads) { head -> flattenRows(keyRowsByHead[head]) },
+            outputs = dQueryByHead,
+            inputColumns = seqLen,
+            outputColumns = headDim
+        )
 
-            // LoRA V
-            for (r in 0 until loraRank) {
-                val mvVal = mV[t][r]
-                for (c in 0 until dModel) gradLoraVb[r * dModel + c] += mvVal * dV[t][c]
+        val transposedDScoreByHead = Array(nHeads) { head ->
+            transposeRows(dScoreByHead[head])
+        }
+        val dKeyByHead = Array(nHeads) { Array(seqLen) { FloatArray(headDim) } }
+        computeBatchedLinear(
+            inputs = transposedDScoreByHead,
+            weights = Array(nHeads) { head -> flattenRows(queryRowsByHead[head]) },
+            outputs = dKeyByHead,
+            inputColumns = seqLen,
+            outputColumns = headDim
+        )
+
+        for (head in 0 until nHeads) {
+            val headOffset = head * headDim
+            for (time in 0 until seqLen) {
+                System.arraycopy(dQueryByHead[head][time], 0, dQ[time], headOffset, headDim)
+                System.arraycopy(dKeyByHead[head][time], 0, dK[time], headOffset, headDim)
+                System.arraycopy(dValueByHead[head][time], 0, dV[time], headOffset, headDim)
             }
-            for (c in 0 until loraRank) {
-                var sum = 0f
-                for (j in 0 until dModel) sum += dV[t][j] * loraVb[c * dModel + j]
-                for (d in 0 until dModel) gradLoraVa[d * loraRank + c] += x[t][d] * sum
+        }
+
+        // (4) Q/K/V parameter gradients. The small rank-by-model LoRA updates
+        // remain on CPU to avoid extra synchronization for low-rank workloads.
+        val inputRowsForGradient = Array(attentionBackwardRows) { row -> x[row] }
+        val transposedInputRows = transposeRows(inputRowsForGradient)
+        val queryGradientRows = Array(attentionBackwardRows) { row -> dQ[row] }
+        val keyGradientRows = Array(attentionBackwardRows) { row -> dK[row] }
+        val valueGradientRows = Array(attentionBackwardRows) { row -> dV[row] }
+
+        val qkvGradientOutputs = Array(3) { Array(dModel) { FloatArray(dModel) } }
+        computeBatchedLinear(
+            inputs = arrayOf(transposedInputRows, transposedInputRows, transposedInputRows),
+            weights = arrayOf(
+                flattenRows(queryGradientRows),
+                flattenRows(keyGradientRows),
+                flattenRows(valueGradientRows)
+            ),
+            outputs = qkvGradientOutputs,
+            inputColumns = attentionBackwardRows,
+            outputColumns = dModel
+        )
+        System.arraycopy(flattenRows(qkvGradientOutputs[0]), 0, gradWQ, 0, gradWQ.size)
+        System.arraycopy(flattenRows(qkvGradientOutputs[1]), 0, gradWK, 0, gradWK.size)
+        System.arraycopy(flattenRows(qkvGradientOutputs[2]), 0, gradWV, 0, gradWV.size)
+
+        // LoRA Q/V gradients remain local and use the original rank-sized equations.
+        for (time in 0 until attentionBackwardRows) {
+            for (rankIndex in 0 until loraRank) {
+                val queryMidValue = mQ[time][rankIndex]
+                val valueMidValue = mV[time][rankIndex]
+                val queryGradientOffset = rankIndex * dModel
+                for (dimension in 0 until dModel) {
+                    gradLoraQb[queryGradientOffset + dimension] +=
+                        queryMidValue * dQ[time][dimension]
+                    gradLoraVb[queryGradientOffset + dimension] +=
+                        valueMidValue * dV[time][dimension]
+                }
+            }
+            for (rankIndex in 0 until loraRank) {
+                var queryBackProjection = 0f
+                var valueBackProjection = 0f
+                val queryWeightOffset = rankIndex * dModel
+                for (dimension in 0 until dModel) {
+                    queryBackProjection +=
+                        dQ[time][dimension] * loraQb[queryWeightOffset + dimension]
+                    valueBackProjection +=
+                        dV[time][dimension] * loraVb[queryWeightOffset + dimension]
+                }
+                for (dimension in 0 until dModel) {
+                    gradLoraQa[dimension * loraRank + rankIndex] +=
+                        x[time][dimension] * queryBackProjection
+                    gradLoraVa[dimension * loraRank + rankIndex] +=
+                        x[time][dimension] * valueBackProjection
+                }
             }
         }
 
@@ -1145,28 +1378,32 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
-        for (t in 0 until seqLen - 1) {
-            val dX_t = FloatArray(dModel)
-            for (d in 0 until dModel) {
-                dX_t[d] += dL_dh1PreLN[t][d]
-                var sumQ = 0f
-                var sumK = 0f
-                var sumV = 0f
-                val dOff = d * dModel
-                for (c in 0 until dModel) {
-                    sumQ += dQ[t][c] * wQEff[dOff + c]
-                    sumK += dK[t][c] * wK[dOff + c]
-                    sumV += dV[t][c] * wVEff[dOff + c]
-                }
-                dX_t[d] += sumQ + sumK + sumV
-            }
+        val inputGradientByProjection =
+            Array(3) { Array(attentionBackwardRows) { FloatArray(dModel) } }
+        computeBatchedLinear(
+            inputs = arrayOf(queryGradientRows, keyGradientRows, valueGradientRows),
+            weights = arrayOf(wQEff, wK, wVEff),
+            outputs = inputGradientByProjection,
+            inputColumns = dModel,
+            outputColumns = dModel,
+            transposeWeights = true
+        )
 
-            val tok = seq[t]
-            if (tok in 0 until vocabCap) {
-                val embOff = tok * dModel
-                for (d in 0 until dModel) {
-                    gradWEmbed[embOff + d] += dX_t[d] * embedScale
-                }
+        for (time in 0 until attentionBackwardRows) {
+            val token = seq[time]
+            if (token !in 0 until vocabCap) continue
+
+            val embeddingOffset = token * dModel
+            val queryInputGradient = inputGradientByProjection[0][time]
+            val keyInputGradient = inputGradientByProjection[1][time]
+            val valueInputGradient = inputGradientByProjection[2][time]
+            for (dimension in 0 until dModel) {
+                val inputGradient =
+                    dL_dh1PreLN[time][dimension] +
+                    queryInputGradient[dimension] +
+                    keyInputGradient[dimension] +
+                    valueInputGradient[dimension]
+                gradWEmbed[embeddingOffset + dimension] += inputGradient * embedScale
             }
         }
 
@@ -1243,40 +1480,78 @@ class ArgusNeuralEngine private constructor(
         if (!totalNorm.isFinite()) { adamStep--; return Float.NaN }
         val clipFactor = if (totalNorm > maxGradNorm) maxGradNorm / (totalNorm + 1e-6f) else 1.0f
 
-        applyClip(gradWHead, clipFactor)
-        applyClip(gradWEmbed, clipFactor)
-        applyClip(gradWDown, clipFactor)
-        applyClip(gradWUp, clipFactor)
-        applyClip(gradWGate, clipFactor)
-        applyClip(gradWO, clipFactor)
-        applyClip(gradWQ, clipFactor)
-        applyClip(gradWK, clipFactor)
-        applyClip(gradWV, clipFactor)
-        applyClip(gradLoraQa, clipFactor)
-        applyClip(gradLoraQb, clipFactor)
-        applyClip(gradLoraVa, clipFactor)
-        applyClip(gradLoraVb, clipFactor)
-
-        // Adam Step terpusat dengan koreksi bias
+        // Keep the existing clipped-gradient AdamW math available as the exact CPU fallback.
         val beta1Pow = Math.pow(beta1.toDouble(), adamStep.toDouble()).toFloat()
         val beta2Pow = Math.pow(beta2.toDouble(), adamStep.toDouble()).toFloat()
         val biasCorr1 = 1f - beta1Pow
         val biasCorr2 = 1f - beta2Pow
 
-        adamUpdate(wHead, gradWHead, mHead, vHead, lr, biasCorr1, biasCorr2)
-        adamUpdate(wEmbed, gradWEmbed, mEmbed, vEmbed, lr, biasCorr1, biasCorr2)
-        adamUpdate(wDown, gradWDown, mWDown, vWDown, lr, biasCorr1, biasCorr2, weightDecay)
-        adamUpdate(wUp, gradWUp, mWUp, vWUp, lr, biasCorr1, biasCorr2, weightDecay)
-        adamUpdate(wGate, gradWGate, mWGate, vWGate, lr, biasCorr1, biasCorr2, weightDecay)
-        adamUpdate(wO, gradWO, mWO, vWO, lr, biasCorr1, biasCorr2, weightDecay)
-        adamUpdate(wQ, gradWQ, mWQ, vWQ, lr, biasCorr1, biasCorr2, weightDecay)
-        adamUpdate(wK, gradWK, mWK, vWK, lr, biasCorr1, biasCorr2, weightDecay)
-        adamUpdate(wV, gradWV, mWV, vWV, lr, biasCorr1, biasCorr2, weightDecay)
+        val parameterGroups = arrayOf(
+            wHead, wEmbed, wDown, wUp, wGate, wO, wQ, wK, wV,
+            loraQa, loraQb, loraVa, loraVb
+        )
+        val gradientGroups = arrayOf(
+            gradWHead, gradWEmbed, gradWDown, gradWUp, gradWGate, gradWO,
+            gradWQ, gradWK, gradWV, gradLoraQa, gradLoraQb, gradLoraVa, gradLoraVb
+        )
+        val firstMomentGroups = arrayOf(
+            mHead, mEmbed, mWDown, mWUp, mWGate, mWO, mWQ, mWK, mWV,
+            mLoraQa, mLoraQb, mLoraVa, mLoraVb
+        )
+        val secondMomentGroups = arrayOf(
+            vHead, vEmbed, vWDown, vWUp, vWGate, vWO, vWQ, vWK, vWV,
+            vLoraQa, vLoraQb, vLoraVa, vLoraVb
+        )
+        val weightDecayByGroup = floatArrayOf(
+            0f, 0f,
+            weightDecay, weightDecay, weightDecay, weightDecay, weightDecay, weightDecay, weightDecay,
+            0f, 0f, 0f, 0f
+        )
 
-        adamUpdate(loraQa, gradLoraQa, mLoraQa, vLoraQa, lr, biasCorr1, biasCorr2)
-        adamUpdate(loraQb, gradLoraQb, mLoraQb, vLoraQb, lr, biasCorr1, biasCorr2)
-        adamUpdate(loraVa, gradLoraVa, mLoraVa, vLoraVa, lr, biasCorr1, biasCorr2)
-        adamUpdate(loraVb, gradLoraVb, mLoraVb, vLoraVb, lr, biasCorr1, biasCorr2)
+        val updatedByVulkan = VulkanTrainingBackend.tryApplyAdamWUpdate(
+            parameters = parameterGroups,
+            gradients = gradientGroups,
+            firstMoments = firstMomentGroups,
+            secondMoments = secondMomentGroups,
+            weightDecayByGroup = weightDecayByGroup,
+            learningRate = lr,
+            beta1 = beta1,
+            beta2 = beta2,
+            biasCorrection1 = biasCorr1,
+            biasCorrection2 = biasCorr2,
+            epsilon = epsilon,
+            gradientClipFactor = clipFactor
+        )
+
+        if (!updatedByVulkan) {
+            applyClip(gradWHead, clipFactor)
+            applyClip(gradWEmbed, clipFactor)
+            applyClip(gradWDown, clipFactor)
+            applyClip(gradWUp, clipFactor)
+            applyClip(gradWGate, clipFactor)
+            applyClip(gradWO, clipFactor)
+            applyClip(gradWQ, clipFactor)
+            applyClip(gradWK, clipFactor)
+            applyClip(gradWV, clipFactor)
+            applyClip(gradLoraQa, clipFactor)
+            applyClip(gradLoraQb, clipFactor)
+            applyClip(gradLoraVa, clipFactor)
+            applyClip(gradLoraVb, clipFactor)
+
+            adamUpdate(wHead, gradWHead, mHead, vHead, lr, biasCorr1, biasCorr2)
+            adamUpdate(wEmbed, gradWEmbed, mEmbed, vEmbed, lr, biasCorr1, biasCorr2)
+            adamUpdate(wDown, gradWDown, mWDown, vWDown, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(wUp, gradWUp, mWUp, vWUp, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(wGate, gradWGate, mWGate, vWGate, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(wO, gradWO, mWO, vWO, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(wQ, gradWQ, mWQ, vWQ, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(wK, gradWK, mWK, vWK, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(wV, gradWV, mWV, vWV, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(loraQa, gradLoraQa, mLoraQa, vLoraQa, lr, biasCorr1, biasCorr2)
+            adamUpdate(loraQb, gradLoraQb, mLoraQb, vLoraQb, lr, biasCorr1, biasCorr2)
+            adamUpdate(loraVa, gradLoraVa, mLoraVa, vLoraVa, lr, biasCorr1, biasCorr2)
+            adamUpdate(loraVb, gradLoraVb, mLoraVb, vLoraVb, lr, biasCorr1, biasCorr2)
+        }
 
         return if (validSteps > 0) totalLoss / validSteps else Float.NaN
     }
@@ -1332,21 +1607,177 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
+    private fun flattenRows(rows: Array<FloatArray>): FloatArray {
+        if (rows.isEmpty()) return FloatArray(0)
+        val columnCount = rows[0].size
+        require(rows.all { row -> row.size == columnCount }) {
+            "Matrix rows must have a consistent width."
+        }
+        val elementCount = Math.multiplyExact(rows.size, columnCount)
+        return FloatArray(elementCount).also { flattened ->
+            for (rowIndex in rows.indices) {
+                System.arraycopy(
+                    rows[rowIndex],
+                    0,
+                    flattened,
+                    rowIndex * columnCount,
+                    columnCount
+                )
+            }
+        }
+    }
+
+    private fun transposeRows(rows: Array<FloatArray>): Array<FloatArray> {
+        if (rows.isEmpty()) return emptyArray()
+        val columnCount = rows[0].size
+        require(rows.all { row -> row.size == columnCount }) {
+            "Matrix rows must have a consistent width."
+        }
+        return Array(columnCount) { column ->
+            FloatArray(rows.size) { row -> rows[row][column] }
+        }
+    }
+
+    private fun computeLinearBatch(
+        inputs: Array<FloatArray>,
+        weights: FloatArray,
+        inputColumns: Int,
+        outputColumns: Int,
+        outputs: Array<FloatArray>,
+        transposeWeights: Boolean = false
+    ) {
+        val dispatchedToVulkan = VulkanTrainingBackend.tryApplyLinear(
+            inputRows = inputs,
+            weights = weights,
+            outputRows = outputs,
+            inputColumns = inputColumns,
+            outputColumns = outputColumns,
+            transposeWeights = transposeWeights
+        )
+        if (dispatchedToVulkan) return
+
+        if (transposeWeights) {
+            for (row in inputs.indices) {
+                computeLinearTransposed(
+                    inputs[row],
+                    weights,
+                    inputColumns,
+                    outputColumns,
+                    outputs[row]
+                )
+            }
+        } else {
+            for (row in inputs.indices) {
+                computeLinear(
+                    inputs[row],
+                    weights,
+                    inputColumns,
+                    outputColumns,
+                    outputs[row]
+                )
+            }
+        }
+    }
+
+    private fun computeBatchedLinear(
+        inputs: Array<Array<FloatArray>>,
+        weights: Array<FloatArray>,
+        outputs: Array<Array<FloatArray>>,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean = false
+    ) {
+        require(inputs.isNotEmpty()) { "Batched linear inputs must not be empty." }
+        require(inputs.size == weights.size && inputs.size == outputs.size) {
+            "Batched linear inputs, weights, and outputs must have matching batch counts."
+        }
+
+        val dispatchedToVulkan = VulkanTrainingBackend.tryApplyBatchedLinear(
+            inputBatches = inputs,
+            weightBatches = weights,
+            outputBatches = outputs,
+            inputColumns = inputColumns,
+            outputColumns = outputColumns,
+            transposeWeights = transposeWeights
+        )
+        if (dispatchedToVulkan) return
+
+        for (batch in inputs.indices) {
+            val weight = weights[batch]
+            require(inputs[batch].size == outputs[batch].size) {
+                "Batched linear input and output row counts must match."
+            }
+            for (row in inputs[batch].indices) {
+                if (transposeWeights) {
+                    computeLinearTransposed(
+                        inputs[batch][row],
+                        weight,
+                        inputColumns,
+                        outputColumns,
+                        outputs[batch][row]
+                    )
+                } else {
+                    computeLinear(
+                        inputs[batch][row],
+                        weight,
+                        inputColumns,
+                        outputColumns,
+                        outputs[batch][row]
+                    )
+                }
+            }
+        }
+    }
+
+    private fun computeLinearTransposed(
+        input: FloatArray,
+        weights: FloatArray,
+        inputColumns: Int,
+        outputColumns: Int,
+        output: FloatArray
+    ) {
+        for (column in 0 until outputColumns) {
+            var sum = 0f
+            val weightOffset = column * inputColumns
+            for (inner in 0 until inputColumns) {
+                sum += input[inner] * weights[weightOffset + inner]
+            }
+            output[column] = sum
+        }
+    }
+
     private fun computeLinearWithLora(
         x: FloatArray, wBase: FloatArray, loraA: FloatArray, loraB: FloatArray,
         inDim: Int, outDim: Int, rank: Int,
         midBuf: FloatArray, finalOut: FloatArray
     ) {
         computeLinear(x, wBase, inDim, outDim, finalOut)
-        for (c in 0 until rank) {
+        addLoraProjection(x, loraA, loraB, inDim, outDim, rank, midBuf, finalOut)
+    }
+
+    private fun addLoraProjection(
+        input: FloatArray,
+        loraA: FloatArray,
+        loraB: FloatArray,
+        inputColumns: Int,
+        outputColumns: Int,
+        rank: Int,
+        intermediate: FloatArray,
+        output: FloatArray
+    ) {
+        for (rankIndex in 0 until rank) {
             var sum = 0f
-            for (r in 0 until inDim) sum += x[r] * loraA[r * rank + c]
-            midBuf[c] = sum
+            for (inputIndex in 0 until inputColumns) {
+                sum += input[inputIndex] * loraA[inputIndex * rank + rankIndex]
+            }
+            intermediate[rankIndex] = sum
         }
-        for (c in 0 until outDim) {
+        for (outputIndex in 0 until outputColumns) {
             var sum = 0f
-            for (r in 0 until rank) sum += midBuf[r] * loraB[r * outDim + c]
-            finalOut[c] += sum
+            for (rankIndex in 0 until rank) {
+                sum += intermediate[rankIndex] * loraB[rankIndex * outputColumns + outputIndex]
+            }
+            output[outputIndex] += sum
         }
     }
 

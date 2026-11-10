@@ -1,0 +1,56 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer TrainingBuffer {
+    float values[];
+};
+
+layout(push_constant) uniform LinearParameters {
+    uint rowCount;
+    uint batchCount;
+    uint rowsPerBatch;
+    uint inputColumns;
+    uint outputColumns;
+    uint inputOffset;
+    uint weightOffset;
+    uint outputOffset;
+    uint transposeWeights;
+} parameters;
+
+void main() {
+    const uint outputIndex = gl_GlobalInvocationID.x;
+    const uint outputElementCount = parameters.rowCount * parameters.outputColumns;
+    if (outputIndex >= outputElementCount) {
+        return;
+    }
+
+    const uint row = outputIndex / parameters.outputColumns;
+    const uint column = outputIndex - row * parameters.outputColumns;
+    const uint batchIndex = row / parameters.rowsPerBatch;
+    if (batchIndex >= parameters.batchCount) {
+        return;
+    }
+
+    const uint rowInBatch = row - batchIndex * parameters.rowsPerBatch;
+    const uint inputRowOffset =
+        parameters.inputOffset +
+        batchIndex * parameters.rowsPerBatch * parameters.inputColumns +
+        rowInBatch * parameters.inputColumns;
+    const uint batchWeightOffset =
+        parameters.weightOffset +
+        batchIndex * parameters.inputColumns * parameters.outputColumns;
+
+    float sum = 0.0;
+    for (uint inner = 0u; inner < parameters.inputColumns; ++inner) {
+        uint weightIndex;
+        if (parameters.transposeWeights == 0u) {
+            weightIndex = batchWeightOffset + inner * parameters.outputColumns + column;
+        } else {
+            weightIndex = batchWeightOffset + column * parameters.inputColumns + inner;
+        }
+        sum += values[inputRowOffset + inner] * values[weightIndex];
+    }
+
+    values[parameters.outputOffset + outputIndex] = sum;
+}

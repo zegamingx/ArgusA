@@ -34,11 +34,11 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
           cache: gradle
 
       - name: Verify runner Android SDK
@@ -64,6 +64,25 @@ jobs:
 
           test -s "${platform_alias}/android.jar"
           echo "Android SDK ready: API 37.0, Build Tools 36.0.0."
+
+      - name: Install pinned Vulkan NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager_path="$(command -v sdkmanager || true)"
+          if [[ -z "${sdkmanager_path}" ]]; then
+            sdkmanager_path="$(find "${ANDROID_HOME}/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          fi
+          test -n "${sdkmanager_path}"
+          set +o pipefail
+          yes | "${sdkmanager_path}" --licenses >/dev/null
+          set -o pipefail
+          "${sdkmanager_path}" --install "ndk;30.0.16248370" "cmake;3.22.1"
+          glslc_path="$(find "${ANDROID_HOME}/ndk/30.0.16248370/shader-tools" -type f -name glslc -print -quit)"
+          test -n "${glslc_path}"
+          test -x "${glslc_path}"
+          test -d "${ANDROID_HOME}/cmake/3.22.1"
+          echo "NDK r30 and CMake 3.22.1 are ready."
 
       - name: Resolve application version
         shell: bash
@@ -118,6 +137,10 @@ jobs:
           set -euo pipefail
           apk_path="app/build/outputs/apk/release/app-release.apk"
           test -s "${apk_path}"
+
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
+          done
 
           "${ANDROID_HOME}/build-tools/36.0.0/apksigner" verify --verbose --print-certs "${apk_path}" > /tmp/apksigner-report.txt
 

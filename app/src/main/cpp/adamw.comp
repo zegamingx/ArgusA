@@ -1,0 +1,57 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer TrainingBuffer {
+    float values[];
+};
+
+layout(push_constant) uniform AdamwParameters {
+    uint elementCount;
+    float learningRate;
+    float beta1;
+    float beta2;
+    float biasCorrection1;
+    float biasCorrection2;
+    float epsilon;
+    float gradientClipFactor;
+} parameters;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.elementCount) {
+        return;
+    }
+
+    const uint gradientOffset = parameters.elementCount;
+    const uint firstMomentOffset = parameters.elementCount * 2u;
+    const uint secondMomentOffset = parameters.elementCount * 3u;
+    const uint weightDecayOffset = parameters.elementCount * 4u;
+
+    const float parameter = values[index];
+    const float gradient =
+        values[gradientOffset + index] * parameters.gradientClipFactor;
+
+    const float firstMoment =
+        parameters.beta1 * values[firstMomentOffset + index] +
+        (1.0 - parameters.beta1) * gradient;
+
+    const float secondMoment =
+        parameters.beta2 * values[secondMomentOffset + index] +
+        (1.0 - parameters.beta2) * gradient * gradient;
+
+    const float correctedFirstMoment =
+        firstMoment / parameters.biasCorrection1;
+    const float correctedSecondMoment =
+        secondMoment / parameters.biasCorrection2;
+    const float decay = values[weightDecayOffset + index];
+
+    values[index] = parameter - parameters.learningRate * (
+        correctedFirstMoment /
+            (sqrt(correctedSecondMoment) + parameters.epsilon) +
+        decay * parameter
+    );
+
+    values[firstMomentOffset + index] = firstMoment;
+    values[secondMomentOffset + index] = secondMoment;
+}

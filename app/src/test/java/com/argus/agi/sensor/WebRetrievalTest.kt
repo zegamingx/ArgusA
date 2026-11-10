@@ -89,6 +89,72 @@ class WebRetrievalTest {
     }
 
     @Test
+    fun generalWebResultsKeepPriorityOverSupplementaryWikipediaResults() {
+        val generalResults = listOf(
+            SearchResultItem(
+                title = "General result one",
+                snippet = "Primary web result.",
+                sourceUrl = "https://example.org/one",
+                provider = "DuckDuckGo"
+            ),
+            SearchResultItem(
+                title = "General result two",
+                snippet = "Second primary result.",
+                sourceUrl = "https://example.org/two",
+                provider = "DuckDuckGo"
+            )
+        )
+        val supplementaryResults = listOf(
+            SearchResultItem(
+                title = "Duplicate encyclopedia result",
+                snippet = "This must not replace the primary result.",
+                sourceUrl = "https://example.org/one",
+                provider = "Wikipedia"
+            ),
+            SearchResultItem(
+                title = "Supplementary encyclopedia result",
+                snippet = "This may be appended after primary results.",
+                sourceUrl = "https://example.org/three",
+                provider = "Wikipedia"
+            )
+        )
+
+        val merged = mergeSearchResults(
+            primaryResults = generalResults,
+            supplementaryResults = supplementaryResults,
+            maxResults = 3
+        )
+
+        assertEquals(3, merged.size)
+        assertEquals("General result one", merged[0].title)
+        assertEquals("General result two", merged[1].title)
+        assertEquals("Supplementary encyclopedia result", merged[2].title)
+        assertEquals(1, merged.count { it.sourceUrl == "https://example.org/one" })
+    }
+
+    @Test
+    fun searchResultMergeEnforcesMaximumResultCount() {
+        val primaryResults = (1..4).map { index ->
+            SearchResultItem(
+                title = "Result $index",
+                snippet = "General web result $index.",
+                sourceUrl = "https://example.org/$index",
+                provider = "DuckDuckGo"
+            )
+        }
+
+        val merged = mergeSearchResults(
+            primaryResults = primaryResults,
+            supplementaryResults = emptyList(),
+            maxResults = 2
+        )
+
+        assertEquals(2, merged.size)
+        assertEquals("Result 1", merged[0].title)
+        assertEquals("Result 2", merged[1].title)
+    }
+
+    @Test
     fun articleParserRejectsPrivateCanonicalMetadataWithoutDnsLookup() {
         val paragraphs = (1..8).joinToString("\n") {
             "<p>Paragraph $it contains enough readable article text to pass extraction validation without network access.</p>"
