@@ -38,7 +38,7 @@ The private repository keeps the CI signing-key backup in the private GitHub Rel
 - Web Search returns result titles, snippets, provider names, and actual destination URLs.
 - Article extraction fetches a selected page and records its canonical URL, publisher, domain, publication date (when present), language, extracted character count, and SHA-256 digest.
 - Search snippets and unresolved user queries are not inserted into training.
-- A web article is shown in a review preview and is queued only after the user acknowledges that they have the rights or permission to use it.
+- A web article is shown in a review preview and is queued only after the user acknowledges that they have the rights or permission to use it. `TrainingManager` enforces this rule for text, stream, and validation imports: web sources with `UNVERIFIED` rights status are rejected before corpus storage.
 - Article extraction is limited to readable HTML pages. Login walls, blocked pages, non-HTML content, and short landing pages are rejected.
 
 ### Local document formats
