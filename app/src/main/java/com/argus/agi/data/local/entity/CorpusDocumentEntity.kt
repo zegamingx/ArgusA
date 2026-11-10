@@ -12,7 +12,8 @@ import androidx.room.PrimaryKey
     tableName = "corpus_documents",
     indices = [
         Index(value = ["contentFingerprint"], unique = true),
-        Index(value = ["createdAtEpochMs"])
+        Index(value = ["createdAtEpochMs"]),
+        Index(value = ["datasetSplit", "createdAtEpochMs"])
     ]
 )
 data class CorpusDocumentEntity(
