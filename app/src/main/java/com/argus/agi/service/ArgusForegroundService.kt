@@ -40,6 +40,13 @@ class ArgusForegroundService : Service() {
             }
             context.stopService(intent)
         }
+
+        internal fun foregroundServiceTypeForApi(sdkInt: Int): Int =
+            if (sdkInt >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            }
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.Default + Job())
@@ -68,22 +75,13 @@ class ArgusForegroundService : Service() {
 
     private fun startForegroundCompat() {
         val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            // On API 34+, this is a user-visible local compute workload. Do not
-            // activate dataSync: Android 15+ applies a shared six-hour/24-hour
-            // background execution budget to active dataSync foreground services.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // API 34+ activates specialUse only. API 29-33 uses the legacy
+            // dataSync compatibility type because specialUse did not yet exist.
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // specialUse was introduced in API 34. Keep the legacy API 29-33
-            // declaration path; those OS releases do not apply the Android 15 timeout.
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                foregroundServiceTypeForApi(Build.VERSION.SDK_INT)
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
