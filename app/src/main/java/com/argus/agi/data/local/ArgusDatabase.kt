@@ -63,6 +63,8 @@ abstract class ArgusDatabase : RoomDatabase() {
                         `canonicalUrl` TEXT,
                         `characterCount` INTEGER NOT NULL,
                         `chunkCount` INTEGER NOT NULL,
+                        `datasetSplit` TEXT NOT NULL,
+                        `validationText` TEXT,
                         `plannedEpochs` INTEGER NOT NULL,
                         `rightsStatus` TEXT NOT NULL,
                         `status` TEXT NOT NULL,
