@@ -53,14 +53,7 @@ class ArgusApp : Application() {
                 availableRamGb = hardwareInfo.availRamGb
             )
 
-            if (resolvedConfig != deviceConfig) {
-                Log.i(
-                    TAG,
-                    "Preserving saved model architecture: ${resolvedConfig.architectureLabel}"
-                )
-            } else {
-                Log.i(TAG, "Fresh device model architecture: ${resolvedConfig.architectureLabel}")
-            }
+            Log.i(TAG, "Resolved neural engine architecture: ${resolvedConfig.architectureLabel}")
 
             ArgusNeuralEngine.createBlocking(instance, resolvedConfig)
         }
