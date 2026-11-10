@@ -88,6 +88,13 @@ interface CorpusDao {
     ): Int
 
     @Query(
+        "UPDATE corpus_documents SET status = 'TRAINING', " +
+            "lastTrainedAtEpochMs = NULL, completedPassCount = 0 " +
+            "WHERE id = :documentId AND status != 'PARTIAL'"
+    )
+    suspend fun markTrainingIfNotPartial(documentId: String): Int
+
+    @Query(
         "UPDATE corpus_documents SET status = 'TRAINED', " +
             "lastTrainedAtEpochMs = :trainedAtEpochMs, " +
             "completedPassCount = :completedPassCount " +
