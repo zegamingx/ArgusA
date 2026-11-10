@@ -103,10 +103,14 @@ jobs:
           echo "Persistent Argus signing identity restored."
 
       - name: Verify Gradle Wrapper
-        run: ./gradlew --version
+        run: |
+          chmod +x gradlew
+          ./gradlew --version
 
       - name: Run release lint, unit tests and APK build
-        run: env -u ANDROID_SDK_ROOT ./gradlew --no-daemon --no-configuration-cache --stacktrace clean :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
+        run: |
+          chmod +x gradlew
+          env -u ANDROID_SDK_ROOT ./gradlew --no-daemon --no-configuration-cache --stacktrace clean :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
 
       - name: Verify APK signature and prepare checksums
         shell: bash

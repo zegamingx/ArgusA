@@ -140,10 +140,13 @@ jobs:
           echo "KEY_PASSWORD=" >> "${GITHUB_ENV}"
 
       - name: Verify Gradle Wrapper
-        run: ./gradlew --version
+        run: |
+          chmod +x gradlew
+          ./gradlew --version
 
       - name: Run release lint and build
         run: |
+          chmod +x gradlew
           # Keep lint, Robolectric unit tests, and the signed APK build in one
           # release gate so publication cannot proceed after an untested build.
           env -u ANDROID_SDK_ROOT ./gradlew \
