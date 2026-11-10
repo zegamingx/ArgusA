@@ -7,6 +7,7 @@ import com.argus.agi.data.local.ArgusDatabase
 import com.argus.agi.data.local.entity.ChatMessageEntity
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
+import com.argus.agi.data.local.entity.CorpusSourceEntity
 import com.argus.agi.data.local.entity.TrainingItemEntity
 import com.argus.agi.data.local.entity.WorldMemoryEntity
 import com.argus.agi.model.TrainingData
@@ -134,12 +135,28 @@ class ArgusRepository(
 
         db.withTransaction {
             val insertedRowId = corpusDao.insertDocument(document)
-            if (insertedRowId == -1L) {
-                false
+            val storedDocumentId = if (insertedRowId == -1L) {
+                corpusDao.getDocumentByFingerprint(document.contentFingerprint)?.id
+                    ?: error("Corpus fingerprint conflict has no matching document.")
             } else {
                 corpusDao.insertChunks(chunks)
-                true
+                document.id
             }
+
+            val sourceIdentity = document.canonicalUrl ?: document.source
+            val sourceId = sha256Utf16Be("${storedDocumentId}\u0000$sourceIdentity")
+            corpusDao.insertSource(
+                CorpusSourceEntity(
+                    id = sourceId,
+                    documentId = storedDocumentId,
+                    source = document.source,
+                    canonicalUrl = document.canonicalUrl,
+                    language = document.language,
+                    rightsStatus = document.rightsStatus,
+                    importedAtEpochMs = document.createdAtEpochMs
+                )
+            )
+            insertedRowId != -1L
         }
     }
 
@@ -166,6 +183,11 @@ class ArgusRepository(
     suspend fun getCorpusChunks(documentId: String): List<CorpusChunkEntity> =
         withContext(Dispatchers.IO) {
             corpusDao.getChunks(documentId)
+        }
+
+    suspend fun getCorpusSources(documentId: String): List<CorpusSourceEntity> =
+        withContext(Dispatchers.IO) {
+            corpusDao.getSources(documentId)
         }
 
     suspend fun markCorpusDocumentTraining(documentId: String) =
@@ -214,6 +236,19 @@ class ArgusRepository(
         withContext(Dispatchers.IO) {
             corpusDao.deleteDocument(documentId) > 0
         }
+
+    private fun sha256Utf16Be(value: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(value.toByteArray(Charsets.UTF_16BE))
+        val alphabet = "0123456789abcdef"
+        return buildString(digest.size * 2) {
+            digest.forEach { byte ->
+                val item = byte.toInt() and 0xFF
+                append(alphabet[item ushr 4])
+                append(alphabet[item and 0x0F])
+            }
+        }
+    }
 
     // =========================================================================
     // Converters
