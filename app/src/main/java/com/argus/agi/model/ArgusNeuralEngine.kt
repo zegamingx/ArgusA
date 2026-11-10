@@ -632,6 +632,49 @@ class ArgusNeuralEngine private constructor(
         return loss
     }
 
+    private fun computeCrossEntropyLoss(
+        logits: Array<FloatArray>,
+        sequence: List<Int>,
+        currentVocab: Int,
+        firstTargetIndex: Int
+    ): Float {
+        require(sequence.size >= 2) { "A validation window must contain at least two tokens." }
+        require(firstTargetIndex in 0 until sequence.size - 1) {
+            "firstTargetIndex must identify at least one next-token target."
+        }
+
+        var totalLoss = 0f
+        var validTargets = 0
+
+        for (timeIndex in firstTargetIndex until sequence.size - 1) {
+            val target = sequence[timeIndex + 1]
+            if (target !in 0 until currentVocab) continue
+
+            val row = logits[timeIndex]
+            var maxLogit = -Float.MAX_VALUE
+            for (vocabularyIndex in 0 until currentVocab) {
+                if (row[vocabularyIndex] > maxLogit) {
+                    maxLogit = row[vocabularyIndex]
+                }
+            }
+
+            var sumExp = 0f
+            for (vocabularyIndex in 0 until currentVocab) {
+                sumExp += exp(row[vocabularyIndex] - maxLogit)
+            }
+
+            val logProbability =
+                (row[target] - maxLogit) - ln(max(sumExp, 1e-9f))
+            val loss = -logProbability
+            if (loss.isFinite()) {
+                totalLoss += loss
+                validTargets++
+            }
+        }
+
+        return if (validTargets > 0) totalLoss / validTargets else Float.NaN
+    }
+
     private fun trainSingleWindow(
         seq: List<Int>,
         currentVocab: Int,
@@ -727,6 +770,15 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
+        if (!updateParameters) {
+            return computeCrossEntropyLoss(
+                logits = logits,
+                sequence = seq,
+                currentVocab = currentVocab,
+                firstTargetIndex = firstTargetIndex
+            )
+        }
+
         // ============================ BACKWARD ============================
         // Alokasi Gradient Accumulators untuk seluruh tensor (Minibatch Pattern)
         val gradWHead = FloatArray(currentVocab * dModel)
@@ -783,10 +835,6 @@ class ArgusNeuralEngine private constructor(
                     dL_dh2PostLN[t][d] += g * wHead[wOff + d]
                 }
             }
-        }
-
-        if (!updateParameters) {
-            return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
 
         // (2) SwiGLU MLP & Residual Backward
