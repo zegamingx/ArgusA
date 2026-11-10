@@ -57,6 +57,13 @@ interface CorpusDao {
     @Query("SELECT COUNT(*) FROM corpus_documents")
     suspend fun getDocumentCount(): Int
 
+    @Query(
+        "SELECT * FROM corpus_documents " +
+            "WHERE datasetSplit = 'VALIDATION' AND validationText IS NOT NULL " +
+            "ORDER BY createdAtEpochMs ASC LIMIT :limit"
+    )
+    suspend fun getValidationDocuments(limit: Int): List<CorpusDocumentEntity>
+
     @Query("SELECT * FROM corpus_chunks WHERE documentId = :documentId ORDER BY chunkIndex ASC")
     suspend fun getChunks(documentId: String): List<CorpusChunkEntity>
 
