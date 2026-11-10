@@ -90,6 +90,12 @@ data class EngineConfig(
  * Menggunakan akumulasi gradien sekuensial (minibatch sliding window) dan optimizer Adam
  * tanpa mutasi in-place prematur di tengah sekuens token.
  */
+data class LossEvaluation(
+    val meanLoss: Float,
+    val targetCount: Int,
+    val evaluatedDocumentCount: Int
+)
+
 class ArgusNeuralEngine private constructor(
     private val context: Context,
     val config: EngineConfig = EngineConfig()
@@ -522,18 +528,29 @@ class ArgusNeuralEngine private constructor(
      * Computes next-token cross-entropy without changing weights, optimizer state,
      * tokenizer vocabulary, or checkpoint files. Use only on held-out validation text.
      */
-    fun evaluateLoss(text: String): Float = synchronized(modelLock) {
+    fun evaluateLoss(text: String): Float = evaluateLossWithTargetCount(text).meanLoss
+
+    /**
+     * Computes held-out next-token cross-entropy and the exact number of scored targets.
+     * No parameters, optimizer state, tokenizer vocabulary, or checkpoint files are changed.
+     */
+    fun evaluateLossWithTargetCount(text: String): LossEvaluation = synchronized(modelLock) {
         val tokens = tokenizer.encode(text, autoRegister = false)
         if (tokens.size < 2 || tokenizer.vocabSize > vocabCap) {
-            return@synchronized Float.NaN
+            return@synchronized LossEvaluation(Float.NaN, 0, 0)
         }
 
         val currentVocab = tokenizer.vocabSize
         if (tokens.size <= maxSeqLen) {
-            return@synchronized trainSingleWindow(
+            val loss = trainSingleWindow(
                 tokens,
                 currentVocab,
                 updateParameters = false
+            )
+            return@synchronized LossEvaluation(
+                meanLoss = loss,
+                targetCount = if (loss.isFinite()) tokens.size - 1 else 0,
+                evaluatedDocumentCount = if (loss.isFinite()) 1 else 0
             )
         }
 
@@ -566,7 +583,40 @@ class ArgusNeuralEngine private constructor(
             start += stride
         }
 
-        if (evaluatedTargets > 0) weightedLoss / evaluatedTargets else Float.NaN
+        val meanLoss = if (evaluatedTargets > 0) {
+            weightedLoss / evaluatedTargets
+        } else {
+            Float.NaN
+        }
+        LossEvaluation(
+            meanLoss = meanLoss,
+            targetCount = evaluatedTargets,
+            evaluatedDocumentCount = if (evaluatedTargets > 0) 1 else 0
+        )
+    }
+
+    /**
+     * Aggregates document losses by scored next-token targets, not by document count.
+     * The model lock prevents training from changing weights between validation documents.
+     */
+    fun evaluateCorpusLoss(texts: List<String>): LossEvaluation = synchronized(modelLock) {
+        var weightedLoss = 0.0
+        var targetCount = 0
+        var evaluatedDocumentCount = 0
+        texts.forEach { text ->
+            val result = evaluateLossWithTargetCount(text)
+            if (result.targetCount > 0 && result.meanLoss.isFinite()) {
+                weightedLoss += result.meanLoss.toDouble() * result.targetCount
+                targetCount += result.targetCount
+                evaluatedDocumentCount += result.evaluatedDocumentCount
+            }
+        }
+        val meanLoss = if (targetCount > 0) {
+            (weightedLoss / targetCount).toFloat()
+        } else {
+            Float.NaN
+        }
+        LossEvaluation(meanLoss, targetCount, evaluatedDocumentCount)
     }
 
     /**
