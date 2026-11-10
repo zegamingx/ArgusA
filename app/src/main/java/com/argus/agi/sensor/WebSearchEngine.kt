@@ -71,7 +71,13 @@ class WebSearchEngine(
                 client.newCall(request).execute().use { response ->
                     if (response.isSuccessful) {
                         val html = response.body
-                            ?.let { body -> readBoundedResponseBody(body.byteStream(), body.contentLength(), MAX_DDG_RESPONSE_BYTES) }
+                            ?.let { body ->
+                                readBoundedResponseBody(
+                                    input = body.byteStream(),
+                                    contentLength = body.contentLength(),
+                                    maxBytes = MAX_DDG_RESPONSE_BYTES
+                                )
+                            }
                             .orEmpty()
                         parseDdgHtml(html).forEach { item ->
                             collected.putIfAbsent(item.sourceUrl, item)
@@ -218,7 +224,6 @@ class WebSearchEngine(
         ).toASCIIString()
     }
 }
-
 
 /**
  * Reads an HTTP response with a hard byte ceiling. Content-Length is only an early
