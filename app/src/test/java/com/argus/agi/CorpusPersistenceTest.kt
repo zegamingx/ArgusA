@@ -502,6 +502,12 @@ class CorpusPersistenceTest {
                 "PARTIAL",
                 repository.getCorpusDocument(document.id)?.status
             )
+            repository.markCorpusDocumentTraining(document.id)
+            assertEquals(
+                "A late worker callback must not overwrite an interrupted partial state.",
+                "PARTIAL",
+                repository.getCorpusDocument(document.id)?.status
+            )
 
             assertEquals(
                 "Interrupted active training rows must be re-queued on recovery.",
