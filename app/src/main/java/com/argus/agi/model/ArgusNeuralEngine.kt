@@ -537,7 +537,8 @@ class ArgusNeuralEngine private constructor(
             )
         }
 
-        val stride = (maxSeqLen - 24).coerceAtLeast(1)
+        val overlapTokens = min(24, maxSeqLen - 2)
+        val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
         var weightedLoss = 0f
         var evaluatedTargets = 0
         var start = 0
@@ -546,15 +547,19 @@ class ArgusNeuralEngine private constructor(
             val end = min(start + maxSeqLen, tokens.size)
             val windowTokens = tokens.subList(start, end)
             if (windowTokens.size >= 2) {
-                val windowLoss = trainSingleWindow(
-                    windowTokens,
-                    currentVocab,
-                    updateParameters = false
-                )
-                if (windowLoss.isFinite()) {
-                    val targetCount = windowTokens.size - 1
-                    weightedLoss += windowLoss * targetCount
-                    evaluatedTargets += targetCount
+                val firstTargetIndex = if (start == 0) 0 else overlapTokens - 1
+                val targetCount = (windowTokens.size - 1 - firstTargetIndex).coerceAtLeast(0)
+                if (targetCount > 0) {
+                    val windowLoss = trainSingleWindow(
+                        seq = windowTokens,
+                        currentVocab = currentVocab,
+                        updateParameters = false,
+                        firstTargetIndex = firstTargetIndex
+                    )
+                    if (windowLoss.isFinite()) {
+                        weightedLoss += windowLoss * targetCount
+                        evaluatedTargets += targetCount
+                    }
                 }
             }
             if (end >= tokens.size) break
@@ -585,7 +590,8 @@ class ArgusNeuralEngine private constructor(
             val result = if (tokens.size <= maxSeqLen) {
                 trainSingleWindow(tokens, currentVocab)
             } else {
-                val stride = (maxSeqLen - 24).coerceAtLeast(1)
+                val overlapTokens = min(24, maxSeqLen - 2)
+                val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
                 var weightedLoss = 0f
                 var trainedTargets = 0
                 var start = 0
@@ -594,11 +600,18 @@ class ArgusNeuralEngine private constructor(
                     val end = min(start + maxSeqLen, tokens.size)
                     val windowSeq = tokens.subList(start, end)
                     if (windowSeq.size >= 2) {
-                        val windowLoss = trainSingleWindow(windowSeq, currentVocab)
-                        if (windowLoss.isFinite()) {
-                            val targetCount = windowSeq.size - 1
-                            weightedLoss += windowLoss * targetCount
-                            trainedTargets += targetCount
+                        val firstTargetIndex = if (start == 0) 0 else overlapTokens - 1
+                        val targetCount = (windowSeq.size - 1 - firstTargetIndex).coerceAtLeast(0)
+                        if (targetCount > 0) {
+                            val windowLoss = trainSingleWindow(
+                                seq = windowSeq,
+                                currentVocab = currentVocab,
+                                firstTargetIndex = firstTargetIndex
+                            )
+                            if (windowLoss.isFinite()) {
+                                weightedLoss += windowLoss * targetCount
+                                trainedTargets += targetCount
+                            }
                         }
                     }
                     if (end >= tokens.size) break
@@ -622,7 +635,8 @@ class ArgusNeuralEngine private constructor(
     private fun trainSingleWindow(
         seq: List<Int>,
         currentVocab: Int,
-        updateParameters: Boolean = true
+        updateParameters: Boolean = true,
+        firstTargetIndex: Int = 0
     ): Float {
         val seqLen = seq.size
         if (seqLen < 2) return Float.NaN
@@ -743,7 +757,10 @@ class ArgusNeuralEngine private constructor(
         var validSteps = 0
 
         // (1) Cross-Entropy & Akumulasi Gradien Head (TANPA mutasi in-place)
-        for (t in 0 until seqLen - 1) {
+        require(firstTargetIndex in 0 until seqLen - 1) {
+            "firstTargetIndex must identify at least one next-token target."
+        }
+        for (t in firstTargetIndex until seqLen - 1) {
             val target = seq[t + 1]
             if (target !in 0 until currentVocab) continue
             val logitRow = logits[t]
