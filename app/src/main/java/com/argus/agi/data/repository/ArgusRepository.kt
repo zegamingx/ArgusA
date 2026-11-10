@@ -138,20 +138,39 @@ class ArgusRepository(
         document: CorpusDocumentEntity,
         chunks: List<CorpusChunkEntity>
     ): Boolean = withContext(Dispatchers.IO) {
+        require(document.datasetSplit == "TRAIN" || document.datasetSplit == "VALIDATION") {
+            "Unsupported corpus dataset split: ${document.datasetSplit}"
+        }
         require(chunks.size == document.chunkCount) {
             "Corpus chunk count does not match document metadata."
         }
         require(chunks.all { it.documentId == document.id }) {
             "Every corpus chunk must reference the document being stored."
         }
+        when (document.datasetSplit) {
+            "TRAIN" -> require(document.validationText == null && document.chunkCount > 0) {
+                "Training documents must contain retained chunks and no validation payload."
+            }
+            "VALIDATION" -> require(
+                !document.validationText.isNullOrBlank() &&
+                    document.chunkCount == 0 &&
+                    chunks.isEmpty()
+            ) {
+                "Validation documents must retain source text and must not contain training chunks."
+            }
+        }
 
         db.withTransaction {
             val insertedRowId = corpusDao.insertDocument(document)
             val storedDocumentId = if (insertedRowId == -1L) {
-                corpusDao.getDocumentByFingerprint(document.contentFingerprint)?.id
+                val existing = corpusDao.getDocumentByFingerprint(document.contentFingerprint)
                     ?: error("Corpus fingerprint conflict has no matching document.")
+                require(existing.datasetSplit == document.datasetSplit) {
+                    "Identical content already belongs to the ${existing.datasetSplit} corpus; cross-split reuse is blocked to prevent leakage."
+                }
+                existing.id
             } else {
-                corpusDao.insertChunks(chunks)
+                if (chunks.isNotEmpty()) corpusDao.insertChunks(chunks)
                 document.id
             }
 
@@ -199,6 +218,12 @@ class ArgusRepository(
     suspend fun getCorpusDocumentCount(): Int = withContext(Dispatchers.IO) {
         corpusDao.getDocumentCount()
     }
+
+    suspend fun getValidationCorpusDocuments(limit: Int = 500): List<CorpusDocumentEntity> =
+        withContext(Dispatchers.IO) {
+            require(limit in 1..500) { "Validation document limit must be in 1..500." }
+            corpusDao.getValidationDocuments(limit)
+        }
 
     suspend fun getCorpusChunks(documentId: String): List<CorpusChunkEntity> =
         withContext(Dispatchers.IO) {
