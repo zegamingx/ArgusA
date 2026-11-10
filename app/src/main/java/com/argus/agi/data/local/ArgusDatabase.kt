@@ -13,6 +13,7 @@ import com.argus.agi.data.local.dao.WorldMemoryDao
 import com.argus.agi.data.local.entity.ChatMessageEntity
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
+import com.argus.agi.data.local.entity.CorpusSourceEntity
 import com.argus.agi.data.local.entity.TrainingItemEntity
 import com.argus.agi.data.local.entity.WorldMemoryEntity
 
@@ -22,6 +23,7 @@ import com.argus.agi.data.local.entity.WorldMemoryEntity
         WorldMemoryEntity::class,
         TrainingItemEntity::class,
         CorpusDocumentEntity::class,
+        CorpusSourceEntity::class,
         CorpusChunkEntity::class
     ],
     version = 2,
@@ -79,6 +81,27 @@ abstract class ArgusDatabase : RoomDatabase() {
                 database.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_corpus_documents_createdAtEpochMs` " +
                         "ON `corpus_documents` (`createdAtEpochMs`)"
+                )
+
+                database.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `corpus_sources` (
+                        `id` TEXT NOT NULL,
+                        `documentId` TEXT NOT NULL,
+                        `source` TEXT NOT NULL,
+                        `canonicalUrl` TEXT,
+                        `language` TEXT,
+                        `rightsStatus` TEXT NOT NULL,
+                        `importedAtEpochMs` INTEGER NOT NULL,
+                        PRIMARY KEY(`id`),
+                        FOREIGN KEY(`documentId`) REFERENCES `corpus_documents`(`id`)
+                            ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent()
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_corpus_sources_documentId` " +
+                        "ON `corpus_sources` (`documentId`)"
                 )
 
                 database.execSQL(
