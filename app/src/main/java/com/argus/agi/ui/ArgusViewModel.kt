@@ -226,13 +226,12 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         )
                         val initialMsg = ChatMessage(
                             isUser = false,
-                            text = "A.R.G.U.S Genesis Core aktif (${identity.originId}). " +
-                                    "100% on-device neural intelligence. Parameter diinisialisasi " +
-                                    "dan dievolusikan langsung pada perangkat ini.",
+                            text = "A.R.G.U.S local model initialized on this device (${identity.originId}). " +
+                                    "Model parameters are initialized locally and can continue to evolve through on-device training.",
                             thinkReasoning = "Genesis Origin: ${identity.originId} | " +
-                                    "Dibuat: ${identity.formattedBirthDate} | " +
-                                    "Arsitektur: ${identity.architectureTier}. " +
-                                    "Parameter total: ${identity.parameterCount} (FP32)."
+                                    "Created: ${identity.formattedBirthDate} | " +
+                                    "Architecture: ${identity.architectureTier}. " +
+                                    "Total parameters: ${identity.parameterCount} (FP32)."
                         )
                         withContext(Dispatchers.Main) {
                             appendMessage(initialMsg)
@@ -243,13 +242,12 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 } else {
                     val initialMsg = ChatMessage(
                         isUser = false,
-                        text = "A.R.G.U.S Genesis Core aktif (${existing.originId}). " +
-                                "100% on-device neural intelligence. Parameter diinisialisasi " +
-                                "dan dievolusikan langsung pada perangkat ini.",
+                        text = "A.R.G.U.S local model initialized on this device (${existing.originId}). " +
+                                "Model parameters are initialized locally and can continue to evolve through on-device training.",
                         thinkReasoning = "Genesis Origin: ${existing.originId} | " +
-                                "Dibuat: ${existing.formattedBirthDate} | " +
-                                "Arsitektur: ${existing.architectureTier}. " +
-                                "Parameter total: ${existing.parameterCount} (FP32)."
+                                "Created: ${existing.formattedBirthDate} | " +
+                                "Architecture: ${existing.architectureTier}. " +
+                                "Total parameters: ${existing.parameterCount} (FP32)."
                     )
                     withContext(Dispatchers.Main) {
                         appendMessage(initialMsg)
@@ -298,9 +296,9 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 appendMessage(
                     ChatMessage(
                         isUser = false,
-                        text = "Assessment ulang selesai. SoC ${info.socManufacturer} ${info.socModel}, " +
-                                "RAM ${info.totalRamGb} GB, akselerator ${info.primaryAccelerator}.",
-                        thinkReasoning = "Hardware re-fetch. Tidak mengubah origin identity."
+                        text = "Hardware assessment refreshed. SoC: ${info.socManufacturer} ${info.socModel}, " +
+                                "RAM: ${info.totalRamGb} GB, reported capability: ${info.primaryAccelerator}.",
+                        thinkReasoning = "Hardware assessment refreshed. The model origin identity was not changed."
                     )
                 )
             } catch (e: Exception) {
@@ -319,7 +317,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     _hardwareInfo.value, trainingManager
                 )
             }.onFailure { e ->
-                Log.e(TAG, "retryGenesis gagal", e)
+                Log.e(TAG, "Genesis retry failed", e)
             }
         }
     }
@@ -349,8 +347,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 appendMessage(
                     ChatMessage(
                         isUser = false,
-                        text = "Benchmark gagal: ${e.message}",
-                        thinkReasoning = "Exception saat runBenchmark"
+                        text = "Benchmark failed: ${e.message}",
+                        thinkReasoning = "Exception while running the benchmark."
                     )
                 )
             } finally {
@@ -369,8 +367,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             appendMessage(
                 ChatMessage(
                     isUser = false,
-                    text = "Genesis sedang berjalan (${stage.displayName}). " +
-                            "Tunggu hingga selesai sebelum mulai chat."
+                    text = "Genesis is running (${stage.displayName}). " +
+                            "Wait for initialization to finish before starting a conversation."
                 )
             )
             return
@@ -385,7 +383,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             appendMessage(
                 ChatMessage(
                     isUser = false,
-                    text = "Tunggu respon sebelumnya selesai, atau tekan stop."
+                    text = "Wait for the previous response to finish, or stop it."
                 )
             )
             return
@@ -423,14 +421,14 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 val rawOutput = try {
                     when {
                         explicitWebQuery != null ->
-                            "Permintaan pencarian web: $explicitWebQuery"
+                            "Web search request: $explicitWebQuery"
                         mathResult != null -> mathResult
                         else -> neuralEngine.generate(multiTurnPrompt, maxNewTokens = 60)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Generation failed", e)
-                    "Model lokal sedang sibuk atau mengalami error (${e.javaClass.simpleName}). " +
-                            "Coba lagi sebentar."
+                    "The local model is busy or encountered an error (${e.javaClass.simpleName}). " +
+                            "Please try again shortly."
                 }
 
                 val reflection = worldModel.reflectOnResponse(text, rawOutput)
@@ -516,8 +514,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         appendMessage(
                             ChatMessage(
                                 isUser = false,
-                                text = "File terlalu besar (${sizeBytes / 1024 / 1024} MB). " +
-                                    "Batas impor untuk kondisi memori perangkat saat ini adalah " +
+                                text = "File is too large (${sizeBytes / 1024 / 1024} MB). " +
+                                    "The current device-memory-based import limit is " +
                                     "${maxFileSizeBytes / 1024 / 1024} MB.",
                                 thinkReasoning = "Device-memory-aware import size guard triggered."
                             )
@@ -532,8 +530,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
                         if (idx != -1 && cursor.moveToFirst()) name = cursor.getString(idx)
                     }
-                    name ?: "Dokumen_${System.currentTimeMillis() % 10000}.txt"
-                }.getOrDefault("Dokumen_${System.currentTimeMillis() % 10000}.txt")
+                    name ?: "Document_${System.currentTimeMillis() % 10000}.txt"
+                }.getOrDefault("Document_${System.currentTimeMillis() % 10000}.txt")
 
                 val mimeType = cr.getType(uri).orEmpty().lowercase(Locale.ROOT)
                 val extension = docDisplayName.substringAfterLast('.', "").lowercase(Locale.ROOT)
@@ -581,7 +579,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                 maxTextCharacters = maxImportTextCharacters().toInt()
                             )
                         }
-                    } ?: throw IOException("Tidak dapat membuka file untuk ekstraksi teks.")
+                    } ?: throw IOException("Unable to open the file for text extraction.")
 
                     val (chunkCount, charsRead) = enqueueExtractedDocument(
                         extracted = extracted,
@@ -595,7 +593,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             appendMessage(
                                 ChatMessage(
                                     isUser = false,
-                                    text = "File '" + docDisplayName + "' tidak menghasilkan blok teks yang dapat dilatih.",
+                                    text = "File '" + docDisplayName + "' did not produce any trainable text chunks.",
                                     thinkReasoning = "Structured document extractor returned empty content."
                                 )
                             )
@@ -607,8 +605,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         appendMessage(
                             ChatMessage(
                                 isUser = true,
-                                text = "Mengunggah " + extracted.format + " '" + extracted.title +
-                                    "' (" + extracted.characterCount + " karakter) untuk pelatihan on-device.",
+                                text = "Importing " + extracted.format + " '" + extracted.title +
+                                    "' (" + extracted.characterCount + " characters) for on-device training.",
                                 attachedFileName = docDisplayName
                             )
                         )
@@ -616,8 +614,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             ChatMessage(
                                 isUser = false,
                                 text = extracted.format + " '" + extracted.title +
-                                    "' berhasil diekstrak menjadi " + chunkCount +
-                                    " blok training. Konten teks tetap diproses lokal pada perangkat.",
+                                    "' was extracted into " + chunkCount +
+                                    " training chunks. Text content remains on this device.",
                                 thinkReasoning = extracted.format + " extraction: " +
                                     extracted.characterCount + " characters → " + chunkCount + " blocks."
                             )
@@ -662,14 +660,14 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
                 if (chunkCount == 0 || charsRead == 0L) {
                     val reason = when {
-                        charsRead == 0L -> "File kosong atau tidak bisa dibaca."
-                        else -> "Konten tidak menghasilkan blok baru; kemungkinan dokumen identik sudah tersimpan di corpus lokal."
+                        charsRead == 0L -> "The file is empty or could not be read."
+                        else -> "The content produced no new chunks. An identical document may already exist in the local corpus."
                     }
                     withContext(Dispatchers.Main) {
                         appendMessage(
                             ChatMessage(
                                 isUser = false,
-                                text = "File '$docDisplayName' dilewati. $reason",
+                                text = "Skipped '$docDisplayName'. $reason",
                                 thinkReasoning = "Buffered import produced $charsRead characters and $chunkCount new training chunks."
                             )
                         )
@@ -682,25 +680,24 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     if (mb >= 1.0) String.format(Locale.US, "%.1f MB", mb)
                     else String.format(Locale.US, "%.1f KB", sizeBytes / 1024.0)
                 } else {
-                    "$charsRead karakter"
+                    "$charsRead characters"
                 }
 
                 withContext(Dispatchers.Main) {
                     appendMessage(
                         ChatMessage(
                             isUser = true,
-                            text = "Mengunggah dokumen '$docDisplayName' ($sizeDisplay, $charsRead karakter) untuk pelatihan on-device.",
+                            text = "Importing '$docDisplayName' ($sizeDisplay, $charsRead characters) for on-device training.",
                             attachedFileName = docDisplayName
                         )
                     )
                     appendMessage(
                         ChatMessage(
                             isUser = false,
-                            text = "Dokumen '$docDisplayName' ($sizeDisplay) berhasil dibaca bertahap.\n\n" +
-                                    "Teks dipartisi menjadi $chunkCount blok dan dijadwalkan untuk training lokal. " +
-                                    "Blok antrean masih disimpan dalam memori aplikasi; impor file berukuran besar " +
-                                    "perlu memperhatikan RAM yang tersedia.\n\n" +
-                                    "Pantau progres latihan di tab Neural Core.",
+                            text = "Document '$docDisplayName' ($sizeDisplay) was read incrementally.\n\n" +
+                                    "The text was split into $chunkCount chunks and scheduled for local training. " +
+                                    "Queued chunks are currently held in application memory, so large imports require sufficient available RAM.\n\n" +
+                                    "Track progress in the Neural Core tab.",
                             thinkReasoning = "Buffered document ingestion: $charsRead characters → $chunkCount queued blocks."
                         )
                     )
@@ -711,7 +708,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     appendMessage(
                         ChatMessage(
                             isUser = false,
-                            text = "Gagal membaca file: ${e.message}",
+                            text = "Failed to read the file: ${e.message}",
                             thinkReasoning = "I/O exception: ${e.javaClass.simpleName}"
                         )
                     )
@@ -818,7 +815,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             appendMessage(
                                 ChatMessage(
                                     isUser = false,
-                                    text = "Gambar tidak valid atau tidak bisa dibaca.",
+                                    text = "The image is invalid or could not be read.",
                                     thinkReasoning = "BitmapFactory bounds decode failed."
                                 )
                             )
@@ -836,10 +833,10 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     val finalH = bitmap?.height ?: h
                     val (avgLum, dominantTone, contrast) = bitmap?.let { bmp ->
                         analyzeBitmapMetrics(bmp)
-                    } ?: Triple(50f, "Netral", 1.0f)
+                    } ?: Triple(50f, "Neutral", 1.0f)
 
-                    val desc = "Gambar ${finalW}×${finalH} px diimpor untuk persepsi visual on-device. " +
-                            "Kecerahan: ${String.format(Locale.US, "%.1f", avgLum)}%, Palet: $dominantTone, Kontras: ${String.format(Locale.US, "%.1f", contrast)}:1."
+                    val desc = "Image ${finalW}×${finalH} px imported for on-device visual perception. " +
+                            "Average luminance: ${String.format(Locale.US, "%.1f", avgLum)}%, palette: $dominantTone, contrast: ${String.format(Locale.US, "%.1f", contrast)}:1."
 
                     withContext(Dispatchers.Main) {
                         sendMessage(desc, uri, isImage = true)
@@ -848,10 +845,10 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     trainingManager.enqueueData(
                         source = "Image Vision Import",
                         title = "Visual $finalW×$finalH",
-                        content = "Persepsi Visual On-Device: Gambar resolusi ${finalW}×${finalH} px. " +
-                                "Tingkat pencahayaan rata-rata: ${String.format(Locale.US, "%.1f", avgLum)}%, " +
-                                "Karakteristik spektrum warna: $dominantTone, " +
-                                "Rasio kontras: ${String.format(Locale.US, "%.1f", contrast)}:1."
+                        content = "On-device visual input: image resolution ${finalW}×${finalH} px. " +
+                                "Average luminance: ${String.format(Locale.US, "%.1f", avgLum)}%, " +
+                                "color palette: $dominantTone, " +
+                                "contrast ratio: ${String.format(Locale.US, "%.1f", contrast)}:1."
                     )
                 }
             } catch (e: Exception) {
@@ -860,7 +857,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     appendMessage(
                         ChatMessage(
                             isUser = false,
-                            text = "Gagal memuat gambar: ${e.message}",
+                            text = "Failed to load the image: ${e.message}",
                             thinkReasoning = "Image decode exception."
                         )
                     )
@@ -900,11 +897,11 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         val avgLum = (totalLum / 256f) / 255f * 100f
         val contrast = if (minLum > 0f) maxLum / minLum else maxLum
         val dominant = when {
-            rSum > gSum * 1.25f && rSum > bSum * 1.25f -> "Dominan Merah/Hangat"
-            bSum > rSum * 1.25f && bSum > gSum * 1.25f -> "Dominan Biru/Sejuk"
-            gSum > rSum * 1.25f && gSum > bSum * 1.25f -> "Dominan Hijau/Alami"
-            kotlin.math.abs(rSum - gSum) < rSum * 0.15f && kotlin.math.abs(rSum - bSum) < rSum * 0.15f -> "Monokrom/Seimbang"
-            else -> "Spektrum Campuran"
+            rSum > gSum * 1.25f && rSum > bSum * 1.25f -> "Dominant red/warm"
+            bSum > rSum * 1.25f && bSum > gSum * 1.25f -> "Dominant blue/cool"
+            gSum > rSum * 1.25f && gSum > bSum * 1.25f -> "Dominant green/natural"
+            kotlin.math.abs(rSum - gSum) < rSum * 0.15f && kotlin.math.abs(rSum - bSum) < rSum * 0.15f -> "Monochrome/balanced"
+            else -> "Mixed spectrum"
         }
         return Triple(avgLum, dominant, contrast)
     }
@@ -939,7 +936,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             entryCount++
                             if (entryCount > MAX_ZIP_ENTRIES) {
                                 throw IOException(
-                                    "Arsip ZIP melebihi batas " + MAX_ZIP_ENTRIES + " entri."
+                                    "ZIP archive exceeds the limit of " + MAX_ZIP_ENTRIES + " entri."
                                 )
                             }
 
@@ -1031,7 +1028,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
                                 if (boundedEntry.limitExceeded) {
                                     throw IOException(
-                                        "Satu entri ZIP melewati batas " +
+                                        "A ZIP entry exceeds the limit of " +
                                             (maxZipEntryBytes / 1024L / 1024L) + " MB: " + normalizedName
                                     )
                                 }
@@ -1050,12 +1047,12 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                         }
                                         else -> {
                                             failedFiles++
-                                            Log.w(TAG, "Tidak ada teks yang dapat diimpor dari " + normalizedName)
+                                            Log.w(TAG, "No importable text was found in " + normalizedName)
                                         }
                                     }
                                 }.onFailure { error ->
                                     failedFiles++
-                                    Log.w(TAG, "Gagal memproses ZIP entry " + normalizedName, error)
+                                    Log.w(TAG, "Failed to process ZIP entry " + normalizedName, error)
                                 }
                             }
 
@@ -1070,7 +1067,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             totalExpandedBytes += boundedEntry.bytesRead
                             if (totalExpandedBytes > maxZipTotalBytes) {
                                 throw IOException(
-                                    "Arsip ZIP melewati batas ekspansi total " +
+                                    "ZIP archive exceeds the total expanded-size limit of " +
                                         (maxZipTotalBytes / 1024L / 1024L) + " MB."
                                 )
                             }
@@ -1079,49 +1076,49 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             entry = zipStream.nextEntry
                         }
                     }
-                } ?: throw IOException("Tidak dapat membuka arsip ZIP.")
+                } ?: throw IOException("Unable to open the ZIP archive.")
 
                 withContext(Dispatchers.Main) {
                     if (processedFiles == 0 && duplicateFilesSkipped == 0) {
                         appendMessage(
                             ChatMessage(
                                 isUser = false,
-                                text = "Arsip ZIP '" + displayName +
-                                    "' tidak menghasilkan teks yang dapat diimpor. " +
-                                    "File yang didukung: TXT, Markdown, JSON/JSONL, CSV/TSV, HTML, PDF, DOCX, dan EPUB.",
+                                text = "ZIP archive '" + displayName +
+                                    "' did not contain importable text. " +
+                                    "Supported formats: TXT, Markdown, JSON/JSONL, CSV/TSV, HTML, PDF, DOCX, and EPUB.",
                                 thinkReasoning = "No supported archive entries produced extractable text."
                             )
                         )
                     } else {
                         val charsDisplay = String.format(Locale.US, "%,d", totalCharsExtracted)
                         val duplicateSummary = if (duplicateFilesSkipped > 0) {
-                            "\nDokumen identik yang sudah tersimpan: " + duplicateFilesSkipped + "."
+                            "\nIdentical documents already stored: " + duplicateFilesSkipped + "."
                         } else {
                             ""
                         }
                         val failureSummary = if (failedFiles > 0) {
-                            "\nFile gagal/tidak dapat diekstrak: " + failedFiles + "."
+                            "\nFiles that failed or could not be extracted: " + failedFiles + "."
                         } else {
                             ""
                         }
                         appendMessage(
                             ChatMessage(
                                 isUser = true,
-                                text = "Mengunggah arsip dataset ZIP '" + displayName +
-                                    "' (" + processedFiles + " file berhasil, " +
-                                    charsDisplay + " karakter).",
+                                text = "Importing ZIP dataset archive '" + displayName +
+                                    "' (" + processedFiles + " files processed, " +
+                                    charsDisplay + " characters).",
                                 attachedFileName = displayName
                             )
                         )
                         appendMessage(
                             ChatMessage(
                                 isUser = false,
-                                text = "Arsip ZIP '" + displayName + "' selesai diproses secara lokal.\n\n" +
-                                    "• File berhasil diproses: " + processedFiles + "\n" +
-                                    "• File gagal/tidak dapat diekstrak: " + failedFiles + "\n" +
-                                    "• Duplikat yang dilewati: " + duplicateFilesSkipped + "\n" +
-                                    "• Total karakter: " + charsDisplay + "\n" +
-                                    "• Blok training dijadwalkan: " + totalChunksEnqueued +
+                                text = "ZIP archive '" + displayName + "' was processed locally.\n\n" +
+                                    "• Files processed: " + processedFiles + "\n" +
+                                    "• Files failed or not extracted: " + failedFiles + "\n" +
+                                    "• Duplicates skipped: " + duplicateFilesSkipped + "\n" +
+                                    "• Total characters: " + charsDisplay + "\n" +
+                                    "• Training chunks scheduled: " + totalChunksEnqueued +
                                     duplicateSummary +
                                     failureSummary,
                                 thinkReasoning = "Bounded ZIP extraction: " +
@@ -1136,7 +1133,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     appendMessage(
                         ChatMessage(
                             isUser = false,
-                            text = "Gagal mengekstraksi file ZIP: " + error.message,
+                            text = "Failed to extract the ZIP archive: " + error.message,
                             thinkReasoning = "Bounded ZIP extraction exception: " +
                                 error.javaClass.simpleName
                         )
@@ -1182,7 +1179,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
                 val (avgLum, dominantTone, contrast) = frame1?.let {
                     analyzeBitmapMetrics(it)
-                } ?: Triple(50f, "Netral", 1.0f)
+                } ?: Triple(50f, "Neutral", 1.0f)
                 frame1?.recycle()
 
                 val videoDisplayName = runCatching {
@@ -1194,7 +1191,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     name ?: "Video_${System.currentTimeMillis() % 10000}.mp4"
                 }.getOrDefault("Video_${System.currentTimeMillis() % 10000}.mp4")
 
-                val desc = "Video '$videoDisplayName' (${String.format(Locale.US, "%.1f", durationSec)}s, ${w}×${h} px, $mime) diimpor untuk persepsi visual on-device."
+                val desc = "Video '$videoDisplayName' (${String.format(Locale.US, "%.1f", durationSec)}s, ${w}×${h} px, $mime) was imported for on-device visual perception."
 
                 withContext(Dispatchers.Main) {
                     appendMessage(
@@ -1206,13 +1203,13 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
 
-                val perceptualStimulus = "Persepsi Temporal Video On-Device: File '$videoDisplayName', " +
-                        "Durasi: ${String.format(Locale.US, "%.1f", durationSec)} detik, " +
-                        "Resolusi frame: ${w}×${h} px, " +
-                        "Format: $mime. " +
-                        "Analisis visual keyframe: Kecerahan rata-rata ${String.format(Locale.US, "%.1f", avgLum)}%, " +
-                        "Karakteristik warna: $dominantTone, " +
-                        "Rasio kontras: ${String.format(Locale.US, "%.1f", contrast)}:1."
+                val perceptualStimulus = "On-device video perception: '$videoDisplayName', " +
+                        "duration: ${String.format(Locale.US, "%.1f", durationSec)} seconds, " +
+                        "frame resolution: ${w}×${h} px, " +
+                        "format: $mime. " +
+                        "Keyframe analysis: average luminance ${String.format(Locale.US, "%.1f", avgLum)}%, " +
+                        "color palette: $dominantTone, " +
+                        "contrast ratio: ${String.format(Locale.US, "%.1f", contrast)}:1."
 
                 trainingManager.enqueueData(
                     source = "Video Perception Import",
@@ -1228,11 +1225,11 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     appendMessage(
                         ChatMessage(
                             isUser = false,
-                            text = "Video '$videoDisplayName' berhasil dianalisis on-device secara hemat RAM.\n\n" +
-                                    "• Durasi: ${String.format(Locale.US, "%.1f", durationSec)} detik\n" +
-                                    "• Resolusi: ${w}×${h} px ($mime)\n" +
-                                    "• Analisis Keyframe: Luminansi ${String.format(Locale.US, "%.1f", avgLum)}%, Palet $dominantTone, Kontras ${String.format(Locale.US, "%.1f", contrast)}:1\n\n" +
-                                    "Stimulus visual temporal telah dimasukkan ke World Model dan antrean training lokal.",
+                            text = "Video '$videoDisplayName' was analyzed on-device using memory-bounded sampling.\n\n" +
+                                    "• Duration: ${String.format(Locale.US, "%.1f", durationSec)} seconds\n" +
+                                    "• Resolution: ${w}×${h} px ($mime)\n" +
+                                    "• Keyframe analysis: luminance ${String.format(Locale.US, "%.1f", avgLum)}%, palette $dominantTone, contrast ${String.format(Locale.US, "%.1f", contrast)}:1\n\n" +
+                                    "The visual summary was stored in the World Model and added to the local training queue.",
                             thinkReasoning = "Video keyframe & metadata extraction (OOM-safe sample)."
                         )
                     )
@@ -1243,7 +1240,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     appendMessage(
                         ChatMessage(
                             isUser = false,
-                            text = "Gagal memproses video: ${e.message}",
+                            text = "Failed to process the video: ${e.message}",
                             thinkReasoning = "MediaMetadataRetriever error."
                         )
                     )
@@ -1291,7 +1288,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 _articlePreview.value = executeWebArticleExtractionSkill(result.sourceUrl)
             } catch (error: Exception) {
                 Log.w(TAG, "Article extraction failed for ${result.sourceUrl}", error)
-                _articleExtractionError.value = error.message ?: "Artikel tidak dapat diekstrak."
+                _articleExtractionError.value = error.message ?: "The article could not be extracted."
             } finally {
                 _isExtractingArticle.value = false
             }
@@ -1358,14 +1355,14 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     if (queuedChunks > 0) {
                         _articlePreview.value = null
                         _articleExtractionError.value = null
-                        _articleQueueStatus.value = "Artikel dijadwalkan menjadi $queuedChunks blok training dalam $epochs pass, disesuaikan dengan RAM dan heap aplikasi."
+                        _articleQueueStatus.value = "Article queued as $queuedChunks training chunks across $epochs passes, based on available device RAM and app heap."
                     } else {
                         _articleQueueStatus.value =
-                            "Artikel ini sudah ada di corpus lokal. Tidak ada salinan training baru yang dibuat."
+                            "This article is already in the local corpus. No new training copy was created."
                     }
                 }.onFailure { error ->
                     Log.e(TAG, "Failed to queue reviewed web article", error)
-                    _articleQueueStatus.value = error.message ?: "Artikel gagal dimasukkan ke antrean."
+                    _articleQueueStatus.value = error.message ?: "The article could not be added to the queue."
                 }
             }
         }
@@ -1393,7 +1390,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 appendMessage(
                     ChatMessage(
                         isUser = false,
-                        text = "Pencarian web gagal: ${error.message}",
+                        text = "Web search failed: ${error.message}",
                         thinkReasoning = "Web search exception."
                     )
                 )
@@ -1414,8 +1411,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         stopGeneration()
         val resetMsg = ChatMessage(
             isUser = false,
-            text = "Terminal percakapan dibersihkan. Memori episodik dan bobot model tetap aman.",
-            thinkReasoning = "Histori pesan di-reset. Bobot model tidak terpengaruh."
+            text = "The conversation was cleared. Local model weights and stored World Model records remain unchanged.",
+            thinkReasoning = "The message history was reset. Model weights were not changed."
         )
         _messages.value = listOf(resetMsg)
         viewModelScope.launch(Dispatchers.IO) {
