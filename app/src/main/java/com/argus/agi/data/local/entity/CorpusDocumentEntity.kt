@@ -26,6 +26,8 @@ data class CorpusDocumentEntity(
     val canonicalUrl: String?,
     val characterCount: Int,
     val chunkCount: Int,
+    val datasetSplit: String = "TRAIN",
+    val validationText: String? = null,
     val plannedEpochs: Int,
     val rightsStatus: String,
     val status: String,
