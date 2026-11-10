@@ -113,6 +113,21 @@ class CorpusPersistenceTest {
             assertEquals("USER_DECLARED", articleSource.rightsStatus)
             assertEquals(4, repository.getCorpusSources(document.id).size)
 
+            manager.enqueueDocument(
+                source = "web_article|source=reviewed-page",
+                title = "Article source",
+                fullText = text,
+                canonicalUrl = "https://example.org/article",
+                rightsStatus = "UNVERIFIED"
+            )
+            val sourceAfterUnverifiedReimport = repository.getCorpusSources(document.id)
+                .single { it.canonicalUrl == "https://example.org/article" }
+            assertEquals(
+                "A less authoritative repeat import must not downgrade a prior rights declaration.",
+                "USER_DECLARED",
+                sourceAfterUnverifiedReimport.rightsStatus
+            )
+
             manager.clearQueue()
             manager.awaitQueuePersistenceIdle()
 
