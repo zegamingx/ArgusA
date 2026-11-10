@@ -21,6 +21,20 @@ interface CorpusDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertSource(source: CorpusSourceEntity): Long
 
+    @Query(
+        "UPDATE corpus_sources SET source = :source, canonicalUrl = :canonicalUrl, " +
+            "language = :language, rightsStatus = :rightsStatus, " +
+            "importedAtEpochMs = :importedAtEpochMs WHERE id = :sourceId"
+    )
+    suspend fun updateSourceMetadata(
+        sourceId: String,
+        source: String,
+        canonicalUrl: String?,
+        language: String?,
+        rightsStatus: String,
+        importedAtEpochMs: Long
+    ): Int
+
     @Query("SELECT * FROM corpus_sources WHERE documentId = :documentId ORDER BY importedAtEpochMs ASC")
     suspend fun getSources(documentId: String): List<CorpusSourceEntity>
 
