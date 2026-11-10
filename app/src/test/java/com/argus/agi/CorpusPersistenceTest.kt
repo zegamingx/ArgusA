@@ -545,4 +545,60 @@ class CorpusPersistenceTest {
             database.close()
         }
     }
+
+    @Test
+    fun clearingQueueKeepsAnActiveFinalChunkEligibleForCompletion() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(context),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val queuedCount = manager.enqueueDocument(
+                source = "Queue clear final-chunk test",
+                title = "Single chunk document",
+                fullText = "A single retained source chunk remains eligible for completion.",
+                chunkSize = 180,
+                overlap = 30,
+                epochs = 1
+            )
+            assertEquals(1, queuedCount)
+            manager.awaitQueuePersistenceIdle()
+
+            val document = repository.getCorpusDocuments().single()
+            val activeItem = repository.getPendingQueueSnapshot().single()
+            assertEquals(1, activeItem.chunkIndex)
+            assertEquals(1, activeItem.totalChunks)
+            assertTrue(repository.markTrainingStarted(activeItem.id))
+            repository.markCorpusDocumentTraining(document.id)
+
+            manager.clearQueue()
+            manager.awaitQueuePersistenceIdle()
+
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            assertEquals(
+                "A sole active final chunk must remain eligible to complete its document.",
+                "TRAINING",
+                repository.getCorpusDocument(document.id)?.status
+            )
+
+            repository.markTrainingCompleted(activeItem.id, loss = 0.1f, durationMs = 1L)
+            repository.markCorpusDocumentTrained(document.id, completedPassCount = 1)
+            assertEquals("TRAINED", repository.getCorpusDocument(document.id)?.status)
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
 }
