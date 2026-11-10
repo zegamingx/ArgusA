@@ -290,7 +290,7 @@ class ArgusAppRobolectricTest {
                     "Training passes repeat the document blocks without modifying their token IDs. "
                 ).repeat(10)
 
-            val multiPassDocument = document.replaceFirst("Argus parses", "Argus scans")
+            val multiPassDocument = document.replaceFirst("Argus parses", "Argus copies")
 
             val firstPass = manager.enqueueDocumentStream(
                 source = "Single pass test",
