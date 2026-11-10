@@ -547,7 +547,7 @@ class ArgusNeuralEngine private constructor(
             val end = min(start + maxSeqLen, tokens.size)
             val windowTokens = tokens.subList(start, end)
             if (windowTokens.size >= 2) {
-                val firstTargetIndex = if (start == 0) 0 else overlapTokens - 1
+                val firstTargetIndex = if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
                 val targetCount = (windowTokens.size - 1 - firstTargetIndex).coerceAtLeast(0)
                 if (targetCount > 0) {
                     val windowLoss = trainSingleWindow(
@@ -600,7 +600,7 @@ class ArgusNeuralEngine private constructor(
                     val end = min(start + maxSeqLen, tokens.size)
                     val windowSeq = tokens.subList(start, end)
                     if (windowSeq.size >= 2) {
-                        val firstTargetIndex = if (start == 0) 0 else overlapTokens - 1
+                        val firstTargetIndex = if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
                         val targetCount = (windowSeq.size - 1 - firstTargetIndex).coerceAtLeast(0)
                         if (targetCount > 0) {
                             val windowLoss = trainSingleWindow(
