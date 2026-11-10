@@ -263,8 +263,6 @@ class TrainingManager(
             "Unsupported corpus rights status: $rightsStatus"
         }
         requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
-        requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
-        requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
 
         val clean = fullText.trim()
         if (clean.isBlank() || closed) return 0
@@ -388,6 +386,7 @@ class TrainingManager(
         require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
             "Unsupported corpus rights status: $rightsStatus"
         }
+        requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
         if (closed) return Pair(0, 0L)
 
         val rawChunks = mutableListOf<String>()
@@ -557,6 +556,7 @@ class TrainingManager(
         require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
             "Unsupported corpus rights status: $rightsStatus"
         }
+        requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
         val clean = fullText.trim()
         if (clean.isBlank() || closed) return false
 
