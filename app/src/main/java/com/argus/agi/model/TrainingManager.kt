@@ -83,6 +83,11 @@ class TrainingManager(
             val generation: Long
         ) : QueuePersistenceOperation
 
+        data class Start(
+            val itemId: String,
+            val completion: CompletableDeferred<Unit>
+        ) : QueuePersistenceOperation
+
         data class Barrier(
             val completion: CompletableDeferred<Unit>
         ) : QueuePersistenceOperation
@@ -763,6 +768,24 @@ class TrainingManager(
                 }
             }
 
+            is QueuePersistenceOperation.Start -> {
+                try {
+                    repo?.let { repository ->
+                        runCatching {
+                            repository.markTrainingStarted(operation.itemId)
+                        }.onFailure { error ->
+                            Log.e(
+                                TAG,
+                                "Failed to persist active training state for '${operation.itemId}'",
+                                error
+                            )
+                        }
+                    }
+                } finally {
+                    operation.completion.complete(Unit)
+                }
+            }
+
             is QueuePersistenceOperation.Barrier -> {
                 operation.completion.complete(Unit)
             }
@@ -822,13 +845,32 @@ class TrainingManager(
         return ordered
     }
 
-    private fun popNext(): TrainingData? = synchronized(queueLock) {
-        val list = _nextQueue.value
-        val first = list.firstOrNull() ?: return@synchronized null
-        if (first.status != TrainingStatus.QUEUED) return@synchronized null
+    private suspend fun popNext(): TrainingData? {
+        val startCompletion = CompletableDeferred<Unit>()
+        val item = synchronized(queueLock) {
+            val list = _nextQueue.value
+            val first = list.firstOrNull() ?: return@synchronized null
+            if (first.status != TrainingStatus.QUEUED) return@synchronized null
 
-        _nextQueue.value = list.drop(1)
-        first
+            val sendResult = persistenceOperations.trySend(
+                QueuePersistenceOperation.Start(
+                    itemId = first.id,
+                    completion = startCompletion
+                )
+            )
+            if (sendResult.isFailure) {
+                Log.e(TAG, "Could not persist training start for '${first.id}'.")
+                return@synchronized null
+            }
+
+            _nextQueue.value = list.drop(1)
+            first
+        }
+
+        // Start is ordered in the same persistence channel as Clear. The worker waits for
+        // that update so a concurrent clear cannot delete an already-active queue row.
+        if (item != null) startCompletion.await()
+        return item
     }
 
     private fun updateActiveDocumentEntering(item: TrainingData) {
@@ -850,20 +892,6 @@ class TrainingManager(
     }
 
     private suspend fun processItem(item: TrainingData) {
-        // Persist the active row as TRAINING before entering the non-interruptible optimizer
-        // step. clearPendingQueue() can then safely remove only waiting rows.
-        repo?.let { repository ->
-            val markedStarted = runCatching {
-                repository.markTrainingStarted(item.id)
-            }.onFailure { error ->
-                Log.w(TAG, "Failed to persist active training state for '${item.id}'", error)
-            }.getOrDefault(false)
-
-            if (!markedStarted) {
-                Log.w(TAG, "Training item '${item.id}' was not marked TRAINING in Room.")
-            }
-        }
-
         if (item.chunkIndex == 1) {
             item.documentId?.let { documentId ->
                 repo?.let { repository ->
