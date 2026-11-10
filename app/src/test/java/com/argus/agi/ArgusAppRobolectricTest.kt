@@ -744,9 +744,9 @@ class ArgusAppRobolectricTest {
     fun testTextModalityProcessorArticleNewsFormat() {
         val rawNews = """
             JAKARTA — Pemerintah Indonesia menurut laporan resmi telah meresmikan pusat riset teknologi masa depan.
-            
+
             Penelitian ini melibatkan berbagai perguruan tinggi negeri dan institusi riset independen. Menurut juru bicara kepresidenan, fasilitas ini diharapkan dapat mempercepat inovasi komputasi tepi di berbagai sektor vital nasional.
-            
+
             Perusahaan teknologi swasta juga turut serta memberikan kontribusi berupa infrastruktur pengujian terdesentralisasi.
         """.trimIndent()
 
