@@ -458,6 +458,33 @@ class CorpusPersistenceTest {
                 "A unique web article without a rights declaration must be rejected.",
                 unverifiedArticleImport != null
             )
+            val unverifiedStreamImport = runCatching {
+                manager.enqueueDocumentStream(
+                    source = "web_article|source=unreviewed-stream",
+                    title = "Unreviewed stream article",
+                    reader = StringReader("A separate unreviewed web stream. ".repeat(12)),
+                    canonicalUrl = "https://example.org/unreviewed-stream",
+                    rightsStatus = "UNVERIFIED"
+                )
+            }.exceptionOrNull()
+            assertTrue(
+                "An unverified web stream must be rejected before content ingestion.",
+                unverifiedStreamImport != null
+            )
+
+            val unverifiedValidationImport = runCatching {
+                manager.importValidationDocument(
+                    source = "web_article|source=unreviewed-validation",
+                    title = "Unreviewed validation article",
+                    fullText = "A separate unreviewed held-out article. ".repeat(12),
+                    canonicalUrl = "https://example.org/unreviewed-validation",
+                    rightsStatus = "UNVERIFIED"
+                )
+            }.exceptionOrNull()
+            assertTrue(
+                "An unverified web article must also be rejected from held-out storage.",
+                unverifiedValidationImport != null
+            )
             assertEquals(1, repository.getCorpusDocumentCount())
 
             val declaredArticleImport = manager.enqueueDocument(
