@@ -31,6 +31,7 @@ import java.io.StringReader
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
+import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 
@@ -59,6 +60,14 @@ data class ActiveDocumentTraining(
     val currentChunkIndex: Int,
     val latestLoss: Float? = null,
     val runningAverageLoss: Float? = null
+)
+
+data class ValidationCorpusEvaluation(
+    val corpusDocumentCount: Int,
+    val evaluatedDocumentCount: Int,
+    val targetTokenCount: Int,
+    val meanLoss: Float,
+    val perplexity: Float
 )
 
 class TrainingManager(
@@ -523,6 +532,85 @@ class TrainingManager(
     }
 
     /**
+     * Imports one complete document into the held-out validation split.
+     *
+     * Validation content is persisted as one source text, not split into overlapping
+     * training chunks. It is never appended to the training queue. An identical document
+     * already present in the training split is rejected by the repository.
+     */
+    suspend fun importValidationDocument(
+        source: String,
+        title: String,
+        fullText: String,
+        language: String? = null,
+        canonicalUrl: String? = null,
+        rightsStatus: String = "UNVERIFIED"
+    ): Boolean {
+        require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
+            "Unsupported corpus rights status: $rightsStatus"
+        }
+        val clean = fullText.trim()
+        if (clean.isBlank() || closed) return false
+
+        val normalizedText = TextModalityProcessor.normalizeTypography(clean)
+            .lines()
+            .joinToString("\n") { TextModalityProcessor.formatStructuredLineIfJson(it) }
+        if (normalizedText.isBlank()) return false
+
+        val documentId = sha256Utf16Be(fullText)
+        val document = CorpusDocumentEntity(
+            id = documentId,
+            contentFingerprint = documentId,
+            fingerprintAlgorithm = "SHA-256/UTF-16BE",
+            source = source,
+            title = title,
+            language = language,
+            canonicalUrl = canonicalUrl,
+            characterCount = clean.length,
+            chunkCount = 0,
+            datasetSplit = "VALIDATION",
+            validationText = normalizedText,
+            plannedEpochs = 0,
+            rightsStatus = rightsStatus,
+            status = "READY",
+            createdAtEpochMs = System.currentTimeMillis(),
+            lastTrainedAtEpochMs = null,
+            completedPassCount = 0
+        )
+
+        val activeRepository = requireNotNull(repo) {
+            "Local corpus storage is unavailable; validation data was not imported."
+        }
+        return activeRepository.storeCorpusDocument(document, emptyList())
+    }
+
+    /**
+     * Evaluates held-out documents as one token-weighted corpus.
+     * The neural engine holds its model lock for the whole evaluation and does not update weights.
+     */
+    suspend fun evaluateValidationCorpus(limit: Int = 500): ValidationCorpusEvaluation {
+        require(limit in 1..500) { "Validation document limit must be in 1..500." }
+        val activeRepository = requireNotNull(repo) {
+            "Local corpus storage is unavailable; validation cannot be evaluated."
+        }
+        val documents = activeRepository.getValidationCorpusDocuments(limit)
+        val texts = documents.mapNotNull { it.validationText }
+        val evaluation = neuralEngine.evaluateCorpusLoss(texts)
+        val perplexity = if (evaluation.meanLoss.isFinite()) {
+            exp(evaluation.meanLoss)
+        } else {
+            Float.NaN
+        }
+        return ValidationCorpusEvaluation(
+            corpusDocumentCount = documents.size,
+            evaluatedDocumentCount = evaluation.evaluatedDocumentCount,
+            targetTokenCount = evaluation.targetCount,
+            meanLoss = evaluation.meanLoss,
+            perplexity = perplexity
+        )
+    }
+
+    /**
      * Re-enqueues retained corpus chunks without re-reading the original file or web page.
      * Queue clearing therefore does not delete the data needed for another training pass.
      */
@@ -539,6 +627,9 @@ class TrainingManager(
             "Local corpus storage is unavailable; corpus replay cannot be scheduled."
         }
         val document = activeRepository.getCorpusDocument(documentId) ?: return 0
+        require(document.datasetSplit == "TRAIN") {
+            "Validation-only documents cannot be replayed into the training queue."
+        }
         val chunks = activeRepository.getCorpusChunks(documentId)
         if (chunks.size != document.chunkCount || chunks.isEmpty()) {
             throw IllegalStateException(
