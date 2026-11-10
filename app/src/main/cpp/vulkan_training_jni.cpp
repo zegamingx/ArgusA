@@ -5,6 +5,7 @@
 #include "adamw_shader_spv.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -28,7 +29,9 @@ struct AdamwPushConstants {
     float gradientClipFactor;
 };
 
-static_assert(sizeof(AdamwPushConstants) == 28);
+// Must match the eight 32-bit scalar members in adamw.comp's push-constant block.
+static_assert(sizeof(AdamwPushConstants) == 32);
+static_assert(offsetof(AdamwPushConstants, gradientClipFactor) == 28);
 
 struct VulkanRuntime {
     VkInstance instance = VK_NULL_HANDLE;
