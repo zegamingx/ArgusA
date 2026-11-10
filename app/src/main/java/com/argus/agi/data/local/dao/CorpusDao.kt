@@ -23,7 +23,11 @@ interface CorpusDao {
 
     @Query(
         "UPDATE corpus_sources SET source = :source, canonicalUrl = :canonicalUrl, " +
-            "language = :language, rightsStatus = :rightsStatus, " +
+            "language = :language, rightsStatus = CASE " +
+            "WHEN rightsStatus = 'LICENSE_REVIEWED' THEN rightsStatus " +
+            "WHEN :rightsStatus = 'LICENSE_REVIEWED' THEN :rightsStatus " +
+            "WHEN rightsStatus = 'USER_DECLARED' AND :rightsStatus = 'UNVERIFIED' THEN rightsStatus " +
+            "ELSE :rightsStatus END, " +
             "importedAtEpochMs = :importedAtEpochMs WHERE id = :sourceId"
     )
     suspend fun updateSourceMetadata(
