@@ -5,121 +5,204 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
+import org.jsoup.Jsoup
+import java.net.URI
+import java.net.URLDecoder
 import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+import java.util.Locale
 import java.util.concurrent.TimeUnit
-import java.util.regex.Pattern
 
 data class SearchResultItem(
     val title: String,
     val snippet: String,
-    val sourceUrl: String
+    val sourceUrl: String,
+    val provider: String = "web"
 )
 
-class WebSearchEngine {
-
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
+/** Retrieves search metadata only; article bodies are handled by ArticleExtractor. */
+class WebSearchEngine(
+    private val client: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
+        .callTimeout(20, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
+) {
+    companion object {
+        private const val MAX_QUERY_LENGTH = 300
+        private const val MAX_RESULTS = 8
+        private const val MAX_WIKI_RESPONSE_CHARS = 512_000
+        private const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+    }
 
     suspend fun search(query: String): List<SearchResultItem> = withContext(Dispatchers.IO) {
-        val results = mutableListOf<SearchResultItem>()
-        if (query.isBlank()) return@withContext results
+        val normalizedQuery = query.trim().replace(Regex("\\s+"), " ").take(MAX_QUERY_LENGTH)
+        if (normalizedQuery.isBlank()) return@withContext emptyList()
 
-        // 1. First attempt: Direct Wikipedia API search for verified factual knowledge
-        try {
-            val encodedQuery = URLEncoder.encode(query, java.nio.charset.StandardCharsets.UTF_8)
-            val idWikiUrl = "https://id.wikipedia.org/w/api.php?action=opensearch&search=$encodedQuery&limit=4&namespace=0&format=json"
-            val enWikiUrl = "https://en.wikipedia.org/w/api.php?action=opensearch&search=$encodedQuery&limit=4&namespace=0&format=json"
+        val collected = LinkedHashMap<String, SearchResultItem>()
 
-            val wikiResults = fetchWikiResults(idWikiUrl).ifEmpty { fetchWikiResults(enWikiUrl) }
-            results.addAll(wikiResults)
-        } catch (_: Exception) {}
+        runCatching {
+            val encoded = URLEncoder.encode(normalizedQuery, StandardCharsets.UTF_8.name())
+            val idUrl = "https://id.wikipedia.org/w/api.php?action=opensearch&search=$encoded&limit=5&namespace=0&format=json"
+            val enUrl = "https://en.wikipedia.org/w/api.php?action=opensearch&search=$encoded&limit=5&namespace=0&format=json"
 
-        // 2. DuckDuckGo HTML Search Query
-        if (results.size < 3) {
-            try {
-                val encodedQuery = URLEncoder.encode(query, java.nio.charset.StandardCharsets.UTF_8)
-                val ddgUrl = "https://html.duckduckgo.com/html/?q=$encodedQuery"
+            val indonesian = fetchWikiResults(idUrl)
+            val english = if (indonesian.isEmpty()) fetchWikiResults(enUrl) else emptyList()
+            (indonesian + english).forEach { item ->
+                collected.putIfAbsent(item.sourceUrl, item)
+            }
+        }
+
+        if (collected.size < 3) {
+            runCatching {
+                val encoded = URLEncoder.encode(normalizedQuery, StandardCharsets.UTF_8.name())
                 val request = Request.Builder()
-                    .url(ddgUrl)
-                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                    .url("https://html.duckduckgo.com/html/?q=$encoded")
+                    .header("User-Agent", USER_AGENT)
+                    .header("Accept", "text/html,application/xhtml+xml")
+                    .get()
                     .build()
 
                 client.newCall(request).execute().use { response ->
                     if (response.isSuccessful) {
-                        val html = response.body?.string() ?: ""
-                        val ddgItems = parseDdgHtml(html)
-                        results.addAll(ddgItems)
-                    }
-                }
-            } catch (_: Exception) {}
-        }
-
-        results.distinctBy { it.title }.take(5)
-    }
-
-    private fun fetchWikiResults(url: String): List<SearchResultItem> {
-        val list = mutableListOf<SearchResultItem>()
-        val request = Request.Builder()
-            .url(url)
-            .header("User-Agent", "ARGUS-Autonomous-System/1.0 (Android)")
-            .build()
-
-        client.newCall(request).execute().use { response ->
-            if (response.isSuccessful) {
-                val bodyStr = response.body?.string() ?: return emptyList()
-                val json = JSONArray(bodyStr)
-                if (json.length() >= 4) {
-                    val titles = json.getJSONArray(1)
-                    val snippets = json.getJSONArray(2)
-                    val urls = json.getJSONArray(3)
-                    for (i in 0 until titles.length()) {
-                        val title = titles.optString(i)
-                        val snippet = snippets.optString(i)
-                        val sourceUrl = urls.optString(i)
-                        if (snippet.isNotBlank()) {
-                            list.add(SearchResultItem(title = title, snippet = snippet, sourceUrl = sourceUrl))
+                        val html = response.body?.string().orEmpty()
+                        parseDdgHtml(html).forEach { item ->
+                            collected.putIfAbsent(item.sourceUrl, item)
                         }
                     }
                 }
             }
         }
-        return list
+
+        collected.values.take(MAX_RESULTS)
     }
 
-    private fun parseDdgHtml(html: String): List<SearchResultItem> {
-        val list = mutableListOf<SearchResultItem>()
-        // Extract result snippet blocks via regex
-        val snippetPattern = Pattern.compile("<a class=\"result__snippet[^\"]*\"[^>]*>(.*?)</a>", Pattern.DOTALL)
-        val titlePattern = Pattern.compile("<a class=\"result__url[^\"]*\"[^>]*>(.*?)</a>", Pattern.DOTALL)
+    private fun fetchWikiResults(url: String): List<SearchResultItem> {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "ArgusAndroid/1.0 (on-device web retrieval)")
+            .header("Accept", "application/json")
+            .get()
+            .build()
 
-        val snippetMatcher = snippetPattern.matcher(html)
-        val titleMatcher = titlePattern.matcher(html)
+        return client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return@use emptyList()
 
-        var count = 0
-        while (snippetMatcher.find() && count < 4) {
-            val rawSnippet = snippetMatcher.group(1) ?: ""
-            val cleanSnippet = rawSnippet.replace(Regex("<[^>]*>"), "").replace("&quot;", "\"").replace("&amp;", "&").trim()
+            val body = response.body?.string().orEmpty()
+            if (body.length > MAX_WIKI_RESPONSE_CHARS) return@use emptyList()
 
-            var cleanUrl = "Web Resource"
-            if (titleMatcher.find()) {
-                val rawUrl = titleMatcher.group(1) ?: ""
-                cleanUrl = rawUrl.replace(Regex("<[^>]*>"), "").trim()
-            }
+            val json = JSONArray(body)
+            if (json.length() < 4) return@use emptyList()
 
-            if (cleanSnippet.length > 20) {
-                list.add(
-                    SearchResultItem(
-                        title = cleanUrl.substringBefore("/").ifBlank { "Hasil Web" },
-                        snippet = cleanSnippet,
-                        sourceUrl = cleanUrl
-                    )
+            val titles = json.optJSONArray(1) ?: return@use emptyList()
+            val descriptions = json.optJSONArray(2) ?: return@use emptyList()
+            val urls = json.optJSONArray(3) ?: return@use emptyList()
+            val output = ArrayList<SearchResultItem>(titles.length())
+
+            for (index in 0 until titles.length()) {
+                val title = titles.optString(index).trim()
+                val description = descriptions.optString(index).trim()
+                val sourceUrl = normalizeHttpUrl(urls.optString(index)) ?: continue
+                if (title.isBlank()) continue
+
+                output += SearchResultItem(
+                    title = title,
+                    snippet = description.ifBlank { "Wikipedia article. Open the source for its full content." },
+                    sourceUrl = sourceUrl,
+                    provider = "Wikipedia"
                 )
-                count++
             }
+            output
         }
-        return list
+    }
+
+    internal fun parseDdgHtml(html: String): List<SearchResultItem> {
+        if (html.isBlank()) return emptyList()
+
+        val document = Jsoup.parse(html, "https://html.duckduckgo.com/")
+        val output = ArrayList<SearchResultItem>()
+
+        document.select("a.result__a").forEach { anchor ->
+            if (output.size >= MAX_RESULTS) return@forEach
+
+            val title = anchor.text().trim()
+            val sourceUrl = resolveDdgResultUrl(anchor.attr("href")) ?: return@forEach
+            if (title.isBlank()) return@forEach
+
+            val resultContainer = anchor.parents().firstOrNull { it.hasClass("result") }
+            val snippet = resultContainer
+                ?.selectFirst(".result__snippet")
+                ?.text()
+                ?.trim()
+                .orEmpty()
+
+            output += SearchResultItem(
+                title = title,
+                snippet = snippet.ifBlank { "Open the source page to read the article." },
+                sourceUrl = sourceUrl,
+                provider = "DuckDuckGo"
+            )
+        }
+
+        return output.distinctBy { it.sourceUrl }
+    }
+
+    private fun resolveDdgResultUrl(rawHref: String): String? {
+        if (rawHref.isBlank()) return null
+
+        val resolved = runCatching {
+            URI("https://html.duckduckgo.com/").resolve(rawHref)
+        }.getOrNull() ?: return null
+
+        val host = resolved.host?.lowercase(Locale.ROOT).orEmpty()
+        val target = if (
+            host == "duckduckgo.com" ||
+            host == "www.duckduckgo.com" ||
+            host == "html.duckduckgo.com"
+        ) {
+            val encodedTarget = resolved.rawQuery
+                ?.split('&')
+                ?.firstOrNull { it.substringBefore('=') == "uddg" }
+                ?.substringAfter('=', missingDelimiterValue = "")
+                .orEmpty()
+
+            if (encodedTarget.isBlank()) return null
+            runCatching {
+                URLDecoder.decode(encodedTarget, StandardCharsets.UTF_8)
+            }.getOrNull() ?: return null
+        } else {
+            resolved.toString()
+        }
+
+        return normalizeHttpUrl(target)
+    }
+
+    private fun normalizeHttpUrl(rawUrl: String): String? {
+        val uri = runCatching { URI(rawUrl.trim()).normalize() }.getOrNull() ?: return null
+        val scheme = uri.scheme?.lowercase(Locale.ROOT) ?: return null
+        if (scheme != "http" && scheme != "https") return null
+
+        val host = uri.host?.lowercase(Locale.ROOT) ?: return null
+        if (
+            host == "localhost" ||
+            host.endsWith(".localhost") ||
+            host.endsWith(".local") ||
+            host.endsWith(".invalid")
+        ) return null
+
+        if (host == "duckduckgo.com" || host.endsWith(".duckduckgo.com")) return null
+        if (uri.userInfo != null) return null
+
+        return URI(
+            scheme,
+            null,
+            host,
+            uri.port,
+            uri.path.ifBlank { "/" },
+            uri.query,
+            null
+        ).toASCIIString()
     }
 }

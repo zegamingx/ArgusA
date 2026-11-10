@@ -36,7 +36,53 @@ data class EngineConfig(
     val maxSeqLen: Int = 128,
     val loraRank: Int = 4,
     val isFullTrainingEnabled: Boolean = true
-)
+) {
+    init {
+        require(dModel > 0) { "dModel must be positive." }
+        require(nHeads > 0 && dModel % nHeads == 0) {
+            "nHeads must be positive and divide dModel evenly."
+        }
+        require(dFf > 0) { "dFf must be positive." }
+        require(maxSeqLen >= 2) { "maxSeqLen must be at least 2." }
+        require(loraRank > 0) { "loraRank must be positive." }
+    }
+
+    val architectureLabel: String
+        get() = when {
+            dModel >= 128 && dFf >= 512 ->
+                "Flagship Dynamic Core"
+            dModel >= 96 && dFf >= 384 ->
+                "High Memory Neural Core"
+            dModel >= 64 && dFf >= 256 ->
+                "Balanced Neural Core"
+            else ->
+                "Compact Neural Core"
+        } + " (d_model $dModel, d_ff $dFf, context $maxSeqLen, LoRA rank $loraRank)"
+
+    companion object {
+        /**
+         * Selects a fresh model shape from stable device capacity, not volatile free RAM.
+         * Existing checkpoint configurations are resolved separately before engine creation.
+         */
+        fun forDevice(
+            totalRamGb: Int,
+            maxHeapMb: Long,
+            availableRamGb: Float = totalRamGb.toFloat()
+        ): EngineConfig = when {
+            totalRamGb >= 12 && maxHeapMb >= 512L && availableRamGb >= 3.0f ->
+                EngineConfig(dModel = 128, nHeads = 4, dFf = 512, maxSeqLen = 128, loraRank = 4)
+
+            totalRamGb >= 8 && maxHeapMb >= 384L && availableRamGb >= 2.0f ->
+                EngineConfig(dModel = 96, nHeads = 4, dFf = 384, maxSeqLen = 128, loraRank = 4)
+
+            totalRamGb >= 6 && maxHeapMb >= 256L && availableRamGb >= 1.0f ->
+                EngineConfig(dModel = 64, nHeads = 4, dFf = 256, maxSeqLen = 96, loraRank = 2)
+
+            else ->
+                EngineConfig(dModel = 48, nHeads = 4, dFf = 128, maxSeqLen = 64, loraRank = 2)
+        }
+    }
+}
 
 /**
  * On-Device Neural Engine A.R.G.U.S:
@@ -147,6 +193,70 @@ class ArgusNeuralEngine private constructor(
         private const val HEADER_SIZE = 48
         private const val CHECKPOINT_VERSION = 3
         private const val CHECKPOINT_INTERVAL = 8
+
+        /**
+         * Preserve an existing ARG3 model's tensor dimensions when reopening the app.
+         * Fresh installations use a deterministic RAM/heap tier instead.
+         */
+        fun resolveConfig(
+            context: Context,
+            totalRamGb: Int,
+            maxHeapMb: Long,
+            availableRamGb: Float = totalRamGb.toFloat()
+        ): EngineConfig {
+            val checkpoint = File(context.filesDir, "argus_model_weights.bin")
+            if (checkpoint.isFile && checkpoint.length() >= HEADER_SIZE) {
+                val savedConfig = runCatching {
+                    FileInputStream(checkpoint).use { input ->
+                        val bytes = ByteArray(HEADER_SIZE)
+                        var offset = 0
+                        while (offset < bytes.size) {
+                            val count = input.read(bytes, offset, bytes.size - offset)
+                            if (count < 0) error("Incomplete ARG3 checkpoint header.")
+                            offset += count
+                        }
+
+                        val header = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+                        require(
+                            header.get() == MAGIC_0 &&
+                                header.get() == MAGIC_1 &&
+                                header.get() == MAGIC_2 &&
+                                header.get() == MAGIC_3
+                        ) { "Unsupported checkpoint magic." }
+                        require(header.int == CHECKPOINT_VERSION) {
+                            "Unsupported checkpoint version."
+                        }
+
+                        val savedDModel = header.int
+                        val savedNHeads = header.int
+                        val savedDFf = header.int
+                        val savedMaxSeq = header.int
+                        val savedLoraRank = header.int
+                        val savedVocabSize = header.int
+                        val savedVocabCap = header.int
+                        header.int // saved optimizer step
+                        header.int // reserved field
+
+                        require(savedVocabSize > 0 && savedVocabCap >= savedVocabSize) {
+                            "Invalid checkpoint vocabulary dimensions."
+                        }
+
+                        EngineConfig(
+                            dModel = savedDModel,
+                            nHeads = savedNHeads,
+                            dFf = savedDFf,
+                            maxSeqLen = savedMaxSeq,
+                            loraRank = savedLoraRank,
+                            isFullTrainingEnabled = true
+                        )
+                    }
+                }.getOrNull()
+
+                if (savedConfig != null) return savedConfig
+            }
+
+            return EngineConfig.forDevice(totalRamGb, maxHeapMb, availableRamGb)
+        }
 
         @JvmStatic
         fun createBlocking(context: Context, config: EngineConfig = EngineConfig()): ArgusNeuralEngine =
@@ -408,10 +518,70 @@ class ArgusNeuralEngine private constructor(
     // =====================================================================
     // Training: True Full-Parameter Backprop with Minibatch Accumulation
     // =====================================================================
+    /**
+     * Computes next-token cross-entropy without changing weights, optimizer state,
+     * tokenizer vocabulary, or checkpoint files. Use only on held-out validation text.
+     */
+    fun evaluateLoss(text: String): Float = synchronized(modelLock) {
+        val tokens = tokenizer.encode(text, autoRegister = false)
+        if (tokens.size < 2 || tokenizer.vocabSize > vocabCap) {
+            return@synchronized Float.NaN
+        }
+
+        val currentVocab = tokenizer.vocabSize
+        if (tokens.size <= maxSeqLen) {
+            return@synchronized trainSingleWindow(
+                tokens,
+                currentVocab,
+                updateParameters = false
+            )
+        }
+
+        val overlapTokens = min(24, maxSeqLen - 1)
+        val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
+        var weightedLoss = 0f
+        var evaluatedTargets = 0
+        var start = 0
+
+        while (start < tokens.size - 1) {
+            val end = min(start + maxSeqLen, tokens.size)
+            val windowTokens = tokens.subList(start, end)
+            if (windowTokens.size >= 2) {
+                val firstTargetIndex = if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
+                val targetCount = (windowTokens.size - 1 - firstTargetIndex).coerceAtLeast(0)
+                if (targetCount > 0) {
+                    val windowLoss = trainSingleWindow(
+                        seq = windowTokens,
+                        currentVocab = currentVocab,
+                        updateParameters = false,
+                        firstTargetIndex = firstTargetIndex
+                    )
+                    if (windowLoss.isFinite()) {
+                        weightedLoss += windowLoss * targetCount
+                        evaluatedTargets += targetCount
+                    }
+                }
+            }
+            if (end >= tokens.size) break
+            start += stride
+        }
+
+        if (evaluatedTargets > 0) weightedLoss / evaluatedTargets else Float.NaN
+    }
+
+    /**
+     * Returns exp(crossEntropy). Use the same fixed held-out corpus between evaluations.
+     */
+    fun evaluatePerplexity(text: String): Float {
+        val loss = evaluateLoss(text)
+        return if (loss.isFinite()) exp(loss) else Float.NaN
+    }
+
     fun trainStep(text: String): Float {
         var pendingSnapshot: ByteArray? = null
         val loss = synchronized(modelLock) {
-            val tokens = tokenizer.encode(text, autoRegister = true)
+            // Keep token IDs stable while training; unknown Unicode uses the tokenizer's deterministic Unicode escape.
+            val tokens = tokenizer.encode(text, autoRegister = false)
             if (tokens.size < 2) return@synchronized Float.NaN
 
             ensureVocabCapacity(tokenizer.vocabSize)
@@ -420,21 +590,35 @@ class ArgusNeuralEngine private constructor(
             val result = if (tokens.size <= maxSeqLen) {
                 trainSingleWindow(tokens, currentVocab)
             } else {
-                val stride = maxSeqLen - 24
-                var total = 0f
-                var windows = 0
+                val overlapTokens = min(24, maxSeqLen - 1)
+                val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
+                var weightedLoss = 0f
+                var trainedTargets = 0
                 var start = 0
+
                 while (start < tokens.size - 1) {
                     val end = min(start + maxSeqLen, tokens.size)
                     val windowSeq = tokens.subList(start, end)
                     if (windowSeq.size >= 2) {
-                        val l = trainSingleWindow(windowSeq, currentVocab)
-                        if (l.isFinite()) { total += l; windows++ }
+                        val firstTargetIndex = if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
+                        val targetCount = (windowSeq.size - 1 - firstTargetIndex).coerceAtLeast(0)
+                        if (targetCount > 0) {
+                            val windowLoss = trainSingleWindow(
+                                seq = windowSeq,
+                                currentVocab = currentVocab,
+                                firstTargetIndex = firstTargetIndex
+                            )
+                            if (windowLoss.isFinite()) {
+                                weightedLoss += windowLoss * targetCount
+                                trainedTargets += targetCount
+                            }
+                        }
                     }
                     if (end >= tokens.size) break
                     start += stride
                 }
-                if (windows > 0) total / windows else Float.NaN
+
+                if (trainedTargets > 0) weightedLoss / trainedTargets else Float.NaN
             }
 
             if (adamStep % CHECKPOINT_INTERVAL == 0) pendingSnapshot = buildCheckpointBytes()
@@ -448,12 +632,21 @@ class ArgusNeuralEngine private constructor(
         return loss
     }
 
-    private fun trainSingleWindow(seq: List<Int>, currentVocab: Int): Float {
+    private fun trainSingleWindow(
+        seq: List<Int>,
+        currentVocab: Int,
+        updateParameters: Boolean = true,
+        firstTargetIndex: Int = 0
+    ): Float {
         val seqLen = seq.size
         if (seqLen < 2) return Float.NaN
 
-        adamStep++
-        val lr = baseLearningRate / (1f + 0.0002f * adamStep)
+        if (updateParameters) adamStep++
+        val lr = if (updateParameters) {
+            baseLearningRate / (1f + 0.0002f * adamStep)
+        } else {
+            0f
+        }
         val embedScale = sqrt(dModel.toFloat())
 
         // ============================= FORWARD =============================
@@ -564,7 +757,10 @@ class ArgusNeuralEngine private constructor(
         var validSteps = 0
 
         // (1) Cross-Entropy & Akumulasi Gradien Head (TANPA mutasi in-place)
-        for (t in 0 until seqLen - 1) {
+        require(firstTargetIndex in 0 until seqLen - 1) {
+            "firstTargetIndex must identify at least one next-token target."
+        }
+        for (t in firstTargetIndex until seqLen - 1) {
             val target = seq[t + 1]
             if (target !in 0 until currentVocab) continue
             val logitRow = logits[t]
@@ -587,6 +783,10 @@ class ArgusNeuralEngine private constructor(
                     dL_dh2PostLN[t][d] += g * wHead[wOff + d]
                 }
             }
+        }
+
+        if (!updateParameters) {
+            return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
 
         // (2) SwiGLU MLP & Residual Backward

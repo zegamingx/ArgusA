@@ -3,6 +3,7 @@ package com.argus.agi.model
 import android.content.Context
 import android.util.Log
 import com.argus.agi.sensor.DeviceGuard
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -30,7 +31,7 @@ import java.util.UUID
 import kotlin.math.max
 import kotlin.math.min
 
-enum class TrainingStatus { QUEUED, TRAINING, COMPLETED, FAILED }
+enum class TrainingStatus { PERSISTING, QUEUED, TRAINING, COMPLETED, FAILED }
 
 data class TrainingData(
     val id: String = UUID.randomUUID().toString(),
@@ -68,16 +69,36 @@ class TrainingManager(
     private val repo: com.argus.agi.data.repository.ArgusRepository? =
         repository ?: runCatching { com.argus.agi.data.repository.ArgusRepository(context) }.getOrNull()
 
+    private sealed interface QueuePersistenceOperation {
+        data class Save(
+            val generation: Long,
+            val items: List<TrainingData>
+        ) : QueuePersistenceOperation
+
+        data class Clear(
+            val generation: Long
+        ) : QueuePersistenceOperation
+
+        data class Barrier(
+            val completion: CompletableDeferred<Unit>
+        ) : QueuePersistenceOperation
+    }
+
     companion object {
         private const val TAG = "TrainingManager"
         const val MAX_COMPLETED_SIZE = 100
         const val MAX_LOSS_HISTORY = 100
+        const val MAX_DOCUMENT_EPOCHS = 5
         private const val IDLE_POLL_MS = 500L
     }
 
     // StateFlow<List<TrainingData>> sebagai satu-satunya sumber kebenaran untuk queue.
     // Channel hanya berfungsi sebagai wakeup signal, bukan storage.
     private val queueLock = Any()
+    private var lastScheduledTimestamp: Long = System.currentTimeMillis()
+    private var queueGeneration: Long = 0L
+    private val persistenceOperations =
+        Channel<QueuePersistenceOperation>(capacity = Channel.UNLIMITED)
 
     private val _nextQueue = MutableStateFlow<List<TrainingData>>(emptyList())
     val nextQueue: StateFlow<List<TrainingData>> = _nextQueue.asStateFlow()
@@ -109,24 +130,43 @@ class TrainingManager(
     }
     private val scope = CoroutineScope(SupervisorJob() + trainingDispatcher + exceptionHandler)
     private var workerJob: Job? = null
+    private var persistenceJob: Job? = null
 
     init {
+        persistenceJob = scope.launch {
+            for (operation in persistenceOperations) {
+                processQueuePersistenceOperation(operation)
+            }
+        }
+
+        val restoreGeneration = synchronized(queueLock) { queueGeneration }
         scope.launch {
-            repo?.let { r ->
-                runCatching {
-                    val pending = r.getPendingQueueSnapshot()
-                    if (pending.isNotEmpty()) {
-                        synchronized(queueLock) {
-                            val current = _nextQueue.value
-                            if (current.isEmpty()) {
-                                _nextQueue.value = pending
-                                wakeupSignal.trySend(Unit)
+            repo?.let { repository ->
+                runCatching { repository.getPendingQueueSnapshot() }
+                    .onSuccess { pending ->
+                        if (pending.isNotEmpty()) {
+                            synchronized(queueLock) {
+                                if (
+                                    restoreGeneration == queueGeneration &&
+                                    _nextQueue.value.isEmpty()
+                                ) {
+                                    val orderedPending = pending.sortedBy { it.timestamp }
+                                    _nextQueue.value = orderedPending
+                                    lastScheduledTimestamp = maxOf(
+                                        lastScheduledTimestamp,
+                                        orderedPending.maxOf { it.timestamp }
+                                    )
+                                    wakeupSignal.trySend(Unit)
+                                }
                             }
                         }
                     }
-                }
+                    .onFailure { error ->
+                        Log.e(TAG, "Failed to restore persisted training queue", error)
+                    }
             }
         }
+
         startTrainingWorker()
     }
 
@@ -153,15 +193,24 @@ class TrainingManager(
      */
     fun clearQueue() {
         synchronized(queueLock) {
+            queueGeneration += 1L
             _nextQueue.value = emptyList()
+            persistenceOperations.trySend(
+                QueuePersistenceOperation.Clear(queueGeneration)
+            )
         }
         _activeDocument.value = null
-        scope.launch {
-            repo?.let { runCatching { it.clearPendingQueue() } }
-        }
+        wakeupSignal.trySend(Unit)
     }
 
     fun clearCompleted() { _completedQueue.value = emptyList() }
+
+    internal suspend fun awaitQueuePersistenceIdle() {
+        if (closed) return
+        val barrier = CompletableDeferred<Unit>()
+        persistenceOperations.send(QueuePersistenceOperation.Barrier(barrier))
+        barrier.await()
+    }
 
     // =====================================================================
     // Enqueue API
@@ -172,64 +221,79 @@ class TrainingManager(
         title: String,
         fullText: String,
         chunkSize: Int = 380,
-        overlap: Int = 50
+        overlap: Int = 50,
+        epochs: Int = 1
     ): Int {
         require(chunkSize > overlap) {
             "chunkSize ($chunkSize) harus > overlap ($overlap) agar iterasi maju"
+        }
+        require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
+            "epochs harus berada pada rentang 1..$MAX_DOCUMENT_EPOCHS"
         }
         val clean = fullText.trim()
         if (clean.isBlank() || closed) return 0
 
         val processedChunks = TextModalityProcessor.process(clean, title, chunkSize, overlap)
-        val total = processedChunks.size
-        if (total == 0) return 0
+        val chunksPerEpoch = processedChunks.size
+        if (chunksPerEpoch == 0) return 0
 
-        val newItems = processedChunks.mapIndexed { idx, pChunk ->
-            TrainingData(
-                source = source,
-                title = pChunk.segmentTitle,
-                content = pChunk.content,
-                chunkIndex = idx + 1,
-                totalChunks = total,
-                documentTitle = title,
-                status = TrainingStatus.QUEUED
-            )
+        val totalScheduledChunks = Math.multiplyExact(chunksPerEpoch, epochs)
+        val newItems = ArrayList<TrainingData>(totalScheduledChunks)
+
+        // Epoch-major ordering: the model sees the complete document before its next pass.
+        for (epochIndex in 0 until epochs) {
+            processedChunks.forEachIndexed { chunkIndex, chunk ->
+                val epochTitle = if (epochs == 1) {
+                    chunk.segmentTitle
+                } else {
+                    "${chunk.segmentTitle} [Epoch ${epochIndex + 1}/$epochs]"
+                }
+
+                newItems += TrainingData(
+                    source = source,
+                    title = epochTitle,
+                    content = chunk.content,
+                    chunkIndex = epochIndex * chunksPerEpoch + chunkIndex + 1,
+                    totalChunks = totalScheduledChunks,
+                    documentTitle = title,
+                    status = TrainingStatus.QUEUED
+                )
+            }
         }
 
         synchronized(queueLock) {
             if (closed) return 0
-            val current = _nextQueue.value
-            _nextQueue.value = current + newItems
-            scope.launch {
-                repo?.let { runCatching { it.saveTrainingItems(newItems) } }
-            }
-            if (_activeDocument.value == null && newItems.isNotEmpty()) {
+            val orderedItems = appendPersistingQueueItems(newItems)
+
+            if (_activeDocument.value == null && orderedItems.isNotEmpty()) {
                 _activeDocument.value = ActiveDocumentTraining(
                     docTitle = title,
                     totalCharacters = clean.length,
-                    totalChunks = newItems.size,
+                    totalChunks = orderedItems.size,
                     completedChunks = 0,
                     currentChunkIndex = 1
                 )
             }
-            wakeupSignal.trySend(Unit)
-            return newItems.size
+            return orderedItems.size
         }
     }
 
     /**
-     * Memproses dokumen besar secara streaming tanpa memuat seluruh teks ke heap RAM sekaligus.
-     * Menggunakan buffer 4KB dan sliding window lokal berukuran chunkSize (~380 karakter),
-     * membaca seluruh file sampai tuntas (EOF) tanpa batasan blok arbitrer.
+     * Reads the source incrementally with a 4 KB input buffer and a sliding text window.
      *
-     * @return Pair(jumlahChunkDihasilkan, totalKarakterTerbaca)
+     * The generated chunk strings and queue items are still accumulated in memory until
+     * they are scheduled and persisted. Callers must apply file/decompression limits.
+     * This method is buffered ingestion, not a fully disk-backed or constant-memory queue.
+     *
+     * @return Pair(number of generated chunks, total characters read)
      */
     fun enqueueDocumentStream(
         source: String,
         title: String,
         reader: Reader,
         chunkSize: Int = 380,
-        overlap: Int = 50
+        overlap: Int = 50,
+        epochs: Int = 1
     ): Pair<Int, Long> {
         require(chunkSize > overlap) {
             "chunkSize ($chunkSize) harus > overlap ($overlap) agar iterasi maju"
@@ -237,46 +301,55 @@ class TrainingManager(
         require(overlap <= chunkSize / 3) {
             "overlap ($overlap) harus <= chunkSize / 3 (${chunkSize / 3}) agar jaminan sliding window selalu maju"
         }
+        require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
+            "epochs harus berada pada rentang 1..$MAX_DOCUMENT_EPOCHS"
+        }
         if (closed) return Pair(0, 0L)
 
         val rawChunks = mutableListOf<String>()
-        val buf = CharArray(4096)
+        val buffer = CharArray(4096)
         val window = StringBuilder()
         var totalCharsRead = 0L
 
-        var readCount: Int
-        while (reader.read(buf).also { readCount = it } != -1) {
+        while (true) {
+            val readCount = reader.read(buffer)
+            if (readCount < 0) break
             if (closed) break
-            window.append(buf, 0, readCount)
-            totalCharsRead += readCount
+
+            window.append(buffer, 0, readCount)
+            totalCharsRead += readCount.toLong()
 
             while (window.length >= chunkSize) {
-                var splitIdx = -1
-                val minBreakPos = chunkSize / 3
-                val searchStr = window.substring(minBreakPos, chunkSize)
+                val minimumBreakPosition = chunkSize / 3
+                val searchText = window.substring(minimumBreakPosition, chunkSize)
+                val lastNewLine = searchText.lastIndexOf('\n')
+                val lastSentenceBreak = max(
+                    searchText.lastIndexOf(". "),
+                    max(searchText.lastIndexOf("? "), searchText.lastIndexOf("! "))
+                )
+                val punctuationBreak = max(lastNewLine, lastSentenceBreak)
 
-                val nl = searchStr.lastIndexOf('\n')
-                val dot = searchStr.lastIndexOf(". ")
-                val qm = searchStr.lastIndexOf("? ")
-                val em = searchStr.lastIndexOf("! ")
-                val punct = max(nl, max(dot, max(qm, em)))
-
-                if (punct >= 0) {
-                    splitIdx = minBreakPos + punct + 1
+                val splitPosition = if (punctuationBreak >= 0) {
+                    minimumBreakPosition + punctuationBreak + 1
                 } else {
-                    val sp = searchStr.lastIndexOf(' ')
-                    if (sp >= 0) splitIdx = minBreakPos + sp + 1
-                }
+                    val lastSpace = searchText.lastIndexOf(' ')
+                    if (lastSpace >= 0) minimumBreakPosition + lastSpace + 1 else chunkSize
+                }.coerceIn(1, chunkSize)
 
-                val cutPos = if (splitIdx in 1..chunkSize) splitIdx else chunkSize
-                val rawSegment = TextModalityProcessor.normalizeTypography(window.substring(0, cutPos))
-                val segment = rawSegment.lines().joinToString("\n") { TextModalityProcessor.formatStructuredLineIfJson(it) }
-                if (segment.isNotBlank()) {
-                    rawChunks.add(segment)
+                val rawSegment = TextModalityProcessor.normalizeTypography(
+                    window.substring(0, splitPosition)
+                )
+                val normalizedSegment = rawSegment.lines().joinToString("\n") {
+                    TextModalityProcessor.formatStructuredLineIfJson(it)
                 }
+                if (normalizedSegment.isNotBlank()) rawChunks.add(normalizedSegment)
 
-                val nextStart = (cutPos - overlap).coerceAtLeast(0)
-                val safeNextStart = if (nextStart == 0 && cutPos > 0) cutPos else nextStart
+                val nextStart = (splitPosition - overlap).coerceAtLeast(0)
+                val safeNextStart = if (nextStart == 0 && splitPosition > 0) {
+                    splitPosition
+                } else {
+                    nextStart
+                }
                 val tail = window.substring(safeNextStart)
                 window.setLength(0)
                 window.append(tail)
@@ -284,44 +357,52 @@ class TrainingManager(
         }
 
         val trailingRaw = TextModalityProcessor.normalizeTypography(window.toString().trim())
-        val trailing = trailingRaw.lines().joinToString("\n") { TextModalityProcessor.formatStructuredLineIfJson(it) }
-        if (trailing.isNotBlank()) {
-            rawChunks.add(trailing)
+        val trailing = trailingRaw.lines().joinToString("\n") {
+            TextModalityProcessor.formatStructuredLineIfJson(it)
         }
+        if (trailing.isNotBlank()) rawChunks.add(trailing)
 
-        val total = rawChunks.size
-        if (total == 0) return Pair(0, totalCharsRead)
+        val chunksPerEpoch = rawChunks.size
+        if (chunksPerEpoch == 0) return Pair(0, totalCharsRead)
 
-        val newItems = rawChunks.mapIndexed { idx, chunkText ->
-            TrainingData(
-                source = source,
-                title = "$title [Blok ${idx + 1}/$total]",
-                content = chunkText,
-                chunkIndex = idx + 1,
-                totalChunks = total,
-                documentTitle = title,
-                status = TrainingStatus.QUEUED
-            )
+        val totalScheduledChunks = Math.multiplyExact(chunksPerEpoch, epochs)
+        val newItems = ArrayList<TrainingData>(totalScheduledChunks)
+
+        for (epochIndex in 0 until epochs) {
+            rawChunks.forEachIndexed { chunkIndex, chunkText ->
+                val chunkTitle = if (epochs == 1) {
+                    "$title [Blok ${chunkIndex + 1}/$chunksPerEpoch]"
+                } else {
+                    "$title [Blok ${chunkIndex + 1}/$chunksPerEpoch] [Epoch ${epochIndex + 1}/$epochs]"
+                }
+
+                newItems += TrainingData(
+                    source = source,
+                    title = chunkTitle,
+                    content = chunkText,
+                    chunkIndex = epochIndex * chunksPerEpoch + chunkIndex + 1,
+                    totalChunks = totalScheduledChunks,
+                    documentTitle = title,
+                    status = TrainingStatus.QUEUED
+                )
+            }
         }
+        rawChunks.clear()
 
         synchronized(queueLock) {
             if (closed) return Pair(0, totalCharsRead)
-            val current = _nextQueue.value
-            _nextQueue.value = current + newItems
-            scope.launch {
-                repo?.let { runCatching { it.saveTrainingItems(newItems) } }
-            }
-            if (_activeDocument.value == null && newItems.isNotEmpty()) {
+            val orderedItems = appendPersistingQueueItems(newItems)
+
+            if (_activeDocument.value == null && orderedItems.isNotEmpty()) {
                 _activeDocument.value = ActiveDocumentTraining(
                     docTitle = title,
-                    totalCharacters = if (totalCharsRead > 0) totalCharsRead.toInt() else newItems.sumOf { it.content.length },
-                    totalChunks = newItems.size,
+                    totalCharacters = totalCharsRead.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    totalChunks = orderedItems.size,
                     completedChunks = 0,
                     currentChunkIndex = 1
                 )
             }
-            wakeupSignal.trySend(Unit)
-            return Pair(newItems.size, totalCharsRead)
+            return Pair(orderedItems.size, totalCharsRead)
         }
     }
 
@@ -354,13 +435,9 @@ class TrainingManager(
                 current.none { it.content == item.content && it.documentTitle == null }
             }
             if (nonDuplicates.isNotEmpty()) {
-                _nextQueue.value = current + nonDuplicates
-                scope.launch {
-                    repo?.let { runCatching { it.saveTrainingItems(nonDuplicates) } }
-                }
+                appendPersistingQueueItems(nonDuplicates)
             }
         }
-        wakeupSignal.trySend(Unit)
     }
 
     // =====================================================================
@@ -387,10 +464,11 @@ class TrainingManager(
                 // 3. Pop item dari queue secara atomik
                 val item = popNext()
                 if (item == null) {
-                    // Antrean selesai: barulah set item aktif dan corpus aktif ke null
-                    _currentTrainingItem.value = null
-                    _activeDocument.value = null
-                    // Idle: tunggu wakeup, tapi berkala cek pause/close
+                    // Keep document progress while the head item is still being persisted.
+                    if (_nextQueue.value.isEmpty()) {
+                        _currentTrainingItem.value = null
+                        _activeDocument.value = null
+                    }
                     withTimeoutOrNull(IDLE_POLL_MS) {
                         wakeupSignal.receiveCatching()
                     }
@@ -430,13 +508,110 @@ class TrainingManager(
         }
     }
 
+    private fun appendPersistingQueueItems(items: List<TrainingData>): List<TrainingData> {
+        if (items.isEmpty()) return emptyList()
+
+        val orderedItems = assignPersistentQueueOrder(items)
+        val persistingItems = orderedItems.map { it.copy(status = TrainingStatus.PERSISTING) }
+        _nextQueue.value = _nextQueue.value + persistingItems
+
+        val operation = QueuePersistenceOperation.Save(
+            generation = queueGeneration,
+            items = orderedItems
+        )
+        val sendResult = persistenceOperations.trySend(operation)
+        if (sendResult.isFailure) {
+            val itemIds = orderedItems.mapTo(HashSet(orderedItems.size)) { it.id }
+            _nextQueue.value = _nextQueue.value.filterNot { it.id in itemIds }
+            orderedItems.forEach { item ->
+                pushCompleted(item.copy(status = TrainingStatus.FAILED))
+            }
+            Log.e(TAG, "Training persistence worker is not accepting queue items.")
+            return emptyList()
+        }
+
+        return orderedItems
+    }
+
+    private suspend fun processQueuePersistenceOperation(
+        operation: QueuePersistenceOperation
+    ) {
+        when (operation) {
+            is QueuePersistenceOperation.Clear -> {
+                repo?.let { repository ->
+                    runCatching { repository.clearPendingQueue() }
+                        .onFailure { error ->
+                            Log.e(TAG, "Failed to clear persisted training queue", error)
+                        }
+                }
+            }
+
+            is QueuePersistenceOperation.Barrier -> {
+                operation.completion.complete(Unit)
+            }
+
+            is QueuePersistenceOperation.Save -> {
+                val isCurrentGeneration = synchronized(queueLock) {
+                    operation.generation == queueGeneration
+                }
+                if (!isCurrentGeneration) return
+
+                val persistenceFailure = repo?.let { repository ->
+                    runCatching {
+                        repository.saveTrainingItems(operation.items)
+                    }.exceptionOrNull()
+                }
+
+                synchronized(queueLock) {
+                    if (operation.generation != queueGeneration) return@synchronized
+
+                    val itemIds = operation.items.mapTo(HashSet(operation.items.size)) { it.id }
+                    if (persistenceFailure == null) {
+                        _nextQueue.value = _nextQueue.value.map { item ->
+                            if (item.id in itemIds) {
+                                item.copy(status = TrainingStatus.QUEUED)
+                            } else {
+                                item
+                            }
+                        }
+                    } else {
+                        _nextQueue.value = _nextQueue.value.filterNot { it.id in itemIds }
+                        operation.items.forEach { item ->
+                            pushCompleted(item.copy(status = TrainingStatus.FAILED))
+                        }
+                    }
+                }
+
+                if (persistenceFailure != null) {
+                    Log.e(
+                        TAG,
+                        "Failed to persist " + operation.items.size + " training items",
+                        persistenceFailure
+                    )
+                }
+                wakeupSignal.trySend(Unit)
+            }
+        }
+    }
+
+    private fun assignPersistentQueueOrder(items: List<TrainingData>): List<TrainingData> {
+        if (items.isEmpty()) return emptyList()
+
+        val firstTimestamp = maxOf(System.currentTimeMillis(), lastScheduledTimestamp + 1L)
+        val ordered = items.mapIndexed { index, item ->
+            item.copy(timestamp = firstTimestamp + index.toLong())
+        }
+        lastScheduledTimestamp = firstTimestamp + ordered.lastIndex
+        return ordered
+    }
+
     private fun popNext(): TrainingData? = synchronized(queueLock) {
         val list = _nextQueue.value
-        if (list.isEmpty()) null
-        else {
-            _nextQueue.value = list.subList(1, list.size).toList()
-            list[0]
-        }
+        val first = list.firstOrNull() ?: return@synchronized null
+        if (first.status != TrainingStatus.QUEUED) return@synchronized null
+
+        _nextQueue.value = list.drop(1)
+        first
     }
 
     private fun updateActiveDocumentEntering(item: TrainingData) {
@@ -582,22 +757,26 @@ class TrainingManager(
     // =====================================================================
 
     /**
-     * Menutup manager. Item yang sedang diproses tidak di-cancel paksa — worker
-     * akan menyelesaikan step yang sedang berjalan lalu berhenti.
-     * Item yang masih pending DI-DROP karena shutdown. Panggil [clearQueue]
-     * sebelum [close] jika ingin memastikan queue kosong diketahui user.
+     * Stops the training worker and drains queued persistence operations before shutdown.
+     * An active optimizer step is allowed to finish within the shutdown timeout.
+     * Pending queue items remain persisted in Room and can be restored by the next manager.
      */
     override fun close() {
         closed = true
+        _isTrainingPaused.value = false
+        persistenceOperations.close()
         wakeupSignal.trySend(Unit)
         resetForceOverrideIfSet()
-        // Beri waktu bagi worker untuk menyelesaikan step yang sedang berjalan
+
         runBlocking {
             runCatching {
-                withTimeout(1500L) {
+                withTimeout(2000L) {
                     workerJob?.join()
+                    persistenceJob?.join()
                 }
-            }.onFailure { Log.w(TAG, "Worker join timeout saat close", it) }
+            }.onFailure {
+                Log.w(TAG, "Training workers did not finish before shutdown timeout", it)
+            }
         }
         scope.cancel()
     }
