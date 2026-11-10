@@ -690,7 +690,18 @@ class TrainingManager(
                     val failed = activeItem.copy(status = TrainingStatus.FAILED)
                     pushCompleted(failed)
                     scope.launch {
-                        repo?.let { runCatching { it.markTrainingFailed(failed.id) } }
+                        repo?.let { repository ->
+                            runCatching { repository.markTrainingFailed(failed.id) }
+                                .onFailure { error ->
+                                    Log.w(TAG, "Failed to persist exception-failed training item", error)
+                                }
+                            failed.documentId?.let { documentId ->
+                                runCatching { repository.markCorpusDocumentPartial(documentId) }
+                                    .onFailure { error ->
+                                        Log.w(TAG, "Failed to mark exception-failed corpus document partial", error)
+                                    }
+                            }
+                        }
                     }
                 } finally {
                     // PENTING: Jangan set _currentTrainingItem.value = null di sini!
