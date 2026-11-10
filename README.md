@@ -117,7 +117,7 @@ Current limitations:
 - Corpus replay rejects documents that already have queued or active training work, preventing accidental duplicate scheduling. A completed or cleared corpus can be replayed again using the same seed.
 - Replay is bounded to 500 documents per scheduling request. Its default chunk limit is estimated from the current app heap (using a conservative 4 KiB per queue item) and capped at 4,096; callers may configure a larger limit up to the 50,000-item hard ceiling. Requests exceeding the configured limit are rejected before queue insertion.
 - `replayCorpusDocument` remains available for one-document replay and defaults to sequential chunk order.
-- NPU/APU and Vulkan may be detected for device information, but the current training implementation executes through Kotlin CPU operations. Detection is not accelerator dispatch.
+- Vulkan executes eligible batched forward/backward matrix products and AdamW updates after native numerical self-checks. Attention score generation, softmax, layer normalization, QKV/LoRA gradient accumulation, and global gradient-norm reduction remain Kotlin operations. NPU/APU hardware detection is informational only; no vendor-specific NPU/APU training runtime is integrated.
 - This pipeline is not yet validated as scalable from-random-initialization pretraining or general intelligence training.
 
 ## Compatibility note

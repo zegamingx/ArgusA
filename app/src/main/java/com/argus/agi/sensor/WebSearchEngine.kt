@@ -46,17 +46,13 @@ class WebSearchEngine(
 
         // Search the open web first. Wikipedia is an enrichment/fallback source,
         // never the primary ranking signal for a general web-search request.
-        val collected = LinkedHashMap<String, SearchResultItem>()
-
-        runCatching {
+        val generalResults = runCatching {
             fetchDdgResults(normalizedQuery)
         }.onFailure { error ->
             android.util.Log.w("WebSearchEngine", "General web provider failed.", error)
-        }.getOrDefault(emptyList()).forEach { item ->
-            collected.putIfAbsent(item.sourceUrl, item)
-        }
+        }.getOrDefault(emptyList())
 
-        if (collected.size < MAX_RESULTS) {
+        val supplementaryResults = if (generalResults.size < MAX_RESULTS) {
             runCatching {
                 val encoded = URLEncoder.encode(normalizedQuery, StandardCharsets.UTF_8.name())
                 val indonesianUrl =
@@ -65,16 +61,19 @@ class WebSearchEngine(
                     "https://en.wikipedia.org/w/api.php?action=opensearch&search=$encoded&limit=5&namespace=0&format=json"
 
                 val indonesian = fetchWikiResults(indonesianUrl)
-                val english = if (indonesian.isEmpty()) fetchWikiResults(englishUrl) else emptyList()
-                (indonesian + english).forEach { item ->
-                    collected.putIfAbsent(item.sourceUrl, item)
-                }
+                if (indonesian.isEmpty()) fetchWikiResults(englishUrl) else indonesian
             }.onFailure { error ->
                 android.util.Log.w("WebSearchEngine", "Wikipedia enrichment provider failed.", error)
-            }
+            }.getOrDefault(emptyList())
+        } else {
+            emptyList()
         }
 
-        collected.values.take(MAX_RESULTS)
+        mergeSearchResults(
+            primaryResults = generalResults,
+            supplementaryResults = supplementaryResults,
+            maxResults = MAX_RESULTS
+        )
     }
 
     private fun fetchDdgResults(query: String): List<SearchResultItem> {
@@ -265,4 +264,24 @@ internal fun readBoundedResponseBody(
     }
 
     return output.toString(StandardCharsets.UTF_8.name())
+}
+
+
+/**
+ * Preserves the primary provider's ranking and only appends unique supplemental URLs.
+ */
+internal fun mergeSearchResults(
+    primaryResults: List<SearchResultItem>,
+    supplementaryResults: List<SearchResultItem>,
+    maxResults: Int
+): List<SearchResultItem> {
+    require(maxResults > 0) { "maxResults must be positive." }
+    val collected = LinkedHashMap<String, SearchResultItem>()
+    primaryResults.forEach { item ->
+        collected.putIfAbsent(item.sourceUrl, item)
+    }
+    supplementaryResults.forEach { item ->
+        collected.putIfAbsent(item.sourceUrl, item)
+    }
+    return collected.values.take(maxResults)
 }
