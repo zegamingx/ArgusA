@@ -26,10 +26,18 @@ if(NOT ARGUS_NDK_ROOT)
     message(FATAL_ERROR "Android NDK path is not available to the Vulkan shader build.")
 endif()
 
+# The NDK stores shader-tools in host-specific subdirectories such as
+# shader-tools/linux-x86_64 and shader-tools/windows-x86_64.
+file(
+    GLOB ARGUS_SHADER_TOOL_DIRS
+    LIST_DIRECTORIES true
+    "${ARGUS_NDK_ROOT}/shader-tools/*"
+)
+
 find_program(
     ARGUS_GLSLC
     NAMES glslc glslc.exe
-    HINTS "${ARGUS_NDK_ROOT}/shader-tools"
+    HINTS ${ARGUS_SHADER_TOOL_DIRS}
     NO_DEFAULT_PATH
 )
 
