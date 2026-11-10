@@ -6,6 +6,7 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
+import com.argus.agi.data.local.entity.CorpusSourceEntity
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -16,6 +17,12 @@ interface CorpusDao {
 
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertChunks(chunks: List<CorpusChunkEntity>)
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertSource(source: CorpusSourceEntity): Long
+
+    @Query("SELECT * FROM corpus_sources WHERE documentId = :documentId ORDER BY importedAtEpochMs ASC")
+    suspend fun getSources(documentId: String): List<CorpusSourceEntity>
 
     @Query("SELECT * FROM corpus_documents WHERE id = :documentId LIMIT 1")
     suspend fun getDocument(documentId: String): CorpusDocumentEntity?
