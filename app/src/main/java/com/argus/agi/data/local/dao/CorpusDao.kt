@@ -64,6 +64,13 @@ interface CorpusDao {
     )
     suspend fun getValidationDocuments(limit: Int): List<CorpusDocumentEntity>
 
+    @Query(
+        "SELECT * FROM corpus_documents " +
+            "WHERE datasetSplit = 'TRAIN' AND chunkCount > 0 " +
+            "ORDER BY createdAtEpochMs ASC, id ASC LIMIT :limit"
+    )
+    suspend fun getTrainingDocuments(limit: Int): List<CorpusDocumentEntity>
+
     @Query("SELECT * FROM corpus_chunks WHERE documentId = :documentId ORDER BY chunkIndex ASC")
     suspend fun getChunks(documentId: String): List<CorpusChunkEntity>
 
