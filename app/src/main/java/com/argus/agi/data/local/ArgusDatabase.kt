@@ -84,6 +84,10 @@ abstract class ArgusDatabase : RoomDatabase() {
                     "CREATE INDEX IF NOT EXISTS `index_corpus_documents_createdAtEpochMs` " +
                         "ON `corpus_documents` (`createdAtEpochMs`)"
                 )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_corpus_documents_datasetSplit_createdAtEpochMs` " +
+                        "ON `corpus_documents` (`datasetSplit`, `createdAtEpochMs`)"
+                )
 
                 database.execSQL(
                     """
