@@ -847,10 +847,6 @@ class TrainingManager(
     }
 
     private fun processItem(item: TrainingData) {
-        val startNs = System.nanoTime()
-        val stepLoss = neuralEngine.trainStep(item.content)
-        val durationMs = (System.nanoTime() - startNs) / 1_000_000L
-
         if (item.chunkIndex == 1) {
             item.documentId?.let { documentId ->
                 scope.launch {
@@ -863,6 +859,10 @@ class TrainingManager(
                 }
             }
         }
+
+        val startNs = System.nanoTime()
+        val stepLoss = neuralEngine.trainStep(item.content)
+        val durationMs = (System.nanoTime() - startNs) / 1_000_000L
 
         // Loss tidak valid → FAILED, bukan COMPLETED.
         if (!stepLoss.isFinite()) {
