@@ -978,6 +978,7 @@ class ArgusNeuralEngine private constructor(
         val gradLoraVa = FloatArray(dModel * loraRank)
         val gradLoraVb = FloatArray(loraRank * dModel)
 
+        val dLogits = Array(seqLen) { FloatArray(currentVocab) }
         val dL_dh2PostLN = Array(seqLen) { FloatArray(dModel) }
         val dL_dh2PreLN = Array(seqLen) { FloatArray(dModel) }
         val dL_dh1PostLN = Array(seqLen) { FloatArray(dModel) }
@@ -1015,14 +1016,40 @@ class ArgusNeuralEngine private constructor(
             for (vocabIndex in 0 until currentVocab) {
                 val probability = exp(logitRow[vocabIndex] - maxLogit) * inverseSumExp
                 val gradient = if (vocabIndex == target) probability - 1f else probability
-                val weightOffset = vocabIndex * dModel
-                for (dimension in 0 until dModel) {
-                    gradWHead[weightOffset + dimension] += gradient * h2[t][dimension]
-                    // Backpropagate using the unmodified output-head weights.
-                    dL_dh2PostLN[t][dimension] +=
-                        gradient * wHead[weightOffset + dimension]
-                }
+                dLogits[t][vocabIndex] = gradient
             }
+        }
+
+        // Output-head backward is two matrix products:
+        // dHidden = dLogits × WHead and dWHead = transpose(dLogits) × hidden.
+        computeLinearBatch(
+            inputs = dLogits,
+            weights = wHead,
+            inputColumns = currentVocab,
+            outputColumns = dModel,
+            outputs = dL_dh2PostLN
+        )
+
+        val dLogitsByVocab = Array(currentVocab) { vocabIndex ->
+            FloatArray(seqLen) { timeIndex -> dLogits[timeIndex][vocabIndex] }
+        }
+        val hiddenRows = flattenRows(h2)
+        val gradWHeadRows = Array(currentVocab) { FloatArray(dModel) }
+        computeLinearBatch(
+            inputs = dLogitsByVocab,
+            weights = hiddenRows,
+            inputColumns = seqLen,
+            outputColumns = dModel,
+            outputs = gradWHeadRows
+        )
+        for (vocabIndex in 0 until currentVocab) {
+            System.arraycopy(
+                gradWHeadRows[vocabIndex],
+                0,
+                gradWHead,
+                vocabIndex * dModel,
+                dModel
+            )
         }
 
         // (2) SwiGLU MLP & Residual Backward
@@ -1381,6 +1408,26 @@ class ArgusNeuralEngine private constructor(
             var sum = 0f
             for (r in 0 until inDim) sum += x[r] * w[r * outDim + c]
             out[c] = sum
+        }
+    }
+
+    private fun flattenRows(rows: Array<FloatArray>): FloatArray {
+        if (rows.isEmpty()) return FloatArray(0)
+        val columnCount = rows[0].size
+        require(rows.all { row -> row.size == columnCount }) {
+            "Matrix rows must have a consistent width."
+        }
+        val elementCount = Math.multiplyExact(rows.size, columnCount)
+        return FloatArray(elementCount).also { flattened ->
+            for (rowIndex in rows.indices) {
+                System.arraycopy(
+                    rows[rowIndex],
+                    0,
+                    flattened,
+                    rowIndex * columnCount,
+                    columnCount
+                )
+            }
         }
     }
 
