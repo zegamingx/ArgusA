@@ -117,7 +117,10 @@ class ArgusDatabaseMigrationTest {
             }
 
             assertEquals(2, database.version)
-            assertEquals(0, migrated.corpusDao().getDocumentCount())
+            database.query("SELECT COUNT(*) FROM `corpus_documents`").use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(0, cursor.getInt(0))
+            }
         } finally {
             migrated.close()
             context.deleteDatabase(databaseName)
