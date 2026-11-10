@@ -69,12 +69,17 @@ class ArgusForegroundService : Service() {
     private fun startForegroundCompat() {
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            // On API 34+, this is a user-visible local compute workload. Do not
+            // activate dataSync: Android 15+ applies a shared six-hour/24-hour
+            // background execution budget to active dataSync foreground services.
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             )
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // specialUse was introduced in API 34. Keep the legacy API 29-33
+            // declaration path; those OS releases do not apply the Android 15 timeout.
             startForeground(
                 NOTIFICATION_ID,
                 notification,
