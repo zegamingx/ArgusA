@@ -107,6 +107,18 @@ class ArgusRepository(
         trainingQueueDao.updateStatus(id, "COMPLETED", loss, durationMs)
     }
 
+    suspend fun markTrainingStarted(id: String): Boolean = withContext(Dispatchers.IO) {
+        trainingQueueDao.markTrainingStarted(id) > 0
+    }
+
+    suspend fun getTrainingItem(id: String): TrainingData? = withContext(Dispatchers.IO) {
+        trainingQueueDao.getItem(id)?.toDomain()
+    }
+
+    suspend fun recoverInterruptedTrainingItems(): Int = withContext(Dispatchers.IO) {
+        trainingQueueDao.recoverInterruptedTrainingItems()
+    }
+
     suspend fun markTrainingFailed(id: String) = withContext(Dispatchers.IO) {
         trainingQueueDao.updateStatus(id, "FAILED", null, 0L)
     }
