@@ -30,6 +30,7 @@ import com.argus.agi.service.ArgusForegroundService
 import com.argus.agi.skill.SkillRegistry
 import com.argus.agi.skill.WebArticleExtractionSkill
 import com.argus.agi.skill.WebArticleExtractionSkillOutput
+import com.argus.agi.skill.WebSearchIntentRouter
 import com.argus.agi.skill.WebSearchSkill
 import com.argus.agi.skill.WebSearchSkillOutput
 import kotlinx.coroutines.Dispatchers
@@ -406,11 +407,16 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     append("<USER> ").append(text).append(" <ASSISTANT>")
                 }
 
+                val explicitWebQuery = WebSearchIntentRouter.extractQuery(text)
                 val mathResult = tryEvaluateMath(text)
 
                 val rawOutput = try {
-                    if (mathResult != null) mathResult
-                    else neuralEngine.generate(multiTurnPrompt, maxNewTokens = 60)
+                    when {
+                        explicitWebQuery != null ->
+                            "Permintaan pencarian web: $explicitWebQuery"
+                        mathResult != null -> mathResult
+                        else -> neuralEngine.generate(multiTurnPrompt, maxNewTokens = 60)
+                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "Generation failed", e)
                     "Model lokal sedang sibuk atau mengalami error (${e.javaClass.simpleName}). " +
@@ -425,26 +431,37 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 thinking.append(" | Keyakinan: ")
                     .append(String.format("%.0f%%", reflection.confidenceScore * 100))
 
-                if (!reflection.isConfident || reflection.suggestedAction == "AUTO_LEARN_QUERY") {
-                    thinking.append("\n→ Web retrieval initiated; sources require article review before local training.")
+                val shouldSearchWeb = explicitWebQuery != null ||
+                    !reflection.isConfident ||
+                    reflection.suggestedAction == "AUTO_LEARN_QUERY"
 
-                    val webItems = runCatching { executeWebSearchSkill(text) }
+                if (shouldSearchWeb) {
+                    val searchQuery = explicitWebQuery ?: text
+                    thinking.append(
+                        if (explicitWebQuery != null) {
+                            "\n→ Explicit web-search request matched; Web Search skill invoked directly."
+                        } else {
+                            "\n→ Confidence-based web retrieval initiated; sources require article review before local training."
+                        }
+                    )
+
+                    val webItems = runCatching { executeWebSearchSkill(searchQuery) }
                         .onFailure { Log.w(TAG, "Web search failed", it) }
                         .getOrDefault(emptyList())
 
                     _searchResults.value = webItems
                     if (webItems.isNotEmpty()) {
-                        finalAnswer = "Saya menemukan beberapa sumber web yang relevan. Ringkasan di bawah " +
-                                "hanya cuplikan pencarian, belum isi artikel dan belum dimasukkan ke training:\n\n" +
+                        finalAnswer = "Saya menemukan beberapa sumber web untuk \"$searchQuery\". " +
+                                "Ringkasan di bawah hanya cuplikan pencarian, belum isi artikel dan belum " +
+                                "dimasukkan ke training:\n\n" +
                                 webItems.take(2).joinToString("\n\n") {
                                     "• ${it.title}\n${it.snippet}\n${it.sourceUrl}"
                                 } +
                                 "\n\nBuka bagian Skill Agent untuk mengekstrak artikel, meninjau sumber, " +
-                                "lalu memilih apakah kontennya layak masuk antrean training lokal."
+                                "lalu menyatakan hak penggunaan sebelum memasukkannya ke antrean training lokal."
                     } else {
-                        finalAnswer = "Pencarian web belum menemukan sumber yang dapat digunakan. " +
-                                "Pertanyaan ini tidak dimasukkan ke antrean training karena query saja " +
-                                "bukan bukti pengetahuan."
+                        finalAnswer = "Pencarian web untuk \"$searchQuery\" belum menemukan sumber yang dapat digunakan. " +
+                                "Query pencarian saja tidak disimpan sebagai data training."
                     }
                 }
 

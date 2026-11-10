@@ -39,7 +39,7 @@ The foreground service uses the `specialUse` type alone on Android 14 (API 34) a
 
 ### Web retrieval
 
-- Web Search returns result titles, snippets, provider names, and actual destination URLs.
+- Web Search returns result titles, snippets, provider names, and actual destination URLs. Explicit requests such as `/web <query>`, `cari web <query>`, and `carikan <query> di internet` invoke the registered Web Search skill independently of the local model's confidence score.
 - Article extraction fetches a selected page and records its canonical URL, publisher, domain, publication date (when present), language, extracted character count, and SHA-256 digest.
 - Search snippets and unresolved user queries are not inserted into training.
 - A web article is shown in a review preview and is queued only after the user acknowledges that they have the rights or permission to use it. Both `TrainingManager` and the repository persistence boundary enforce this rule for text, stream, and validation imports: web sources with `UNVERIFIED` rights status are rejected before corpus storage.
