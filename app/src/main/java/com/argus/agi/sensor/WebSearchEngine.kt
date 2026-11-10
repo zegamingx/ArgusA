@@ -44,50 +44,63 @@ class WebSearchEngine(
         val normalizedQuery = query.trim().replace(Regex("\\s+"), " ").take(MAX_QUERY_LENGTH)
         if (normalizedQuery.isBlank()) return@withContext emptyList()
 
+        // Search the open web first. Wikipedia is an enrichment/fallback source,
+        // never the primary ranking signal for a general web-search request.
         val collected = LinkedHashMap<String, SearchResultItem>()
 
         runCatching {
-            val encoded = URLEncoder.encode(normalizedQuery, StandardCharsets.UTF_8.name())
-            val idUrl = "https://id.wikipedia.org/w/api.php?action=opensearch&search=$encoded&limit=5&namespace=0&format=json"
-            val enUrl = "https://en.wikipedia.org/w/api.php?action=opensearch&search=$encoded&limit=5&namespace=0&format=json"
-
-            val indonesian = fetchWikiResults(idUrl)
-            val english = if (indonesian.isEmpty()) fetchWikiResults(enUrl) else emptyList()
-            (indonesian + english).forEach { item ->
-                collected.putIfAbsent(item.sourceUrl, item)
-            }
+            fetchDdgResults(normalizedQuery)
+        }.onFailure { error ->
+            android.util.Log.w("WebSearchEngine", "General web provider failed.", error)
+        }.getOrDefault(emptyList()).forEach { item ->
+            collected.putIfAbsent(item.sourceUrl, item)
         }
 
-        if (collected.size < 3) {
+        if (collected.size < MAX_RESULTS) {
             runCatching {
                 val encoded = URLEncoder.encode(normalizedQuery, StandardCharsets.UTF_8.name())
-                val request = Request.Builder()
-                    .url("https://html.duckduckgo.com/html/?q=$encoded")
-                    .header("User-Agent", USER_AGENT)
-                    .header("Accept", "text/html,application/xhtml+xml")
-                    .get()
-                    .build()
+                val indonesianUrl =
+                    "https://id.wikipedia.org/w/api.php?action=opensearch&search=$encoded&limit=5&namespace=0&format=json"
+                val englishUrl =
+                    "https://en.wikipedia.org/w/api.php?action=opensearch&search=$encoded&limit=5&namespace=0&format=json"
 
-                client.newCall(request).execute().use { response ->
-                    if (response.isSuccessful) {
-                        val html = response.body
-                            ?.let { body ->
-                                readBoundedResponseBody(
-                                    input = body.byteStream(),
-                                    contentLength = body.contentLength(),
-                                    maxBytes = MAX_DDG_RESPONSE_BYTES
-                                )
-                            }
-                            .orEmpty()
-                        parseDdgHtml(html).forEach { item ->
-                            collected.putIfAbsent(item.sourceUrl, item)
-                        }
-                    }
+                val indonesian = fetchWikiResults(indonesianUrl)
+                val english = if (indonesian.isEmpty()) fetchWikiResults(englishUrl) else emptyList()
+                (indonesian + english).forEach { item ->
+                    collected.putIfAbsent(item.sourceUrl, item)
                 }
+            }.onFailure { error ->
+                android.util.Log.w("WebSearchEngine", "Wikipedia enrichment provider failed.", error)
             }
         }
 
         collected.values.take(MAX_RESULTS)
+    }
+
+    private fun fetchDdgResults(query: String): List<SearchResultItem> {
+        val encoded = URLEncoder.encode(query, StandardCharsets.UTF_8.name())
+        val request = Request.Builder()
+            .url("https://html.duckduckgo.com/html/?q=$encoded")
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "text/html,application/xhtml+xml")
+            .get()
+            .build()
+
+        return client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return@use emptyList()
+
+            val html = response.body
+                ?.let { body ->
+                    readBoundedResponseBody(
+                        input = body.byteStream(),
+                        contentLength = body.contentLength(),
+                        maxBytes = MAX_DDG_RESPONSE_BYTES
+                    )
+                }
+                .orEmpty()
+
+            parseDdgHtml(html)
+        }
     }
 
     private fun fetchWikiResults(url: String): List<SearchResultItem> {

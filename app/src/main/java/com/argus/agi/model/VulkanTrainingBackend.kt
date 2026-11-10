@@ -5,8 +5,8 @@ import android.util.Log
 /**
  * Optional Vulkan Compute backend for batched dense operations and AdamW updates.
  *
- * Dense forward operations and selected output-head backward operations use Vulkan
- * when the runtime passes its numerical self-check and the workload is large enough.
+ * Dense forward and backward operations use Vulkan when the runtime passes its
+ * numerical self-check and the workload is large enough.
  * All callers retain a numerically equivalent Kotlin fallback.
  */
 internal object VulkanTrainingBackend {
@@ -38,7 +38,7 @@ internal object VulkanTrainingBackend {
                 }
             Log.e(TAG, "Vulkan numerical self-check failed; keeping the Kotlin CPU backend.")
         } else if (verified) {
-            Log.i(TAG, "Vulkan Compute initialized and passed linear/AdamW numerical self-checks.")
+            Log.i(TAG, "Vulkan Compute initialized and passed linear/batched-linear/AdamW numerical self-checks.")
         } else {
             Log.i(TAG, "Vulkan Compute is unavailable; Kotlin CPU backend will be used.")
         }
@@ -70,6 +70,8 @@ internal object VulkanTrainingBackend {
                 normalWeights,
                 normalOutput,
                 2,
+                1,
+                2,
                 3,
                 2,
                 false
@@ -92,11 +94,46 @@ internal object VulkanTrainingBackend {
                 transposedWeights,
                 transposedOutput,
                 2,
+                1,
+                2,
                 3,
                 2,
                 true
             ) ||
             !approximatelyEqual(transposedOutput, expectedOutput, 1e-4f)) {
+            return false
+        }
+
+        val batchedInput = floatArrayOf(
+            1f, 2f, 3f,
+            4f, 5f, 6f,
+            1f, 2f, 3f,
+            4f, 5f, 6f
+        )
+        val batchedWeights = floatArrayOf(
+            1f, 2f,
+            3f, 4f,
+            5f, 6f,
+            2f, 0f,
+            0f, 3f,
+            1f, 1f
+        )
+        val batchedOutput = FloatArray(8)
+        if (!nativeApplyLinear(
+                batchedInput,
+                batchedWeights,
+                batchedOutput,
+                rows = 4,
+                batchCount = 2,
+                rowsPerBatch = 2,
+                inputColumns = 3,
+                outputColumns = 2,
+                transposeWeights = false
+            ) || !approximatelyEqual(
+                batchedOutput,
+                floatArrayOf(22f, 28f, 49f, 64f, 5f, 9f, 14f, 21f),
+                1e-4f
+            )) {
             return false
         }
 
@@ -148,31 +185,75 @@ internal object VulkanTrainingBackend {
         inputColumns: Int,
         outputColumns: Int,
         transposeWeights: Boolean = false
+    ): Boolean = tryApplyBatchedLinear(
+        inputBatches = arrayOf(inputRows),
+        weightBatches = arrayOf(weights),
+        outputBatches = arrayOf(outputRows),
+        inputColumns = inputColumns,
+        outputColumns = outputColumns,
+        transposeWeights = transposeWeights
+    )
+
+    /**
+     * Runs independent per-batch dense products in one Vulkan dispatch. Each batch
+     * has its own contiguous input matrix and weight tensor (one batch per attention head).
+     */
+    @Synchronized
+    fun tryApplyBatchedLinear(
+        inputBatches: Array<Array<FloatArray>>,
+        weightBatches: Array<FloatArray>,
+        outputBatches: Array<Array<FloatArray>>,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean = false
     ): Boolean {
-        require(inputRows.isNotEmpty()) { "Linear input must contain at least one row." }
+        require(inputBatches.isNotEmpty()) { "Batched linear input must contain at least one batch." }
         require(inputColumns > 0 && outputColumns > 0) {
-            "Linear dimensions must be positive."
+            "Batched linear dimensions must be positive."
         }
-        require(outputRows.size == inputRows.size) {
-            "Linear input and output row counts must match."
+        val batchCount = inputBatches.size
+        require(weightBatches.size == batchCount && outputBatches.size == batchCount) {
+            "Batched linear inputs, weights, and outputs must have the same batch count."
         }
+        val rowsPerBatch = inputBatches[0].size
+        require(rowsPerBatch > 0) { "Every batched linear input must contain at least one row." }
         val requiredWeightElements = inputColumns.toLong() * outputColumns.toLong()
-        require(requiredWeightElements <= Int.MAX_VALUE.toLong() &&
-            weights.size >= requiredWeightElements.toInt()) {
-            "Linear weight tensor is smaller than its dimensions."
+        require(requiredWeightElements <= Int.MAX_VALUE.toLong()) {
+            "Batched linear weight tensor exceeds the supported array size."
         }
-        // A tensor may reserve extra trailing rows (e.g. wHead's vocab capacity).
-        // Only the active K×N prefix is copied to the native dispatch buffer.
-        for (index in inputRows.indices) {
-            require(inputRows[index].size == inputColumns) {
-                "Linear input row $index has an unexpected width."
+
+        for (batchIndex in 0 until batchCount) {
+            require(inputBatches[batchIndex].size == rowsPerBatch) {
+                "Batched linear inputs must have an identical row count."
             }
-            require(outputRows[index].size == outputColumns) {
-                "Linear output row $index has an unexpected width."
+            require(outputBatches[batchIndex].size == rowsPerBatch) {
+                "Batched linear outputs must match the input row count."
+            }
+            require(weightBatches[batchIndex].size >= requiredWeightElements.toInt()) {
+                "Batched linear weight tensor $batchIndex is smaller than its dimensions."
+            }
+            for (row in 0 until rowsPerBatch) {
+                require(inputBatches[batchIndex][row].size == inputColumns) {
+                    "Batched linear input row $row in batch $batchIndex has an unexpected width."
+                }
+                require(outputBatches[batchIndex][row].size == outputColumns) {
+                    "Batched linear output row $row in batch $batchIndex has an unexpected width."
+                }
             }
         }
 
-        val operationCount = inputRows.size.toLong() *
+        val totalRowsLong = batchCount.toLong() * rowsPerBatch.toLong()
+        val inputElementCountLong = totalRowsLong * inputColumns.toLong()
+        val weightElementCountLong = batchCount.toLong() * requiredWeightElements
+        val outputElementCountLong = totalRowsLong * outputColumns.toLong()
+        if (totalRowsLong > Int.MAX_VALUE.toLong() ||
+            inputElementCountLong > Int.MAX_VALUE.toLong() ||
+            weightElementCountLong > Int.MAX_VALUE.toLong() ||
+            outputElementCountLong > Int.MAX_VALUE.toLong()) {
+            return false
+        }
+
+        val operationCount = totalRowsLong *
             inputColumns.toLong() *
             outputColumns.toLong()
         if (!nativeReady ||
@@ -181,36 +262,36 @@ internal object VulkanTrainingBackend {
             return false
         }
 
-        val inputElementCountLong = inputRows.size.toLong() * inputColumns.toLong()
-        val outputElementCountLong = outputRows.size.toLong() * outputColumns.toLong()
-        if (inputElementCountLong > Int.MAX_VALUE.toLong() ||
-            outputElementCountLong > Int.MAX_VALUE.toLong()) {
-            return false
-        }
-
         val flattenedInput: FloatArray
         val flattenedWeights: FloatArray
         val flattenedOutput: FloatArray
         try {
             flattenedInput = FloatArray(inputElementCountLong.toInt())
-            flattenedWeights = if (weights.size == requiredWeightElements.toInt()) {
-                weights
-            } else {
-                weights.copyOf(requiredWeightElements.toInt())
-            }
+            flattenedWeights = FloatArray(weightElementCountLong.toInt())
             flattenedOutput = FloatArray(outputElementCountLong.toInt())
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Not enough heap memory to stage a Vulkan linear operation.", error)
+            Log.w(TAG, "Not enough heap memory to stage a Vulkan batched-linear operation.", error)
             return false
         }
 
-        for (row in inputRows.indices) {
+        val weightBatchSize = requiredWeightElements.toInt()
+        for (batchIndex in 0 until batchCount) {
+            val inputBatchOffset = batchIndex * rowsPerBatch * inputColumns
+            for (row in 0 until rowsPerBatch) {
+                System.arraycopy(
+                    inputBatches[batchIndex][row],
+                    0,
+                    flattenedInput,
+                    inputBatchOffset + row * inputColumns,
+                    inputColumns
+                )
+            }
             System.arraycopy(
-                inputRows[row],
+                weightBatches[batchIndex],
                 0,
-                flattenedInput,
-                row * inputColumns,
-                inputColumns
+                flattenedWeights,
+                batchIndex * weightBatchSize,
+                weightBatchSize
             )
         }
 
@@ -219,16 +300,18 @@ internal object VulkanTrainingBackend {
                 input = flattenedInput,
                 weights = flattenedWeights,
                 output = flattenedOutput,
-                rows = inputRows.size,
+                rows = totalRowsLong.toInt(),
+                batchCount = batchCount,
+                rowsPerBatch = rowsPerBatch,
                 inputColumns = inputColumns,
                 outputColumns = outputColumns,
                 transposeWeights = transposeWeights
             )
         } catch (error: UnsatisfiedLinkError) {
-            Log.e(TAG, "Vulkan linear entry point is unavailable; disabling the backend.", error)
+            Log.e(TAG, "Vulkan batched-linear entry point is unavailable; disabling the backend.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Vulkan linear dispatch failed; disabling the backend.", error)
+            Log.e(TAG, "Vulkan batched-linear dispatch failed; disabling the backend.", error)
             false
         }
 
@@ -237,22 +320,26 @@ internal object VulkanTrainingBackend {
             _currentBackend = "Kotlin CPU"
             runCatching { nativeDestroy() }
                 .onFailure { error ->
-                    Log.w(TAG, "Failed to release Vulkan after a linear dispatch failure.", error)
+                    Log.w(TAG, "Failed to release Vulkan after a batched-linear dispatch failure.", error)
                 }
-            Log.w(TAG, "Vulkan linear dispatch was not completed; using the Kotlin CPU path.")
+            Log.w(TAG, "Vulkan batched-linear dispatch was not completed; using the Kotlin CPU path.")
             return false
         }
 
-        for (row in outputRows.indices) {
-            System.arraycopy(
-                flattenedOutput,
-                row * outputColumns,
-                outputRows[row],
-                0,
-                outputColumns
-            )
+        val outputBatchSize = rowsPerBatch * outputColumns
+        for (batchIndex in 0 until batchCount) {
+            val outputBatchOffset = batchIndex * outputBatchSize
+            for (row in 0 until rowsPerBatch) {
+                System.arraycopy(
+                    flattenedOutput,
+                    outputBatchOffset + row * outputColumns,
+                    outputBatches[batchIndex][row],
+                    0,
+                    outputColumns
+                )
+            }
         }
-        _currentBackend = "Vulkan Compute (Linear)"
+        _currentBackend = "Vulkan Compute (Batched Linear)"
         return true
     }
 
@@ -348,6 +435,8 @@ internal object VulkanTrainingBackend {
         weights: FloatArray,
         output: FloatArray,
         rows: Int,
+        batchCount: Int,
+        rowsPerBatch: Int,
         inputColumns: Int,
         outputColumns: Int,
         transposeWeights: Boolean

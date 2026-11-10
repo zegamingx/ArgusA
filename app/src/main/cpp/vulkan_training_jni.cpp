@@ -36,6 +36,8 @@ static_assert(offsetof(AdamwPushConstants, gradientClipFactor) == 28);
 
 struct LinearPushConstants {
     uint32_t rowCount;
+    uint32_t batchCount;
+    uint32_t rowsPerBatch;
     uint32_t inputColumns;
     uint32_t outputColumns;
     uint32_t inputOffset;
@@ -44,8 +46,8 @@ struct LinearPushConstants {
     uint32_t transposeWeights;
 };
 
-static_assert(sizeof(LinearPushConstants) == 28);
-static_assert(offsetof(LinearPushConstants, transposeWeights) == 24);
+static_assert(sizeof(LinearPushConstants) == 36);
+static_assert(offsetof(LinearPushConstants, transposeWeights) == 32);
 
 struct VulkanRuntime {
     VkInstance instance = VK_NULL_HANDLE;
@@ -542,7 +544,7 @@ bool initializeRuntime() {
     VkPushConstantRange pushConstantRange{};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(AdamwPushConstants);
+    pushConstantRange.size = sizeof(LinearPushConstants);
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1136,6 +1138,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
     jfloatArray weightArray,
     jfloatArray outputArray,
     jint rowCount,
+    jint batchCount,
+    jint rowsPerBatch,
     jint inputColumns,
     jint outputColumns,
     jboolean transposeWeights
@@ -1148,6 +1152,9 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         weightArray == nullptr ||
         outputArray == nullptr ||
         rowCount <= 0 ||
+        batchCount <= 0 ||
+        rowsPerBatch <= 0 ||
+        static_cast<int64_t>(batchCount) * static_cast<int64_t>(rowsPerBatch) != rowCount ||
         inputColumns <= 0 ||
         outputColumns <= 0) {
         return JNI_FALSE;
@@ -1156,7 +1163,9 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
     const uint64_t inputElements =
         static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(inputColumns);
     const uint64_t weightElements =
-        static_cast<uint64_t>(inputColumns) * static_cast<uint64_t>(outputColumns);
+        static_cast<uint64_t>(batchCount) *
+        static_cast<uint64_t>(inputColumns) *
+        static_cast<uint64_t>(outputColumns);
     const uint64_t outputElements =
         static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(outputColumns);
     const uint64_t totalElements = inputElements + weightElements + outputElements;
@@ -1296,6 +1305,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
 
     const LinearPushConstants pushConstants{
         static_cast<uint32_t>(rowCount),
+        static_cast<uint32_t>(batchCount),
+        static_cast<uint32_t>(rowsPerBatch),
         static_cast<uint32_t>(inputColumns),
         static_cast<uint32_t>(outputColumns),
         static_cast<uint32_t>(inputOffset),

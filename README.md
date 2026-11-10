@@ -39,11 +39,14 @@ The native training module is built with Android NDK r30 and CMake 3.22.1 for
 arm64-v8a, armeabi-v7a, and x86_64. It uses the NDK-bundled glslc compiler to
 compile the AdamW compute shader to SPIR-V during the native build.
 
-When a compatible Vulkan GPU and compute queue are available, workloads with at
-least 49,152 optimizer elements can offload gradient clipping and the fused
-AdamW parameter/moment update to Vulkan Compute. Forward propagation and
-backpropagation remain in the Kotlin engine; this is an optimizer offload, not
-a claim that the complete training graph runs on the GPU.
+When a compatible Vulkan GPU and compute queue are available, sufficiently large
+matrix products in Q/K/V projections, attention output projection, SwiGLU, the
+output head, output-head backward, SwiGLU backward, and batched attention backward
+can run through Vulkan Compute. The fused AdamW update also runs on Vulkan for
+workloads with at least 49,152 optimizer elements. Attention score generation,
+softmax, the softmax-Jacobian reduction, layer normalization, QKV/LoRA gradient
+accumulation, and global gradient-norm reduction remain in Kotlin. This is an
+incremental GPU training path, not a fully GPU-resident training graph.
 
 Vulkan is declared as an optional device feature. Devices without a compatible
 Vulkan driver, compute queue, shader pipeline, suitable storage memory, or
@@ -64,7 +67,9 @@ The foreground service uses the `specialUse` type alone on Android 14 (API 34) a
 
 ### Web retrieval
 
-- Web Search returns result titles, snippets, provider names, and actual destination URLs. Explicit requests such as `/web <query>`, `cari web <query>`, and `carikan <query> di internet` invoke the registered Web Search skill independently of the local model's confidence score.
+- Web Search queries the general web first through DuckDuckGo's HTML result endpoint. Wikipedia OpenSearch is consulted only as a supplementary/fallback provider and does not outrank general web results.
+- Search results return titles, snippets, provider names, and actual destination URLs. Explicit requests such as `/web <query>`, `cari web <query>`, and `carikan <query> di internet` invoke the registered Web Search skill independently of the local model's confidence score.
+- Google Custom Search JSON API is closed to new customers, and existing customers must migrate by January 1, 2027. Argus does not scrape Google's consumer result pages or rely on undocumented Google endpoints. A future Google-backed provider requires an eligible legacy API configuration or a supported Google replacement.
 - Article extraction fetches a selected page and records its canonical URL, publisher, domain, publication date (when present), language, extracted character count, and SHA-256 digest.
 - Search snippets and unresolved user queries are not inserted into training.
 - A web article is shown in a review preview and is queued only after the user acknowledges that they have the rights or permission to use it. Both `TrainingManager` and the repository persistence boundary enforce this rule for text, stream, and validation imports: web sources with `UNVERIFIED` rights status are rejected before corpus storage.

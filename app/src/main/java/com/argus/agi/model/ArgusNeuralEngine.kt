@@ -1174,32 +1174,113 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
-        // (3) Causal Attention Softmax Backward
-        for (h in 0 until nHeads) {
-            val hOff = h * headDim
-            for (j in 0 until seqLen) {
-                for (d in 0 until headDim) {
-                    var sum = 0f
-                    for (i in j until seqLen) sum += attnWeights[h][i][j] * dL_dattnOut[i][hOff + d]
-                    dV[j][hOff + d] += sum
+        // (3) Causal attention backward. Independent heads are processed as a batch,
+        // avoiding one queue submission and synchronization for every individual head.
+        val attentionGradientByHead = Array(nHeads) { head ->
+            val headOffset = head * headDim
+            Array(seqLen) { time ->
+                FloatArray(headDim) { dimension ->
+                    dL_dattnOut[time][headOffset + dimension]
                 }
             }
-            val dW = FloatArray(seqLen)
-            for (i in 0 until seqLen) {
-                for (j in 0..i) {
-                    var dot = 0f
-                    for (d in 0 until headDim) dot += dL_dattnOut[i][hOff + d] * v[j][hOff + d]
-                    dW[j] = dot
-                }
-                var sumWdW = 0f
-                for (j in 0..i) sumWdW += attnWeights[h][i][j] * dW[j]
-                for (j in 0..i) {
-                    val dScore = attnWeights[h][i][j] * (dW[j] - sumWdW) * scale
-                    for (d in 0 until headDim) {
-                        dQ[i][hOff + d] += dScore * k[j][hOff + d]
-                        dK[j][hOff + d] += dScore * q[i][hOff + d]
+        }
+        val queryRowsByHead = Array(nHeads) { head ->
+            val headOffset = head * headDim
+            Array(seqLen) { time ->
+                FloatArray(headDim) { dimension -> q[time][headOffset + dimension] }
+            }
+        }
+        val keyRowsByHead = Array(nHeads) { head ->
+            val headOffset = head * headDim
+            Array(seqLen) { time ->
+                FloatArray(headDim) { dimension -> k[time][headOffset + dimension] }
+            }
+        }
+        val valueRowsByHead = Array(nHeads) { head ->
+            val headOffset = head * headDim
+            Array(seqLen) { time ->
+                FloatArray(headDim) { dimension -> v[time][headOffset + dimension] }
+            }
+        }
+
+        // dV = transpose(P) × dAttention. P is lower triangular.
+        val transposedAttentionByHead = Array(nHeads) { head ->
+            Array(seqLen) { keyIndex ->
+                FloatArray(seqLen) { queryIndex ->
+                    if (queryIndex >= keyIndex) {
+                        attnWeights[head][queryIndex][keyIndex]
+                    } else {
+                        0f
                     }
                 }
+            }
+        }
+        val dValueByHead = Array(nHeads) { Array(seqLen) { FloatArray(headDim) } }
+        computeBatchedLinear(
+            inputs = transposedAttentionByHead,
+            weights = Array(nHeads) { head -> flattenRows(attentionGradientByHead[head]) },
+            outputs = dValueByHead,
+            inputColumns = seqLen,
+            outputColumns = headDim
+        )
+
+        // dW = dAttention × transpose(V); the causal mask is applied below.
+        val dWeightsByHead = Array(nHeads) { Array(seqLen) { FloatArray(seqLen) } }
+        computeBatchedLinear(
+            inputs = attentionGradientByHead,
+            weights = Array(nHeads) { head -> flattenRows(valueRowsByHead[head]) },
+            outputs = dWeightsByHead,
+            inputColumns = headDim,
+            outputColumns = seqLen,
+            transposeWeights = true
+        )
+
+        val dScoreByHead = Array(nHeads) { Array(seqLen) { FloatArray(seqLen) } }
+        for (head in 0 until nHeads) {
+            for (queryIndex in 0 until seqLen) {
+                var weightedGradient = 0f
+                for (keyIndex in 0..queryIndex) {
+                    weightedGradient +=
+                        attnWeights[head][queryIndex][keyIndex] *
+                        dWeightsByHead[head][queryIndex][keyIndex]
+                }
+                for (keyIndex in 0..queryIndex) {
+                    dScoreByHead[head][queryIndex][keyIndex] =
+                        attnWeights[head][queryIndex][keyIndex] *
+                        (dWeightsByHead[head][queryIndex][keyIndex] - weightedGradient) *
+                        scale
+                }
+            }
+        }
+
+        // dQ = dScore × K; dK = transpose(dScore) × Q.
+        val dQueryByHead = Array(nHeads) { Array(seqLen) { FloatArray(headDim) } }
+        computeBatchedLinear(
+            inputs = dScoreByHead,
+            weights = Array(nHeads) { head -> flattenRows(keyRowsByHead[head]) },
+            outputs = dQueryByHead,
+            inputColumns = seqLen,
+            outputColumns = headDim
+        )
+
+        val transposedDScoreByHead = Array(nHeads) { head ->
+            transposeRows(dScoreByHead[head])
+        }
+        val dKeyByHead = Array(nHeads) { Array(seqLen) { FloatArray(headDim) } }
+        computeBatchedLinear(
+            inputs = transposedDScoreByHead,
+            weights = Array(nHeads) { head -> flattenRows(queryRowsByHead[head]) },
+            outputs = dKeyByHead,
+            inputColumns = seqLen,
+            outputColumns = headDim
+        )
+
+        for (head in 0 until nHeads) {
+            val headOffset = head * headDim
+            for (time in 0 until seqLen) {
+                System.arraycopy(dQueryByHead[head][time], 0, dQ[time], headOffset, headDim)
+                System.arraycopy(dKeyByHead[head][time], 0, dK[time], headOffset, headDim)
+                System.arraycopy(dValueByHead[head][time], 0, dV[time], headOffset, headDim)
             }
         }
 
@@ -1548,6 +1629,56 @@ class ArgusNeuralEngine private constructor(
                     outputColumns,
                     outputs[row]
                 )
+            }
+        }
+    }
+
+    private fun computeBatchedLinear(
+        inputs: Array<Array<FloatArray>>,
+        weights: Array<FloatArray>,
+        outputs: Array<Array<FloatArray>>,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean = false
+    ) {
+        require(inputs.isNotEmpty()) { "Batched linear inputs must not be empty." }
+        require(inputs.size == weights.size && inputs.size == outputs.size) {
+            "Batched linear inputs, weights, and outputs must have matching batch counts."
+        }
+
+        val dispatchedToVulkan = VulkanTrainingBackend.tryApplyBatchedLinear(
+            inputBatches = inputs,
+            weightBatches = weights,
+            outputBatches = outputs,
+            inputColumns = inputColumns,
+            outputColumns = outputColumns,
+            transposeWeights = transposeWeights
+        )
+        if (dispatchedToVulkan) return
+
+        for (batch in inputs.indices) {
+            val weight = weights[batch]
+            require(inputs[batch].size == outputs[batch].size) {
+                "Batched linear input and output row counts must match."
+            }
+            for (row in inputs[batch].indices) {
+                if (transposeWeights) {
+                    computeLinearTransposed(
+                        inputs[batch][row],
+                        weight,
+                        inputColumns,
+                        outputColumns,
+                        outputs[batch][row]
+                    )
+                } else {
+                    computeLinear(
+                        inputs[batch][row],
+                        weight,
+                        inputColumns,
+                        outputColumns,
+                        outputs[batch][row]
+                    )
+                }
             }
         }
     }

@@ -8,6 +8,8 @@ layout(set = 0, binding = 0, std430) buffer TrainingBuffer {
 
 layout(push_constant) uniform LinearParameters {
     uint rowCount;
+    uint batchCount;
+    uint rowsPerBatch;
     uint inputColumns;
     uint outputColumns;
     uint inputOffset;
@@ -25,15 +27,27 @@ void main() {
 
     const uint row = outputIndex / parameters.outputColumns;
     const uint column = outputIndex - row * parameters.outputColumns;
-    const uint inputRowOffset = parameters.inputOffset + row * parameters.inputColumns;
+    const uint batchIndex = row / parameters.rowsPerBatch;
+    if (batchIndex >= parameters.batchCount) {
+        return;
+    }
+
+    const uint rowInBatch = row - batchIndex * parameters.rowsPerBatch;
+    const uint inputRowOffset =
+        parameters.inputOffset +
+        batchIndex * parameters.rowsPerBatch * parameters.inputColumns +
+        rowInBatch * parameters.inputColumns;
+    const uint batchWeightOffset =
+        parameters.weightOffset +
+        batchIndex * parameters.inputColumns * parameters.outputColumns;
 
     float sum = 0.0;
     for (uint inner = 0u; inner < parameters.inputColumns; ++inner) {
         uint weightIndex;
         if (parameters.transposeWeights == 0u) {
-            weightIndex = parameters.weightOffset + inner * parameters.outputColumns + column;
+            weightIndex = batchWeightOffset + inner * parameters.outputColumns + column;
         } else {
-            weightIndex = parameters.weightOffset + column * parameters.inputColumns + inner;
+            weightIndex = batchWeightOffset + column * parameters.inputColumns + inner;
         }
         sum += values[inputRowOffset + inner] * values[weightIndex];
     }
