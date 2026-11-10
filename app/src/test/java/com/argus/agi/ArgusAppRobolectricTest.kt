@@ -224,7 +224,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testEnqueueDocumentSchedulesCompleteEpochPassesInOrder() {
+    fun testEnqueueDocumentSchedulesCompleteEpochPassesInOrder() = runTest {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val deviceGuard = DeviceGuard(context)
         val worldModel = WorldModel(context)
@@ -277,7 +277,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testEnqueueDocumentStreamSchedulesMultipleCompletePasses() {
+    fun testEnqueueDocumentStreamSchedulesMultipleCompletePasses() = runTest {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val guard = DeviceGuard(context)
         val worldModel = WorldModel(context)
@@ -535,7 +535,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testEnqueueDocumentMultiChunk() {
+    fun testEnqueueDocumentMultiChunk() = runTest {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val deviceGuard = DeviceGuard(context)
         val worldModel = WorldModel(context)
@@ -589,7 +589,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testEnqueueDocumentStreamLargeCorpus() {
+    fun testEnqueueDocumentStreamLargeCorpus() = runTest {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val deviceGuard = DeviceGuard(context)
         val worldModel = WorldModel(context)
@@ -620,7 +620,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testZipStreamingExtractionInMemory() {
+    fun testZipStreamingExtractionInMemory() = runTest {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val deviceGuard = DeviceGuard(context)
         val worldModel = WorldModel(context)
@@ -807,7 +807,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testUnboundedDocumentAndStreamTrainingBlocks() {
+    fun testUnboundedDocumentAndStreamTrainingBlocks() = runTest {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val guard = DeviceGuard(context)
         val world = WorldModel(context)
