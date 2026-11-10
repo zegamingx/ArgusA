@@ -382,22 +382,22 @@ class TrainingManager(
             val activeRepository = requireNotNull(repo) {
                 "Local corpus storage is unavailable; seed scheduling cannot be recovered."
             }
-        val fingerprint = sha256Utf16Be(fullText)
-        val existingDocument = activeRepository.getCorpusDocumentByFingerprint(fingerprint)
-            ?: return 0
+            val fingerprint = sha256Utf16Be(fullText)
+            val existingDocument = activeRepository.getCorpusDocumentByFingerprint(fingerprint)
+                ?: return 0
 
-        require(existingDocument.datasetSplit == "TRAIN") {
-            "A validation-only document cannot be used as a training seed."
-        }
-        if (existingDocument.status == "TRAINED") return 0
+            require(existingDocument.datasetSplit == "TRAIN") {
+                "A validation-only document cannot be used as a training seed."
+            }
+            if (existingDocument.status == "TRAINED") return 0
 
-        val persistedActive = existingDocument.id in
-            activeRepository.getActiveCorpusTrainingDocumentIds()
-        val memoryActive = synchronized(queueLock) {
-            _nextQueue.value.any { it.documentId == existingDocument.id } ||
-                _currentTrainingItem.value?.documentId == existingDocument.id
-        }
-        if (persistedActive || memoryActive) return 0
+            val persistedActive = existingDocument.id in
+                activeRepository.getActiveCorpusTrainingDocumentIds()
+            val memoryActive = synchronized(queueLock) {
+                _nextQueue.value.any { it.documentId == existingDocument.id } ||
+                    _currentTrainingItem.value?.documentId == existingDocument.id
+            }
+            if (persistedActive || memoryActive) return 0
 
             return replayCorpusDocument(
                 documentId = existingDocument.id,
