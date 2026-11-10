@@ -258,11 +258,7 @@ class GenesisModelManager(
         val archTier = neuralEngine.config.architectureLabel
         // Vulkan accelerates eligible dense operations and AdamW after its runtime self-checks.
         // Remaining operations continue to use the Kotlin CPU implementation.
-        val computeTarget = if (neuralEngine.isVulkanRuntimeReady) {
-            "Vulkan Compute for eligible dense operations and AdamW; Kotlin CPU fallback for remaining operations"
-        } else {
-            "Kotlin CPU backend; Vulkan runtime unavailable or not verified"
-        }
+        val computeTarget = resolveComputeTarget()
         logs += "Selected configuration: $archTier"
         logs += "Execution policy: $computeTarget | Context length: ${neuralEngine.maxSeqLen} tokens"
         throttleStage()
@@ -356,6 +352,13 @@ class GenesisModelManager(
         }
         return identity
     }
+
+    private fun resolveComputeTarget(): String =
+        if (neuralEngine.isVulkanRuntimeReady) {
+            "Vulkan Compute for eligible dense operations and AdamW; Kotlin CPU fallback for remaining operations"
+        } else {
+            "Kotlin CPU backend; Vulkan runtime unavailable or not verified"
+        }
 
     private fun stageProgress(stage: GenesisLifecycleStage): Float {
         val stages = GenesisLifecycleStage.progressStages
@@ -453,7 +456,7 @@ class GenesisModelManager(
             birthTimestamp = birthTs,
             formattedBirthDate = formatDate(birthTs),
             deviceRamGb = prefs.getInt(KEY_RAM_GB, 8),
-            computeTarget = prefs.getString(KEY_COMPUTE, "UNKNOWN") ?: "UNKNOWN",
+            computeTarget = resolveComputeTarget(),
             parameterCount = params,
             architectureTier = prefs.getString(KEY_ARCH_TIER, "Balanced Neural Core")
                 ?: "Balanced Neural Core",

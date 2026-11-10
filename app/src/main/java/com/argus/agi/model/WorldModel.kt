@@ -61,13 +61,17 @@ class WorldModel(
     val entitiesFlow: StateFlow<List<WorldEntity>> = _entitiesFlow.asStateFlow()
 
     private val _currentContextSummary =
-        MutableStateFlow("Sistem Siap. Menunggu stimulus lingkungan & layar.")
+        MutableStateFlow("System ready. Waiting for environment and screen input.")
     val currentContextSummary: StateFlow<String> = _currentContextSummary.asStateFlow()
 
     init {
         storeEntities(
             WorldEntity("identity_name", "A.R.G.U.S", "Core Architecture"),
-            WorldEntity("privacy_boundary", "100% On-Device, Zero Cloud Telemetry", "System Policy"),
+            WorldEntity(
+                "privacy_boundary",
+                "Local model inference and training; web search uses external providers when requested",
+                "System Policy"
+            ),
             WorldEntity("architecture_type",
                 "Autonomous Micro-Transformer with LoRA Adapters", "Neural Specification")
         )
@@ -79,9 +83,18 @@ class WorldModel(
                     val saved = r.getMemoriesSnapshot()
                     if (saved.isNotEmpty()) {
                         saved.forEach { entities[it.key] = it }
-                        pruneIfNeeded()
-                        publishSnapshot()
                     }
+
+                    // A persisted legacy policy must not restore the old "zero cloud" claim.
+                    val currentPrivacyPolicy = WorldEntity(
+                        key = "privacy_boundary",
+                        value = "Local model inference and training; web search uses external providers when requested",
+                        source = "System Policy"
+                    )
+                    entities[currentPrivacyPolicy.key] = currentPrivacyPolicy
+                    pruneIfNeeded()
+                    publishSnapshot()
+                    r.saveMemories(listOf(currentPrivacyPolicy))
                 }
             }
         }
