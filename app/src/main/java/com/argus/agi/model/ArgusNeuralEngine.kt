@@ -646,7 +646,8 @@ class ArgusNeuralEngine private constructor(
     /**
      * Compares one analytic backprop gradient with a central finite-difference estimate.
      * This diagnostic is internal to the module, only supports short single-window inputs,
-     * and never applies Adam, changes the tokenizer, or writes a checkpoint.
+     * and never applies Adam, changes the tokenizer, or writes a checkpoint. Pass -1 as the
+     * parameter index to inspect the coordinate with the largest absolute analytic gradient.
      */
     internal fun checkGradient(
         text: String,
