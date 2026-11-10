@@ -792,6 +792,49 @@ class ArgusNeuralEngine private constructor(
         return loss
     }
 
+    private fun computeCrossEntropyLoss(
+        logits: Array<FloatArray>,
+        sequence: List<Int>,
+        currentVocab: Int,
+        firstTargetIndex: Int
+    ): Float {
+        require(sequence.size >= 2) { "A validation window must contain at least two tokens." }
+        require(firstTargetIndex in 0 until sequence.size - 1) {
+            "firstTargetIndex must identify at least one next-token target."
+        }
+
+        var totalLoss = 0f
+        var validTargets = 0
+
+        for (timeIndex in firstTargetIndex until sequence.size - 1) {
+            val target = sequence[timeIndex + 1]
+            if (target !in 0 until currentVocab) continue
+
+            val row = logits[timeIndex]
+            var maxLogit = -Float.MAX_VALUE
+            for (vocabularyIndex in 0 until currentVocab) {
+                if (row[vocabularyIndex] > maxLogit) {
+                    maxLogit = row[vocabularyIndex]
+                }
+            }
+
+            var sumExp = 0f
+            for (vocabularyIndex in 0 until currentVocab) {
+                sumExp += exp(row[vocabularyIndex] - maxLogit)
+            }
+
+            val logProbability =
+                (row[target] - maxLogit) - ln(max(sumExp, 1e-9f))
+            val loss = -logProbability
+            if (loss.isFinite()) {
+                totalLoss += loss
+                validTargets++
+            }
+        }
+
+        return if (validTargets > 0) totalLoss / validTargets else Float.NaN
+    }
+
     private fun trainSingleWindow(
         seq: List<Int>,
         currentVocab: Int,
@@ -889,39 +932,20 @@ class ArgusNeuralEngine private constructor(
         }
 
         // ============================ BACKWARD ============================
-        var totalLoss = 0f
-        var validSteps = 0
-
-        require(firstTargetIndex in 0 until seqLen - 1) {
-            "firstTargetIndex must identify at least one next-token target."
+        // Loss-only evaluation exits before allocating gradient or backpropagation buffers.
+        if (!updateParameters && gradientProbe == null) {
+            return computeCrossEntropyLoss(
+                logits = logits,
+                sequence = seq,
+                currentVocab = currentVocab,
+                firstTargetIndex = firstTargetIndex
+            )
         }
 
-        // Validation-only evaluation computes loss without allocating any gradient tensors.
-        if (!updateParameters && gradientProbe == null) {
-            for (t in firstTargetIndex until seqLen - 1) {
-                val target = seq[t + 1]
-                if (target !in 0 until currentVocab) continue
-
-                val logitRow = logits[t]
-                var maxLogit = -Float.MAX_VALUE
-                for (vocabIndex in 0 until currentVocab) {
-                    if (logitRow[vocabIndex] > maxLogit) maxLogit = logitRow[vocabIndex]
-                }
-
-                var sumExp = 0f
-                for (vocabIndex in 0 until currentVocab) {
-                    sumExp += exp(logitRow[vocabIndex] - maxLogit)
-                }
-
-                val logProbability =
-                    (logitRow[target] - maxLogit) - ln(max(sumExp, 1e-9f))
-                val loss = -logProbability
-                if (loss.isFinite()) {
-                    totalLoss += loss
-                    validSteps++
-                }
-            }
-            return if (validSteps > 0) totalLoss / validSteps else Float.NaN
+        var totalLoss = 0f
+        var validSteps = 0
+        require(firstTargetIndex in 0 until seqLen - 1) {
+            "firstTargetIndex must identify at least one next-token target."
         }
 
         // Backpropagation buffers are allocated only for optimizer updates or explicit diagnostics.
