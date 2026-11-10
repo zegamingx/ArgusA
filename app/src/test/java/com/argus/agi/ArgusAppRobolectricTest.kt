@@ -13,6 +13,7 @@ import com.argus.agi.service.ArgusForegroundService
 import java.io.StringReader
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
