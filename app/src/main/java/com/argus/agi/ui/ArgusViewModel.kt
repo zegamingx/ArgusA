@@ -712,7 +712,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             maxQueuedTextMemoryBudgetBytes()
         )
 
-    private fun enqueueExtractedDocument(
+    private suspend fun enqueueExtractedDocument(
         extracted: ExtractedDocument,
         source: String,
         epochs: Int = recommendedTrainingPasses(extracted.characterCount.toLong())
@@ -1285,7 +1285,10 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     fullText = article.text,
                     chunkSize = 700,
                     overlap = 80,
-                    epochs = epochs
+                    epochs = epochs,
+                    language = article.language,
+                    canonicalUrl = article.canonicalUrl,
+                    rightsStatus = "USER_DECLARED"
                 )
             }
 
@@ -1297,7 +1300,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         _articleExtractionError.value = null
                         _articleQueueStatus.value = "Artikel dijadwalkan menjadi $queuedChunks blok training dalam $epochs pass, disesuaikan dengan RAM dan heap aplikasi."
                     } else {
-                        _articleQueueStatus.value = "Tidak ada blok yang dapat dibuat dari artikel ini."
+                        _articleQueueStatus.value =
+                            "Artikel ini sudah ada di corpus lokal. Tidak ada salinan training baru yang dibuat."
                     }
                 }.onFailure { error ->
                     Log.e(TAG, "Failed to queue reviewed web article", error)
