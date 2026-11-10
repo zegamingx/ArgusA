@@ -670,7 +670,6 @@ class CorpusPersistenceTest {
         }
     }
 
-
     @Test
     fun genesisFoundationCorpusIsPersistentAndRecoversWithoutDuplicates() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
