@@ -249,6 +249,19 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+
+        // Existing installations can have a Genesis identity and chat history while
+        // their original seed work was never persisted in the retained corpus.
+        if (genesisModelManager.hasCompletedGenesis()) {
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching {
+                    genesisModelManager.ensureGeneralLearningCorpus(trainingManager)
+                }.onFailure { error ->
+                    Log.w(TAG, "Genesis seed corpus recovery failed", error)
+                }
+            }
+        }
+
         loadInstalledApps()
     }
 
