@@ -48,7 +48,16 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - PDF extraction supports selectable text. Scanned/image-only PDFs are rejected; OCR is not included.
 - DOCX reads the Word document XML body. EPUB follows its package spine order.
 - Archive entry counts, per-entry expansion, total expansion, source file size, and extracted text length are bounded.
-- Import budgets are reduced using the device's available RAM and app heap. The training queue still holds generated chunk records in app memory; ingestion is buffered, not a fully disk-backed queue.
+- Import budgets are reduced using the device's available RAM and app heap. The active training queue still holds generated chunk records in app memory; ingestion is buffered, not a fully disk-backed queue.
+
+### Persistent corpus
+
+- Imported documents are retained in Room as corpus-document metadata and normalized text chunks, independently from the active training queue.
+- A SHA-256/UTF-16BE fingerprint identifies the exact imported character sequence. Identical content is not scheduled for training twice, while additional source and rights-provenance records are retained.
+- Clearing the pending training queue does not delete retained corpus documents or their chunks.
+- Retained documents can be replayed into the training queue without reopening the original file or fetching the article again.
+- Corpus status records whether training is ready, active, complete, or partial after a failed chunk.
+- Room schema version 2 adds corpus tables and an optional training-item document reference through an additive version 1 to 2 migration. Existing chat, memory, and training-queue rows are preserved; destructive migration fallback is not enabled.
 
 ## On-device training scope
 
@@ -59,7 +68,7 @@ Training currently uses causal next-token cross-entropy, full-parameter backprop
 Current limitations:
 
 - The tokenizer uses a fixed seed vocabulary and deterministic Unicode fallback. A learned BPE/Unigram tokenizer is not implemented.
-- There is no corpus-level shuffle/replay scheduler or automatic held-out corpus management yet.
+- A document-level replay API exists, but corpus-level shuffle scheduling, replay policies, and automatic held-out corpus management are not implemented yet.
 - The validation APIs require the caller to supply held-out text; they do not create a train/validation split automatically.
 - NPU/APU and Vulkan may be detected for device information, but the current training implementation executes through Kotlin CPU operations. Detection is not accelerator dispatch.
 - This pipeline is not yet validated as scalable from-random-initialization pretraining or general intelligence training.
