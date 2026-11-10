@@ -268,6 +268,17 @@ class CorpusPersistenceTest {
             val expectedChunkCount =
                 trainingDocuments.sumOf { it.chunkCount.toLong() } * 2L
 
+            val overLimitFailure = runCatching {
+                manager.scheduleCorpusReplay(
+                    seed = 42L,
+                    epochs = 2,
+                    policy = CorpusReplayPolicy.INTERLEAVED_DOCUMENTS,
+                    maxQueuedChunks = 1
+                )
+            }.exceptionOrNull()
+            assertTrue("An oversized replay must be rejected before queue insertion.", overLimitFailure != null)
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+
             val firstRun = manager.scheduleCorpusReplay(
                 seed = 42L,
                 epochs = 2,
@@ -289,11 +300,22 @@ class CorpusPersistenceTest {
 
             val orderedByDocument = firstQueue.groupBy { requireNotNull(it.documentId) }
             assertEquals(3, orderedByDocument.size)
-            orderedByDocument.values.forEach { documentItems ->
+            orderedByDocument.forEach { (documentId, documentItems) ->
                 assertEquals(
                     "Each document must retain a contiguous chunk order over all epochs.",
                     (1..documentItems.size).toList(),
                     documentItems.map { it.chunkIndex }
+                )
+                val retainedChunks = repository.getCorpusChunks(documentId)
+                    .sortedBy { it.chunkIndex }
+                    .map { it.content }
+                val expectedDocumentContent = buildList {
+                    repeat(2) { addAll(retainedChunks) }
+                }
+                assertEquals(
+                    "Each epoch must replay the retained document chunks in their original order.",
+                    expectedDocumentContent,
+                    documentItems.map { it.content }
                 )
             }
             assertTrue(
