@@ -280,7 +280,7 @@ fun GenesisBootScreen(
                                 )
                                 Spacer(Modifier.width(8.dp))
                                 Text(
-                                    text = "GENESIS GAGAL",
+                                    text = "GENESIS FAILED",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = errorColor,
                                     fontWeight = FontWeight.Bold,
@@ -291,7 +291,7 @@ fun GenesisBootScreen(
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
                                 text = genesisState.errorMessage
-                                    ?: "Penyebab tidak diketahui. Periksa storage, baterai, dan suhu perangkat.",
+                                    ?: "Unknown cause. Check available storage, battery level, and device temperature.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = onErrorContainerColor,
                                 fontSize = 12.sp
@@ -375,7 +375,7 @@ fun GenesisBootScreen(
                 ) {
                     Column(modifier = Modifier.padding(14.dp)) {
                         Text(
-                            text = "TAHAPAN KELAHIRAN MODEL (LOCAL GENESIS)",
+                            text = "MODEL INITIALIZATION STAGES (LOCAL GENESIS)",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusCyanPrimary,
                             fontWeight = FontWeight.Bold,
@@ -471,7 +471,7 @@ fun GenesisBootScreen(
                     ) {
                         Column(modifier = Modifier.padding(10.dp)) {
                             Text(
-                                text = "LOG TELEMETRI GENESIS (REAL-TIME):",
+                                text = "GENESIS ACTIVITY LOG",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ArgusCyanPrimary,
                                 fontFamily = FontFamily.Monospace,
@@ -515,7 +515,7 @@ fun GenesisBootScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "COBA LAGI GENESIS",
+                            text = "RETRY GENESIS",
                             fontWeight = FontWeight.Bold,
                             fontSize = 13.sp,
                             letterSpacing = 1.sp
@@ -544,7 +544,7 @@ fun GenesisBootScreen(
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "CORE SIAP • MEMASUKI TERMINAL...",
+                                text = "CORE READY • ENTERING TERMINAL...",
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 12.sp,
                                 letterSpacing = 1.sp

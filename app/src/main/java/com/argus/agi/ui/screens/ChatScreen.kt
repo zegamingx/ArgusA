@@ -152,7 +152,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                 }
             )
         } else {
-            Toast.makeText(context, "Izin mikrofon diperlukan untuk perintah suara", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "Microphone permission is required for voice input.", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -195,7 +195,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "100% On-Device | $totalParams Params",
+                                text = "Local model • $totalParams parameters",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ArgusCyanGlow
                             )
@@ -210,7 +210,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                 .padding(horizontal = 8.dp, vertical = 3.dp)
                         ) {
                             Text(
-                                text = "ZERO CLOUD",
+                                text = "NO REMOTE MODEL",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ArgusCyanPrimary
                             )
@@ -218,7 +218,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         Spacer(modifier = Modifier.width(6.dp))
                         Icon(
                             painter = if (isHeaderExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
-                            contentDescription = if (isHeaderExpanded) "Ciutkan Header" else "Perluas Header",
+                            contentDescription = if (isHeaderExpanded) "Collapse header" else "Expand header",
                             tint = ArgusCyanPrimary,
                             modifier = Modifier.size(20.dp)
                         )
@@ -240,7 +240,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Privasi: 100% On-Device | Zero Telemetry",
+                            text = "Local inference and training • Web search makes external requests when used",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted
                         )
@@ -260,14 +260,14 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                 )
                                 Spacer(modifier = Modifier.width(3.dp))
                                 Text(
-                                    text = if (isAutoSpeak) "Suara Aktif" else "Suara Senyap",
+                                    text = if (isAutoSpeak) "Voice on" else "Voice off",
                                     style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                     color = if (isAutoSpeak) ArgusCyanPrimary else ArgusTextMuted
                                 )
                             }
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Bersihkan Chat",
+                                text = "Clear chat",
                                 style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                 color = ArgusCyanPrimary,
                                 fontWeight = FontWeight.Bold,
@@ -275,7 +275,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                     .clip(RoundedCornerShape(4.dp))
                                     .clickable {
                                         viewModel.clearChat()
-                                        Toast.makeText(context, "Percakapan dibersihkan", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(context, "Chat cleared", Toast.LENGTH_SHORT).show()
                                     }
                                     .padding(horizontal = 6.dp, vertical = 2.dp)
                             )
@@ -316,7 +316,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         )
                         Spacer(modifier = Modifier.width(10.dp))
                         Text(
-                            text = "A.R.G.U.S sedang menalar, memeriksa memori & bobot neural...",
+                            text = "Argus is generating a response...",
                             style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp),
                             color = ArgusCyanGlow,
                             fontFamily = FontFamily.Monospace
@@ -331,7 +331,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
             visible = activeDoc != null && (activeDoc?.completedChunks ?: 0) < (activeDoc?.totalChunks ?: 1)
         ) {
             activeDoc?.let { doc ->
-                val pct = if (doc.totalChunks > 0) (doc.currentChunkIndex.toFloat() / doc.totalChunks.toFloat() * 100).toInt() else 0
+                val pct = if (doc.totalChunks > 0) (doc.completedChunks.toFloat() / doc.totalChunks.toFloat() * 100).toInt() else 0
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -354,7 +354,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
-                                    text = "Melatih: ${doc.docTitle}",
+                                    text = "Training: ${doc.docTitle}",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = ArgusCyanPrimary,
                                     fontWeight = FontWeight.Bold,
@@ -362,7 +362,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                 )
                             }
                             Text(
-                                text = "Blok ${doc.currentChunkIndex}/${doc.totalChunks} ($pct%)",
+                                text = "Completed ${doc.completedChunks}/${doc.totalChunks} chunks ($pct%)",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ArgusCyanGlow,
                                 fontFamily = FontFamily.Monospace,
@@ -371,7 +371,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         }
                         Spacer(modifier = Modifier.height(6.dp))
                         androidx.compose.material3.LinearProgressIndicator(
-                            progress = { if (doc.totalChunks > 0) doc.currentChunkIndex.toFloat() / doc.totalChunks.toFloat() else 0f },
+                            progress = { if (doc.totalChunks > 0) doc.completedChunks.toFloat() / doc.totalChunks.toFloat() else 0f },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(4.dp)
@@ -393,10 +393,10 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 val chips = listOf(
-                    "Hitung 125 * 34",
-                    "Apa arsitektur A.R.G.U.S?",
-                    "Pelajari perkembangan AGI terbaru",
-                    "Bagaimana cara kerja LoRA?"
+                    "Calculate 125 * 34",
+                    "What is the A.R.G.U.S architecture?",
+                    "Explore recent AGI developments",
+                    "How does LoRA work?"
                 )
                 items(chips) { chip ->
                     Surface(
@@ -442,13 +442,13 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = if (partialSpeech.isNotBlank()) "Mendengar: \"$partialSpeech\"" else "Mendengarkan ucapan Anda (Offline)...",
+                            text = if (partialSpeech.isNotBlank()) "Heard: \"$partialSpeech\"" else "Listening for voice input...",
                             style = MaterialTheme.typography.bodySmall,
                             color = ArgusWarning,
                             modifier = Modifier.weight(1f)
                         )
                         Text(
-                            text = "Selesai",
+                            text = "Done",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusWarning,
                             fontWeight = FontWeight.Bold,
@@ -477,7 +477,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "Argus sedang berbicara secara offline...",
+                            text = "Argus is speaking...",
                             style = MaterialTheme.typography.bodySmall,
                             color = ArgusCyanPrimary,
                             modifier = Modifier.weight(1f)
@@ -488,7 +488,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         ) {
                             Icon(
                                 painter = painterResource(R.drawable.ic_symbol_stop),
-                                contentDescription = "Hentikan",
+                                contentDescription = "Stop",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(16.dp)
                             )
@@ -509,7 +509,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                     ) {
                         Icon(
                             painter = painterResource(R.drawable.ic_symbol_attach_file),
-                            contentDescription = "Import Dokumen / ZIP",
+                            contentDescription = "Import document or ZIP",
                             tint = ArgusCyanPrimary
                         )
                     }
@@ -525,7 +525,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                     ) {
                         Icon(
                             painter = painterResource(R.drawable.ic_symbol_video_library),
-                            contentDescription = "Import Gambar / Video",
+                            contentDescription = "Import image or video",
                             tint = ArgusBlueAccent
                         )
                     }
@@ -553,9 +553,9 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                                 ?.toString()
                                             if (!clipText.isNullOrBlank()) {
                                                 inputText = clipText
-                                                Toast.makeText(context, "Teks ditempel dari clipboard", Toast.LENGTH_SHORT).show()
+                                                Toast.makeText(context, "Text pasted from clipboard", Toast.LENGTH_SHORT).show()
                                             } else {
-                                                Toast.makeText(context, "Clipboard kosong", Toast.LENGTH_SHORT).show()
+                                                Toast.makeText(context, "Clipboard is empty", Toast.LENGTH_SHORT).show()
                                             }
                                         }
                                     },
@@ -563,7 +563,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                 ) {
                                     Icon(
                                         painter = painterResource(R.drawable.ic_symbol_content_paste),
-                                        contentDescription = "Tempel Clipboard",
+                                        contentDescription = "Paste from clipboard",
                                         tint = ArgusTextMuted,
                                         modifier = Modifier.size(16.dp)
                                     )
@@ -618,7 +618,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                     ) {
                         Icon(
                             painter = if (isListening) painterResource(R.drawable.ic_symbol_mic_off) else painterResource(R.drawable.ic_symbol_mic),
-                            contentDescription = "Bicara Offline",
+                            contentDescription = "Voice input",
                             tint = if (isListening) ArgusDarkBg else ArgusCyanPrimary,
                             modifier = Modifier.size(18.dp)
                         )
@@ -642,7 +642,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                     ) {
                         Icon(
                             painter = painterResource(R.drawable.ic_symbol_send),
-                            contentDescription = "Kirim",
+                            contentDescription = "Send",
                             tint = ArgusDarkBg,
                             modifier = Modifier.size(20.dp)
                         )
@@ -682,7 +682,7 @@ fun ChatMessageItem(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = if (msg.isUser) "Pengguna" else "A.R.G.U.S",
+                text = if (msg.isUser) "User" else "A.R.G.U.S",
                 style = MaterialTheme.typography.labelSmall,
                 color = if (msg.isUser) ArgusBlueAccent else ArgusCyanPrimary,
                 fontWeight = FontWeight.Bold
@@ -713,7 +713,7 @@ fun ChatMessageItem(
                 if (msg.attachedImageUri != null) {
                     Image(
                         painter = rememberAsyncImagePainter(model = msg.attachedImageUri),
-                        contentDescription = "Gambar Terlampir",
+                        contentDescription = "Attached image",
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(160.dp)
@@ -768,7 +768,7 @@ fun ChatMessageItem(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "Penalaran & Self-Reflection",
+                            text = "Reasoning and self-reflection",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusCyanGlow,
                             modifier = Modifier.weight(1f)
@@ -815,7 +815,7 @@ fun ChatMessageItem(
                 if (isLongMessage) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = if (isLongTextExpanded) "Ciutkan Teks ▲" else "Baca Selengkapnya ▼",
+                        text = if (isLongTextExpanded) "Collapse text ▲" else "Read more ▼",
                         style = MaterialTheme.typography.labelSmall,
                         color = ArgusCyanPrimary,
                         fontWeight = FontWeight.Bold,
@@ -844,13 +844,13 @@ fun ChatMessageItem(
                         ) {
                             Icon(
                                 painter = painterResource(R.drawable.ic_symbol_volume_up),
-                                contentDescription = "Bicara Offline",
+                                contentDescription = "Voice input",
                                 tint = ArgusCyanPrimary,
                                 modifier = Modifier.size(13.dp)
                             )
                             Spacer(modifier = Modifier.width(4.dp))
                             Text(
-                                text = "Bicara",
+                                text = "Speak",
                                 style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                 color = ArgusCyanPrimary
                             )
@@ -869,20 +869,20 @@ fun ChatMessageItem(
                                     )
                                 }
                                 isCopied = true
-                                Toast.makeText(context, "Pesan disalin ke clipboard", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "Message copied to clipboard", Toast.LENGTH_SHORT).show()
                             }
                             .padding(horizontal = 6.dp, vertical = 3.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
                             painter = if (isCopied) painterResource(R.drawable.ic_symbol_check) else painterResource(R.drawable.ic_symbol_content_copy),
-                            contentDescription = "Salin pesan",
+                            contentDescription = "Copy message",
                             tint = if (isCopied) ArgusSuccess else ArgusTextMuted,
                             modifier = Modifier.size(13.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = if (isCopied) "Tersalin" else "Salin",
+                            text = if (isCopied) "Copied" else "Copy",
                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                             color = if (isCopied) ArgusSuccess else ArgusTextMuted
                         )

@@ -69,8 +69,8 @@ val ArgusScreen.label: String
     get() = when (this) {
         ArgusScreen.CHAT -> "Terminal"
         ArgusScreen.NEURAL_CORE -> "Neural Core"
-        ArgusScreen.PERCEPTION -> "Persepsi"
-        ArgusScreen.SETTINGS -> "Skill & Privasi"
+        ArgusScreen.PERCEPTION -> "Perception"
+        ArgusScreen.SETTINGS -> "Skills & Settings"
     }
 
 val ArgusScreen.iconRes: Int
@@ -113,11 +113,11 @@ fun MainScreen(viewModel: ArgusViewModel) {
         return
     }
 
-    // Modern Loading Screen saat masuk aplikasi kembali sebelum data terinisialisasi
+    // Show the loading screen while the local conversation history is being restored
     if (!isMessagesLoaded) {
         com.argus.agi.ui.components.ArgusModernLoadingScreen(
             title = "A . R . G . U . S",
-            subtitle = "MEMULIHKAN NEURAL CORE & RIWAYAT..."
+            subtitle = "RESTORING THE NEURAL CORE & CHAT HISTORY..."
         )
         return
     }
