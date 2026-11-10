@@ -128,10 +128,35 @@ class CorpusPersistenceTest {
                 sourceAfterUnverifiedReimport.rightsStatus
             )
 
+            val activeQueueItem = repository.getPendingQueueSnapshot().first()
+            assertTrue(repository.markTrainingStarted(activeQueueItem.id))
+
             manager.clearQueue()
             manager.awaitQueuePersistenceIdle()
 
-            assertTrue("Queue clearing must remove pending work.", repository.getPendingQueueSnapshot().isEmpty())
+            assertTrue(
+                "Queue clearing must remove waiting work.",
+                repository.getPendingQueueSnapshot().isEmpty()
+            )
+            assertEquals(
+                "An already active training row must survive queue clearing.",
+                com.argus.agi.model.TrainingStatus.TRAINING,
+                repository.getTrainingItem(activeQueueItem.id)?.status
+            )
+
+            assertEquals(
+                "Interrupted active training rows must be re-queued on recovery.",
+                1,
+                repository.recoverInterruptedTrainingItems()
+            )
+            val recoveredItems = repository.getPendingQueueSnapshot()
+            assertEquals(1, recoveredItems.size)
+            assertEquals(activeQueueItem.id, recoveredItems.single().id)
+
+            manager.clearQueue()
+            manager.awaitQueuePersistenceIdle()
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+
             assertEquals(
                 "Corpus data must survive queue clearing.",
                 document.chunkCount,
