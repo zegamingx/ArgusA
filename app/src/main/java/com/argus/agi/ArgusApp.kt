@@ -43,12 +43,14 @@ class ArgusApp : Application() {
             val hardwareInfo = hardwareProfile.getHardwareInfo()
             val deviceConfig = EngineConfig.forDevice(
                 totalRamGb = hardwareInfo.totalRamGb,
-                maxHeapMb = hardwareInfo.maxHeapMb
+                maxHeapMb = hardwareInfo.maxHeapMb,
+                availableRamGb = hardwareInfo.availRamGb
             )
             val resolvedConfig = ArgusNeuralEngine.resolveConfig(
                 context = instance,
                 totalRamGb = hardwareInfo.totalRamGb,
-                maxHeapMb = hardwareInfo.maxHeapMb
+                maxHeapMb = hardwareInfo.maxHeapMb,
+                availableRamGb = hardwareInfo.availRamGb
             )
 
             if (resolvedConfig != deviceConfig) {
