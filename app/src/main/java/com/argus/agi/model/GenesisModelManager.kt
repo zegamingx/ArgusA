@@ -8,6 +8,7 @@ import android.os.StatFs
 import android.util.Log
 import com.argus.agi.sensor.DeviceGuard
 import com.argus.agi.sensor.SystemHardwareInfo
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -410,17 +411,19 @@ class GenesisModelManager(
 
         var scheduledChunks = 0
         corpusItems.forEach { (source, title, text) ->
-            runCatching {
+            val queuedChunks = try {
                 trainingManager.ensureCorpusDocumentScheduled(
                     source = source,
                     title = title,
                     fullText = text
                 )
-            }.onSuccess { count ->
-                scheduledChunks += count
-            }.onFailure { error ->
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
                 Log.w(TAG, "Gagal memulihkan Genesis seed '$title'", error)
+                0
             }
+            scheduledChunks += queuedChunks
         }
         return scheduledChunks
     }
