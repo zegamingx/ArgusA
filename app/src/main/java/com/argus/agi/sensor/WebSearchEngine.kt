@@ -3,7 +3,6 @@ package com.argus.agi.sensor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
-import okhttp3.ResponseBody
 import okhttp3.Request
 import org.json.JSONArray
 import org.jsoup.Jsoup
