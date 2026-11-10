@@ -250,7 +250,7 @@ class TrainingManager(
         val chunksPerEpoch = processedChunks.size
         if (chunksPerEpoch == 0) return 0
 
-        val documentId = sha256Utf16Be(clean)
+        val documentId = sha256Utf16Be(fullText)
         val corpusDocument = CorpusDocumentEntity(
             id = documentId,
             contentFingerprint = documentId,
@@ -842,13 +842,37 @@ class TrainingManager(
         val stepLoss = neuralEngine.trainStep(item.content)
         val durationMs = (System.nanoTime() - startNs) / 1_000_000L
 
-        // Loss tidak valid → FAILED, bukan COMPLETED
+        if (item.chunkIndex == 1) {
+            item.documentId?.let { documentId ->
+                scope.launch {
+                    repo?.let { repository ->
+                        runCatching { repository.markCorpusDocumentTraining(documentId) }
+                            .onFailure { error ->
+                                Log.w(TAG, "Failed to mark corpus document as training", error)
+                            }
+                    }
+                }
+            }
+        }
+
+        // Loss tidak valid → FAILED, bukan COMPLETED.
         if (!stepLoss.isFinite()) {
             Log.w(TAG, "trainStep return non-finite loss=$stepLoss untuk '${item.title}'")
             val failed = item.copy(status = TrainingStatus.FAILED, stepDurationMs = durationMs)
             pushCompleted(failed)
             scope.launch {
-                repo?.let { runCatching { it.markTrainingFailed(failed.id) } }
+                repo?.let { repository ->
+                    runCatching { repository.markTrainingFailed(failed.id) }
+                        .onFailure { error ->
+                            Log.w(TAG, "Failed to persist failed training item", error)
+                        }
+                    failed.documentId?.let { documentId ->
+                        runCatching { repository.markCorpusDocumentPartial(documentId) }
+                            .onFailure { error ->
+                                Log.w(TAG, "Failed to mark corpus document as partial", error)
+                            }
+                    }
+                }
             }
             return
         }
@@ -898,14 +922,37 @@ class TrainingManager(
                         "Document Trainer"
                     )
                 }.onFailure { Log.w(TAG, "Gagal mencatat telemetri docCompleted", it) }
-                // Corpus Aktif sudah selesai: bersihkan dari UI agar tidak terus muncul!
                 _activeDocument.value = null
             }
         }
 
         pushCompleted(finished)
         scope.launch {
-            repo?.let { runCatching { it.markTrainingCompleted(finished.id, stepLoss, durationMs) } }
+            repo?.let { repository ->
+                runCatching {
+                    repository.markTrainingCompleted(finished.id, stepLoss, durationMs)
+                }.onFailure { error ->
+                    Log.w(TAG, "Failed to persist completed training item", error)
+                }
+
+                if (
+                    finished.documentId != null &&
+                    finished.chunkIndex >= finished.totalChunks
+                ) {
+                    runCatching {
+                        val document = repository.getCorpusDocument(finished.documentId)
+                        if (document != null && document.chunkCount > 0) {
+                            val completedPasses = finished.totalChunks / document.chunkCount
+                            repository.markCorpusDocumentTrained(
+                                documentId = document.id,
+                                completedPassCount = completedPasses
+                            )
+                        }
+                    }.onFailure { error ->
+                        Log.w(TAG, "Failed to update completed corpus document state", error)
+                    }
+                }
+            }
         }
     }
 
