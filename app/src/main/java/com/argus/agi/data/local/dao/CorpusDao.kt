@@ -48,6 +48,18 @@ interface CorpusDao {
         completedPassCount: Int
     ): Int
 
+    @Query(
+        "UPDATE corpus_documents SET status = 'TRAINED', " +
+            "lastTrainedAtEpochMs = :trainedAtEpochMs, " +
+            "completedPassCount = :completedPassCount " +
+            "WHERE id = :documentId AND status != 'PARTIAL'"
+    )
+    suspend fun markTrainedIfNoChunkFailed(
+        documentId: String,
+        trainedAtEpochMs: Long,
+        completedPassCount: Int
+    ): Int
+
     @Query("DELETE FROM corpus_documents WHERE id = :documentId")
     suspend fun deleteDocument(documentId: String): Int
 }
