@@ -146,7 +146,10 @@ class TrainingManager(
         val restoreGeneration = synchronized(queueLock) { queueGeneration }
         scope.launch {
             repo?.let { repository ->
-                runCatching { repository.getPendingQueueSnapshot() }
+                runCatching {
+                    repository.recoverInterruptedTrainingItems()
+                    repository.getPendingQueueSnapshot()
+                }
                     .onSuccess { pending ->
                         if (pending.isNotEmpty()) {
                             synchronized(queueLock) {
@@ -166,7 +169,7 @@ class TrainingManager(
                         }
                     }
                     .onFailure { error ->
-                        Log.e(TAG, "Failed to restore persisted training queue", error)
+                        Log.e(TAG, "Failed to recover and restore persisted training queue", error)
                     }
             }
         }
@@ -846,16 +849,28 @@ class TrainingManager(
         }
     }
 
-    private fun processItem(item: TrainingData) {
+    private suspend fun processItem(item: TrainingData) {
+        // Persist the active row as TRAINING before entering the non-interruptible optimizer
+        // step. clearPendingQueue() can then safely remove only waiting rows.
+        repo?.let { repository ->
+            val markedStarted = runCatching {
+                repository.markTrainingStarted(item.id)
+            }.onFailure { error ->
+                Log.w(TAG, "Failed to persist active training state for '${item.id}'", error)
+            }.getOrDefault(false)
+
+            if (!markedStarted) {
+                Log.w(TAG, "Training item '${item.id}' was not marked TRAINING in Room.")
+            }
+        }
+
         if (item.chunkIndex == 1) {
             item.documentId?.let { documentId ->
-                scope.launch {
-                    repo?.let { repository ->
-                        runCatching { repository.markCorpusDocumentTraining(documentId) }
-                            .onFailure { error ->
-                                Log.w(TAG, "Failed to mark corpus document as training", error)
-                            }
-                    }
+                repo?.let { repository ->
+                    runCatching { repository.markCorpusDocumentTraining(documentId) }
+                        .onFailure { error ->
+                            Log.w(TAG, "Failed to mark corpus document as training", error)
+                        }
                 }
             }
         }
