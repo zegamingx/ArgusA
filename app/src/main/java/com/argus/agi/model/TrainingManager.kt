@@ -118,6 +118,7 @@ class TrainingManager(
     // Channel hanya berfungsi sebagai wakeup signal, bukan storage.
     private val queueLock = Any()
     private val corpusSchedulingMutex = Mutex()
+    private val seedSchedulingMutex = Mutex()
     private var lastScheduledTimestamp: Long = System.currentTimeMillis()
     private var queueGeneration: Long = 0L
     private val persistenceOperations =
@@ -366,19 +367,21 @@ class TrainingManager(
         overlap: Int = 50,
         epochs: Int = 1
     ): Int {
-        val newlyQueuedChunks = enqueueDocument(
-            source = source,
-            title = title,
-            fullText = fullText,
-            chunkSize = chunkSize,
-            overlap = overlap,
-            epochs = epochs
-        )
-        if (newlyQueuedChunks > 0 || closed) return newlyQueuedChunks
+        seedSchedulingMutex.lock()
+        try {
+            val newlyQueuedChunks = enqueueDocument(
+                source = source,
+                title = title,
+                fullText = fullText,
+                chunkSize = chunkSize,
+                overlap = overlap,
+                epochs = epochs
+            )
+            if (newlyQueuedChunks > 0 || closed) return newlyQueuedChunks
 
-        val activeRepository = requireNotNull(repo) {
-            "Local corpus storage is unavailable; seed scheduling cannot be recovered."
-        }
+            val activeRepository = requireNotNull(repo) {
+                "Local corpus storage is unavailable; seed scheduling cannot be recovered."
+            }
         val fingerprint = sha256Utf16Be(fullText)
         val existingDocument = activeRepository.getCorpusDocumentByFingerprint(fingerprint)
             ?: return 0
@@ -396,10 +399,13 @@ class TrainingManager(
         }
         if (persistedActive || memoryActive) return 0
 
-        return replayCorpusDocument(
-            documentId = existingDocument.id,
-            epochs = epochs
-        )
+            return replayCorpusDocument(
+                documentId = existingDocument.id,
+                epochs = epochs
+            )
+        } finally {
+            seedSchedulingMutex.unlock()
+        }
     }
 
     /**
