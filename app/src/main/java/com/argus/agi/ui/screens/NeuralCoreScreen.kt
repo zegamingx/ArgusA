@@ -78,7 +78,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
     val vocabSize = viewModel.getVocabSize()
     val worldEntities by viewModel.worldEntities.collectAsState()
     val modelConfig = viewModel.engineConfig
-    val lastVulkanDispatch = viewModel.activeComputeBackend
+    val backendState = viewModel.activeComputeBackend
     val isVulkanRuntimeReady = viewModel.isVulkanRuntimeReady
     val activeDocument = activeDoc
     val activeTrainingItem = currentItem
@@ -316,7 +316,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             fontSize = 10.sp
                         )
                         Text(
-                            text = "Parameters: $formattedParams • LoRA adapter: $adapterSizeStr • Last successful dispatch: $lastVulkanDispatch • Vulkan runtime: ${if (isVulkanRuntimeReady) "SELF-CHECKED" else "UNAVAILABLE"}",
+                            text = "Parameters: $formattedParams • LoRA adapter: $adapterSizeStr • Backend state: $backendState • Vulkan runtime: ${if (isVulkanRuntimeReady) "SELF-CHECKED" else "UNAVAILABLE"}",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted,
                             fontFamily = FontFamily.Monospace,
@@ -344,7 +344,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             fontFamily = FontFamily.Monospace
                         )
                         Text(
-                            text = "> Current item: ${activeTrainingItem?.title?.take(60) ?: "None"}",
+                            text = "> Current item: ${activeTrainingItem?.let { displayTrainingItemTitle(it.title).take(60) } ?: "None"}",
                             style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
                             color = ArgusTextSecondary,
                             fontFamily = FontFamily.Monospace
@@ -511,6 +511,18 @@ fun QueueSectionHeader(title: String, count: Int, onClear: (() -> Unit)? = null)
     }
 }
 
+
+/**
+ * Translates built-in Genesis seed titles for display only.
+ * Corpus content, fingerprints, and persisted document metadata remain unchanged.
+ */
+private fun displayTrainingItemTitle(title: String): String = when (title) {
+    "Prinsip Kemandirian AGI" -> "AGI Independence Principles"
+    "Privasi dan Sensor" -> "Privacy and Sensors"
+    "Arsitektur Transformer On-Device" -> "On-Device Transformer Architecture"
+    else -> title
+}
+
 @Composable
 fun ActiveTrainingCard(item: TrainingData) {
     Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(ArgusCyanPrimary.copy(alpha = 0.12f)).padding(12.dp)) {
@@ -521,7 +533,7 @@ fun ActiveTrainingCard(item: TrainingData) {
                 Text(text = "IN PROGRESS • ${item.source}", style = MaterialTheme.typography.labelSmall, color = ArgusCyanPrimary, fontWeight = FontWeight.Bold)
             }
             Spacer(modifier = Modifier.height(6.dp))
-            Text(text = item.title, style = MaterialTheme.typography.titleMedium.copy(fontSize = 13.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Medium)
+            Text(text = displayTrainingItemTitle(item.title), style = MaterialTheme.typography.titleMedium.copy(fontSize = 13.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Medium)
             if (item.totalChunks > 1) {
                 Spacer(modifier = Modifier.height(6.dp))
                 val progress = (item.chunkIndex - 1).coerceAtLeast(0).toFloat() / item.totalChunks.toFloat()
@@ -539,7 +551,7 @@ fun ActiveTrainingCard(item: TrainingData) {
 fun QueuedItemCard(item: TrainingData) {
     Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color.White.copy(alpha = 0.04f)).padding(10.dp)) {
         Column {
-            Text(text = item.title, style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary)
+            Text(text = displayTrainingItemTitle(item.title), style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary)
             Text(text = "Source: ${item.source} (${item.content.length} characters)", style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted)
         }
     }
@@ -550,7 +562,7 @@ fun CompletedItemCard(item: TrainingData) {
     val isFailed = item.status == TrainingStatus.FAILED
     Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color.White.copy(alpha = 0.03f)).padding(10.dp)) {
         Column {
-            Text(text = item.title, style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary)
+            Text(text = displayTrainingItemTitle(item.title), style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary)
             val lossStr = if (isFailed) "Status: Failed" else item.finalLoss?.let { String.format(Locale.US, "Loss: %.4f", it) } ?: "Loss: unavailable"
             Text(text = "$lossStr | ${item.stepDurationMs}ms | ${item.source}", style = MaterialTheme.typography.labelSmall, color = if (isFailed) ArgusError else ArgusTextSecondary, fontFamily = FontFamily.Monospace)
         }

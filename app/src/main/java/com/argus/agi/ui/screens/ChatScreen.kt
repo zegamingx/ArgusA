@@ -240,7 +240,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Local inference and training • Web search makes external requests when used",
+                            text = "Local model inference and training • Web, article, and speech services may contact external providers",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted
                         )

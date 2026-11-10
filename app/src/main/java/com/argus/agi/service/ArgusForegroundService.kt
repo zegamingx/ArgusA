@@ -112,7 +112,7 @@ class ArgusForegroundService : Service() {
     private fun buildNotification(): Notification {
         val trainingManager = ArgusApp.trainingManager
         val deviceGuard = ArgusApp.deviceGuard
-        val hardware = ArgusApp.hardwareProfile.getHardwareInfo()
+        val neuralEngine = ArgusApp.neuralEngine
 
         val isPaused = trainingManager.isTrainingPaused.value
         val safety = deviceGuard.safetyState.value
@@ -127,7 +127,12 @@ class ArgusForegroundService : Service() {
         }
 
         val lossText = if (latestLoss != null) "Loss: ${String.format("%.4f", latestLoss)}" else "Loss: not available"
-        val content = "$lossText | ${safety.batteryPct}% (${String.format("%.1f", safety.temperatureCelsius)}°C) | ${hardware.primaryAccelerator.substringBefore('+')}"
+        val computeStatus = if (neuralEngine.isVulkanRuntimeReady) {
+            "Vulkan runtime verified"
+        } else {
+            "Kotlin CPU fallback"
+        }
+        val content = "$lossText | ${safety.batteryPct}% (${String.format("%.1f", safety.temperatureCelsius)}°C) | $computeStatus"
 
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
