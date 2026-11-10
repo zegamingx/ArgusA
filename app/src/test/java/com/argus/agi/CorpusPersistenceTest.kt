@@ -443,14 +443,22 @@ class CorpusPersistenceTest {
             assertEquals(1, repository.getCorpusDocumentCount())
             assertEquals(3, repository.getCorpusSources(document.id).size)
 
-            val unverifiedArticleImport = manager.enqueueDocument(
-                source = "web_article|source=reviewed-page",
-                title = "Article source",
-                fullText = text,
-                canonicalUrl = "https://example.org/article",
-                rightsStatus = "UNVERIFIED"
+            val unverifiedArticleText =
+                "This unique article has not received a rights declaration. ".repeat(8)
+            val unverifiedArticleImport = runCatching {
+                manager.enqueueDocument(
+                    source = "web_article|source=unreviewed-page",
+                    title = "Unreviewed article",
+                    fullText = unverifiedArticleText,
+                    canonicalUrl = "https://example.org/unreviewed",
+                    rightsStatus = "UNVERIFIED"
+                )
+            }.exceptionOrNull()
+            assertTrue(
+                "A unique web article without a rights declaration must be rejected.",
+                unverifiedArticleImport != null
             )
-            assertEquals(0, unverifiedArticleImport)
+            assertEquals(1, repository.getCorpusDocumentCount())
 
             val declaredArticleImport = manager.enqueueDocument(
                 source = "web_article|source=reviewed-page|rights_declared_by_user=true",
@@ -466,12 +474,18 @@ class CorpusPersistenceTest {
             assertEquals("USER_DECLARED", articleSource.rightsStatus)
             assertEquals(4, repository.getCorpusSources(document.id).size)
 
-            manager.enqueueDocument(
-                source = "web_article|source=reviewed-page",
-                title = "Article source",
-                fullText = text,
-                canonicalUrl = "https://example.org/article",
-                rightsStatus = "UNVERIFIED"
+            val unverifiedReimport = runCatching {
+                manager.enqueueDocument(
+                    source = "web_article|source=reviewed-page",
+                    title = "Article source",
+                    fullText = text,
+                    canonicalUrl = "https://example.org/article",
+                    rightsStatus = "UNVERIFIED"
+                )
+            }.exceptionOrNull()
+            assertTrue(
+                "A later unverified import must not overwrite an existing user declaration.",
+                unverifiedReimport != null
             )
             val sourceAfterUnverifiedReimport = repository.getCorpusSources(document.id)
                 .single { it.canonicalUrl == "https://example.org/article" }
