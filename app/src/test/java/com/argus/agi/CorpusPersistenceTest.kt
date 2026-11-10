@@ -4,6 +4,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import android.content.Context
 import com.argus.agi.data.local.ArgusDatabase
+import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.repository.ArgusRepository
 import com.argus.agi.model.ArgusNeuralEngine
 import com.argus.agi.model.CorpusReplayPolicy
@@ -486,6 +487,33 @@ class CorpusPersistenceTest {
                 unverifiedValidationImport != null
             )
             assertEquals(1, repository.getCorpusDocumentCount())
+
+            val directUnverifiedDocument = CorpusDocumentEntity(
+                id = "direct-unverified-web-document",
+                contentFingerprint = "direct-unverified-web-fingerprint",
+                fingerprintAlgorithm = "SHA-256/UTF-16BE",
+                source = "web_article|source=direct-import",
+                title = "Direct unverified article",
+                language = "en",
+                canonicalUrl = "https://example.org/direct-unverified",
+                characterCount = 24,
+                chunkCount = 0,
+                datasetSplit = "VALIDATION",
+                validationText = "Unverified web validation text",
+                plannedEpochs = 0,
+                rightsStatus = "UNVERIFIED",
+                status = "READY",
+                createdAtEpochMs = System.currentTimeMillis(),
+                lastTrainedAtEpochMs = null,
+                completedPassCount = 0
+            )
+            val directStorageFailure = runCatching {
+                repository.storeCorpusDocument(directUnverifiedDocument, emptyList())
+            }.exceptionOrNull()
+            assertTrue(
+                "The repository must reject unverified web content even when the manager is bypassed.",
+                directStorageFailure != null
+            )
 
             val declaredArticleImport = manager.enqueueDocument(
                 source = "web_article|source=reviewed-page|rights_declared_by_user=true",
