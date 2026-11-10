@@ -6,6 +6,7 @@ import android.content.Context
 import com.argus.agi.data.local.ArgusDatabase
 import com.argus.agi.data.repository.ArgusRepository
 import com.argus.agi.model.ArgusNeuralEngine
+import com.argus.agi.model.EngineConfig
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.WorldModel
@@ -13,6 +14,7 @@ import com.argus.agi.sensor.DeviceGuard
 import java.io.StringReader
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -23,6 +25,74 @@ import org.robolectric.annotation.Config
 @Config(sdk = [33])
 class CorpusPersistenceTest {
 
+
+
+    @Test
+    fun analyticalBackpropGradientsMatchCentralFiniteDifferences() {
+        val checkpointFile = java.io.File(context.filesDir, "argus_model_weights.bin")
+        val previousCheckpoint = checkpointFile.takeIf { it.isFile }?.readBytes()
+
+        try {
+            checkpointFile.delete()
+            val engine = ArgusNeuralEngine.createBlocking(
+                context = context,
+                config = EngineConfig(
+                    dModel = 48,
+                    nHeads = 4,
+                    dFf = 128,
+                    maxSeqLen = 32,
+                    loraRank = 2
+                )
+            )
+            val sample = "Argus learns local language"
+            val parameterGroups = listOf(
+                "wHead",
+                "wEmbed",
+                "wDown",
+                "wGate",
+                "wQ",
+                "wK",
+                "wV",
+                "wO",
+                "loraQb",
+                "loraVb"
+            )
+
+            parameterGroups.forEach { parameterName ->
+                val result = engine.checkGradient(
+                    text = sample,
+                    parameterName = parameterName,
+                    parameterIndex = -1,
+                    epsilon = 1e-2f
+                )
+                val magnitude = maxOf(
+                    kotlin.math.abs(result.analyticalGradient),
+                    kotlin.math.abs(result.numericalGradient)
+                )
+                val tolerance = 2e-3f + 0.05f * magnitude
+
+                assertTrue(
+                    "$parameterName selected gradient should be informative: $result",
+                    kotlin.math.abs(result.analyticalGradient) > 1e-8f
+                )
+                assertTrue(
+                    "$parameterName analytical/numerical mismatch: $result",
+                    result.absoluteError <= tolerance
+                )
+            }
+
+            assertFalse(
+                "Gradient diagnostics must not create or write a model checkpoint.",
+                checkpointFile.exists()
+            )
+        } finally {
+            if (previousCheckpoint == null) {
+                checkpointFile.delete()
+            } else {
+                checkpointFile.writeBytes(previousCheckpoint)
+            }
+        }
+    }
 
     @Test
     fun validationDocumentsStayHeldOutAndEvaluateWithoutChangingWeights() = runTest {
