@@ -78,7 +78,8 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
     val vocabSize = viewModel.getVocabSize()
     val worldEntities by viewModel.worldEntities.collectAsState()
     val modelConfig = viewModel.engineConfig
-    val activeBackend = viewModel.activeComputeBackend
+    val lastVulkanDispatch = viewModel.activeComputeBackend
+    val isVulkanRuntimeReady = viewModel.isVulkanRuntimeReady
     val activeDocument = activeDoc
     val activeTrainingItem = currentItem
 
@@ -251,7 +252,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        StatMetricBox(label = "LAST LOSS", value = lastLoss, unit = "most recent item", valueColor = ArgusCyanPrimary, modifier = Modifier.weight(1f))
+                        StatMetricBox(label = "LAST LOSS", value = lastLoss, unit = "latest completed item", valueColor = ArgusCyanPrimary, modifier = Modifier.weight(1f))
                         StatMetricBox(label = "VOCABULARY", value = "$vocabSize", unit = "tokens", valueColor = ArgusCyanGlow, modifier = Modifier.weight(1f))
                         StatMetricBox(label = "WORLD MODEL", value = "${worldEntities.size}", unit = "records", valueColor = ArgusSuccess, modifier = Modifier.weight(1f))
                     }
@@ -315,7 +316,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             fontSize = 10.sp
                         )
                         Text(
-                            text = "Parameters: $formattedParams • LoRA adapter: $adapterSizeStr • Active backend: $activeBackend",
+                            text = "Parameters: $formattedParams • LoRA adapter: $adapterSizeStr • Last successful dispatch: $lastVulkanDispatch • Vulkan runtime: ${if (isVulkanRuntimeReady) "SELF-CHECKED" else "UNAVAILABLE"}",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted,
                             fontFamily = FontFamily.Monospace,
@@ -370,7 +371,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "DEVICE SAFETY: ${if (safetyState.isSafeToTrain) "CLEAR" else "HOLD"} • ${if (isPaused) "PAUSED" else "RUNNING"}",
+                            text = "DEVICE SAFETY: ${if (safetyState.isSafeToTrain) "CLEAR" else "HOLD"} • $trainingStatusLabel",
                             style = MaterialTheme.typography.labelSmall,
                             color = if (safetyState.isSafeToTrain && !isPaused) ArgusSuccess else ArgusWarning,
                             fontWeight = FontWeight.Bold

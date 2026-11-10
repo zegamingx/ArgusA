@@ -431,7 +431,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                             fontWeight = FontWeight.Bold
                                         )
                                         Text(
-                                            text = "${article.siteName} · ${article.domain} · ${article.characterCount} karakter",
+                                            text = "${article.siteName} · ${article.domain} · ${article.characterCount} characters",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = ArgusTextMuted
                                         )
@@ -489,7 +489,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                                 shape = RoundedCornerShape(8.dp)
                                             ) {
                                                 Text(
-                                                    if (isQueueingArticle) "Memasukkan…" else "Masukkan ke training",
+                                                    if (isQueueingArticle) "Adding…" else "Add to training",
                                                     fontSize = 11.sp
                                                 )
                                             }

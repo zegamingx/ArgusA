@@ -106,24 +106,24 @@ class ArgusApp : Application() {
         // Ini juga memicu load checkpoint neural engine di background.
         applicationScope.launch {
             runCatching { neuralEngine }
-                .onFailure { Log.e(TAG, "Gagal init neuralEngine", it) }
+                .onFailure { Log.e(TAG, "Failed to initialize the neural engine", it) }
 
             runCatching { deviceGuard }
-                .onFailure { Log.e(TAG, "Gagal init deviceGuard", it) }
+                .onFailure { Log.e(TAG, "Failed to initialize the device guard", it) }
 
             runCatching { worldModel }
-                .onFailure { Log.e(TAG, "Gagal init worldModel", it) }
+                .onFailure { Log.e(TAG, "Failed to initialize the World Model", it) }
 
             runCatching { hardwareProfile }
-                .onFailure { Log.e(TAG, "Gagal init hardwareProfile", it) }
+                .onFailure { Log.e(TAG, "Failed to initialize the hardware profile", it) }
 
             runCatching { genesisModelManager }
-                .onFailure { Log.e(TAG, "Gagal init genesisModelManager", it) }
+                .onFailure { Log.e(TAG, "Failed to initialize the Genesis model manager", it) }
 
             // trainingManager memulai worker coroutine. Pre-warm setelah
             // deviceGuard siap agar safetyState sudah terisi.
             runCatching { trainingManager }
-                .onFailure { Log.e(TAG, "Gagal init trainingManager", it) }
+                .onFailure { Log.e(TAG, "Failed to initialize the training manager", it) }
         }
     }
 
@@ -150,7 +150,7 @@ class ArgusApp : Application() {
         // Tidak dipanggil di production Android; berguna untuk instrumentation test.
         if (isTrainingManagerInitialized()) {
             runCatching { trainingManager.close() }
-                .onFailure { Log.w(TAG, "Gagal menutup trainingManager", it) }
+                .onFailure { Log.w(TAG, "Failed to close the training manager", it) }
         }
         applicationScope.cancel()
         super.onTerminate()
