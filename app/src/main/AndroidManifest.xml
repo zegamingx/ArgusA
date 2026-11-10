@@ -61,6 +61,10 @@
             </intent-filter>
         </activity>
 
+        <!--
+            dataSync is selected only on API 29-33, where specialUse is unavailable.
+            API 34+ activates specialUse alone for the ongoing local compute workload.
+        -->
         <service
             android:name=".service.ArgusForegroundService"
             android:enabled="true"

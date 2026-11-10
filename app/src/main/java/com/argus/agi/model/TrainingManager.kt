@@ -118,6 +118,7 @@ class TrainingManager(
     // Channel hanya berfungsi sebagai wakeup signal, bukan storage.
     private val queueLock = Any()
     private val corpusSchedulingMutex = Mutex()
+    private val seedSchedulingMutex = Mutex()
     private var lastScheduledTimestamp: Long = System.currentTimeMillis()
     private var queueGeneration: Long = 0L
     private val persistenceOperations =
@@ -347,6 +348,63 @@ class TrainingManager(
                 )
             }
             return orderedItems.size
+        }
+    }
+
+    /**
+     * Ensures a durable training document has pending work without duplicating an
+     * already queued, active, or fully trained document.
+     *
+     * This is intended for idempotent application-owned seed corpora. If the document
+     * already exists but its queue was cleared or its work was interrupted, retained
+     * chunks are replayed instead of trying to import the same fingerprint again.
+     */
+    suspend fun ensureCorpusDocumentScheduled(
+        source: String,
+        title: String,
+        fullText: String,
+        chunkSize: Int = 380,
+        overlap: Int = 50,
+        epochs: Int = 1
+    ): Int {
+        seedSchedulingMutex.lock()
+        try {
+            val newlyQueuedChunks = enqueueDocument(
+                source = source,
+                title = title,
+                fullText = fullText,
+                chunkSize = chunkSize,
+                overlap = overlap,
+                epochs = epochs
+            )
+            if (newlyQueuedChunks > 0 || closed) return newlyQueuedChunks
+
+            val activeRepository = requireNotNull(repo) {
+                "Local corpus storage is unavailable; seed scheduling cannot be recovered."
+            }
+            val fingerprint = sha256Utf16Be(fullText)
+            val existingDocument = activeRepository.getCorpusDocumentByFingerprint(fingerprint)
+                ?: return 0
+
+            require(existingDocument.datasetSplit == "TRAIN") {
+                "A validation-only document cannot be used as a training seed."
+            }
+            if (existingDocument.status == "TRAINED") return 0
+
+            val persistedActive = existingDocument.id in
+                activeRepository.getActiveCorpusTrainingDocumentIds()
+            val memoryActive = synchronized(queueLock) {
+                _nextQueue.value.any { it.documentId == existingDocument.id } ||
+                    _currentTrainingItem.value?.documentId == existingDocument.id
+            }
+            if (persistedActive || memoryActive) return 0
+
+            return replayCorpusDocument(
+                documentId = existingDocument.id,
+                epochs = epochs
+            )
+        } finally {
+            seedSchedulingMutex.unlock()
         }
     }
 

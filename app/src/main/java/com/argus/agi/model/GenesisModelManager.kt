@@ -8,6 +8,7 @@ import android.os.StatFs
 import android.util.Log
 import com.argus.agi.sensor.DeviceGuard
 import com.argus.agi.sensor.SystemHardwareInfo
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -159,7 +160,29 @@ class GenesisModelManager(
         hardwareInfo: SystemHardwareInfo,
         trainingManager: TrainingManager? = null
     ): GenesisIdentity = genesisLock.withLock {
-        loadIdentity()?.let { return@withLock it }
+        loadIdentity()?.let { existing ->
+            if (trainingManager != null) {
+                val scheduled = ensureGeneralLearningCorpus(trainingManager)
+                _lifecycleState.update { current ->
+                    current.copy(
+                        stage = GenesisLifecycleStage.GENERAL_LEARNING_SCHEDULED,
+                        progress = 1.0f,
+                        assessedDetails = "Existing local model verified; durable Genesis seed corpus checked.",
+                        stageLog = current.stageLog + (
+                            if (scheduled > 0) {
+                                "Recovered $scheduled Genesis seed training chunks from the local corpus."
+                            } else {
+                                "Genesis seed corpus is already queued, active, or fully trained."
+                            }
+                        ),
+                        identity = existing,
+                        isComplete = true,
+                        errorMessage = null
+                    )
+                }
+            }
+            return@withLock existing
+        }
 
         withContext(Dispatchers.Default) {
             try {
@@ -319,7 +342,7 @@ class GenesisModelManager(
         }
 
         if (trainingManager != null) {
-            val scheduled = scheduleGeneralLearningCorpus(trainingManager)
+            val scheduled = ensureGeneralLearningCorpus(trainingManager)
             logs += if (scheduled == 0) {
                 "General learning corpus kosong atau sudah pernah dijadwalkan."
             } else {
@@ -367,7 +390,16 @@ class GenesisModelManager(
         }
     }
 
-    private fun scheduleGeneralLearningCorpus(trainingManager: TrainingManager): Int {
+    /**
+     * Checks the bundled foundation notes on every completed Genesis lifecycle.
+     *
+     * The notes are persisted as ordinary TRAIN corpus documents. Existing pending
+     * work is left alone, completed notes are not trained again, and interrupted or
+     * cleared notes are replayed from Room without reopening an asset or rebuilding text.
+     *
+     * These short notes are only a bootstrap seed; they are not a general language dataset.
+     */
+    suspend fun ensureGeneralLearningCorpus(trainingManager: TrainingManager): Int {
         val corpusItems = listOf(
             Triple("Genesis Foundation", "Prinsip Kemandirian AGI",
                 "A.R.G.U.S adalah inteligensi personal lokal yang diciptakan langsung dari perangkat pengguna. Setiap instalasi berkembang independen dari origin lokalnya sendiri."),
@@ -376,13 +408,24 @@ class GenesisModelManager(
             Triple("Genesis Foundation", "Arsitektur Transformer On-Device",
                 "Struktur transformer on-device mengintegrasikan Causal Multi-Head Attention, LoRA Low-Rank Adaptation, dan feed-forward SwiGLU dengan alokasi tensor datar.")
         )
-        var enqueued = 0
-        corpusItems.forEach { (source, title, content) ->
-            runCatching { trainingManager.enqueueData(source, title, content) }
-                .onSuccess { enqueued++ }
-                .onFailure { Log.w(TAG, "Gagal enqueue '$title'", it) }
+
+        var scheduledChunks = 0
+        corpusItems.forEach { (source, title, text) ->
+            val queuedChunks = try {
+                trainingManager.ensureCorpusDocumentScheduled(
+                    source = source,
+                    title = title,
+                    fullText = text
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.w(TAG, "Gagal memulihkan Genesis seed '$title'", error)
+                0
+            }
+            scheduledChunks += queuedChunks
         }
-        return enqueued
+        return scheduledChunks
     }
 
     private fun saveIdentity(identity: GenesisIdentity) {

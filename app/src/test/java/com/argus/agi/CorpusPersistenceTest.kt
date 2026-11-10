@@ -670,4 +670,90 @@ class CorpusPersistenceTest {
         }
     }
 
+    @Test
+    fun genesisFoundationCorpusIsPersistentAndRecoversWithoutDuplicates() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val engine = ArgusNeuralEngine.createBlocking(
+            context,
+            EngineConfig(
+                dModel = 48,
+                nHeads = 4,
+                dFf = 128,
+                maxSeqLen = 32,
+                loraRank = 2
+            )
+        )
+        val deviceGuard = DeviceGuard(context)
+        val trainingManager = TrainingManager(
+            context = context,
+            neuralEngine = engine,
+            deviceGuard = deviceGuard,
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+        val genesisManager = com.argus.agi.model.GenesisModelManager(
+            context = context,
+            neuralEngine = engine,
+            deviceGuard = deviceGuard
+        )
+
+        try {
+            trainingManager.pauseTraining()
+
+            val initialScheduledChunks =
+                genesisManager.ensureGeneralLearningCorpus(trainingManager)
+            assertEquals("The three built-in foundation notes must be scheduled.", 3, initialScheduledChunks)
+            trainingManager.awaitQueuePersistenceIdle()
+
+            val initialDocuments = repository.getTrainingCorpusDocuments()
+            assertEquals("Each Genesis note must be retained as its own corpus document.", 3, initialDocuments.size)
+            assertTrue(initialDocuments.all { it.source == "Genesis Foundation" })
+            assertTrue(initialDocuments.all { it.datasetSplit == "TRAIN" })
+            assertEquals(3, repository.getPendingQueueSnapshot().size)
+
+            val duplicateScheduledChunks =
+                genesisManager.ensureGeneralLearningCorpus(trainingManager)
+            assertEquals("Already queued Genesis notes must not be scheduled twice.", 0, duplicateScheduledChunks)
+            assertEquals(3, repository.getCorpusDocumentCount())
+
+            trainingManager.clearQueue()
+            trainingManager.awaitQueuePersistenceIdle()
+            initialDocuments.forEach { document ->
+                assertEquals(
+                    "Clearing waiting seed work must retain its corpus and mark it partial.",
+                    "PARTIAL",
+                    repository.getCorpusDocument(document.id)?.status
+                )
+            }
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+
+            val recoveredScheduledChunks =
+                genesisManager.ensureGeneralLearningCorpus(trainingManager)
+            assertEquals("Interrupted Genesis seed work must replay from Room.", 3, recoveredScheduledChunks)
+            trainingManager.awaitQueuePersistenceIdle()
+
+            val recoveredQueue = repository.getPendingQueueSnapshot()
+            assertEquals(3, recoveredQueue.size)
+            assertEquals(3, repository.getCorpusDocumentCount())
+            assertEquals(
+                "Replay must reuse the retained Genesis corpus documents.",
+                initialDocuments.map { it.id }.toSet(),
+                recoveredQueue.mapNotNull { it.documentId }.toSet()
+            )
+
+            val repeatedRecovery =
+                genesisManager.ensureGeneralLearningCorpus(trainingManager)
+            assertEquals("Active replay work must remain idempotent.", 0, repeatedRecovery)
+            assertEquals(3, repository.getPendingQueueSnapshot().size)
+        } finally {
+            trainingManager.close()
+            database.close()
+        }
+    }
+
 }

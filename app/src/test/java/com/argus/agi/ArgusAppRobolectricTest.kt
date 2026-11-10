@@ -1,9 +1,7 @@
 package com.argus.agi
 
 import android.content.Context
-import java.io.StringReader
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import android.content.pm.ServiceInfo
 import androidx.test.core.app.ApplicationProvider
 import com.argus.agi.model.ArgusNeuralEngine
 import com.argus.agi.model.EngineConfig
@@ -11,6 +9,10 @@ import com.argus.agi.model.Tokenizer
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.WorldModel
 import com.argus.agi.sensor.DeviceGuard
+import com.argus.agi.service.ArgusForegroundService
+import java.io.StringReader
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -32,6 +34,22 @@ class ArgusAppRobolectricTest {
     @org.junit.Before
     fun setUp() = kotlinx.coroutines.runBlocking<Unit> {
         com.argus.agi.data.repository.ArgusRepository(context).clearPendingQueue()
+    }
+
+    @Test
+    fun foregroundTrainingServiceSelectsOnlyTheSupportedRuntimeType() {
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            ArgusForegroundService.foregroundServiceTypeForApi(33)
+        )
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            ArgusForegroundService.foregroundServiceTypeForApi(34)
+        )
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            ArgusForegroundService.foregroundServiceTypeForApi(35)
+        )
     }
 
     @Test

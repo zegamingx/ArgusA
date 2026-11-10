@@ -1,10 +1,6 @@
 name: Argus Android Release
 
 on:
-  # One-time migration build for v1.0.6. Future builds use published releases.
-  push:
-    branches:
-      - "build/v1.0.6"
   release:
     types:
       - published
@@ -13,16 +9,14 @@ permissions:
   contents: write
 
 concurrency:
-  group: argus-release-${{ github.event.release.tag_name || github.ref_name }}
+  group: argus-release-${{ github.event.release.tag_name }}
   cancel-in-progress: true
 
 jobs:
   build-release:
     if: >-
-      github.event_name == 'push' ||
-      (github.event_name == 'release' &&
-       startsWith(github.event.release.tag_name, 'v') &&
-       github.event.release.tag_name != 'v1.0.6')
+      startsWith(github.event.release.tag_name, 'v') &&
+      github.event.release.tag_name != 'v1.0.6'
     name: Lint, test, sign and publish APK
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -32,7 +26,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}
+          ref: ${{ github.event.release.tag_name }}
 
       - name: Set up JDK 17
         uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
@@ -71,15 +65,13 @@ jobs:
           echo "Android SDK ready: API 37.0, Build Tools 36.0.0."
 
       - name: Resolve and validate release version
+        env:
+          RELEASE_TAG_INPUT: ${{ github.event.release.tag_name }}
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            release_tag="${GITHUB_REF_NAME#build/}"
-          else
-            release_tag="${{ github.event.release.tag_name }}"
-          fi
+          release_tag="${RELEASE_TAG_INPUT}"
 
           major="$(awk -F= '$1 == "VERSION_MAJOR" { print $2 }' version.properties)"
           minor="$(awk -F= '$1 == "VERSION_MINOR" { print $2 }' version.properties)"
@@ -152,16 +144,15 @@ jobs:
 
       - name: Run release lint and build
         run: |
-          # Use one SDK path and disable the Gradle configuration cache for
-          # this AGP 9.1 release build. Robolectric tests remain a separate
-          # validation task because Maven Central rate-limited their runtime
-          # artifact during the release run.
+          # Keep lint, Robolectric unit tests, and the signed APK build in one
+          # release gate so publication cannot proceed after an untested build.
           env -u ANDROID_SDK_ROOT ./gradlew \
             --no-daemon \
             --no-configuration-cache \
             --stacktrace \
             clean \
             :app:lintRelease \
+            :app:testReleaseUnitTest \
             :app:assembleRelease
 
       - name: Verify APK signature matches Argus signing identity
