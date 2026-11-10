@@ -73,6 +73,7 @@ Current limitations:
 - Held-out evaluation uses evaluateValidationCorpus, aggregates cross-entropy by the exact number of scored next-token targets, and computes perplexity without updating model weights or optimizer state.
 - A content fingerprint cannot exist in both splits. Importing identical source text into the opposite split is rejected to prevent train/validation leakage.
 - Split selection is explicit through TrainingManager.importValidationDocument; the app does not randomly split chunks or automatically choose held-out documents. The caller must select representative validation documents before training.
+- Held-out metrics are calculated over the normalized document source stream, not a reconstruction of each importer-specific training chunk boundary. Compare runs using the same fixed validation documents and model configuration; do not interpret validation loss as an exact reproduction of the per-chunk training loss.
 - Corpus-level shuffle scheduling and replay policies are not implemented yet.
 - NPU/APU and Vulkan may be detected for device information, but the current training implementation executes through Kotlin CPU operations. Detection is not accelerator dispatch.
 - This pipeline is not yet validated as scalable from-random-initialization pretraining or general intelligence training.
