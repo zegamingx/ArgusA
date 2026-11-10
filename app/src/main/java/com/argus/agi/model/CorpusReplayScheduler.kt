@@ -57,12 +57,16 @@ internal object CorpusReplayScheduler {
         }
         require(sources.isNotEmpty()) { "At least one training corpus document is required." }
 
-        val stableSources = sources.sortedWith(
-            compareBy<CorpusReplaySource>(
-                { it.document.createdAtEpochMs },
-                { it.document.id }
+        val stableSources = sources
+            .sortedWith(
+                compareBy<CorpusReplaySource>(
+                    { it.document.createdAtEpochMs },
+                    { it.document.id }
+                )
             )
-        )
+            .map { source ->
+                source.copy(chunks = source.chunks.sortedBy { it.chunkIndex })
+            }
         require(stableSources.map { it.document.id }.toSet().size == stableSources.size) {
             "A corpus document may appear only once in a replay plan."
         }
@@ -78,11 +82,10 @@ internal object CorpusReplayScheduler {
                 "Corpus document ${source.document.id} has missing or inconsistent chunks."
             }
 
-            val orderedChunks = source.chunks.sortedBy { it.chunkIndex }
-            require(orderedChunks.all { it.documentId == source.document.id }) {
+            require(source.chunks.all { it.documentId == source.document.id }) {
                 "Corpus document ${source.document.id} contains a foreign chunk reference."
             }
-            require(orderedChunks.map { it.chunkIndex } == (1..orderedChunks.size).toList()) {
+            require(source.chunks.map { it.chunkIndex } == (1..source.chunks.size).toList()) {
                 "Corpus document ${source.document.id} has non-contiguous chunk indexes."
             }
         }
@@ -122,18 +125,17 @@ internal object CorpusReplayScheduler {
                     while (active.isNotEmpty()) {
                         val selectedIndex = random.nextInt(active.size)
                         val cursor = active[selectedIndex]
-                        val orderedChunks = cursor.source.chunks.sortedBy { it.chunkIndex }
                         appendChunk(
                             result = result,
                             source = cursor.source,
-                            chunk = orderedChunks[cursor.nextChunkIndex],
+                            chunk = cursor.source.chunks[cursor.nextChunkIndex],
                             chunkIndexWithinEpoch = cursor.nextChunkIndex,
                             epochIndex = epochIndex,
                             epochs = epochs
                         )
 
                         cursor.nextChunkIndex += 1
-                        if (cursor.nextChunkIndex >= orderedChunks.size) {
+                        if (cursor.nextChunkIndex >= cursor.source.chunks.size) {
                             active.removeAt(selectedIndex)
                         }
                     }
@@ -150,7 +152,7 @@ internal object CorpusReplayScheduler {
         epochIndex: Int,
         epochs: Int
     ) {
-        source.chunks.sortedBy { it.chunkIndex }.forEachIndexed { index, chunk ->
+        source.chunks.forEachIndexed { index, chunk ->
             appendChunk(
                 result = result,
                 source = source,
