@@ -31,6 +31,10 @@ Publishing a versioned GitHub Release (for example, `v1.0.7`) runs release lint,
 
 The private repository keeps the CI signing-key backup in the private GitHub Release named `argus-signing-key`. Repository access therefore also grants access to the app-signing identity. Keep this repository private and restrict collaborator access. Never redistribute the signing-key asset.
 
+## Background training service
+
+The foreground service uses the `specialUse` type alone on Android 14 (API 34) and later for the ongoing user-visible local compute workload. Android 13 (API 33) uses the legacy `dataSync` compatibility type because `specialUse` did not exist on that platform. The manifest retains both declarations for this version split and supplies the required `specialUse` subtype explanation. Google Play still reviews the declared `specialUse` use case; declaring it does not guarantee policy approval.
+
 ## Local knowledge ingestion
 
 ### Web retrieval
