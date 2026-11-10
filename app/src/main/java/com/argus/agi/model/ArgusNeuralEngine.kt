@@ -886,7 +886,42 @@ class ArgusNeuralEngine private constructor(
         }
 
         // ============================ BACKWARD ============================
-        // Alokasi Gradient Accumulators untuk seluruh tensor (Minibatch Pattern)
+        var totalLoss = 0f
+        var validSteps = 0
+
+        require(firstTargetIndex in 0 until seqLen - 1) {
+            "firstTargetIndex must identify at least one next-token target."
+        }
+
+        // Validation-only evaluation computes loss without allocating any gradient tensors.
+        if (!updateParameters && gradientProbe == null) {
+            for (t in firstTargetIndex until seqLen - 1) {
+                val target = seq[t + 1]
+                if (target !in 0 until currentVocab) continue
+
+                val logitRow = logits[t]
+                var maxLogit = -Float.MAX_VALUE
+                for (vocabIndex in 0 until currentVocab) {
+                    if (logitRow[vocabIndex] > maxLogit) maxLogit = logitRow[vocabIndex]
+                }
+
+                var sumExp = 0f
+                for (vocabIndex in 0 until currentVocab) {
+                    sumExp += exp(logitRow[vocabIndex] - maxLogit)
+                }
+
+                val logProbability =
+                    (logitRow[target] - maxLogit) - ln(max(sumExp, 1e-9f))
+                val loss = -logProbability
+                if (loss.isFinite()) {
+                    totalLoss += loss
+                    validSteps++
+                }
+            }
+            return if (validSteps > 0) totalLoss / validSteps else Float.NaN
+        }
+
+        // Backpropagation buffers are allocated only for optimizer updates or explicit diagnostics.
         val gradWHead = FloatArray(currentVocab * dModel)
         val gradWEmbed = FloatArray(vocabCap * dModel)
         val gradWDown = FloatArray(dFf * dModel)
@@ -911,40 +946,42 @@ class ArgusNeuralEngine private constructor(
         val dK = Array(seqLen) { FloatArray(dModel) }
         val dV = Array(seqLen) { FloatArray(dModel) }
 
-        var totalLoss = 0f
-        var validSteps = 0
-
-        // (1) Cross-Entropy & Akumulasi Gradien Head (TANPA mutasi in-place)
-        require(firstTargetIndex in 0 until seqLen - 1) {
-            "firstTargetIndex must identify at least one next-token target."
-        }
+        // (1) Cross-Entropy & Gradient Accumulation for the Output Head.
         for (t in firstTargetIndex until seqLen - 1) {
             val target = seq[t + 1]
             if (target !in 0 until currentVocab) continue
-            val logitRow = logits[t]
-            var maxL = -Float.MAX_VALUE
-            for (vI in 0 until currentVocab) if (logitRow[vI] > maxL) maxL = logitRow[vI]
-            var sumExp = 0f
-            for (vI in 0 until currentVocab) sumExp += exp(logitRow[vI] - maxL)
-            val logProb = (logitRow[target] - maxL) - ln(max(sumExp, 1e-9f))
-            val loss = -logProb
-            if (loss.isFinite()) { totalLoss += loss; validSteps++ }
 
-            val invSumExp = 1f / max(sumExp, 1e-9f)
-            for (vI in 0 until currentVocab) {
-                val p = exp(logitRow[vI] - maxL) * invSumExp
-                val g = if (vI == target) p - 1f else p
-                val wOff = vI * dModel
-                for (d in 0 until dModel) {
-                    gradWHead[wOff + d] += g * h2[t][d]
-                    // Propagasi mundur menggunakan bobot wHead yang belum dimutasi
-                    dL_dh2PostLN[t][d] += g * wHead[wOff + d]
+            val logitRow = logits[t]
+            var maxLogit = -Float.MAX_VALUE
+            for (vocabIndex in 0 until currentVocab) {
+                if (logitRow[vocabIndex] > maxLogit) maxLogit = logitRow[vocabIndex]
+            }
+
+            var sumExp = 0f
+            for (vocabIndex in 0 until currentVocab) {
+                sumExp += exp(logitRow[vocabIndex] - maxLogit)
+            }
+
+            val logProbability =
+                (logitRow[target] - maxLogit) - ln(max(sumExp, 1e-9f))
+            val loss = -logProbability
+            if (loss.isFinite()) {
+                totalLoss += loss
+                validSteps++
+            }
+
+            val inverseSumExp = 1f / max(sumExp, 1e-9f)
+            for (vocabIndex in 0 until currentVocab) {
+                val probability = exp(logitRow[vocabIndex] - maxLogit) * inverseSumExp
+                val gradient = if (vocabIndex == target) probability - 1f else probability
+                val weightOffset = vocabIndex * dModel
+                for (dimension in 0 until dModel) {
+                    gradWHead[weightOffset + dimension] += gradient * h2[t][dimension]
+                    // Backpropagate using the unmodified output-head weights.
+                    dL_dh2PostLN[t][dimension] +=
+                        gradient * wHead[weightOffset + dimension]
                 }
             }
-        }
-
-        if (!updateParameters && gradientProbe == null) {
-            return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
 
         // (2) SwiGLU MLP & Residual Backward
