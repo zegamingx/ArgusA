@@ -57,7 +57,7 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - Clearing the pending training queue does not delete retained corpus documents or their chunks.
 - Retained documents can be replayed into the training queue without reopening the original file or fetching the article again.
 - Corpus status records whether training is ready, active, complete, or partial after a failed chunk.
-- Room schema version 2 adds corpus tables and an optional training-item document reference through an additive version 1 to 2 migration. Existing chat, memory, and training-queue rows are preserved; destructive migration fallback is not enabled.
+- Room schema version 2 adds corpus tables and an optional training-item document reference through an additive version 1 to 2 migration. Existing chat, memory, and training-queue rows are preserved; destructive migration fallback is not enabled. Legacy queue rows remain valid but are not retroactively grouped into corpus documents because their original document boundaries and fingerprints were not stored.
 
 ## On-device training scope
 
