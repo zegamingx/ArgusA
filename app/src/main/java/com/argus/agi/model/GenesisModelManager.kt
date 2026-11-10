@@ -37,44 +37,44 @@ data class GenesisIdentity(
 
 enum class GenesisLifecycleStage(val displayName: String, val description: String) {
     IDLE(
-        "Menunggu Inisialisasi",
-        "Sistem siap melakukan Local Knowledge Genesis."
+        "Waiting for initialization",
+        "The system is ready to initialize a local model."
     ),
     ASSESSING_DEVICE(
         "Assessing device",
-        "Mendeteksi kemampuan CPU, GPU/NPU, RAM, storage, thermal, dan kondisi perangkat."
+        "Assessing CPU/GPU capabilities, RAM, storage, thermal state, and device health."
     ),
     SELECTING_CONFIGURATION(
         "Selecting configuration",
-        "Memilih konfigurasi model yang sesuai kemampuan HP."
+        "Selecting a model configuration that fits the device capacity."
     ),
     PREPARING_TOKENIZER(
         "Preparing tokenizer",
-        "Menyiapkan tokenizer yang kompatibel sebelum tensor model dibuat."
+        "Preparing the tokenizer before model tensors are allocated."
     ),
     CONSTRUCTING_MODEL(
         "Constructing model",
-        "Membentuk struktur neural network dan alokasi tensor."
+        "Building the neural network structure and allocating tensors."
     ),
     INITIALIZING_PARAMETERS(
         "Initializing parameters",
-        "Membuat bobot awal secara lokal, bukan mengunduh pretrained model."
+        "Initializing model weights locally without downloading a pretrained model."
     ),
     COMMITTING_INITIAL_GENERATION(
         "Committing initial generation",
-        "Memvalidasi dan menyimpan generasi awal secara aman."
+        "Validating and safely saving the initial model generation."
     ),
     APPLICATION_READY(
         "Application ready",
-        "Argus membuka aplikasi setelah generasi awal berhasil disimpan."
+        "Argus can open after the initial model generation is saved."
     ),
     GENERAL_LEARNING_SCHEDULED(
         "General learning scheduled",
-        "Training corpus berlanjut di background, tidak menahan pengguna di loading screen."
+        "Corpus training continues in the background without blocking the loading screen."
     ),
     FAILED(
-        "Genesis gagal",
-        "Terjadi kesalahan saat inisialisasi. Aplikasi akan mencoba lagi saat kondisi perangkat membaik."
+        "Genesis failed",
+        "Initialization failed. Argus can retry when device conditions improve."
     );
 
     companion object {
@@ -137,8 +137,8 @@ class GenesisModelManager(
                 progress = 1.0f,
                 assessedDetails = "Model Origin: ${existing.originId} | ${existing.deviceRamGb}GB RAM | ${existing.computeTarget}",
                 stageLog = listOf(
-                    "Model Genesis Identity terverifikasi di penyimpanan perangkat.",
-                    "Generasi 0 divalidasi: ${existing.parameterCount} parameter aktif."
+                    "Genesis identity verified in local storage.",
+                    "Generation 0 verified: ${existing.parameterCount} active parameters."
                 ),
                 identity = existing,
                 isComplete = true
@@ -188,7 +188,7 @@ class GenesisModelManager(
             try {
                 runGenesis(hardwareInfo, trainingManager)
             } catch (t: Throwable) {
-                Log.e(TAG, "Genesis gagal di stage ${_lifecycleState.value.stage}", t)
+                Log.e(TAG, "Genesis failed during stage ${_lifecycleState.value.stage}", t)
                 _lifecycleState.update {
                     it.copy(
                         stage = GenesisLifecycleStage.FAILED,
@@ -196,7 +196,7 @@ class GenesisModelManager(
                         errorMessage = t.message ?: t.javaClass.simpleName
                     )
                 }
-                throw GenesisException("Genesis gagal: ${t.message}", t)
+                throw GenesisException("Genesis failed: ${t.message}", t)
             }
         }
     }
@@ -222,38 +222,38 @@ class GenesisModelManager(
         }
 
         publish(GenesisLifecycleStage.ASSESSING_DEVICE,
-            "CPU: ${hardwareInfo.cpuCores} Cores | RAM: ${hardwareInfo.totalRamGb}GB | Storage: Probing...")
+            "CPU cores: ${hardwareInfo.cpuCores} | RAM: ${hardwareInfo.totalRamGb} GB | Checking storage...")
 
         val safety = deviceGuard.safetyState.value
         val freeStorageGb = calculateFreeStorageGb()
 
-        logs += "Memulai audit hardware: ${Build.MANUFACTURER} ${Build.MODEL} " +
+        logs += "Starting hardware assessment: ${Build.MANUFACTURER} ${Build.MODEL} " +
                 "(${hardwareInfo.socManufacturer} ${hardwareInfo.socModel})"
         logs += "CPU Cores: ${hardwareInfo.cpuCores} | SoC: ${hardwareInfo.socManufacturer} | " +
-                "Akselerator: ${hardwareInfo.primaryAccelerator}"
-        logs += "RAM: ${hardwareInfo.totalRamGb} GB (Tersedia: " +
+                "Hardware capability: ${hardwareInfo.primaryAccelerator}"
+        logs += "RAM: ${hardwareInfo.totalRamGb} GB (Available: " +
                 "${String.format(Locale.US, "%.1f", hardwareInfo.availRamGb)} GB) | " +
-                "Storage Bebas: $freeStorageGb GB"
-        logs += "Baterai: ${safety.batteryPct}% | Suhu: " +
+                "Free storage: $freeStorageGb GB"
+        logs += "Battery: ${safety.batteryPct}% | Temperature: " +
                 "${String.format(Locale.US, "%.1f", safety.temperatureCelsius)}°C"
 
         if (freeStorageGb < minFreeStorageGb) {
             throw GenesisException(
-                "Storage tidak cukup: ${freeStorageGb}GB (butuh minimal ${minFreeStorageGb}GB)")
+                "Insufficient storage: ${freeStorageGb} GB (at least ${minFreeStorageGb} GB required)")
         }
         if (safety.batteryPct in 0..minBatteryPct) {
             throw GenesisException(
-                "Baterai terlalu rendah (${safety.batteryPct}%) untuk inisialisasi model.")
+                "Battery level is too low (${safety.batteryPct}%) to initialize the model.")
         }
         if (safety.temperatureCelsius > maxThermalCelsius) {
             throw GenesisException(
-                "Suhu perangkat ${String.format(Locale.US, "%.1f", safety.temperatureCelsius)}°C " +
-                        "melebihi batas aman ${maxThermalCelsius}°C.")
+                "Device temperature ${String.format(Locale.US, "%.1f", safety.temperatureCelsius)}°C " +
+                        "exceeds the safe limit of ${maxThermalCelsius}°C.")
         }
         throttleStage()
 
         publish(GenesisLifecycleStage.SELECTING_CONFIGURATION,
-            "Memilih konfigurasi tensor berdasarkan budget komputasi perangkat...")
+            "Selecting tensor dimensions based on the device compute and memory budget...")
 
         val archTier = neuralEngine.config.architectureLabel
         val detectedAccelerators = buildList {
@@ -261,57 +261,57 @@ class GenesisModelManager(
             if (hardwareInfo.vulkanSupported) add("Vulkan ${hardwareInfo.vulkanVersionName}")
         }.distinct()
 
-        // NeuralEngine currently executes its tensor operations in Kotlin CPU loops.
-        // Detection must not be reported as an active NPU/Vulkan training backend.
-        val computeTarget = if (detectedAccelerators.isEmpty()) {
-            "Kotlin CPU backend"
+        // Vulkan accelerates eligible dense operations and AdamW after its runtime self-checks.
+        // Remaining operations continue to use the Kotlin CPU implementation.
+        val computeTarget = if (neuralEngine.isVulkanRuntimeReady) {
+            "Vulkan Compute for eligible dense operations and AdamW; Kotlin CPU fallback for remaining operations"
         } else {
-            "Kotlin CPU backend; detected but unused: ${detectedAccelerators.joinToString()}"
+            "Kotlin CPU backend; Vulkan runtime unavailable or not verified"
         }
-        logs += "Konfigurasi Terpilih: $archTier"
-        logs += "Backend Eksekusi: $computeTarget | Context Length: ${neuralEngine.maxSeqLen} Token"
+        logs += "Selected configuration: $archTier"
+        logs += "Execution policy: $computeTarget | Context length: ${neuralEngine.maxSeqLen} tokens"
         throttleStage()
 
         publish(GenesisLifecycleStage.PREPARING_TOKENIZER,
-            "Menyiapkan kamus token & token kontrol khusus sebelum alokasi tensor...")
+            "Preparing the tokenizer vocabulary and control tokens before tensor allocation...")
 
         val tokenizer = neuralEngine.tokenizer
-        logs += "Tokenizer Diinisialisasi: ${tokenizer.vocabSize} token dasar terverifikasi."
+        logs += "Tokenizer initialized with ${tokenizer.vocabSize} base tokens."
         logs += "Special Tokens: <pad>, <unk>, <s>, </s>, <user>, <assistant>, <think>, </think>"
         throttleStage()
 
         publish(GenesisLifecycleStage.CONSTRUCTING_MODEL,
-            "Membentuk arsitektur layer neural transformer & alokasi flat tensor...")
+            "Constructing the transformer architecture and allocating flat tensors...")
 
         val totalParams = neuralEngine.countTotalParameters()
         if (totalParams <= 0L) {
-            throw GenesisException("Alokasi parameter gagal: totalParams = $totalParams")
+            throw GenesisException("Parameter allocation failed: totalParams = $totalParams")
         }
         val adapterBytes = neuralEngine.calculateAdapterSizeBytes()
-        logs += "Alokasi Tensor: wEmbed, wPos, wQ, wK, wV, wO, SwiGLU, LM Head."
-        logs += "LoRA Adapters: ${String.format(Locale.US, "%.2f KB", adapterBytes / 1024.0)} " +
+        logs += "Allocated tensors: embeddings, positional vectors, Q/K/V/O projections, SwiGLU, and LM head."
+        logs += "LoRA adapters: ${String.format(Locale.US, "%.2f KB", adapterBytes / 1024.0)} " +
                 "(Rank ${neuralEngine.loraRank})."
-        logs += "Total parameter terstruktur: $totalParams (FP32)."
+        logs += "Total structured parameters: $totalParams (FP32)."
         throttleStage()
 
         publish(GenesisLifecycleStage.INITIALIZING_PARAMETERS,
-            "Membuat bobot awal secara lokal (Xavier / He Normal), zero cloud download...")
+            "Initializing model weights locally (Xavier / He normal); no pretrained weights are downloaded...")
 
-        logs += "Parameter diinisialisasi lokal via Xavier/Glorot Normal & Sinusoidal pos vectors."
-        logs += "LoRA A diinisialisasi Gaussian, LoRA B = 0 untuk stabilitas."
-        logs += "Verifikasi integritas: 0 byte diunduh dari cloud, identitas origin 100% lokal."
+        logs += "Parameters initialized locally with Xavier/Glorot initialization and sinusoidal positional vectors."
+        logs += "LoRA A uses Gaussian initialization; LoRA B starts at zero for stability."
+        logs += "Integrity check: no model weights downloaded; the model identity is created locally."
         throttleStage()
 
         publish(GenesisLifecycleStage.COMMITTING_INITIAL_GENERATION,
-            "Memvalidasi numerik forward pass & menyimpan checkpoint awal ARG3...")
+            "Validating the forward pass and saving the initial ARG3 checkpoint...")
 
         val sanityLoss = neuralEngine.evaluateLoss("A.R.G.U.S Genesis origin test.")
         if (!sanityLoss.isFinite()) {
-            throw GenesisException("Forward validation menghasilkan nilai tidak valid: $sanityLoss")
+            throw GenesisException("Forward validation produced an invalid loss: $sanityLoss")
         }
         val checkpointSaved = neuralEngine.saveCheckpoint()
         if (!checkpointSaved) {
-            throw GenesisException("Penyimpanan checkpoint awal gagal ditulis ke disk. Transaksi dibatalkan.")
+            throw GenesisException("The initial checkpoint could not be written to disk. Genesis was aborted.")
         }
 
         val originId = "GENESIS-" + UUID.randomUUID().toString().take(8).uppercase(Locale.US)
@@ -328,15 +328,15 @@ class GenesisModelManager(
         )
         saveIdentity(identity)
 
-        logs += "Validasi forward pass selesai tanpa optimizer update: loss awal = " +
+        logs += "Forward validation completed without an optimizer update: initial loss = " +
                 String.format(Locale.US, "%.4f", sanityLoss)
-        logs += "Checkpoint 'argus_model_weights.bin' (Format ARG3) diverifikasi tersimpan permanen."
-        logs += "Model Origin Identity Dikomit: $originId"
+        logs += "Checkpoint 'argus_model_weights.bin' (ARG3 format) was verified in local storage."
+        logs += "Model origin identity committed: $originId"
         throttleStage()
 
-        logs += "Aplikasi siap. Pengguna dapat langsung masuk ke terminal."
+        logs += "Application ready. The user can open the terminal."
         publish(GenesisLifecycleStage.APPLICATION_READY,
-            "Argus siap dibuka. Model Genesis Generasi 0 aktif.")
+            "Argus is ready. Genesis Generation 0 is active.")
         _lifecycleState.update {
             it.copy(identity = identity, isComplete = true)
         }
@@ -344,9 +344,9 @@ class GenesisModelManager(
         if (trainingManager != null) {
             val scheduled = ensureGeneralLearningCorpus(trainingManager)
             logs += if (scheduled == 0) {
-                "General learning corpus kosong atau sudah pernah dijadwalkan."
+                "The general-learning seed corpus is empty or has already been scheduled."
             } else {
-                "General learning scheduled: $scheduled item corpus masuk antrean background."
+                "General learning scheduled: $scheduled corpus items added to the background queue."
             }
         }
         _lifecycleState.update {
@@ -385,7 +385,7 @@ class GenesisModelManager(
                 if (dataGb > 0L) dataGb else 8L // Fallback for JVM/Robolectric test harness
             }
         } catch (e: Exception) {
-            Log.w(TAG, "StatFs gagal; fallback ke 8GB", e)
+            Log.w(TAG, "StatFs failed; using the 8 GB fallback for this environment.", e)
             8L
         }
     }
@@ -420,7 +420,7 @@ class GenesisModelManager(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                Log.w(TAG, "Gagal memulihkan Genesis seed '$title'", error)
+                Log.w(TAG, "Failed to restore Genesis seed '$title'", error)
                 0
             }
             scheduledChunks += queuedChunks
@@ -438,7 +438,7 @@ class GenesisModelManager(
             .putString(KEY_ARCH_TIER, identity.architectureTier)
             .commit()
         if (!ok) {
-            throw GenesisException("Gagal mengkomit Genesis Identity ke SharedPreferences. Transaksi dibatalkan.")
+            throw GenesisException("Failed to commit the Genesis identity to SharedPreferences. The transaction was aborted.")
         }
     }
 

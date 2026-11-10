@@ -116,6 +116,10 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     val lossHistory: StateFlow<List<Float>> = trainingManager.lossHistory
     val isTrainingPaused: StateFlow<Boolean> = trainingManager.isTrainingPaused
     val totalStepsExecuted: StateFlow<Int> = trainingManager.totalStepsExecuted
+    val engineConfig get() = neuralEngine.config
+    val activeComputeBackend get() = neuralEngine.optimizerBackend
+    val isVulkanRuntimeReady get() = neuralEngine.isVulkanRuntimeReady
+    val checkpointInterval get() = neuralEngine.checkpointInterval
     val worldEntities: StateFlow<List<WorldEntity>> = worldModel.entitiesFlow
     val currentContextSummary: StateFlow<String> = worldModel.currentContextSummary
     val genesisState: StateFlow<com.argus.agi.model.GenesisLifecycleState> = genesisModelManager.lifecycleState
