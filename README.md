@@ -66,6 +66,8 @@ Fresh model initialization selects tensor dimensions using total RAM, app heap, 
 
 Training currently uses causal next-token cross-entropy, full-parameter backpropagation, gradient clipping, and Adam. Imported documents can be scheduled for up to three passes on devices that meet the memory thresholds; smaller or larger documents use fewer passes. Loss-only validation skips backpropagation gradient-buffer allocation and does not update model weights or optimizer state. An internal central finite-difference diagnostic and test cover representative output-head, embedding, MLP, attention, and LoRA parameter groups; execution remains part of final verification.
 
+Within each context window, gradients are accumulated over its scored next-token positions and one Adam update is applied. Longer inputs are split into sliding windows with up to 24 tokens of overlap; each window performs its own optimizer update. The `trainStep` loss is a target-count-weighted aggregate of the window losses measured before each window update. It is a training-progress statistic, not a single post-update evaluation of the full document.
+
 Current limitations:
 
 - The tokenizer uses a fixed seed vocabulary and deterministic Unicode fallback. A learned BPE/Unigram tokenizer is not implemented.
