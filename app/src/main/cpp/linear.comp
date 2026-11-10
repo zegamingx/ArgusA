@@ -1,0 +1,42 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer TrainingBuffer {
+    float values[];
+};
+
+layout(push_constant) uniform LinearParameters {
+    uint rowCount;
+    uint inputColumns;
+    uint outputColumns;
+    uint inputOffset;
+    uint weightOffset;
+    uint outputOffset;
+    uint transposeWeights;
+} parameters;
+
+void main() {
+    const uint outputIndex = gl_GlobalInvocationID.x;
+    const uint outputElementCount = parameters.rowCount * parameters.outputColumns;
+    if (outputIndex >= outputElementCount) {
+        return;
+    }
+
+    const uint row = outputIndex / parameters.outputColumns;
+    const uint column = outputIndex - row * parameters.outputColumns;
+    const uint inputRowOffset = parameters.inputOffset + row * parameters.inputColumns;
+
+    float sum = 0.0;
+    for (uint inner = 0u; inner < parameters.inputColumns; ++inner) {
+        uint weightIndex;
+        if (parameters.transposeWeights == 0u) {
+            weightIndex = parameters.weightOffset + inner * parameters.outputColumns + column;
+        } else {
+            weightIndex = parameters.weightOffset + column * parameters.inputColumns + inner;
+        }
+        sum += values[inputRowOffset + inner] * values[weightIndex];
+    }
+
+    values[parameters.outputOffset + outputIndex] = sum;
+}

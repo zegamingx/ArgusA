@@ -875,9 +875,15 @@ class ArgusNeuralEngine private constructor(
 
         for (t in 0 until seqLen) {
             computeTokenEmbedAndPos(seq[t], t, embedScale, x[t])
-            computeLinearWithLora(x[t], wQ, loraQa, loraQb, dModel, dModel, loraRank, mQ[t], q[t])
-            computeLinear(x[t], wK, dModel, dModel, k[t])
-            computeLinearWithLora(x[t], wV, loraVa, loraVb, dModel, dModel, loraRank, mV[t], v[t])
+        }
+
+        computeLinearBatch(x, wQ, dModel, dModel, q)
+        computeLinearBatch(x, wK, dModel, dModel, k)
+        computeLinearBatch(x, wV, dModel, dModel, v)
+
+        for (t in 0 until seqLen) {
+            addLoraProjection(x[t], loraQa, loraQb, dModel, dModel, loraRank, mQ[t], q[t])
+            addLoraProjection(x[t], loraVa, loraVb, dModel, dModel, loraRank, mV[t], v[t])
         }
 
         val attnWeights = attnWeightsCache
@@ -907,32 +913,37 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
-        val projBuf = FloatArray(dModel)
-        val downBuf = FloatArray(dModel)
+        computeLinearBatch(attnOut, wO, dModel, dModel, h1PreLN)
         for (t in 0 until seqLen) {
-            computeLinear(attnOut[t], wO, dModel, dModel, projBuf)
-            for (d in 0 until dModel) h1PreLN[t][d] = x[t][d] + projBuf[d]
+            for (d in 0 until dModel) h1PreLN[t][d] += x[t][d]
             System.arraycopy(h1PreLN[t], 0, h1[t], 0, dModel)
             layerNormInPlace(h1[t], dModel)
+        }
 
-            computeLinear(h1[t], wGate, dModel, dFf, gate[t])
-            computeLinear(h1[t], wUp, dModel, dFf, up[t])
+        computeLinearBatch(h1, wGate, dModel, dFf, gate)
+        computeLinearBatch(h1, wUp, dModel, dFf, up)
+        for (t in 0 until seqLen) {
             for (d in 0 until dFf) {
                 val sig = 1.0f / (1.0f + exp(-gate[t][d]))
                 act[t][d] = (gate[t][d] * sig) * up[t][d]
             }
-            computeLinear(act[t], wDown, dFf, dModel, downBuf)
-            for (d in 0 until dModel) h2PreLN[t][d] = h1[t][d] + downBuf[d]
+        }
+
+        computeLinearBatch(act, wDown, dFf, dModel, h2PreLN)
+        for (t in 0 until seqLen) {
+            for (d in 0 until dModel) h2PreLN[t][d] += h1[t][d]
             System.arraycopy(h2PreLN[t], 0, h2[t], 0, dModel)
             layerNormInPlace(h2[t], dModel)
-
-            for (vIdx in 0 until currentVocab) {
-                var sum = 0f
-                val wOff = vIdx * dModel
-                for (d in 0 until dModel) sum += h2[t][d] * wHead[wOff + d]
-                logits[t][vIdx] = sum
-            }
         }
+
+        computeLinearBatch(
+            inputs = h2,
+            weights = wHead,
+            inputColumns = dModel,
+            outputColumns = currentVocab,
+            outputs = logits,
+            transposeWeights = true
+        )
 
         // ============================ BACKWARD ============================
         // Loss-only evaluation exits before allocating gradient or backpropagation buffers.
@@ -1373,21 +1384,96 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
+    private fun computeLinearBatch(
+        inputs: Array<FloatArray>,
+        weights: FloatArray,
+        inputColumns: Int,
+        outputColumns: Int,
+        outputs: Array<FloatArray>,
+        transposeWeights: Boolean = false
+    ) {
+        val dispatchedToVulkan = VulkanTrainingBackend.tryApplyLinear(
+            inputRows = inputs,
+            weights = weights,
+            outputRows = outputs,
+            inputColumns = inputColumns,
+            outputColumns = outputColumns,
+            transposeWeights = transposeWeights
+        )
+        if (dispatchedToVulkan) return
+
+        if (transposeWeights) {
+            for (row in inputs.indices) {
+                computeLinearTransposed(
+                    inputs[row],
+                    weights,
+                    inputColumns,
+                    outputColumns,
+                    outputs[row]
+                )
+            }
+        } else {
+            for (row in inputs.indices) {
+                computeLinear(
+                    inputs[row],
+                    weights,
+                    inputColumns,
+                    outputColumns,
+                    outputs[row]
+                )
+            }
+        }
+    }
+
+    private fun computeLinearTransposed(
+        input: FloatArray,
+        weights: FloatArray,
+        inputColumns: Int,
+        outputColumns: Int,
+        output: FloatArray
+    ) {
+        for (column in 0 until outputColumns) {
+            var sum = 0f
+            val weightOffset = column * inputColumns
+            for (inner in 0 until inputColumns) {
+                sum += input[inner] * weights[weightOffset + inner]
+            }
+            output[column] = sum
+        }
+    }
+
     private fun computeLinearWithLora(
         x: FloatArray, wBase: FloatArray, loraA: FloatArray, loraB: FloatArray,
         inDim: Int, outDim: Int, rank: Int,
         midBuf: FloatArray, finalOut: FloatArray
     ) {
         computeLinear(x, wBase, inDim, outDim, finalOut)
-        for (c in 0 until rank) {
+        addLoraProjection(x, loraA, loraB, inDim, outDim, rank, midBuf, finalOut)
+    }
+
+    private fun addLoraProjection(
+        input: FloatArray,
+        loraA: FloatArray,
+        loraB: FloatArray,
+        inputColumns: Int,
+        outputColumns: Int,
+        rank: Int,
+        intermediate: FloatArray,
+        output: FloatArray
+    ) {
+        for (rankIndex in 0 until rank) {
             var sum = 0f
-            for (r in 0 until inDim) sum += x[r] * loraA[r * rank + c]
-            midBuf[c] = sum
+            for (inputIndex in 0 until inputColumns) {
+                sum += input[inputIndex] * loraA[inputIndex * rank + rankIndex]
+            }
+            intermediate[rankIndex] = sum
         }
-        for (c in 0 until outDim) {
+        for (outputIndex in 0 until outputColumns) {
             var sum = 0f
-            for (r in 0 until rank) sum += midBuf[r] * loraB[r * outDim + c]
-            finalOut[c] += sum
+            for (rankIndex in 0 until rank) {
+                sum += intermediate[rankIndex] * loraB[rankIndex * outputColumns + outputIndex]
+            }
+            output[outputIndex] += sum
         }
     }
 

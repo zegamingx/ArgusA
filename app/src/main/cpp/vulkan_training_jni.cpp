@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 
 #include "adamw_shader_spv.h"
+#include "linear_shader_spv.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -29,9 +30,22 @@ struct AdamwPushConstants {
     float gradientClipFactor;
 };
 
-// Must match the eight 32-bit scalar members in adamw.comp's push-constant block.
+// Both layouts must match their GLSL push-constant blocks exactly.
 static_assert(sizeof(AdamwPushConstants) == 32);
 static_assert(offsetof(AdamwPushConstants, gradientClipFactor) == 28);
+
+struct LinearPushConstants {
+    uint32_t rowCount;
+    uint32_t inputColumns;
+    uint32_t outputColumns;
+    uint32_t inputOffset;
+    uint32_t weightOffset;
+    uint32_t outputOffset;
+    uint32_t transposeWeights;
+};
+
+static_assert(sizeof(LinearPushConstants) == 28);
+static_assert(offsetof(LinearPushConstants, transposeWeights) == 24);
 
 struct VulkanRuntime {
     VkInstance instance = VK_NULL_HANDLE;
@@ -51,6 +65,7 @@ struct VulkanRuntime {
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline linearPipeline = VK_NULL_HANDLE;
 
     VkBuffer storageBuffer = VK_NULL_HANDLE;
     VkDeviceMemory storageMemory = VK_NULL_HANDLE;
@@ -115,6 +130,9 @@ void destroyRuntime() {
         vkDeviceWaitIdle(gRuntime.device);
         destroyStorageBuffer();
 
+        if (gRuntime.linearPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(gRuntime.device, gRuntime.linearPipeline, nullptr);
+        }
         if (gRuntime.pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(gRuntime.device, gRuntime.pipeline, nullptr);
         }
@@ -586,6 +604,51 @@ bool initializeRuntime() {
 
     if (result != VK_SUCCESS) {
         logError("Vulkan AdamW compute-pipeline creation failed.", result);
+        return false;
+    }
+
+    VkShaderModuleCreateInfo linearShaderInfo{};
+    linearShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    linearShaderInfo.codeSize = kArgusLinearShaderSpvSize;
+    linearShaderInfo.pCode =
+        reinterpret_cast<const uint32_t*>(kArgusLinearShaderSpv);
+
+    VkShaderModule linearShaderModule = VK_NULL_HANDLE;
+    result = vkCreateShaderModule(
+        gRuntime.device,
+        &linearShaderInfo,
+        nullptr,
+        &linearShaderModule
+    );
+    if (result != VK_SUCCESS) {
+        logError("Vulkan linear shader module creation failed.", result);
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo linearShaderStage{};
+    linearShaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    linearShaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    linearShaderStage.module = linearShaderModule;
+    linearShaderStage.pName = "main";
+
+    VkComputePipelineCreateInfo linearPipelineInfo{};
+    linearPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    linearPipelineInfo.stage = linearShaderStage;
+    linearPipelineInfo.layout = gRuntime.pipelineLayout;
+
+    result = vkCreateComputePipelines(
+        gRuntime.device,
+        VK_NULL_HANDLE,
+        1,
+        &linearPipelineInfo,
+        nullptr,
+        &gRuntime.linearPipeline
+    );
+
+    vkDestroyShaderModule(gRuntime.device, linearShaderModule, nullptr);
+
+    if (result != VK_SUCCESS) {
+        logError("Vulkan linear compute-pipeline creation failed.", result);
         return false;
     }
 
@@ -1062,6 +1125,271 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
     }
 
     releaseGroupReferences(env, groups);
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
+    JNIEnv* env,
+    jobject,
+    jfloatArray inputArray,
+    jfloatArray weightArray,
+    jfloatArray outputArray,
+    jint rowCount,
+    jint inputColumns,
+    jint outputColumns,
+    jboolean transposeWeights
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.linearPipeline == VK_NULL_HANDLE ||
+        inputArray == nullptr ||
+        weightArray == nullptr ||
+        outputArray == nullptr ||
+        rowCount <= 0 ||
+        inputColumns <= 0 ||
+        outputColumns <= 0) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t inputElements =
+        static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(inputColumns);
+    const uint64_t weightElements =
+        static_cast<uint64_t>(inputColumns) * static_cast<uint64_t>(outputColumns);
+    const uint64_t outputElements =
+        static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(outputColumns);
+    const uint64_t totalElements = inputElements + weightElements + outputElements;
+
+    if (inputElements > static_cast<uint64_t>(std::numeric_limits<jsize>::max()) ||
+        weightElements > static_cast<uint64_t>(std::numeric_limits<jsize>::max()) ||
+        outputElements > static_cast<uint64_t>(std::numeric_limits<jsize>::max()) ||
+        totalElements > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
+        totalElements > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float))) {
+        return JNI_FALSE;
+    }
+
+    if (env->GetArrayLength(inputArray) != static_cast<jsize>(inputElements) ||
+        env->GetArrayLength(weightArray) != static_cast<jsize>(weightElements) ||
+        env->GetArrayLength(outputArray) != static_cast<jsize>(outputElements)) {
+        return JNI_FALSE;
+    }
+
+    const size_t inputOffset = 0u;
+    const size_t weightOffset = static_cast<size_t>(inputElements);
+    const size_t outputOffset = static_cast<size_t>(inputElements + weightElements);
+    const size_t totalByteCount = static_cast<size_t>(totalElements) * sizeof(float);
+
+    if (totalByteCount > static_cast<size_t>(
+            gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange
+        )) {
+        return JNI_FALSE;
+    }
+
+    std::vector<float> packed;
+    try {
+        packed.resize(static_cast<size_t>(totalElements));
+    } catch (const std::bad_alloc&) {
+        logError("Not enough host memory to prepare a Vulkan linear operation.");
+        return JNI_FALSE;
+    }
+
+    env->GetFloatArrayRegion(
+        inputArray,
+        0,
+        static_cast<jsize>(inputElements),
+        packed.data() + inputOffset
+    );
+    env->GetFloatArrayRegion(
+        weightArray,
+        0,
+        static_cast<jsize>(weightElements),
+        packed.data() + weightOffset
+    );
+    if (env->ExceptionCheck()) {
+        return JNI_FALSE;
+    }
+
+    if (!ensureStorageBuffer(static_cast<VkDeviceSize>(totalByteCount))) {
+        logError("Vulkan linear storage-buffer allocation failed.");
+        return JNI_FALSE;
+    }
+
+    std::memcpy(gRuntime.mappedStorage, packed.data(), totalByteCount);
+
+    if (!gRuntime.hostCoherent) {
+        VkMappedMemoryRange flushRange{};
+        flushRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        flushRange.memory = gRuntime.storageMemory;
+        flushRange.offset = 0;
+        flushRange.size = VK_WHOLE_SIZE;
+
+        const VkResult flushResult = vkFlushMappedMemoryRanges(
+            gRuntime.device,
+            1,
+            &flushRange
+        );
+        if (flushResult != VK_SUCCESS) {
+            logError("Failed to flush Vulkan linear input memory.", flushResult);
+            return JNI_FALSE;
+        }
+    }
+
+    const uint64_t workGroupCount =
+        (outputElements + kLocalWorkGroupSize - 1u) / kLocalWorkGroupSize;
+    if (workGroupCount == 0 ||
+        workGroupCount > gRuntime.maxComputeWorkGroupCountX) {
+        logError("Vulkan linear dispatch exceeds the device work-group limit.");
+        return JNI_FALSE;
+    }
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset the Vulkan linear command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin the Vulkan linear command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkMemoryBarrier hostToComputeBarrier{};
+    hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    hostToComputeBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    hostToComputeBarrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        1,
+        &hostToComputeBarrier,
+        0,
+        nullptr,
+        0,
+        nullptr
+    );
+
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.linearPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0,
+        1,
+        &gRuntime.descriptorSet,
+        0,
+        nullptr
+    );
+
+    const LinearPushConstants pushConstants{
+        static_cast<uint32_t>(rowCount),
+        static_cast<uint32_t>(inputColumns),
+        static_cast<uint32_t>(outputColumns),
+        static_cast<uint32_t>(inputOffset),
+        static_cast<uint32_t>(weightOffset),
+        static_cast<uint32_t>(outputOffset),
+        transposeWeights == JNI_TRUE ? 1u : 0u
+    };
+
+    vkCmdPushConstants(
+        gRuntime.commandBuffer,
+        gRuntime.pipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        sizeof(LinearPushConstants),
+        &pushConstants
+    );
+
+    vkCmdDispatch(
+        gRuntime.commandBuffer,
+        static_cast<uint32_t>(workGroupCount),
+        1,
+        1
+    );
+
+    VkMemoryBarrier computeToHostBarrier{};
+    computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    computeToHostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    computeToHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+
+    vkCmdPipelineBarrier(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        0,
+        1,
+        &computeToHostBarrier,
+        0,
+        nullptr,
+        0,
+        nullptr
+    );
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish the Vulkan linear command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
+
+    result = vkQueueSubmit(gRuntime.computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    if (result != VK_SUCCESS) {
+        logError("Vulkan linear queue submission failed.", result);
+        return JNI_FALSE;
+    }
+
+    result = vkQueueWaitIdle(gRuntime.computeQueue);
+    if (result != VK_SUCCESS) {
+        logError("Vulkan linear queue did not complete.", result);
+        return JNI_FALSE;
+    }
+
+    if (!gRuntime.hostCoherent) {
+        VkMappedMemoryRange invalidateRange{};
+        invalidateRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        invalidateRange.memory = gRuntime.storageMemory;
+        invalidateRange.offset = 0;
+        invalidateRange.size = VK_WHOLE_SIZE;
+
+        result = vkInvalidateMappedMemoryRanges(
+            gRuntime.device,
+            1,
+            &invalidateRange
+        );
+        if (result != VK_SUCCESS) {
+            logError("Failed to invalidate Vulkan linear output memory.", result);
+            return JNI_FALSE;
+        }
+    }
+
+    const float* mappedValues = static_cast<const float*>(gRuntime.mappedStorage);
+    env->SetFloatArrayRegion(
+        outputArray,
+        0,
+        static_cast<jsize>(outputElements),
+        mappedValues + outputOffset
+    );
+    if (env->ExceptionCheck()) {
+        return JNI_FALSE;
+    }
+
     return JNI_TRUE;
 }
 

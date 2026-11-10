@@ -13,6 +13,7 @@ internal object VulkanTrainingBackend {
 
     private const val TAG = "VulkanTrainingBackend"
     private const val MIN_GPU_UPDATE_ELEMENTS = 49_152L
+    private const val MIN_LINEAR_OPERATION_COUNT = 262_144L
 
     @Volatile
     private var disabledAfterRuntimeFailure = false
@@ -41,6 +42,100 @@ internal object VulkanTrainingBackend {
     } catch (error: RuntimeException) {
         Log.w(TAG, "Native Vulkan initialization failed.", error)
         false
+    }
+
+    @Synchronized
+    fun tryApplyLinear(
+        inputRows: Array<FloatArray>,
+        weights: FloatArray,
+        outputRows: Array<FloatArray>,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean = false
+    ): Boolean {
+        require(inputRows.isNotEmpty()) { "Linear input must contain at least one row." }
+        require(inputColumns > 0 && outputColumns > 0) {
+            "Linear dimensions must be positive."
+        }
+        require(outputRows.size == inputRows.size) {
+            "Linear input and output row counts must match."
+        }
+        require(weights.size == inputColumns * outputColumns) {
+            "Linear weight size does not match its dimensions."
+        }
+        for (index in inputRows.indices) {
+            require(inputRows[index].size == inputColumns) {
+                "Linear input row $index has an unexpected width."
+            }
+            require(outputRows[index].size == outputColumns) {
+                "Linear output row $index has an unexpected width."
+            }
+        }
+
+        val operationCount = inputRows.size.toLong() *
+            inputColumns.toLong() *
+            outputColumns.toLong()
+        if (!nativeReady ||
+            disabledAfterRuntimeFailure ||
+            operationCount < MIN_LINEAR_OPERATION_COUNT) {
+            return false
+        }
+
+        val inputElementCount = inputRows.size * inputColumns
+        val outputElementCount = outputRows.size * outputColumns
+        val flattenedInput = FloatArray(inputElementCount)
+        val flattenedOutput = FloatArray(outputElementCount)
+
+        for (row in inputRows.indices) {
+            System.arraycopy(
+                inputRows[row],
+                0,
+                flattenedInput,
+                row * inputColumns,
+                inputColumns
+            )
+        }
+
+        val updated = try {
+            nativeApplyLinear(
+                input = flattenedInput,
+                weights = weights,
+                output = flattenedOutput,
+                rows = inputRows.size,
+                inputColumns = inputColumns,
+                outputColumns = outputColumns,
+                transposeWeights = transposeWeights
+            )
+        } catch (error: UnsatisfiedLinkError) {
+            Log.e(TAG, "Vulkan linear entry point is unavailable; disabling the backend.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Vulkan linear dispatch failed; disabling the backend.", error)
+            false
+        }
+
+        if (!updated) {
+            disabledAfterRuntimeFailure = true
+            _currentBackend = "Kotlin CPU"
+            runCatching { nativeDestroy() }
+                .onFailure { error ->
+                    Log.w(TAG, "Failed to release Vulkan after a linear dispatch failure.", error)
+                }
+            Log.w(TAG, "Vulkan linear dispatch was not completed; using the Kotlin CPU path.")
+            return false
+        }
+
+        for (row in outputRows.indices) {
+            System.arraycopy(
+                flattenedOutput,
+                row * outputColumns,
+                outputRows[row],
+                0,
+                outputColumns
+            )
+        }
+        _currentBackend = "Vulkan Compute (Linear)"
+        return true
     }
 
     @Synchronized
@@ -129,6 +224,16 @@ internal object VulkanTrainingBackend {
     }
 
     private external fun nativeInitialize(): Boolean
+
+    private external fun nativeApplyLinear(
+        input: FloatArray,
+        weights: FloatArray,
+        output: FloatArray,
+        rows: Int,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean
+    ): Boolean
 
     private external fun nativeApplyAdamWUpdate(
         parameterGroups: Array<FloatArray>,
