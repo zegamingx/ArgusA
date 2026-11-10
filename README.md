@@ -54,7 +54,7 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 
 - Imported documents are retained in Room as corpus-document metadata and normalized text chunks, independently from the active training queue.
 - A SHA-256/UTF-16BE fingerprint identifies the exact imported character sequence. Identical content is not scheduled for training twice, while additional source and rights-provenance records are retained.
-- Clearing the pending training queue does not delete retained corpus documents or their chunks, and does not delete a queue row once the worker has marked it active.
+- Clearing the pending training queue does not delete retained corpus documents or their chunks, and does not delete a queue row once the worker has marked it active. The clear transaction marks documents with removed unfinished work as `PARTIAL`; a sole active final chunk is allowed to finish and mark its document `TRAINED`.
 - Active queue rows are marked `TRAINING`; startup recovery returns interrupted rows to `QUEUED`. This is at-least-once recovery, so a chunk may be optimized again if the model checkpoint was saved but its completion status was not persisted before process death.
 - Retained documents can be replayed into the training queue without reopening the original file or fetching the article again.
 - Corpus status records whether training is ready, active, complete, or partial after a failed chunk.
