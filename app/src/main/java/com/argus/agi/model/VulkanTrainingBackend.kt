@@ -60,8 +60,13 @@ internal object VulkanTrainingBackend {
         require(outputRows.size == inputRows.size) {
             "Linear input and output row counts must match."
         }
-        require(weights.size == inputColumns * outputColumns) {
-            "Linear weight size does not match its dimensions."
+        val requiredWeightElements = inputColumns.toLong() * outputColumns.toLong()
+        require(requiredWeightElements <= Int.MAX_VALUE.toLong() &&
+            weights.size >= requiredWeightElements.toInt()) {
+            "Linear weight tensor is smaller than its dimensions."
+        }
+        require(transposeWeights || weights.size == requiredWeightElements.toInt()) {
+            "Non-transposed linear weights must exactly match their dimensions."
         }
         for (index in inputRows.indices) {
             require(inputRows[index].size == inputColumns) {
@@ -84,6 +89,11 @@ internal object VulkanTrainingBackend {
         val inputElementCount = inputRows.size * inputColumns
         val outputElementCount = outputRows.size * outputColumns
         val flattenedInput = FloatArray(inputElementCount)
+        val flattenedWeights = if (weights.size == requiredWeightElements.toInt()) {
+            weights
+        } else {
+            weights.copyOf(requiredWeightElements.toInt())
+        }
         val flattenedOutput = FloatArray(outputElementCount)
 
         for (row in inputRows.indices) {
@@ -99,7 +109,7 @@ internal object VulkanTrainingBackend {
         val updated = try {
             nativeApplyLinear(
                 input = flattenedInput,
-                weights = weights,
+                weights = flattenedWeights,
                 output = flattenedOutput,
                 rows = inputRows.size,
                 inputColumns = inputColumns,

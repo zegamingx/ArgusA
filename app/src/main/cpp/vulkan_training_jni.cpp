@@ -1170,7 +1170,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
     }
 
     if (env->GetArrayLength(inputArray) != static_cast<jsize>(inputElements) ||
-        env->GetArrayLength(weightArray) != static_cast<jsize>(weightElements) ||
+        env->GetArrayLength(weightArray) < static_cast<jsize>(weightElements) ||
         env->GetArrayLength(outputArray) != static_cast<jsize>(outputElements)) {
         return JNI_FALSE;
     }
