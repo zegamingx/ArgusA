@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: argus-main-build-${{ github.ref }}
@@ -138,5 +138,30 @@ jobs:
 
           mkdir -p dist
           cp "${apk_path}" "dist/ARGUS-v${VERSION_NAME}.apk"
+          cp "${apk_path}" "dist/ARGUS.apk"
           (cd dist && sha256sum "ARGUS-v${VERSION_NAME}.apk" > "ARGUS-v${VERSION_NAME}.apk.sha256")
+          (cd dist && sha256sum "ARGUS.apk" > "ARGUS.apk.sha256")
           echo "APK signature verified against the persistent Argus upload certificate."
+
+      - name: Publish latest signed APK to GitHub Release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_path="app/build/outputs/apk/release/app-release.apk"
+          release_apk="ARGUS-v${VERSION_NAME}.apk"
+          cp "${apk_path}" "${release_apk}"
+          cp "${apk_path}" "ARGUS.apk"
+
+          # Upload directly to the 'Release' tag release page
+          if gh release view "Release" >/dev/null 2>&1; then
+            echo "Updating existing Release tag with latest APK..."
+            gh release upload "Release" "${release_apk}" "ARGUS.apk" --clobber
+          else
+            echo "Creating Release tag and publishing latest APK..."
+            gh release create "Release" "${release_apk}" "ARGUS.apk" \
+              --title "Argus Latest Release" \
+              --notes "Latest signed release APK for Argus (v${VERSION_NAME}). Automatically published from main build."
+          fi
+          echo "Successfully published APK to https://github.com/${{ github.repository }}/releases/tag/Release"

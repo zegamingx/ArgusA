@@ -15,7 +15,7 @@ concurrency:
 jobs:
   build-release:
     if: >-
-      startsWith(github.event.release.tag_name, 'v') &&
+      (startsWith(github.event.release.tag_name, 'v') || github.event.release.tag_name == 'Release') &&
       github.event.release.tag_name != 'v1.0.6'
     name: Lint, test, sign and publish APK
     runs-on: ubuntu-24.04
@@ -78,12 +78,13 @@ jobs:
           patch="$(awk -F= '$1 == "VERSION_PATCH" { print $2 }' version.properties)"
           expected_tag="v${major}.${minor}.${patch}"
 
-          if [[ "${release_tag}" != "${expected_tag}" ]]; then
-            echo "::error::Release tag ${release_tag} does not match version.properties (${expected_tag})."
+          if [[ "${release_tag}" != "${expected_tag}" && "${release_tag}" != "Release" ]]; then
+            echo "::error::Release tag ${release_tag} does not match version.properties (${expected_tag}) or 'Release'."
             exit 1
           fi
 
           echo "RELEASE_TAG=${release_tag}" >> "${GITHUB_ENV}"
+          echo "VERSION_LABEL=v${major}.${minor}.${patch}" >> "${GITHUB_ENV}"
           echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
           echo "Building ${release_tag} from $(git rev-parse HEAD)"
 
@@ -198,20 +199,15 @@ jobs:
           apk_path="app/build/outputs/apk/release/app-release.apk"
           release_apk="ARGUS-${RELEASE_TAG}.apk"
           cp "${apk_path}" "${release_apk}"
+          cp "${apk_path}" "ARGUS.apk"
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" "${release_apk}" --clobber
+            gh release upload "${RELEASE_TAG}" "${release_apk}" "ARGUS.apk" --clobber
           else
-            gh release create "${RELEASE_TAG}" "${release_apk}" \
+            gh release create "${RELEASE_TAG}" "${release_apk}" "ARGUS.apk" \
               --target "${SOURCE_SHA}" \
               --title "Argus ${RELEASE_TAG}" \
               --generate-notes
           fi
 
-          echo "Published ${release_apk} to ${RELEASE_TAG}."
-
-          # Remove the previous misnamed debug-preview release after the real
-          # versioned release has been published successfully.
-          if gh release view "Release" >/dev/null 2>&1; then
-            gh release delete "Release" --yes --cleanup-tag
-          fi
+          echo "Published ${release_apk} and ARGUS.apk to ${RELEASE_TAG}."

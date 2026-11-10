@@ -28,6 +28,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -99,6 +100,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainScreen(viewModel: ArgusViewModel) {
     val context = LocalContext.current
+    val isMessagesLoaded by viewModel.isMessagesLoaded.collectAsState()
     var showGenesisBoot by rememberSaveable { mutableStateOf(!viewModel.hasSeenGenesisBoot()) }
     var currentScreen by rememberSaveable { mutableStateOf(ArgusScreen.CHAT) }
     var hasRequestedNotificationPermission by rememberSaveable { mutableStateOf(false) }
@@ -107,6 +109,15 @@ fun MainScreen(viewModel: ArgusViewModel) {
         GenesisBootScreen(
             viewModel = viewModel,
             onFinish = { showGenesisBoot = false }
+        )
+        return
+    }
+
+    // Modern Loading Screen saat masuk aplikasi kembali sebelum data terinisialisasi
+    if (!isMessagesLoaded) {
+        com.argus.agi.ui.components.ArgusModernLoadingScreen(
+            title = "A . R . G . U . S",
+            subtitle = "MEMULIHKAN NEURAL CORE & RIWAYAT..."
         )
         return
     }

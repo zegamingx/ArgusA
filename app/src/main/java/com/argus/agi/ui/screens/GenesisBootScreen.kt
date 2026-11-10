@@ -103,6 +103,15 @@ fun GenesisBootScreen(
         }
     }
 
+    // Masuk otomatis setelah selesai generate model (tidak perlu klik tombol masuk)
+    LaunchedEffect(isReady) {
+        if (isReady) {
+            delay(1200) // Beri waktu sejenak untuk animasi transisi neuron selesai secara mulus
+            viewModel.markGenesisBootSeen()
+            onFinish()
+        }
+    }
+
     val infiniteTransition = rememberInfiniteTransition(label = "genesis_infinite")
 
     val scanY by infiniteTransition.animateFloat(
@@ -528,16 +537,16 @@ fun GenesisBootScreen(
                                 .height(50.dp)
                                 .testTag("enter_terminal_button")
                         ) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_symbol_check_circle),
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp)
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                color = ArgusDarkBg,
+                                strokeWidth = 2.dp
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "MASUK TERMINAL AGI",
+                                text = "CORE SIAP • MEMASUKI TERMINAL...",
                                 fontWeight = FontWeight.Bold,
-                                fontSize = 13.sp,
+                                fontSize = 12.sp,
                                 letterSpacing = 1.sp
                             )
                         }

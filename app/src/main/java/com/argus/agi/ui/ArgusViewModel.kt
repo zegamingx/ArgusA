@@ -99,6 +99,9 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
 
+    private val _isMessagesLoaded = MutableStateFlow(false)
+    val isMessagesLoaded: StateFlow<Boolean> = _isMessagesLoaded.asStateFlow()
+
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
 
@@ -248,6 +251,9 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         appendMessage(initialMsg)
                     }
                 }
+            }
+            withContext(Dispatchers.Main) {
+                _isMessagesLoaded.value = true
             }
         }
 
