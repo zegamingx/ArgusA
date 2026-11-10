@@ -90,6 +90,29 @@ class CorpusPersistenceTest {
             assertEquals(1, repository.getCorpusDocumentCount())
             assertEquals(3, repository.getCorpusSources(document.id).size)
 
+            val unverifiedArticleImport = manager.enqueueDocument(
+                source = "web_article|source=reviewed-page",
+                title = "Article source",
+                fullText = text,
+                canonicalUrl = "https://example.org/article",
+                rightsStatus = "UNVERIFIED"
+            )
+            assertEquals(0, unverifiedArticleImport)
+
+            val declaredArticleImport = manager.enqueueDocument(
+                source = "web_article|source=reviewed-page|rights_declared_by_user=true",
+                title = "Article source",
+                fullText = text,
+                canonicalUrl = "https://example.org/article",
+                rightsStatus = "USER_DECLARED"
+            )
+            assertEquals(0, declaredArticleImport)
+
+            val articleSource = repository.getCorpusSources(document.id)
+                .single { it.canonicalUrl == "https://example.org/article" }
+            assertEquals("USER_DECLARED", articleSource.rightsStatus)
+            assertEquals(4, repository.getCorpusSources(document.id).size)
+
             manager.clearQueue()
             manager.awaitQueuePersistenceIdle()
 
