@@ -57,17 +57,39 @@ class CorpusPersistenceTest {
                     language = "en"
                 )
             )
+            val shorterValidationText =
+                "A second independent held-out document tests corpus-level target weighting. ".repeat(5)
+            assertTrue(
+                manager.importValidationDocument(
+                    source = "Validation test",
+                    title = "Short held-out document",
+                    fullText = shorterValidationText,
+                    language = "en"
+                )
+            )
 
-            val heldOut = repository.getCorpusDocuments().single()
+            val heldOut = repository.getCorpusDocuments()
+                .single { it.validationText == validationText.trim() }
             assertEquals("VALIDATION", heldOut.datasetSplit)
             assertEquals(validationText.trim(), heldOut.validationText)
             assertEquals(0, heldOut.chunkCount)
             assertTrue(repository.getCorpusChunks(heldOut.id).isEmpty())
             assertTrue(repository.getPendingQueueSnapshot().isEmpty())
 
+            val firstDocumentLoss = engine.evaluateLossWithTargetCount(validationText)
+            val secondDocumentLoss = engine.evaluateLossWithTargetCount(shorterValidationText)
+            val expectedTargetCount =
+                firstDocumentLoss.targetCount + secondDocumentLoss.targetCount
+            val expectedWeightedLoss = (
+                firstDocumentLoss.meanLoss * firstDocumentLoss.targetCount +
+                    secondDocumentLoss.meanLoss * secondDocumentLoss.targetCount
+                ) / expectedTargetCount.toFloat()
+
             val evaluation = manager.evaluateValidationCorpus()
-            assertEquals(1, evaluation.corpusDocumentCount)
-            assertEquals(1, evaluation.evaluatedDocumentCount)
+            assertEquals(2, evaluation.corpusDocumentCount)
+            assertEquals(2, evaluation.evaluatedDocumentCount)
+            assertEquals(expectedTargetCount, evaluation.targetTokenCount)
+            assertEquals(expectedWeightedLoss, evaluation.meanLoss, 1e-5f)
             assertTrue(evaluation.targetTokenCount > 0)
             assertTrue(evaluation.meanLoss.isFinite())
             assertTrue(evaluation.perplexity.isFinite())
