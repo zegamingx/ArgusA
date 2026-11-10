@@ -2,6 +2,8 @@ package com.argus.agi.model
 
 import android.content.Context
 import android.util.Log
+import com.argus.agi.data.local.entity.CorpusChunkEntity
+import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.sensor.DeviceGuard
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -26,6 +28,9 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.Closeable
 import java.io.Reader
 import java.io.StringReader
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
 import kotlin.math.max
@@ -44,7 +49,8 @@ data class TrainingData(
     val timestamp: Long = System.currentTimeMillis(),
     val status: TrainingStatus = TrainingStatus.QUEUED,
     val finalLoss: Float? = null,
-    val stepDurationMs: Long = 0L
+    val stepDurationMs: Long = 0L,
+    val documentId: String? = null
 )
 
 data class ActiveDocumentTraining(
@@ -216,13 +222,16 @@ class TrainingManager(
     // Enqueue API
     // =====================================================================
 
-    fun enqueueDocument(
+    suspend fun enqueueDocument(
         source: String,
         title: String,
         fullText: String,
         chunkSize: Int = 380,
         overlap: Int = 50,
-        epochs: Int = 1
+        epochs: Int = 1,
+        language: String? = null,
+        canonicalUrl: String? = null,
+        rightsStatus: String = "UNVERIFIED"
     ): Int {
         require(chunkSize > overlap) {
             "chunkSize ($chunkSize) harus > overlap ($overlap) agar iterasi maju"
@@ -230,12 +239,53 @@ class TrainingManager(
         require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
             "epochs harus berada pada rentang 1..$MAX_DOCUMENT_EPOCHS"
         }
+        require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
+            "Unsupported corpus rights status: $rightsStatus"
+        }
+
         val clean = fullText.trim()
         if (clean.isBlank() || closed) return 0
 
         val processedChunks = TextModalityProcessor.process(clean, title, chunkSize, overlap)
         val chunksPerEpoch = processedChunks.size
         if (chunksPerEpoch == 0) return 0
+
+        val documentId = sha256Utf16Be(clean)
+        val corpusDocument = CorpusDocumentEntity(
+            id = documentId,
+            contentFingerprint = documentId,
+            fingerprintAlgorithm = "SHA-256/UTF-16BE",
+            source = source,
+            title = title,
+            language = language,
+            canonicalUrl = canonicalUrl,
+            characterCount = clean.length,
+            chunkCount = chunksPerEpoch,
+            plannedEpochs = epochs,
+            rightsStatus = rightsStatus,
+            status = "READY",
+            createdAtEpochMs = System.currentTimeMillis(),
+            lastTrainedAtEpochMs = null,
+            completedPassCount = 0
+        )
+        val corpusChunks = processedChunks.mapIndexed { index, chunk ->
+            CorpusChunkEntity(
+                id = "$documentId:${index + 1}",
+                documentId = documentId,
+                chunkIndex = index + 1,
+                content = chunk.content,
+                characterCount = chunk.content.length
+            )
+        }
+
+        val activeRepository = requireNotNull(repo) {
+            "Local corpus storage is unavailable; document training was not queued."
+        }
+        val stored = activeRepository.storeCorpusDocument(corpusDocument, corpusChunks)
+        if (!stored) {
+            Log.i(TAG, "Duplicate corpus document skipped: $documentId")
+            return 0
+        }
 
         val totalScheduledChunks = Math.multiplyExact(chunksPerEpoch, epochs)
         val newItems = ArrayList<TrainingData>(totalScheduledChunks)
@@ -256,7 +306,8 @@ class TrainingManager(
                     chunkIndex = epochIndex * chunksPerEpoch + chunkIndex + 1,
                     totalChunks = totalScheduledChunks,
                     documentTitle = title,
-                    status = TrainingStatus.QUEUED
+                    status = TrainingStatus.QUEUED,
+                    documentId = documentId
                 )
             }
         }
@@ -279,21 +330,28 @@ class TrainingManager(
     }
 
     /**
-     * Reads the source incrementally with a 4 KB input buffer and a sliding text window.
+     * Reads a source incrementally with a 4 KB input buffer and a sliding text window.
      *
-     * The generated chunk strings and queue items are still accumulated in memory until
-     * they are scheduled and persisted. Callers must apply file/decompression limits.
-     * This method is buffered ingestion, not a fully disk-backed or constant-memory queue.
+     * Corpus chunks are retained in Room independently from the transient training queue.
+     * The generated chunk strings are still accumulated in memory during this operation;
+     * this is buffered ingestion, not a constant-memory disk-backed queue.
+     *
+     * The fingerprint is computed over the exact UTF-16 code units read from the Reader,
+     * using SHA-256/UTF-16BE. This produces the same identity as enqueueDocument for the
+     * same character sequence, including when surrogate pairs cross read-buffer boundaries.
      *
      * @return Pair(number of generated chunks, total characters read)
      */
-    fun enqueueDocumentStream(
+    suspend fun enqueueDocumentStream(
         source: String,
         title: String,
         reader: Reader,
         chunkSize: Int = 380,
         overlap: Int = 50,
-        epochs: Int = 1
+        epochs: Int = 1,
+        language: String? = null,
+        canonicalUrl: String? = null,
+        rightsStatus: String = "UNVERIFIED"
     ): Pair<Int, Long> {
         require(chunkSize > overlap) {
             "chunkSize ($chunkSize) harus > overlap ($overlap) agar iterasi maju"
@@ -304,18 +362,26 @@ class TrainingManager(
         require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
             "epochs harus berada pada rentang 1..$MAX_DOCUMENT_EPOCHS"
         }
+        require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
+            "Unsupported corpus rights status: $rightsStatus"
+        }
         if (closed) return Pair(0, 0L)
 
         val rawChunks = mutableListOf<String>()
         val buffer = CharArray(4096)
         val window = StringBuilder()
+        val fingerprintDigest = MessageDigest.getInstance("SHA-256")
         var totalCharsRead = 0L
 
         while (true) {
             val readCount = reader.read(buffer)
             if (readCount < 0) break
-            if (closed) break
+            if (closed) {
+                rawChunks.clear()
+                return Pair(0, totalCharsRead)
+            }
 
+            updateUtf16BeDigest(fingerprintDigest, buffer, readCount)
             window.append(buffer, 0, readCount)
             totalCharsRead += readCount.toLong()
 
@@ -356,6 +422,11 @@ class TrainingManager(
             }
         }
 
+        if (closed) {
+            rawChunks.clear()
+            return Pair(0, totalCharsRead)
+        }
+
         val trailingRaw = TextModalityProcessor.normalizeTypography(window.toString().trim())
         val trailing = trailingRaw.lines().joinToString("\n") {
             TextModalityProcessor.formatStructuredLineIfJson(it)
@@ -364,6 +435,44 @@ class TrainingManager(
 
         val chunksPerEpoch = rawChunks.size
         if (chunksPerEpoch == 0) return Pair(0, totalCharsRead)
+
+        val documentId = fingerprintDigest.digest().toHexString()
+        val corpusDocument = CorpusDocumentEntity(
+            id = documentId,
+            contentFingerprint = documentId,
+            fingerprintAlgorithm = "SHA-256/UTF-16BE",
+            source = source,
+            title = title,
+            language = language,
+            canonicalUrl = canonicalUrl,
+            characterCount = totalCharsRead.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            chunkCount = chunksPerEpoch,
+            plannedEpochs = epochs,
+            rightsStatus = rightsStatus,
+            status = "READY",
+            createdAtEpochMs = System.currentTimeMillis(),
+            lastTrainedAtEpochMs = null,
+            completedPassCount = 0
+        )
+        val corpusChunks = rawChunks.mapIndexed { index, chunkText ->
+            CorpusChunkEntity(
+                id = "$documentId:${index + 1}",
+                documentId = documentId,
+                chunkIndex = index + 1,
+                content = chunkText,
+                characterCount = chunkText.length
+            )
+        }
+
+        val activeRepository = requireNotNull(repo) {
+            "Local corpus storage is unavailable; document training was not queued."
+        }
+        val stored = activeRepository.storeCorpusDocument(corpusDocument, corpusChunks)
+        if (!stored) {
+            Log.i(TAG, "Duplicate corpus document skipped: $documentId")
+            rawChunks.clear()
+            return Pair(0, totalCharsRead)
+        }
 
         val totalScheduledChunks = Math.multiplyExact(chunksPerEpoch, epochs)
         val newItems = ArrayList<TrainingData>(totalScheduledChunks)
@@ -383,7 +492,8 @@ class TrainingManager(
                     chunkIndex = epochIndex * chunksPerEpoch + chunkIndex + 1,
                     totalChunks = totalScheduledChunks,
                     documentTitle = title,
-                    status = TrainingStatus.QUEUED
+                    status = TrainingStatus.QUEUED,
+                    documentId = documentId
                 )
             }
         }
@@ -406,12 +516,76 @@ class TrainingManager(
         }
     }
 
+    /**
+     * Re-enqueues retained corpus chunks without re-reading the original file or web page.
+     * Queue clearing therefore does not delete the data needed for another training pass.
+     */
+    suspend fun replayCorpusDocument(
+        documentId: String,
+        epochs: Int = 1
+    ): Int {
+        require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
+            "epochs must be in 1..$MAX_DOCUMENT_EPOCHS."
+        }
+        if (closed) return 0
+
+        val activeRepository = requireNotNull(repo) {
+            "Local corpus storage is unavailable; corpus replay cannot be scheduled."
+        }
+        val document = activeRepository.getCorpusDocument(documentId) ?: return 0
+        val chunks = activeRepository.getCorpusChunks(documentId)
+        if (chunks.size != document.chunkCount || chunks.isEmpty()) {
+            throw IllegalStateException(
+                "Corpus document $documentId is incomplete: expected ${document.chunkCount} chunks, found ${chunks.size}."
+            )
+        }
+
+        val totalScheduledChunks = Math.multiplyExact(chunks.size, epochs)
+        val items = ArrayList<TrainingData>(totalScheduledChunks)
+        for (epochIndex in 0 until epochs) {
+            chunks.forEachIndexed { index, chunk ->
+                items += TrainingData(
+                    source = document.source,
+                    title = "${document.title} [Replay ${index + 1}/${chunks.size}] [Epoch ${epochIndex + 1}/$epochs]",
+                    content = chunk.content,
+                    chunkIndex = epochIndex * chunks.size + index + 1,
+                    totalChunks = totalScheduledChunks,
+                    documentTitle = document.title,
+                    status = TrainingStatus.QUEUED,
+                    documentId = document.id
+                )
+            }
+        }
+
+        activeRepository.markCorpusDocumentQueued(document.id)
+
+        synchronized(queueLock) {
+            if (closed) return 0
+            val orderedItems = appendPersistingQueueItems(items)
+            if (_activeDocument.value == null && orderedItems.isNotEmpty()) {
+                _activeDocument.value = ActiveDocumentTraining(
+                    docTitle = document.title,
+                    totalCharacters = document.characterCount,
+                    totalChunks = orderedItems.size,
+                    completedChunks = 0,
+                    currentChunkIndex = 1
+                )
+            }
+            return orderedItems.size
+        }
+    }
+
     fun enqueueData(source: String, title: String, content: String) {
         val trimmed = content.trim()
         if (trimmed.isBlank() || closed) return
 
         if (trimmed.length > 380) {
-            enqueueDocument(source, title, trimmed)
+            scope.launch {
+                runCatching { enqueueDocument(source, title, trimmed) }
+                    .onFailure { error ->
+                        Log.e(TAG, "Failed to persist long-form training input", error)
+                    }
+            }
             return
         }
 
@@ -436,6 +610,37 @@ class TrainingManager(
             }
             if (nonDuplicates.isNotEmpty()) {
                 appendPersistingQueueItems(nonDuplicates)
+            }
+        }
+    }
+
+    private fun sha256Utf16Be(text: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val bytes = text.toByteArray(Charsets.UTF_16BE)
+        return digest.digest(bytes).toHexString()
+    }
+
+    private fun updateUtf16BeDigest(
+        digest: MessageDigest,
+        chars: CharArray,
+        length: Int
+    ) {
+        val bytes = ByteArray(length * 2)
+        for (index in 0 until length) {
+            val value = chars[index].code
+            bytes[index * 2] = (value ushr 8).toByte()
+            bytes[index * 2 + 1] = value.toByte()
+        }
+        digest.update(bytes)
+    }
+
+    private fun ByteArray.toHexString(): String {
+        val alphabet = "0123456789abcdef"
+        return buildString(size * 2) {
+            for (byte in this@toHexString) {
+                val value = byte.toInt() and 0xFF
+                append(alphabet[value ushr 4])
+                append(alphabet[value and 0x0F])
             }
         }
     }
