@@ -877,9 +877,13 @@ class ArgusNeuralEngine private constructor(
             computeTokenEmbedAndPos(seq[t], t, embedScale, x[t])
         }
 
-        computeLinearBatch(x, wQ, dModel, dModel, q)
-        computeLinearBatch(x, wK, dModel, dModel, k)
-        computeLinearBatch(x, wV, dModel, dModel, v)
+        computeBatchedLinear(
+            inputs = arrayOf(x, x, x),
+            weights = arrayOf(wQ, wK, wV),
+            outputs = arrayOf(q, k, v),
+            inputColumns = dModel,
+            outputColumns = dModel
+        )
 
         for (t in 0 until seqLen) {
             addLoraProjection(x[t], loraQa, loraQb, dModel, dModel, loraRank, mQ[t], q[t])
@@ -1157,21 +1161,39 @@ class ArgusNeuralEngine private constructor(
             layerNormBackward(dL_dh1PostLN[t], h1PreLN[t], dL_dh1PreLN[t], dModel)
         }
 
-        for (t in 0 until seqLen - 1) {
-            // Accumulate gradW O and propagate through the attention output projection.
-            for (r in 0 until dModel) {
-                val aVal = attnOut[t][r]
-                val rOff = r * dModel
-                for (c in 0 until dModel) {
-                    gradWO[rOff + c] += aVal * dL_dh1PreLN[t][c]
-                }
-            }
+        val attentionBackwardRows = seqLen - 1
+        val attentionOutputRows = Array(attentionBackwardRows) { row -> attnOut[row] }
+        val outputProjectionGradientRows =
+            Array(attentionBackwardRows) { row -> dL_dh1PreLN[row] }
 
-            for (r in 0 until dModel) {
-                var sum = 0f
-                for (c in 0 until dModel) sum += dL_dh1PreLN[t][c] * wO[r * dModel + c]
-                dL_dattnOut[t][r] = sum
-            }
+        val gradWORows = Array(dModel) { FloatArray(dModel) }
+        computeLinearBatch(
+            inputs = transposeRows(attentionOutputRows),
+            weights = flattenRows(outputProjectionGradientRows),
+            inputColumns = attentionBackwardRows,
+            outputColumns = dModel,
+            outputs = gradWORows
+        )
+        System.arraycopy(flattenRows(gradWORows), 0, gradWO, 0, gradWO.size)
+
+        val attentionInputGradientRows =
+            Array(attentionBackwardRows) { FloatArray(dModel) }
+        computeLinearBatch(
+            inputs = outputProjectionGradientRows,
+            weights = wO,
+            inputColumns = dModel,
+            outputColumns = dModel,
+            outputs = attentionInputGradientRows,
+            transposeWeights = true
+        )
+        for (time in 0 until attentionBackwardRows) {
+            System.arraycopy(
+                attentionInputGradientRows[time],
+                0,
+                dL_dattnOut[time],
+                0,
+                dModel
+            )
         }
 
         // (3) Causal attention backward. Independent heads are processed as a batch,
@@ -1284,39 +1306,59 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
-        // (4) Attention Projection & LoRA Gradient Accumulation
-        for (t in 0 until seqLen - 1) {
-            // wQ, wK, wV
-            for (r in 0 until dModel) {
-                val xVal = x[t][r]
-                val rOff = r * dModel
-                for (c in 0 until dModel) {
-                    gradWQ[rOff + c] += xVal * dQ[t][c]
-                    gradWK[rOff + c] += xVal * dK[t][c]
-                    gradWV[rOff + c] += xVal * dV[t][c]
+        // (4) Q/K/V parameter gradients. The small rank-by-model LoRA updates
+        // remain on CPU to avoid extra synchronization for low-rank workloads.
+        val inputRowsForGradient = Array(attentionBackwardRows) { row -> x[row] }
+        val transposedInputRows = transposeRows(inputRowsForGradient)
+        val queryGradientRows = Array(attentionBackwardRows) { row -> dQ[row] }
+        val keyGradientRows = Array(attentionBackwardRows) { row -> dK[row] }
+        val valueGradientRows = Array(attentionBackwardRows) { row -> dV[row] }
+
+        val qkvGradientOutputs = Array(3) { Array(dModel) { FloatArray(dModel) } }
+        computeBatchedLinear(
+            inputs = arrayOf(transposedInputRows, transposedInputRows, transposedInputRows),
+            weights = arrayOf(
+                flattenRows(queryGradientRows),
+                flattenRows(keyGradientRows),
+                flattenRows(valueGradientRows)
+            ),
+            outputs = qkvGradientOutputs,
+            inputColumns = attentionBackwardRows,
+            outputColumns = dModel
+        )
+        System.arraycopy(flattenRows(qkvGradientOutputs[0]), 0, gradWQ, 0, gradWQ.size)
+        System.arraycopy(flattenRows(qkvGradientOutputs[1]), 0, gradWK, 0, gradWK.size)
+        System.arraycopy(flattenRows(qkvGradientOutputs[2]), 0, gradWV, 0, gradWV.size)
+
+        // LoRA Q/V gradients remain local and use the original rank-sized equations.
+        for (time in 0 until attentionBackwardRows) {
+            for (rankIndex in 0 until loraRank) {
+                val queryMidValue = mQ[time][rankIndex]
+                val valueMidValue = mV[time][rankIndex]
+                val queryGradientOffset = rankIndex * dModel
+                for (dimension in 0 until dModel) {
+                    gradLoraQb[queryGradientOffset + dimension] +=
+                        queryMidValue * dQ[time][dimension]
+                    gradLoraVb[queryGradientOffset + dimension] +=
+                        valueMidValue * dV[time][dimension]
                 }
             }
-
-            // LoRA Q
-            for (r in 0 until loraRank) {
-                val mqVal = mQ[t][r]
-                for (c in 0 until dModel) gradLoraQb[r * dModel + c] += mqVal * dQ[t][c]
-            }
-            for (c in 0 until loraRank) {
-                var sum = 0f
-                for (j in 0 until dModel) sum += dQ[t][j] * loraQb[c * dModel + j]
-                for (d in 0 until dModel) gradLoraQa[d * loraRank + c] += x[t][d] * sum
-            }
-
-            // LoRA V
-            for (r in 0 until loraRank) {
-                val mvVal = mV[t][r]
-                for (c in 0 until dModel) gradLoraVb[r * dModel + c] += mvVal * dV[t][c]
-            }
-            for (c in 0 until loraRank) {
-                var sum = 0f
-                for (j in 0 until dModel) sum += dV[t][j] * loraVb[c * dModel + j]
-                for (d in 0 until dModel) gradLoraVa[d * loraRank + c] += x[t][d] * sum
+            for (rankIndex in 0 until loraRank) {
+                var queryBackProjection = 0f
+                var valueBackProjection = 0f
+                val queryWeightOffset = rankIndex * dModel
+                for (dimension in 0 until dModel) {
+                    queryBackProjection +=
+                        dQ[time][dimension] * loraQb[queryWeightOffset + dimension]
+                    valueBackProjection +=
+                        dV[time][dimension] * loraVb[queryWeightOffset + dimension]
+                }
+                for (dimension in 0 until dModel) {
+                    gradLoraQa[dimension * loraRank + rankIndex] +=
+                        x[time][dimension] * queryBackProjection
+                    gradLoraVa[dimension * loraRank + rankIndex] +=
+                        x[time][dimension] * valueBackProjection
+                }
             }
         }
 
@@ -1336,28 +1378,32 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
-        for (t in 0 until seqLen - 1) {
-            val dX_t = FloatArray(dModel)
-            for (d in 0 until dModel) {
-                dX_t[d] += dL_dh1PreLN[t][d]
-                var sumQ = 0f
-                var sumK = 0f
-                var sumV = 0f
-                val dOff = d * dModel
-                for (c in 0 until dModel) {
-                    sumQ += dQ[t][c] * wQEff[dOff + c]
-                    sumK += dK[t][c] * wK[dOff + c]
-                    sumV += dV[t][c] * wVEff[dOff + c]
-                }
-                dX_t[d] += sumQ + sumK + sumV
-            }
+        val inputGradientByProjection =
+            Array(3) { Array(attentionBackwardRows) { FloatArray(dModel) } }
+        computeBatchedLinear(
+            inputs = arrayOf(queryGradientRows, keyGradientRows, valueGradientRows),
+            weights = arrayOf(wQEff, wK, wVEff),
+            outputs = inputGradientByProjection,
+            inputColumns = dModel,
+            outputColumns = dModel,
+            transposeWeights = true
+        )
 
-            val tok = seq[t]
-            if (tok in 0 until vocabCap) {
-                val embOff = tok * dModel
-                for (d in 0 until dModel) {
-                    gradWEmbed[embOff + d] += dX_t[d] * embedScale
-                }
+        for (time in 0 until attentionBackwardRows) {
+            val token = seq[time]
+            if (token !in 0 until vocabCap) continue
+
+            val embeddingOffset = token * dModel
+            val queryInputGradient = inputGradientByProjection[0][time]
+            val keyInputGradient = inputGradientByProjection[1][time]
+            val valueInputGradient = inputGradientByProjection[2][time]
+            for (dimension in 0 until dModel) {
+                val inputGradient =
+                    dL_dh1PreLN[time][dimension] +
+                    queryInputGradient[dimension] +
+                    keyInputGradient[dimension] +
+                    valueInputGradient[dimension]
+                gradWEmbed[embeddingOffset + dimension] += inputGradient * embedScale
             }
         }
 

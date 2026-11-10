@@ -37,16 +37,19 @@ The private repository keeps the CI signing-key backup in the private GitHub Rel
 
 The native training module is built with Android NDK r30 and CMake 3.22.1 for
 arm64-v8a, armeabi-v7a, and x86_64. It uses the NDK-bundled glslc compiler to
-compile the AdamW compute shader to SPIR-V during the native build.
+compile the AdamW and batched-linear compute shaders to SPIR-V during the native build.
 
 When a compatible Vulkan GPU and compute queue are available, sufficiently large
-matrix products in Q/K/V projections, attention output projection, SwiGLU, the
-output head, output-head backward, SwiGLU backward, and batched attention backward
-can run through Vulkan Compute. The fused AdamW update also runs on Vulkan for
-workloads with at least 49,152 optimizer elements. Attention score generation,
-softmax, the softmax-Jacobian reduction, layer normalization, QKV/LoRA gradient
-accumulation, and global gradient-norm reduction remain in Kotlin. This is an
-incremental GPU training path, not a fully GPU-resident training graph.
+matrix products in batched Q/K/V projections, attention output projection, SwiGLU,
+the output head, output-head backward, attention output-projection backward,
+SwiGLU backward, batched attention backward, and Q/K/V weight-gradient accumulation
+can run through Vulkan Compute. The three Q/K/V input-gradient products used by
+embedding backpropagation are also batched through Vulkan. The fused AdamW update
+runs on Vulkan for workloads with at least 49,152 optimizer elements. Attention
+score generation, softmax, the softmax-Jacobian reduction, layer normalization,
+low-rank LoRA gradient accumulation, token-ID embedding scatter, and global
+gradient-norm reduction remain in Kotlin. This is an incremental GPU training
+path, not a fully GPU-resident training graph.
 
 Vulkan is declared as an optional device feature. Devices without a compatible
 Vulkan driver, compute queue, shader pipeline, suitable storage memory, or
