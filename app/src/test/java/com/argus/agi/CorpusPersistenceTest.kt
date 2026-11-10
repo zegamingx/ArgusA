@@ -7,6 +7,7 @@ import com.argus.agi.data.local.ArgusDatabase
 import com.argus.agi.data.repository.ArgusRepository
 import com.argus.agi.model.ArgusNeuralEngine
 import com.argus.agi.model.TrainingManager
+import com.argus.agi.model.TrainingData
 import com.argus.agi.model.WorldModel
 import com.argus.agi.sensor.DeviceGuard
 import java.io.StringReader
@@ -105,6 +106,22 @@ class CorpusPersistenceTest {
                 manager.replayCorpusDocument(heldOut.id, epochs = 1)
             }.exceptionOrNull()
             assertTrue("Validation documents must never be replayed for training.", replayFailure != null)
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+
+            val directQueueFailure = runCatching {
+                repository.saveTrainingItem(
+                    TrainingData(
+                        source = "Repository boundary test",
+                        title = "Invalid validation queue row",
+                        content = validationText,
+                        documentId = heldOut.id
+                    )
+                )
+            }.exceptionOrNull()
+            assertTrue(
+                "Repository must reject validation document queue references.",
+                directQueueFailure != null
+            )
             assertTrue(repository.getPendingQueueSnapshot().isEmpty())
 
             val trainingCollision = runCatching {
