@@ -94,6 +94,7 @@ data class LossEvaluation(
 internal data class GradientCheckResult(
     val parameterName: String,
     val parameterIndex: Int,
+    val meanLoss: Float,
     val analyticalGradient: Float,
     val numericalGradient: Float,
     val absoluteError: Float,
@@ -710,6 +711,7 @@ class ArgusNeuralEngine private constructor(
         GradientCheckResult(
             parameterName = parameterName,
             parameterIndex = resolvedIndex,
+            meanLoss = baseLoss,
             analyticalGradient = probe.analyticalGradient,
             numericalGradient = numericalGradient,
             absoluteError = absoluteError,
