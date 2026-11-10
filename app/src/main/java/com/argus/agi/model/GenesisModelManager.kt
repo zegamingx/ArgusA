@@ -78,7 +78,7 @@ enum class GenesisLifecycleStage(val displayName: String, val description: Strin
     );
 
     companion object {
-        /** Semua stage yang dianggap "progress" (tidak termasuk FAILED). */
+        /** Lifecycle stages that represent progress, excluding FAILED. */
         val progressStages: List<GenesisLifecycleStage> = values().filter {
             it != FAILED
         }
@@ -256,11 +256,6 @@ class GenesisModelManager(
             "Selecting tensor dimensions based on the device compute and memory budget...")
 
         val archTier = neuralEngine.config.architectureLabel
-        val detectedAccelerators = buildList {
-            if (hardwareInfo.npuApuDetected.isNotBlank()) add(hardwareInfo.npuApuDetected)
-            if (hardwareInfo.vulkanSupported) add("Vulkan ${hardwareInfo.vulkanVersionName}")
-        }.distinct()
-
         // Vulkan accelerates eligible dense operations and AdamW after its runtime self-checks.
         // Remaining operations continue to use the Kotlin CPU implementation.
         val computeTarget = if (neuralEngine.isVulkanRuntimeReady) {

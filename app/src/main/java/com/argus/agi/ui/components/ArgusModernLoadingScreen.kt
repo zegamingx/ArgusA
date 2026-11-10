@@ -50,7 +50,7 @@ import kotlin.math.sin
 @Composable
 fun ArgusModernLoadingScreen(
     title: String = "A . R . G . U . S",
-    subtitle: String = "MEMULIHKAN NEURAL CORE & RIWAYAT..."
+    subtitle: String = "RESTORING THE NEURAL CORE & CHAT HISTORY..."
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "loading_infinite")
 

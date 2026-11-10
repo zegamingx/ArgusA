@@ -135,10 +135,10 @@ class ArgusApp : Application() {
 
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "A.R.G.U.S Neural Core & Perception",
+            "A.R.G.U.S Neural Core and Perception",
             NotificationManager.IMPORTANCE_LOW
         ).apply {
-            description = "Status proses training on-device dan persepsi lingkungan A.R.G.U.S"
+            description = "On-device training status and A.R.G.U.S environment perception."
             setShowBadge(false)
             enableLights(false)
             enableVibration(false)
