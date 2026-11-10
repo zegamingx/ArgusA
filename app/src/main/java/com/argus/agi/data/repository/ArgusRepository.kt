@@ -155,6 +155,41 @@ class ArgusRepository(
         trainingQueueDao.clearPendingQueue()
     }
 
+    /**
+     * Clears waiting work and records corpus documents whose replay was interrupted.
+     * A sole active final chunk is allowed to finish and mark its document TRAINED.
+     */
+    suspend fun clearPendingQueueAndMarkInterruptedCorpusDocumentsPartial(): Set<String> =
+        withContext(Dispatchers.IO) {
+            db.withTransaction {
+                val activeItems = trainingQueueDao.getActiveCorpusTrainingItems()
+                val itemsByDocument = activeItems
+                    .filter { it.documentId != null }
+                    .groupBy { requireNotNull(it.documentId) }
+
+                val partialDocumentIds = itemsByDocument
+                    .filterValues { documentItems ->
+                        val canFinishDocument = documentItems.size == 1 &&
+                            documentItems.single().status == "TRAINING" &&
+                            documentItems.single().chunkIndex >= documentItems.single().totalChunks
+                        !canFinishDocument
+                    }
+                    .keys
+                    .toSet()
+
+                trainingQueueDao.clearPendingQueue()
+                partialDocumentIds.forEach { documentId ->
+                    corpusDao.updateTrainingState(
+                        documentId = documentId,
+                        status = "PARTIAL",
+                        trainedAtEpochMs = null,
+                        completedPassCount = 0
+                    )
+                }
+                partialDocumentIds
+            }
+        }
+
     // =========================================================================
     // Persistent Local Corpus
     // =========================================================================
