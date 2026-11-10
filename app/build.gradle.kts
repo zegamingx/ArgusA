@@ -1,3 +1,5 @@
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.util.Properties
 
 plugins {
@@ -32,22 +34,37 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    val jksFile = rootProject.file("my-upload-key.jks")
+    val p12File = rootProject.file("signing/argus-release.p12")
+    val defaultKeystore = when {
+        jksFile.exists() -> jksFile
+        p12File.exists() -> p12File
+        else -> rootProject.file("debug.keystore")
+    }
+
     val releaseKeystorePath = providers.environmentVariable("KEYSTORE_PATH")
-        .orElse(rootProject.file("signing/argus-release.p12").absolutePath)
+        .orElse(defaultKeystore.absolutePath)
         .get()
+
+    val isDebugFallback = releaseKeystorePath.endsWith("debug.keystore")
+    val defaultPass = if (isDebugFallback) "android" else "arguspassword"
+    val defaultAlias = if (isDebugFallback) "androiddebugkey" else "upload"
+
     val releaseStorePassword = providers.environmentVariable("STORE_PASSWORD")
-        .orElse("")
+        .orElse(defaultPass)
         .get()
     val releaseKeyPassword = providers.environmentVariable("KEY_PASSWORD")
-        .orElse("")
+        .orElse(defaultPass)
+        .get()
+    val releaseKeyAlias = providers.environmentVariable("KEY_ALIAS")
+        .orElse(defaultAlias)
         .get()
 
     signingConfigs {
         create("release") {
             storeFile = file(releaseKeystorePath)
-            storeType = "PKCS12"
             storePassword = releaseStorePassword
-            keyAlias = "upload"
+            keyAlias = releaseKeyAlias
             keyPassword = releaseKeyPassword
         }
     }
@@ -139,4 +156,103 @@ dependencies {
 
     ksp(libs.androidx.room.compiler)
     ksp(libs.moshi.kotlin.codegen)
+}
+
+// =====================================================================
+// Copy APK ke root project supaya bisa diunduh dari AI Studio.
+// HANYA 1 FILE APK DI ROOT: ARGUS.apk.
+// File APK lama atau varian lain otomatis dibersihkan.
+// =====================================================================
+abstract class CopyApkTask : DefaultTask() {
+
+    @get:InputFiles
+    abstract val apk: ConfigurableFileCollection
+
+    @get:OutputFile
+    abstract val target: RegularFileProperty
+
+    @TaskAction
+    fun copy() {
+        val dst = target.get().asFile
+        val rootDir = dst.parentFile ?: return
+        rootDir.mkdirs()
+
+        // 1) Hapus semua APK lain di root project (mis. ARGUS-release.apk, ARGUS-debug.apk)
+        //    sehingga HANYA ADA 1 FILE APK di root: ARGUS.apk
+        rootDir.listFiles { f -> f.isFile && f.extension.equals("apk", true) }
+            ?.filter { it.name != dst.name }
+            ?.forEach { stale ->
+                if (stale.delete()) {
+                    logger.lifecycle("Dihapus APK lama: ${stale.name}")
+                }
+            }
+
+        // 2) Salin APK release (atau fallback debug jika hanya debug yang dibuild)
+        val src = apk.files.firstOrNull { it.isFile }
+        if (src == null) {
+            logger.warn("APK sumber belum tersedia untuk disalin.")
+            return
+        }
+
+        try {
+            src.copyTo(dst, overwrite = true)
+            logger.lifecycle("Tersimpan 1 APK utama di root: ${dst.absolutePath} (${src.length() / 1024} KB, dari ${src.name})")
+        } catch (e: Exception) {
+            logger.warn("Gagal menyalin APK ke root: $e")
+        }
+    }
+}
+
+abstract class AutoUpdateVersionTask : DefaultTask() {
+
+    @get:OutputFile
+    abstract val versionFile: RegularFileProperty
+
+    @TaskAction
+    fun updateVersion() {
+        val file = versionFile.get().asFile
+        val props = Properties()
+        if (file.exists()) {
+            FileInputStream(file).use { props.load(it) }
+        }
+        val maj = props.getProperty("VERSION_MAJOR", "1").toIntOrNull() ?: 1
+        val min = props.getProperty("VERSION_MINOR", "0").toIntOrNull() ?: 0
+        var pat = props.getProperty("VERSION_PATCH", "7").toIntOrNull() ?: 7
+        var bld = props.getProperty("VERSION_BUILD", "10007").toIntOrNull() ?: 10007
+
+        pat += 1
+        bld += 1
+
+        props["VERSION_MAJOR"] = maj.toString()
+        props["VERSION_MINOR"] = min.toString()
+        props["VERSION_PATCH"] = pat.toString()
+        props["VERSION_BUILD"] = bld.toString()
+        FileOutputStream(file).use { props.store(it, "Auto-updated by ARGUS Build System") }
+        logger.lifecycle("Version auto-updated untuk build berikutnya: $maj.$min.$pat (Build: $bld)")
+    }
+}
+
+val copyArgusApkToRoot = tasks.register<CopyApkTask>("copyArgusApkToRoot") {
+    // Prioritaskan release, fallback ke debug bila hanya debug yang dibuild
+    apk.from(layout.buildDirectory.file("outputs/apk/release/app-release.apk"))
+    apk.from(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk"))
+    target.set(layout.projectDirectory.file("../ARGUS.apk"))
+    outputs.upToDateWhen { false }
+}
+
+val autoUpdateVersionTask = tasks.register<AutoUpdateVersionTask>("autoUpdateVersion") {
+    versionFile.set(layout.projectDirectory.file("../version.properties"))
+    outputs.upToDateWhen { false }
+}
+
+tasks.matching {
+    it.name in setOf("assembleRelease", "assemble", "assembleDebug")
+}.configureEach {
+    finalizedBy(copyArgusApkToRoot)
+}
+
+tasks.matching {
+    it.name in setOf("assembleRelease", "assemble")
+}.configureEach {
+    finalizedBy(autoUpdateVersionTask)
 }
