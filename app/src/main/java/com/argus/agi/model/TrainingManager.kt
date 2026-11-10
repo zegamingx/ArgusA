@@ -109,7 +109,7 @@ class TrainingManager(
         const val MAX_LOSS_HISTORY = 100
         const val MAX_DOCUMENT_EPOCHS = 5
         const val MAX_CORPUS_REPLAY_DOCUMENTS = 500
-        const val DEFAULT_MAX_CORPUS_REPLAY_CHUNKS = 4_096
+        const val MAX_DEFAULT_CORPUS_REPLAY_CHUNKS = 4_096
         const val MAX_CORPUS_REPLAY_CHUNKS = 50_000
         private const val IDLE_POLL_MS = 500L
     }
@@ -616,6 +616,27 @@ class TrainingManager(
     }
 
     /**
+     * Estimates a conservative queue cap from the current app heap.
+     *
+     * The estimate reserves most of the heap for model tensors, activations, and the UI.
+     * The 4 KiB item estimate includes the retained chunk string and queue object overhead.
+     */
+    private fun recommendedReplayQueueLimit(): Int {
+        val runtime = Runtime.getRuntime()
+        val maxHeapBytes = runtime.maxMemory().coerceAtLeast(1L)
+        val allocatedBytes = runtime.totalMemory()
+        val usedBytes = (allocatedBytes - runtime.freeMemory()).coerceAtLeast(0L)
+        val availableHeapBytes = (maxHeapBytes - usedBytes).coerceAtLeast(0L)
+        val safeBudgetBytes = min(maxHeapBytes / 16L, availableHeapBytes / 3L)
+        val estimatedBytesPerItem = 4_096L
+        val estimatedLimit = safeBudgetBytes / estimatedBytesPerItem
+
+        return estimatedLimit
+            .coerceIn(1L, MAX_DEFAULT_CORPUS_REPLAY_CHUNKS.toLong())
+            .toInt()
+    }
+
+    /**
      * Schedules every eligible TRAIN document in stable corpus order, then applies the
      * requested deterministic replay policy. The same seed and corpus snapshot reproduce
      * the same queue order. Validation documents are excluded by the DAO and planner.
@@ -625,7 +646,7 @@ class TrainingManager(
         epochs: Int = 1,
         policy: CorpusReplayPolicy = CorpusReplayPolicy.INTERLEAVED_DOCUMENTS,
         maxDocuments: Int = MAX_CORPUS_REPLAY_DOCUMENTS,
-        maxQueuedChunks: Int = DEFAULT_MAX_CORPUS_REPLAY_CHUNKS
+        maxQueuedChunks: Int = recommendedReplayQueueLimit()
     ): CorpusReplayResult {
         corpusSchedulingMutex.lock()
         try {
@@ -678,7 +699,7 @@ class TrainingManager(
         epochs: Int = 1,
         seed: Long = 0L,
         policy: CorpusReplayPolicy = CorpusReplayPolicy.SEQUENTIAL_DOCUMENTS,
-        maxQueuedChunks: Int = DEFAULT_MAX_CORPUS_REPLAY_CHUNKS
+        maxQueuedChunks: Int = recommendedReplayQueueLimit()
     ): Int {
         corpusSchedulingMutex.lock()
         try {
