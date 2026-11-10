@@ -46,17 +46,22 @@ class CorpusPersistenceTest {
                 )
             )
             val sample = "Argus learns local language"
+            val initialTrainingLoss = engine.trainStep(sample)
+            assertTrue("The setup step must produce a finite loss.", initialTrainingLoss.isFinite())
             val lossOnlyEvaluation = engine.evaluateLoss(sample)
             val parameterGroups = listOf(
                 "wHead",
                 "wEmbed",
                 "wDown",
+                "wUp",
                 "wGate",
                 "wQ",
                 "wK",
                 "wV",
                 "wO",
+                "loraQa",
                 "loraQb",
+                "loraVa",
                 "loraVb"
             )
 
