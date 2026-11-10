@@ -64,14 +64,18 @@ data class EngineConfig(
          * Selects a fresh model shape from stable device capacity, not volatile free RAM.
          * Existing checkpoint configurations are resolved separately before engine creation.
          */
-        fun forDevice(totalRamGb: Int, maxHeapMb: Long): EngineConfig = when {
-            totalRamGb >= 12 && maxHeapMb >= 512L ->
+        fun forDevice(
+            totalRamGb: Int,
+            maxHeapMb: Long,
+            availableRamGb: Float = totalRamGb.toFloat()
+        ): EngineConfig = when {
+            totalRamGb >= 12 && maxHeapMb >= 512L && availableRamGb >= 3.0f ->
                 EngineConfig(dModel = 128, nHeads = 4, dFf = 512, maxSeqLen = 128, loraRank = 4)
 
-            totalRamGb >= 8 && maxHeapMb >= 384L ->
+            totalRamGb >= 8 && maxHeapMb >= 384L && availableRamGb >= 2.0f ->
                 EngineConfig(dModel = 96, nHeads = 4, dFf = 384, maxSeqLen = 128, loraRank = 4)
 
-            totalRamGb >= 6 && maxHeapMb >= 256L ->
+            totalRamGb >= 6 && maxHeapMb >= 256L && availableRamGb >= 1.0f ->
                 EngineConfig(dModel = 64, nHeads = 4, dFf = 256, maxSeqLen = 96, loraRank = 2)
 
             else ->
@@ -197,7 +201,8 @@ class ArgusNeuralEngine private constructor(
         fun resolveConfig(
             context: Context,
             totalRamGb: Int,
-            maxHeapMb: Long
+            maxHeapMb: Long,
+            availableRamGb: Float = totalRamGb.toFloat()
         ): EngineConfig {
             val checkpoint = File(context.filesDir, "argus_model_weights.bin")
             if (checkpoint.isFile && checkpoint.length() >= HEADER_SIZE) {
@@ -250,7 +255,7 @@ class ArgusNeuralEngine private constructor(
                 if (savedConfig != null) return savedConfig
             }
 
-            return EngineConfig.forDevice(totalRamGb, maxHeapMb)
+            return EngineConfig.forDevice(totalRamGb, maxHeapMb, availableRamGb)
         }
 
         @JvmStatic
