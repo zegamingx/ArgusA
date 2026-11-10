@@ -45,6 +45,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -80,6 +81,11 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
     val installedApps by viewModel.installedApps.collectAsState()
     val worldEntities by viewModel.worldEntities.collectAsState()
     val searchResults by viewModel.searchResults.collectAsState()
+    val articlePreview by viewModel.articlePreview.collectAsState()
+    val isExtractingArticle by viewModel.isExtractingArticle.collectAsState()
+    val articleExtractionError by viewModel.articleExtractionError.collectAsState()
+    val isQueueingArticle by viewModel.isQueueingArticle.collectAsState()
+    val articleQueueStatus by viewModel.articleQueueStatus.collectAsState()
 
     var isBatteryExpanded by remember { mutableStateOf(true) }
     var isSkillsExpanded by remember { mutableStateOf(true) }
@@ -87,6 +93,10 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
     var isWorldModelExpanded by remember { mutableStateOf(true) }
 
     var searchQuery by remember { mutableStateOf("") }
+    var allowArticleTraining by remember { mutableStateOf(false) }
+    LaunchedEffect(articlePreview?.canonicalUrl) {
+        allowArticleTraining = false
+    }
     var actionClickQuery by remember { mutableStateOf("") }
     var actionClickResult by remember { mutableStateOf<String?>(null) }
     var appFilterText by remember { mutableStateOf("") }
@@ -330,22 +340,180 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
 
                             if (searchResults.isNotEmpty()) {
                                 Spacer(modifier = Modifier.height(8.dp))
-                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    searchResults.take(3).forEach { item ->
-                                        Box(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .clip(RoundedCornerShape(8.dp))
-                                                .background(ArgusDarkBg)
-                                                .padding(8.dp)
+                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    searchResults.take(5).forEach { item ->
+                                        Surface(
+                                            shape = RoundedCornerShape(10.dp),
+                                            color = ArgusDarkBg,
+                                            modifier = Modifier.fillMaxWidth()
                                         ) {
-                                            Column {
-                                                Text(text = item.title, style = MaterialTheme.typography.labelSmall, color = ArgusCyanPrimary, fontWeight = FontWeight.Bold)
-                                                Text(text = item.snippet, style = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp), color = ArgusTextSecondary)
+                                            Column(modifier = Modifier.padding(10.dp)) {
+                                                Text(
+                                                    text = item.title,
+                                                    style = MaterialTheme.typography.labelLarge,
+                                                    color = ArgusCyanPrimary,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                                Spacer(modifier = Modifier.height(4.dp))
+                                                Text(
+                                                    text = item.snippet,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = ArgusTextSecondary
+                                                )
+                                                Spacer(modifier = Modifier.height(4.dp))
+                                                Text(
+                                                    text = item.sourceUrl,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = ArgusTextMuted
+                                                )
+                                                Text(
+                                                    text = "Sumber: ${item.provider}",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = ArgusTextMuted
+                                                )
+                                                Spacer(modifier = Modifier.height(6.dp))
+                                                Button(
+                                                    onClick = { viewModel.extractWebArticle(item) },
+                                                    enabled = !isExtractingArticle,
+                                                    colors = ButtonDefaults.buttonColors(
+                                                        containerColor = ArgusCyanPrimary,
+                                                        contentColor = ArgusDarkBg
+                                                    ),
+                                                    shape = RoundedCornerShape(8.dp)
+                                                ) {
+                                                    Text("Ekstrak artikel", fontWeight = FontWeight.SemiBold, fontSize = 11.sp)
+                                                }
                                             }
                                         }
                                     }
                                 }
+                            }
+
+                            if (isExtractingArticle) {
+                                Text(
+                                    text = "Mengambil dan mengekstrak isi halaman…",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = ArgusCyanGlow
+                                )
+                            }
+
+                            articleExtractionError?.let { error ->
+                                Text(
+                                    text = "Ekstraksi gagal: $error",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = ArgusWarning
+                                )
+                            }
+
+                            articlePreview?.let { article ->
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = ArgusSurfaceVariant,
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Text(
+                                            text = "PRATINJAU ARTIKEL · BELUM TRAINING",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = ArgusCyanGlow,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = article.title,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            color = ArgusTextPrimary,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = "${article.siteName} · ${article.domain} · ${article.characterCount} karakter",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = ArgusTextMuted
+                                        )
+                                        article.publishedAt?.let { publishedAt ->
+                                            Text(
+                                                text = "Tanggal sumber: $publishedAt",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = ArgusTextMuted
+                                            )
+                                        }
+                                        Text(
+                                            text = article.canonicalUrl,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = ArgusTextMuted
+                                        )
+                                        Text(
+                                            text = article.text.take(2_800),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = ArgusTextSecondary
+                                        )
+                                        Text(
+                                            text = "Periksa isi, tanggal, penerbit, dan asal sumber sebelum digunakan.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = ArgusTextPrimary
+                                        )
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Checkbox(
+                                                checked = allowArticleTraining,
+                                                onCheckedChange = { allowArticleTraining = it },
+                                                colors = CheckboxDefaults.colors(
+                                                    checkedColor = ArgusCyanPrimary,
+                                                    uncheckedColor = ArgusTextMuted,
+                                                    checkmarkColor = ArgusDarkBg
+                                                )
+                                            )
+                                            Text(
+                                                text = "Saya memiliki izin atau hak untuk menggunakan artikel ini sebagai data training.",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = ArgusTextSecondary
+                                            )
+                                        }
+                                        Row(
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Button(
+                                                onClick = { viewModel.enqueueReviewedWebArticle() },
+                                                enabled = allowArticleTraining && !isQueueingArticle,
+                                                colors = ButtonDefaults.buttonColors(
+                                                    containerColor = ArgusSuccess,
+                                                    contentColor = ArgusDarkBg,
+                                                    disabledContainerColor = ArgusSurface,
+                                                    disabledContentColor = ArgusTextMuted
+                                                ),
+                                                shape = RoundedCornerShape(8.dp)
+                                            ) {
+                                                Text(
+                                                    if (isQueueingArticle) "Memasukkan…" else "Masukkan ke training",
+                                                    fontSize = 11.sp
+                                                )
+                                            }
+                                            Button(
+                                                onClick = { viewModel.dismissWebArticlePreview() },
+                                                enabled = !isQueueingArticle,
+                                                colors = ButtonDefaults.buttonColors(
+                                                    containerColor = ArgusSurface,
+                                                    contentColor = ArgusTextPrimary
+                                                ),
+                                                shape = RoundedCornerShape(8.dp)
+                                            ) {
+                                                Text("Tutup", fontSize = 11.sp)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            articleQueueStatus?.let { status ->
+                                Text(
+                                    text = status,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = ArgusTextPrimary
+                                )
                             }
 
                             Spacer(modifier = Modifier.height(14.dp))

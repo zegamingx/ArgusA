@@ -192,7 +192,7 @@ class Tokenizer {
         maxRegisteredLen = newMaxLen
     }
 
-    fun encode(text: String, autoRegister: Boolean = true): List<Int> {
+    fun encode(text: String, autoRegister: Boolean = false): List<Int> {
         val cleanText = TextModalityProcessor.normalizeTypography(text)
         val n = cleanText.length
         if (n == 0) return emptyList()
@@ -238,11 +238,27 @@ class Tokenizer {
             val charLen = Character.charCount(codePoint)
             val charStr = cleanText.substring(i, i + charLen)
 
-            val id = tokenToId[charStr] ?: run {
-                if (!autoRegister) return@run UNK_ID
-                runCatching { registerToken(charStr) }.getOrDefault(UNK_ID)
+            if (charStr == "~") {
+                val tildeId = tokenToId["~"] ?: UNK_ID
+                result.add(tildeId)
+                result.add(tildeId)
+                i += charLen
+                continue
             }
-            result.add(id)
+
+            val existingId = tokenToId[charStr]
+            if (existingId != null) {
+                result.add(existingId)
+            } else if (autoRegister) {
+                result.add(runCatching { registerToken(charStr) }.getOrDefault(UNK_ID))
+            } else {
+                // Stable Unicode escape fallback encoded with existing ASCII token IDs.
+                // No vocabulary or embedding resize is needed for unseen code points.
+                val codePointMarker = "~u{${codePoint.toString(16).uppercase(java.util.Locale.ROOT)}}~"
+                for (markerChar in codePointMarker) {
+                    result.add(tokenToId[markerChar.toString()] ?: UNK_ID)
+                }
+            }
             i += charLen
         }
 
@@ -265,6 +281,40 @@ class Tokenizer {
             if (!keepControlTokens && token in CONTROL_TOKENS) continue
             sb.append(token)
         }
-        return sb.toString()
+        return decodeUnicodeFallbacks(sb.toString())
+    }
+
+    private fun decodeUnicodeFallbacks(encoded: String): String {
+        val decoded = StringBuilder(encoded.length)
+        var index = 0
+
+        while (index < encoded.length) {
+            if (encoded.startsWith("~~", index)) {
+                decoded.append('~')
+                index += 2
+                continue
+            }
+
+            if (encoded.startsWith("~u{", index)) {
+                val terminator = encoded.indexOf("}~", startIndex = index + 3)
+                if (terminator >= 0) {
+                    val codePoint = encoded.substring(index + 3, terminator).toIntOrNull(16)
+                    if (
+                        codePoint != null &&
+                        Character.isValidCodePoint(codePoint) &&
+                        codePoint !in 0xD800..0xDFFF
+                    ) {
+                        decoded.appendCodePoint(codePoint)
+                        index = terminator + 2
+                        continue
+                    }
+                }
+            }
+
+            decoded.append(encoded[index])
+            index++
+        }
+
+        return decoded.toString()
     }
 }

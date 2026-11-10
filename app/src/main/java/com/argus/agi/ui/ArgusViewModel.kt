@@ -14,6 +14,10 @@ import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.WorldEntity
 import android.media.MediaMetadataRetriever
+import com.argus.agi.sensor.ArticleExtractor
+import com.argus.agi.sensor.ExtractedWebArticle
+import com.argus.agi.sensor.ExtractedDocument
+import com.argus.agi.sensor.StructuredDocumentExtractor
 import com.argus.agi.sensor.AudioVoiceManager
 import com.argus.agi.sensor.DeviceSafetyState
 import com.argus.agi.sensor.ExcludedAppsManager
@@ -23,6 +27,11 @@ import com.argus.agi.sensor.SystemHardwareInfo
 import com.argus.agi.sensor.WebSearchEngine
 import com.argus.agi.service.ArgusAccessibilityService
 import com.argus.agi.service.ArgusForegroundService
+import com.argus.agi.skill.SkillRegistry
+import com.argus.agi.skill.WebArticleExtractionSkill
+import com.argus.agi.skill.WebArticleExtractionSkillOutput
+import com.argus.agi.skill.WebSearchSkill
+import com.argus.agi.skill.WebSearchSkillOutput
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -36,6 +45,11 @@ import java.io.BufferedReader
 import java.io.FilterInputStream
 import java.io.InputStream
 import java.io.InputStreamReader
+import java.io.StringReader
+import java.io.IOException
+import java.security.MessageDigest
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
@@ -56,8 +70,11 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         private const val TAG = "ArgusViewModel"
         private const val MAX_MESSAGES = 200
-        private const val MAX_FILE_SIZE_BYTES = 100L * 1024L * 1024L // Kuota streaming OOM-safe hingga 100 MB
+        private const val ABSOLUTE_MAX_FILE_SIZE_BYTES = 100L * 1024L * 1024L
         private const val MAX_IMAGE_SIDE = 2048
+        private const val MAX_ZIP_ENTRIES = 1_000
+        private const val ABSOLUTE_MAX_ZIP_ENTRY_EXPANDED_BYTES = 20L * 1024L * 1024L
+        private const val ABSOLUTE_MAX_ZIP_EXPANDED_TOTAL_BYTES = 40L * 1024L * 1024L
     }
 
     private val neuralEngine = ArgusApp.neuralEngine
@@ -68,6 +85,13 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     private val genesisModelManager = ArgusApp.genesisModelManager
     private val excludedAppsManager = ExcludedAppsManager(application)
     private val webSearchEngine = WebSearchEngine()
+    private val articleExtractor = ArticleExtractor()
+    private val skillRegistry = SkillRegistry(
+        listOf(
+            WebSearchSkill(webSearchEngine),
+            WebArticleExtractionSkill(articleExtractor)
+        )
+    )
 
     private val repository = ArgusApp.repository
 
@@ -107,6 +131,21 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _searchResults = MutableStateFlow<List<SearchResultItem>>(emptyList())
     val searchResults: StateFlow<List<SearchResultItem>> = _searchResults.asStateFlow()
+
+    private val _articlePreview = MutableStateFlow<ExtractedWebArticle?>(null)
+    val articlePreview: StateFlow<ExtractedWebArticle?> = _articlePreview.asStateFlow()
+
+    private val _isExtractingArticle = MutableStateFlow(false)
+    val isExtractingArticle: StateFlow<Boolean> = _isExtractingArticle.asStateFlow()
+
+    private val _articleExtractionError = MutableStateFlow<String?>(null)
+    val articleExtractionError: StateFlow<String?> = _articleExtractionError.asStateFlow()
+
+    private val _isQueueingArticle = MutableStateFlow(false)
+    val isQueueingArticle: StateFlow<Boolean> = _isQueueingArticle.asStateFlow()
+
+    private val _articleQueueStatus = MutableStateFlow<String?>(null)
+    val articleQueueStatus: StateFlow<String?> = _articleQueueStatus.asStateFlow()
 
     private val _isNotificationPermissionGranted = MutableStateFlow(false)
     val isNotificationPermissionGranted: StateFlow<Boolean> = _isNotificationPermissionGranted.asStateFlow()
@@ -374,34 +413,25 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     .append(String.format("%.0f%%", reflection.confidenceScore * 100))
 
                 if (!reflection.isConfident || reflection.suggestedAction == "AUTO_LEARN_QUERY") {
-                    thinking.append("\n→ Autonomous On-Device Web Retrieval & Training Queue.")
+                    thinking.append("\n→ Web retrieval initiated; sources require article review before local training.")
 
-                    val webItems = runCatching { webSearchEngine.search(text) }
+                    val webItems = runCatching { executeWebSearchSkill(text) }
                         .onFailure { Log.w(TAG, "Web search failed", it) }
                         .getOrDefault(emptyList())
 
+                    _searchResults.value = webItems
                     if (webItems.isNotEmpty()) {
-                        val learned = webItems.joinToString("\n") {
-                            "${it.title}: ${it.snippet}"
-                        }
-                        trainingManager.enqueueData(
-                            source = "Chat Inquiry Learner",
-                            title = "Pertanyaan: ${text.take(30)}",
-                            content = "Tanya: $text. Pengetahuan: $learned"
-                        )
-                        finalAnswer = "Saya sedang mempelajari topik ini langsung dari web on-device:\n\n" +
+                        finalAnswer = "Saya menemukan beberapa sumber web yang relevan. Ringkasan di bawah " +
+                                "hanya cuplikan pencarian, belum isi artikel dan belum dimasukkan ke training:\n\n" +
                                 webItems.take(2).joinToString("\n\n") {
-                                    "• **${it.title}**\n${it.snippet}"
+                                    "• ${it.title}\n${it.snippet}\n${it.sourceUrl}"
                                 } +
-                                "\n\n*Data ini telah dimasukkan ke antrean training lokal.*"
+                                "\n\nBuka bagian Skill Agent untuk mengekstrak artikel, meninjau sumber, " +
+                                "lalu memilih apakah kontennya layak masuk antrean training lokal."
                     } else {
-                        trainingManager.enqueueData(
-                            source = "Chat Unresolved",
-                            title = "Inquiry: ${text.take(30)}",
-                            content = text
-                        )
-                        finalAnswer = "Pola ini baru bagi model. Pertanyaan ini telah langsung " +
-                                "dijadwalkan ke antrean training on-device."
+                        finalAnswer = "Pencarian web belum menemukan sumber yang dapat digunakan. " +
+                                "Pertanyaan ini tidak dimasukkan ke antrean training karena query saja " +
+                                "bukan bukti pengetahuan."
                     }
                 }
 
@@ -440,15 +470,16 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     cr.openFileDescriptor(uri, "r")?.use { it.statSize }
                 }.getOrNull()
 
-                if (sizeBytes != null && sizeBytes > MAX_FILE_SIZE_BYTES) {
+                val maxFileSizeBytes = maxImportFileSizeBytes()
+                if (sizeBytes != null && sizeBytes > maxFileSizeBytes) {
                     withContext(Dispatchers.Main) {
                         appendMessage(
                             ChatMessage(
                                 isUser = false,
                                 text = "File terlalu besar (${sizeBytes / 1024 / 1024} MB). " +
-                                        "Batas maksimal ${MAX_FILE_SIZE_BYTES / 1024 / 1024} MB " +
-                                        "untuk menjaga memori perangkat.",
-                                thinkReasoning = "File size guard triggered."
+                                    "Batas impor untuk kondisi memori perangkat saat ini adalah " +
+                                    "${maxFileSizeBytes / 1024 / 1024} MB.",
+                                thinkReasoning = "Device-memory-aware import size guard triggered."
                             )
                         )
                     }
@@ -464,9 +495,98 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     name ?: "Dokumen_${System.currentTimeMillis() % 10000}.txt"
                 }.getOrDefault("Dokumen_${System.currentTimeMillis() % 10000}.txt")
 
-                val isZip = docDisplayName.endsWith(".zip", ignoreCase = true) ||
-                        cr.getType(uri)?.contains("zip") == true
+                val mimeType = cr.getType(uri).orEmpty().lowercase(Locale.ROOT)
+                val extension = docDisplayName.substringAfterLast('.', "").lowercase(Locale.ROOT)
+                val structuredFormat = when {
+                    extension == "pdf" || mimeType in setOf("application/pdf", "application/x-pdf") -> "pdf"
+                    extension == "docx" || mimeType.contains("wordprocessingml") -> "docx"
+                    extension == "epub" || mimeType.contains("epub+zip") -> "epub"
+                    extension in setOf("html", "htm", "xhtml", "xml") ||
+                        mimeType in setOf("text/html", "application/xhtml+xml", "application/xml", "text/xml") -> "html"
+                    else -> null
+                }
 
+                if (structuredFormat != null) {
+                    val extracted = cr.openInputStream(uri)?.use { stream ->
+                        when (structuredFormat) {
+                            "pdf" -> StructuredDocumentExtractor.extractPdf(
+                                context = getApplication<Application>(),
+                                input = stream,
+                                title = docDisplayName,
+                                maxInputBytes = maxImportFileSizeBytes(),
+                                maxTextCharacters = maxImportTextCharacters().toInt()
+                            )
+                            "docx" -> StructuredDocumentExtractor.extractDocx(
+                                input = stream,
+                                title = docDisplayName,
+                                maxEntryBytes = maxQueuedTextMemoryBudgetBytes(),
+                                maxExpandedBytes = maxQueuedTextMemoryBudgetBytes(),
+                                maxTextCharacters = maxImportTextCharacters().toInt()
+                            )
+                            "epub" -> StructuredDocumentExtractor.extractEpub(
+                                input = stream,
+                                fallbackTitle = docDisplayName,
+                                maxEntryBytes = maxQueuedTextMemoryBudgetBytes(),
+                                maxExpandedBytes = maxQueuedTextMemoryBudgetBytes(),
+                                maxStoredTextBytes = maxQueuedTextMemoryBudgetBytes(),
+                                maxTextCharacters = maxImportTextCharacters().toInt()
+                            )
+                            else -> StructuredDocumentExtractor.extractHtml(
+                                input = stream,
+                                title = docDisplayName,
+                                maxInputBytes = minOf(
+                                    maxImportFileSizeBytes(),
+                                    maxQueuedTextMemoryBudgetBytes() / 2L
+                                ),
+                                maxTextCharacters = maxImportTextCharacters().toInt()
+                            )
+                        }
+                    } ?: throw IOException("Tidak dapat membuka file untuk ekstraksi teks.")
+
+                    val (chunkCount, charsRead) = enqueueExtractedDocument(
+                        extracted = extracted,
+                        source = "local_structured_file|name=" +
+                            encodeProvenanceField(docDisplayName) +
+                            "|format=" + extracted.format
+                    )
+
+                    if (chunkCount == 0 || charsRead == 0L) {
+                        withContext(Dispatchers.Main) {
+                            appendMessage(
+                                ChatMessage(
+                                    isUser = false,
+                                    text = "File '" + docDisplayName + "' tidak menghasilkan blok teks yang dapat dilatih.",
+                                    thinkReasoning = "Structured document extractor returned empty content."
+                                )
+                            )
+                        }
+                        return@launch
+                    }
+
+                    withContext(Dispatchers.Main) {
+                        appendMessage(
+                            ChatMessage(
+                                isUser = true,
+                                text = "Mengunggah " + extracted.format + " '" + extracted.title +
+                                    "' (" + extracted.characterCount + " karakter) untuk pelatihan on-device.",
+                                attachedFileName = docDisplayName
+                            )
+                        )
+                        appendMessage(
+                            ChatMessage(
+                                isUser = false,
+                                text = extracted.format + " '" + extracted.title +
+                                    "' berhasil diekstrak menjadi " + chunkCount +
+                                    " blok training. Konten teks tetap diproses lokal pada perangkat.",
+                                thinkReasoning = extracted.format + " extraction: " +
+                                    extracted.characterCount + " characters → " + chunkCount + " blocks."
+                            )
+                        )
+                    }
+                    return@launch
+                }
+
+                val isZip = extension == "zip" || mimeType.contains("zip")
                 if (isZip) {
                     importZipContent(uri, docDisplayName)
                     return@launch
@@ -487,11 +607,16 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 // Streaming chunk ingestion: membaca langsung secara buffered (4KB)
                 // tanpa pernah memuat seluruh file ke dalam sebuah String raksasa di heap RAM.
                 val (chunkCount, charsRead) = cr.openInputStream(uri)?.use { stream ->
-                    val reader = BufferedReader(InputStreamReader(stream, Charsets.UTF_8), 16384)
+                    val boundedReader = BoundedReader(
+                        InputStreamReader(stream, Charsets.UTF_8),
+                        maxImportTextCharacters()
+                    )
+                    val reader = BufferedReader(boundedReader, 16_384)
                     trainingManager.enqueueDocumentStream(
-                        source = "Dokumen File",
+                        source = "text_file|name=${encodeProvenanceField(docDisplayName)}",
                         title = docDisplayName,
-                        reader = reader
+                        reader = reader,
+                        epochs = recommendedTrainingPasses(sizeBytes ?: 0L)
                     )
                 } ?: Pair(0, 0L)
 
@@ -527,11 +652,12 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     appendMessage(
                         ChatMessage(
                             isUser = false,
-                            text = "Dokumen '$docDisplayName' ($sizeDisplay) berhasil diimpor secara streaming (kebal OOM).\n\n" +
-                                    "Sistem mempartisi teks menjadi $chunkCount blok latihan berurutan secara dinamis. " +
-                                    "Backpropagation melatih bobot model lokal bertahap tanpa mengirim data ke server.\n\n" +
-                                    "Pantau progres latihan & live ETA di tab Neural Core.",
-                            thinkReasoning = "Streaming chunk ingestion: $charsRead char → $chunkCount blok (Heap OOM-safe)."
+                            text = "Dokumen '$docDisplayName' ($sizeDisplay) berhasil dibaca bertahap.\n\n" +
+                                    "Teks dipartisi menjadi $chunkCount blok dan dijadwalkan untuk training lokal. " +
+                                    "Blok antrean masih disimpan dalam memori aplikasi; impor file berukuran besar " +
+                                    "perlu memperhatikan RAM yang tersedia.\n\n" +
+                                    "Pantau progres latihan di tab Neural Core.",
+                            thinkReasoning = "Buffered document ingestion: $charsRead characters → $chunkCount queued blocks."
                         )
                     )
                 }
@@ -546,6 +672,89 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     )
                 }
+            }
+        }
+    }
+
+    private fun maxQueuedTextMemoryBudgetBytes(): Long {
+        val profile = _hardwareInfo.value
+        val heapBytes = profile.maxHeapMb.coerceAtLeast(96L) * 1024L * 1024L
+        val availableRamBytes = (
+            profile.availRamGb.coerceAtLeast(0.25f).toDouble() *
+                1024.0 * 1024.0 * 1024.0
+            ).toLong()
+
+        return minOf(
+            heapBytes / 20L,
+            availableRamBytes / 32L,
+            32L * 1024L * 1024L
+        ).coerceAtLeast(1L * 1024L * 1024L)
+    }
+
+    private fun maxImportFileSizeBytes(): Long =
+        minOf(
+            ABSOLUTE_MAX_FILE_SIZE_BYTES,
+            maxQueuedTextMemoryBudgetBytes() * 2L
+        )
+
+    private fun maxImportTextCharacters(): Long =
+        maxQueuedTextMemoryBudgetBytes() / 4L
+
+    private fun maxZipEntryExpandedBytes(): Long =
+        minOf(
+            ABSOLUTE_MAX_ZIP_ENTRY_EXPANDED_BYTES,
+            maxQueuedTextMemoryBudgetBytes()
+        )
+
+    private fun maxZipExpandedTotalBytes(): Long =
+        minOf(
+            ABSOLUTE_MAX_ZIP_EXPANDED_TOTAL_BYTES,
+            maxQueuedTextMemoryBudgetBytes()
+        )
+
+    private fun enqueueExtractedDocument(
+        extracted: ExtractedDocument,
+        source: String,
+        epochs: Int = recommendedTrainingPasses(extracted.characterCount.toLong())
+    ): Pair<Int, Long> {
+        val provenance = buildString {
+            append(source)
+            append("|document_title=").append(encodeProvenanceField(extracted.title))
+            append("|format=").append(extracted.format)
+            append("|characters=").append(extracted.characterCount)
+            append("|sha256=").append(sha256Hex(extracted.text))
+            append("|extracted_at=").append(extracted.extractedAtEpochMs)
+            append("|rights_status=unverified")
+        }
+        val reader = BufferedReader(
+            BoundedReader(StringReader(extracted.text), maxImportTextCharacters()),
+            16_384
+        )
+        return reader.use {
+            trainingManager.enqueueDocumentStream(
+                source = provenance,
+                title = extracted.title,
+                reader = it,
+                chunkSize = 700,
+                overlap = 80,
+                epochs = epochs
+            )
+        }
+    }
+
+    private fun encodeProvenanceField(value: String): String =
+        URLEncoder.encode(value, StandardCharsets.UTF_8.name())
+
+    private fun sha256Hex(text: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(text.toByteArray(StandardCharsets.UTF_8))
+        val alphabet = "0123456789abcdef"
+
+        return buildString(digest.size * 2) {
+            digest.forEach { byte ->
+                val value = byte.toInt() and 0xFF
+                append(alphabet[value ushr 4])
+                append(alphabet[value and 0x0F])
             }
         }
     }
@@ -659,90 +868,229 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     fun importZipContent(uri: Uri, displayName: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val cr = getApplication<Application>().contentResolver
-                var totalFiles = 0
+                val contentResolver = getApplication<Application>().contentResolver
+                var processedFiles = 0
+                var failedFiles = 0
                 var totalChunksEnqueued = 0
                 var totalCharsExtracted = 0L
-                val textExtensions = listOf(".txt", ".md", ".json", ".jsonl", ".csv", ".tsv", ".log", ".xml", ".html", ".kt", ".java", ".py")
+                var totalExpandedBytes = 0L
+                var entryCount = 0
+                val maxZipEntryBytes = maxZipEntryExpandedBytes()
+                val maxZipTotalBytes = maxZipExpandedTotalBytes()
+                val maxTextCharacters = maxImportTextCharacters()
 
-                cr.openInputStream(uri)?.use { rawStream ->
-                    ZipInputStream(BufferedInputStream(rawStream)).use { zis ->
-                        var entry = zis.nextEntry
+                val plainTextExtensions = setOf(
+                    "txt", "md", "json", "jsonl", "csv", "tsv", "log",
+                    "kt", "java", "py"
+                )
+                val structuredExtensions = setOf(
+                    "pdf", "docx", "epub", "html", "htm", "xhtml", "xml"
+                )
+
+                contentResolver.openInputStream(uri)?.use { rawStream ->
+                    ZipInputStream(BufferedInputStream(rawStream)).use { zipStream ->
+                        var entry = zipStream.nextEntry
                         while (entry != null) {
-                            val name = entry.name
-                            val isDirectory = entry.isDirectory
-
-                            // Proteksi Zip Slip (Path Traversal)
-                            if (name.contains("..") || name.startsWith("/")) {
-                                Log.w(TAG, "Zip entry mencurigakan diabaikan: $name")
-                                zis.closeEntry()
-                                entry = zis.nextEntry
-                                continue
-                            }
-
-                            val isText = textExtensions.any { name.endsWith(it, ignoreCase = true) }
-
-                            if (!isDirectory && isText) {
-                                totalFiles++
-                                val nonClosing = NonClosingInputStream(zis)
-                                val entryReader = BufferedReader(InputStreamReader(nonClosing, Charsets.UTF_8), 8192)
-                                val (chunks, chars) = trainingManager.enqueueDocumentStream(
-                                    source = "ZIP: $displayName",
-                                    title = name.substringAfterLast('/'),
-                                    reader = entryReader
+                            entryCount++
+                            if (entryCount > MAX_ZIP_ENTRIES) {
+                                throw IOException(
+                                    "Arsip ZIP melebihi batas " + MAX_ZIP_ENTRIES + " entri."
                                 )
-                                totalChunksEnqueued += chunks
-                                totalCharsExtracted += chars
                             }
-                            zis.closeEntry()
-                            entry = zis.nextEntry
+
+                            val normalizedName = entry.name.replace('\\', '/')
+                            val pathSegments = normalizedName.split('/')
+                            val unsafePath = normalizedName.startsWith("/") ||
+                                pathSegments.any { it == ".." }
+                            val extension = normalizedName
+                                .substringAfterLast('.', "")
+                                .lowercase(Locale.ROOT)
+                            val isSupported = extension in plainTextExtensions ||
+                                extension in structuredExtensions
+
+                            val boundedEntry = LimitedNonClosingInputStream(
+                                zipStream,
+                                maxZipEntryBytes
+                            )
+
+                            if (unsafePath) {
+                                Log.w(TAG, "Zip entry mencurigakan diabaikan: " + normalizedName)
+                            } else if (!entry.isDirectory && isSupported) {
+                                val entryTitle = normalizedName.substringAfterLast('/')
+                                val source = "zip_file|archive=" +
+                                    encodeProvenanceField(displayName) +
+                                    "|entry=" + encodeProvenanceField(normalizedName) +
+                                    "|format=" + extension
+
+                                val extraction = runCatching {
+                                    when (extension) {
+                                        "pdf" -> enqueueExtractedDocument(
+                                            StructuredDocumentExtractor.extractPdf(
+                                                context = getApplication<Application>(),
+                                                input = boundedEntry,
+                                                title = entryTitle,
+                                                maxInputBytes = maxZipEntryBytes / 2L,
+                                                maxTextCharacters = maxTextCharacters.toInt()
+                                            ),
+                                            source
+                                        )
+                                        "docx" -> enqueueExtractedDocument(
+                                            StructuredDocumentExtractor.extractDocx(
+                                                input = boundedEntry,
+                                                title = entryTitle,
+                                                maxEntryBytes = maxZipEntryBytes,
+                                                maxExpandedBytes = maxZipEntryBytes,
+                                                maxTextCharacters = maxTextCharacters.toInt()
+                                            ),
+                                            source
+                                        )
+                                        "epub" -> enqueueExtractedDocument(
+                                            StructuredDocumentExtractor.extractEpub(
+                                                input = boundedEntry,
+                                                fallbackTitle = entryTitle,
+                                                maxEntryBytes = maxZipEntryBytes,
+                                                maxExpandedBytes = maxZipEntryBytes,
+                                                maxStoredTextBytes = maxZipEntryBytes,
+                                                maxTextCharacters = maxTextCharacters.toInt()
+                                            ),
+                                            source
+                                        )
+                                        "html", "htm", "xhtml", "xml" -> enqueueExtractedDocument(
+                                            StructuredDocumentExtractor.extractHtml(
+                                                input = boundedEntry,
+                                                title = entryTitle,
+                                                maxInputBytes = maxZipEntryBytes / 2L,
+                                                maxTextCharacters = maxTextCharacters.toInt()
+                                            ),
+                                            source
+                                        )
+                                        else -> {
+                                            val reader = BufferedReader(
+                                                BoundedReader(
+                                                    InputStreamReader(boundedEntry, Charsets.UTF_8),
+                                                    maxTextCharacters
+                                                ),
+                                                8_192
+                                            )
+                                            reader.use {
+                                                trainingManager.enqueueDocumentStream(
+                                                    source = source,
+                                                    title = entryTitle,
+                                                    reader = it,
+                                                    epochs = recommendedTrainingPasses(entry.size)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (boundedEntry.limitExceeded) {
+                                    throw IOException(
+                                        "Satu entri ZIP melewati batas " +
+                                            (maxZipEntryBytes / 1024L / 1024L) + " MB: " + normalizedName
+                                    )
+                                }
+
+                                extraction.onSuccess { result ->
+                                    if (result.first > 0 && result.second > 0L) {
+                                        processedFiles++
+                                        totalChunksEnqueued += result.first
+                                        totalCharsExtracted += result.second
+                                    } else {
+                                        failedFiles++
+                                        Log.w(TAG, "Tidak ada teks yang dapat diimpor dari " + normalizedName)
+                                    }
+                                }.onFailure { error ->
+                                    failedFiles++
+                                    Log.w(TAG, "Gagal memproses ZIP entry " + normalizedName, error)
+                                }
+                            }
+
+                            drainLimitedInput(boundedEntry)
+                            if (boundedEntry.limitExceeded) {
+                                throw IOException(
+                                    "Arsip ZIP melewati batas " +
+                                        (maxZipEntryBytes / 1024L / 1024L) + " MB pada entri " + normalizedName + "."
+                                )
+                            }
+
+                            totalExpandedBytes += boundedEntry.bytesRead
+                            if (totalExpandedBytes > maxZipTotalBytes) {
+                                throw IOException(
+                                    "Arsip ZIP melewati batas ekspansi total " +
+                                        (maxZipTotalBytes / 1024L / 1024L) + " MB."
+                                )
+                            }
+
+                            zipStream.closeEntry()
+                            entry = zipStream.nextEntry
                         }
                     }
-                }
+                } ?: throw IOException("Tidak dapat membuka arsip ZIP.")
 
                 withContext(Dispatchers.Main) {
-                    if (totalFiles == 0) {
+                    if (processedFiles == 0) {
                         appendMessage(
                             ChatMessage(
                                 isUser = false,
-                                text = "Arsip ZIP '$displayName' tidak berisi file teks yang didukung (.txt, .md, .json, .csv, dll).",
-                                thinkReasoning = "No valid text entries in zip archive."
+                                text = "Arsip ZIP '" + displayName +
+                                    "' tidak menghasilkan teks yang dapat diimpor. " +
+                                    "File yang didukung: TXT, Markdown, JSON/JSONL, CSV/TSV, HTML, PDF, DOCX, dan EPUB.",
+                                thinkReasoning = "No supported archive entries produced extractable text."
                             )
                         )
                     } else {
                         val charsDisplay = String.format(Locale.US, "%,d", totalCharsExtracted)
+                        val failureSummary = if (failedFiles > 0) {
+                            "\nFile dilewati/gagal: " + failedFiles + "."
+                        } else {
+                            ""
+                        }
                         appendMessage(
                             ChatMessage(
                                 isUser = true,
-                                text = "Mengunggah arsip dataset ZIP '$displayName' ($totalFiles file teks, $charsDisplay karakter).",
+                                text = "Mengunggah arsip dataset ZIP '" + displayName +
+                                    "' (" + processedFiles + " file berhasil, " +
+                                    charsDisplay + " karakter).",
                                 attachedFileName = displayName
                             )
                         )
                         appendMessage(
                             ChatMessage(
                                 isUser = false,
-                                text = "Arsip ZIP '$displayName' berhasil diekstraksi secara streaming tanpa memicu OOM!\n\n" +
-                                        "• File teks diproses: $totalFiles file\n" +
-                                        "• Total karakter: $charsDisplay karakter\n" +
-                                        "• Blok training dihasilkan: $totalChunksEnqueued blok\n\n" +
-                                        "Seluruh blok teks telah dijadwalkan ke antrean training on-device. Pantau progres di tab Neural Core.",
-                                thinkReasoning = "ZIP streaming extraction: $totalFiles files → $totalChunksEnqueued chunks."
+                                text = "Arsip ZIP '" + displayName + "' selesai diproses secara lokal.\n\n" +
+                                    "• File berhasil diproses: " + processedFiles + "\n" +
+                                    "• File dilewati/gagal: " + failedFiles + "\n" +
+                                    "• Total karakter: " + charsDisplay + "\n" +
+                                    "• Blok training dijadwalkan: " + totalChunksEnqueued +
+                                    failureSummary,
+                                thinkReasoning = "Bounded ZIP extraction: " +
+                                    processedFiles + " files → " + totalChunksEnqueued + " blocks."
                             )
                         )
                     }
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "importZipContent failed", e)
+            } catch (error: Exception) {
+                Log.e(TAG, "importZipContent failed", error)
                 withContext(Dispatchers.Main) {
                     appendMessage(
                         ChatMessage(
                             isUser = false,
-                            text = "Gagal mengekstraksi file ZIP: ${e.message}",
-                            thinkReasoning = "ZipInputStream extraction exception."
+                            text = "Gagal mengekstraksi file ZIP: " + error.message,
+                            thinkReasoning = "Bounded ZIP extraction exception: " +
+                                error.javaClass.simpleName
                         )
                     )
                 }
             }
+        }
+    }
+
+    private fun drainLimitedInput(input: InputStream) {
+        val buffer = ByteArray(8_192)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
         }
     }
 
@@ -854,24 +1202,134 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    fun searchWebDirectly(query: String) {
+    private suspend fun executeWebSearchSkill(query: String): List<SearchResultItem> {
+        return when (val output = skillRegistry.execute(WebSearchSkill.ID, query)) {
+            is WebSearchSkillOutput -> output.results
+            else -> throw IllegalStateException("Unexpected output from Web Search skill.")
+        }
+    }
+
+    private suspend fun executeWebArticleExtractionSkill(sourceUrl: String): ExtractedWebArticle {
+        return when (
+            val output = skillRegistry.execute(WebArticleExtractionSkill.ID, sourceUrl)
+        ) {
+            is WebArticleExtractionSkillOutput -> output.article
+            else -> throw IllegalStateException("Unexpected output from Web Article Extraction skill.")
+        }
+    }
+
+    fun extractWebArticle(result: SearchResultItem) {
+        if (_isExtractingArticle.value) return
+
         viewModelScope.launch {
+            _isExtractingArticle.value = true
+            _articleExtractionError.value = null
+            _articleQueueStatus.value = null
+            _articlePreview.value = null
+
             try {
-                val results = webSearchEngine.search(query)
-                _searchResults.value = results
-                if (results.isNotEmpty()) {
-                    trainingManager.enqueueData(
-                        source = "Web Search Tool",
-                        title = "Web: $query",
-                        content = results.joinToString(" ") { it.snippet }
-                    )
+                _articlePreview.value = executeWebArticleExtractionSkill(result.sourceUrl)
+            } catch (error: Exception) {
+                Log.w(TAG, "Article extraction failed for ${result.sourceUrl}", error)
+                _articleExtractionError.value = error.message ?: "Artikel tidak dapat diekstrak."
+            } finally {
+                _isExtractingArticle.value = false
+            }
+        }
+    }
+
+    private fun recommendedTrainingPasses(contentSize: Long): Int {
+        if (contentSize <= 0L) return 1
+        val profile = _hardwareInfo.value
+
+        return when {
+            contentSize <= 250_000L &&
+                profile.totalRamGb >= 8 &&
+                profile.availRamGb >= 2.0f &&
+                profile.maxHeapMb >= 384L -> 3
+
+            contentSize <= 600_000L &&
+                profile.totalRamGb >= 6 &&
+                profile.availRamGb >= 1.0f &&
+                profile.maxHeapMb >= 256L -> 2
+
+            else -> 1
+        }
+    }
+
+    fun enqueueReviewedWebArticle() {
+        val article = _articlePreview.value ?: return
+        if (_isQueueingArticle.value) return
+
+        val epochs = recommendedTrainingPasses(article.characterCount.toLong())
+        _isQueueingArticle.value = true
+        _articleQueueStatus.value = null
+
+        viewModelScope.launch(Dispatchers.Default) {
+            val result = runCatching {
+                trainingManager.enqueueDocument(
+                    source = buildString {
+                        append("web_article")
+                        append("|site=").append(encodeProvenanceField(article.siteName))
+                        append("|domain=").append(article.domain)
+                        append("|source_url=").append(encodeProvenanceField(article.sourceUrl))
+                        append("|canonical=").append(encodeProvenanceField(article.canonicalUrl))
+                        append("|published=").append(encodeProvenanceField(article.publishedAt.orEmpty()))
+                        append("|language=").append(encodeProvenanceField(article.language.orEmpty()))
+                        append("|characters=").append(article.characterCount)
+                        append("|sha256=").append(sha256Hex(article.text))
+                        append("|extracted_at=").append(article.extractedAtEpochMs)
+                        append("|rights_declared_by_user=true")
+                    },
+                    title = article.title,
+                    fullText = article.text,
+                    chunkSize = 700,
+                    overlap = 80,
+                    epochs = epochs
+                )
+            }
+
+            withContext(Dispatchers.Main) {
+                _isQueueingArticle.value = false
+                result.onSuccess { queuedChunks ->
+                    if (queuedChunks > 0) {
+                        _articlePreview.value = null
+                        _articleExtractionError.value = null
+                        _articleQueueStatus.value = "Artikel dijadwalkan menjadi $queuedChunks blok training dalam $epochs pass, disesuaikan dengan RAM dan heap aplikasi."
+                    } else {
+                        _articleQueueStatus.value = "Tidak ada blok yang dapat dibuat dari artikel ini."
+                    }
+                }.onFailure { error ->
+                    Log.e(TAG, "Failed to queue reviewed web article", error)
+                    _articleQueueStatus.value = error.message ?: "Artikel gagal dimasukkan ke antrean."
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "searchWebDirectly failed", e)
+            }
+        }
+    }
+
+    fun dismissWebArticlePreview() {
+        _articlePreview.value = null
+        _articleExtractionError.value = null
+        _articleQueueStatus.value = null
+    }
+
+    fun searchWebDirectly(query: String) {
+        val normalizedQuery = query.trim()
+        if (normalizedQuery.isBlank()) return
+
+        viewModelScope.launch {
+            _articlePreview.value = null
+            _articleExtractionError.value = null
+            _articleQueueStatus.value = null
+
+            try {
+                _searchResults.value = executeWebSearchSkill(normalizedQuery)
+            } catch (error: Exception) {
+                Log.e(TAG, "searchWebDirectly failed", error)
                 appendMessage(
                     ChatMessage(
                         isUser = false,
-                        text = "Pencarian web gagal: ${e.message}",
+                        text = "Pencarian web gagal: ${error.message}",
                         thinkReasoning = "Web search exception."
                     )
                 )
@@ -1043,9 +1501,69 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         audioVoiceManager.close()
     }
 
-    private class NonClosingInputStream(inputStream: InputStream) : FilterInputStream(inputStream) {
+    private class BoundedReader(
+        private val delegate: java.io.Reader,
+        private val maximumCharacters: Long
+    ) : java.io.Reader() {
+        private var charactersRead = 0L
+
+        override fun read(buffer: CharArray, offset: Int, length: Int): Int {
+            require(offset >= 0 && length >= 0 && offset + length <= buffer.size)
+            if (length == 0) return 0
+
+            val remaining = maximumCharacters - charactersRead
+            if (remaining <= 0L) {
+                if (delegate.read() >= 0) {
+                    throw IOException(
+                        "Dokumen teks melewati batas " + maximumCharacters + " karakter."
+                    )
+                }
+                return -1
+            }
+
+            val allowedLength = minOf(length.toLong(), remaining).toInt()
+            val count = delegate.read(buffer, offset, allowedLength)
+            if (count > 0) charactersRead += count.toLong()
+            return count
+        }
+
         override fun close() {
-            // Keep underlying ZipInputStream open across entries
+            delegate.close()
+        }
+    }
+
+    private class LimitedNonClosingInputStream(
+        inputStream: InputStream,
+        private val maximumBytes: Long
+    ) : FilterInputStream(inputStream) {
+        var bytesRead: Long = 0L
+            private set
+
+        var limitExceeded: Boolean = false
+            private set
+
+        override fun read(): Int {
+            val value = super.read()
+            if (value >= 0) countBytes(1L)
+            return value
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            val count = super.read(buffer, offset, length)
+            if (count > 0) countBytes(count.toLong())
+            return count
+        }
+
+        private fun countBytes(count: Long) {
+            bytesRead += count
+            if (bytesRead > maximumBytes) {
+                limitExceeded = true
+                throw IOException("ZIP entry expanded beyond the configured limit.")
+            }
+        }
+
+        override fun close() {
+            // Keep the enclosing ZipInputStream open until closeEntry().
         }
     }
 }

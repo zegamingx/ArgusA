@@ -1,13 +1,17 @@
 package com.argus.agi
 
 import android.content.Context
+import java.io.StringReader
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import androidx.test.core.app.ApplicationProvider
 import com.argus.agi.model.ArgusNeuralEngine
+import com.argus.agi.model.EngineConfig
 import com.argus.agi.model.Tokenizer
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.WorldModel
 import com.argus.agi.sensor.DeviceGuard
-import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -28,6 +32,72 @@ class ArgusAppRobolectricTest {
     @org.junit.Before
     fun setUp() = kotlinx.coroutines.runBlocking<Unit> {
         com.argus.agi.data.repository.ArgusRepository(context).clearPendingQueue()
+    }
+
+    @Test
+    fun testDeviceModelConfigurationUsesStableMemoryTiers() {
+        val compact = EngineConfig.forDevice(totalRamGb = 4, maxHeapMb = 192L)
+        assertEquals(48, compact.dModel)
+        assertEquals(4, compact.nHeads)
+        assertEquals(128, compact.dFf)
+        assertEquals(64, compact.maxSeqLen)
+        assertEquals(2, compact.loraRank)
+
+        val balanced = EngineConfig.forDevice(totalRamGb = 6, maxHeapMb = 256L)
+        assertEquals(64, balanced.dModel)
+        assertEquals(256, balanced.dFf)
+        assertEquals(96, balanced.maxSeqLen)
+
+        val highMemory = EngineConfig.forDevice(totalRamGb = 8, maxHeapMb = 384L)
+        assertEquals(96, highMemory.dModel)
+        assertEquals(384, highMemory.dFf)
+        assertEquals(128, highMemory.maxSeqLen)
+
+        val flagship = EngineConfig.forDevice(totalRamGb = 12, maxHeapMb = 512L)
+        assertEquals(128, flagship.dModel)
+        assertEquals(512, flagship.dFf)
+        assertEquals(128, flagship.maxSeqLen)
+    }
+
+    @Test
+    fun testCheckpointArchitectureTakesPriorityOverCurrentDeviceTier() {
+        val checkpoint = java.io.File(context.filesDir, "argus_model_weights.bin")
+        val previousBytes = checkpoint.takeIf { it.isFile }?.readBytes()
+
+        try {
+            val header = ByteBuffer.allocate(48).order(ByteOrder.LITTLE_ENDIAN)
+            header.put(byteArrayOf(0x41, 0x52, 0x47, 0x33))
+            header.putInt(3)
+            header.putInt(96)
+            header.putInt(4)
+            header.putInt(384)
+            header.putInt(128)
+            header.putInt(4)
+            header.putInt(120)
+            header.putInt(160)
+            header.putInt(25)
+            header.putInt(0)
+            header.position(48)
+            checkpoint.writeBytes(header.array())
+
+            val resolved = ArgusNeuralEngine.resolveConfig(
+                context = context,
+                totalRamGb = 4,
+                maxHeapMb = 192L
+            )
+
+            assertEquals(96, resolved.dModel)
+            assertEquals(4, resolved.nHeads)
+            assertEquals(384, resolved.dFf)
+            assertEquals(128, resolved.maxSeqLen)
+            assertEquals(4, resolved.loraRank)
+        } finally {
+            if (previousBytes == null) {
+                checkpoint.delete()
+            } else {
+                checkpoint.writeBytes(previousBytes)
+            }
+        }
     }
 
     @Test
@@ -97,6 +167,30 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
+    fun testTokenizerUnicodeFallbackIsDeterministicAndDoesNotGrowVocabulary() {
+        val tokenizer = Tokenizer()
+        val input = "Argus 世界 🎯 ~u{1F680}~"
+        val initialVocabSize = tokenizer.vocabSize
+
+        val firstEncoding = tokenizer.encode(input, autoRegister = false)
+        val secondEncoding = tokenizer.encode(input, autoRegister = false)
+
+        assertEquals("Fallback encoding must be deterministic", firstEncoding, secondEncoding)
+        assertEquals("Frozen encoding must not add vocabulary entries", initialVocabSize, tokenizer.vocabSize)
+        assertEquals("Unicode and literal escape markers must round-trip", input, tokenizer.decode(firstEncoding))
+    }
+
+    @Test
+    fun testTokenizerDefaultsToFrozenVocabulary() {
+        val tokenizer = Tokenizer()
+        val initialVocabSize = tokenizer.vocabSize
+
+        tokenizer.encode("Unseen script 漢字 and emoji 🧭")
+
+        assertEquals("Default encode must not mutate vocabulary", initialVocabSize, tokenizer.vocabSize)
+    }
+
+    @Test
     fun testOverfitOneBatchLossReduction() {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val prompt = "A.R.G.U.S belajar on device terus menerus"
@@ -117,6 +211,163 @@ class ArgusAppRobolectricTest {
         assertTrue(
             "Loss should decrease by at least 40% after 35 steps (Initial: $initialLoss, Final: $lastLoss)",
             lastLoss < initialLoss * 0.6f
+        )
+    }
+
+    @Test
+    fun testEnqueueDocumentSchedulesCompleteEpochPassesInOrder() {
+        val engine = ArgusNeuralEngine.createBlocking(context)
+        val deviceGuard = DeviceGuard(context)
+        val worldModel = WorldModel(context)
+        val trainingManager = TrainingManager(context, engine, deviceGuard, worldModel)
+
+        try {
+            trainingManager.pauseTraining()
+
+            val title = "Epoch Training Sample"
+            val document = (
+                "Argus processes a local article as ordered blocks. " +
+                    "Each block contributes next-token targets from its text. "
+                ).repeat(18)
+            val chunkSize = 200
+            val overlap = 30
+            val chunksPerEpoch = com.argus.agi.model.TextModalityProcessor
+                .process(document, title, chunkSize, overlap)
+                .size
+
+            val queued = trainingManager.enqueueDocument(
+                source = "Test Corpus",
+                title = title,
+                fullText = document,
+                chunkSize = chunkSize,
+                overlap = overlap,
+                epochs = 3
+            )
+
+            val items = trainingManager.nextQueue.value
+            assertEquals(chunksPerEpoch * 3, queued)
+            assertEquals(queued, items.size)
+            assertEquals(items[0].content, items[chunksPerEpoch].content)
+            assertEquals(items[chunksPerEpoch].content, items[chunksPerEpoch * 2].content)
+            assertTrue(items[chunksPerEpoch].title.contains("[Epoch 2/3]"))
+            assertTrue(items[chunksPerEpoch * 2].title.contains("[Epoch 3/3]"))
+            assertEquals(queued, items.last().chunkIndex)
+            assertEquals(queued, items.last().totalChunks)
+            assertEquals(
+                "Persisted queue order must use unique timestamps.",
+                items.size,
+                items.map { it.timestamp }.toSet().size
+            )
+            assertTrue(
+                "Queue timestamps must preserve epoch-major order.",
+                items.zipWithNext().all { (first, second) -> first.timestamp < second.timestamp }
+            )
+        } finally {
+            trainingManager.close()
+        }
+    }
+
+    @Test
+    fun testEnqueueDocumentStreamSchedulesMultipleCompletePasses() {
+        val engine = ArgusNeuralEngine.createBlocking(context)
+        val guard = DeviceGuard(context)
+        val worldModel = WorldModel(context)
+        val manager = TrainingManager(context, engine, guard, worldModel)
+
+        try {
+            manager.pauseTraining()
+            val document = (
+                "Argus parses document streams incrementally and keeps each generated chunk ordered. " +
+                    "Training passes repeat the document blocks without modifying their token IDs. "
+                ).repeat(10)
+
+            val firstPass = manager.enqueueDocumentStream(
+                source = "Single pass test",
+                title = "Single pass",
+                reader = StringReader(document),
+                chunkSize = 180,
+                overlap = 30,
+                epochs = 1
+            )
+            val multiPass = manager.enqueueDocumentStream(
+                source = "Multi pass test",
+                title = "Multi pass",
+                reader = StringReader(document),
+                chunkSize = 180,
+                overlap = 30,
+                epochs = 3
+            )
+
+            val allItems = manager.nextQueue.value
+            val multiPassItems = allItems.drop(firstPass.first)
+
+            assertTrue("Streamed document should produce multiple chunks.", firstPass.first > 1)
+            assertEquals(firstPass.first * 3, multiPass.first)
+            assertEquals(multiPass.first, multiPassItems.size)
+            assertEquals(
+                multiPassItems[0].content,
+                multiPassItems[firstPass.first].content
+            )
+            assertEquals(
+                multiPassItems[firstPass.first].content,
+                multiPassItems[firstPass.first * 2].content
+            )
+            assertTrue(multiPassItems[firstPass.first].title.contains("[Epoch 2/3]"))
+            assertTrue(multiPassItems[firstPass.first * 2].title.contains("[Epoch 3/3]"))
+            assertTrue(
+                multiPassItems.zipWithNext().all { (first, second) ->
+                    first.timestamp < second.timestamp
+                }
+            )
+        } finally {
+            manager.close()
+        }
+    }
+
+    @Test
+    fun testTrainingWithUnseenUnicodeDoesNotExpandTokenizerVocabulary() {
+        val engine = ArgusNeuralEngine.createBlocking(context)
+        val initialVocabularySize = engine.tokenizer.vocabSize
+
+        val loss = engine.trainStep("Argus memproses bahasa baru: 世界 🌌 مرحبا")
+
+        assertTrue("Training loss must be finite", loss.isFinite())
+        assertEquals(
+            "Training must use stable Unicode fallback instead of registering tokens.",
+            initialVocabularySize,
+            engine.tokenizer.vocabSize
+        )
+    }
+
+    @Test
+    fun testEvaluateLossDoesNotMutateCheckpointState() {
+        val engine = ArgusNeuralEngine.createBlocking(context)
+        val sample = (
+            "This is held-out validation text. It must be measured without updating " +
+                "the Argus neural weights, optimizer moments, tokenizer, or training step."
+            ).repeat(3)
+
+        assertTrue("Checkpoint must be written before evaluation", engine.saveCheckpoint())
+        val checkpointFile = java.io.File(context.filesDir, "argus_model_weights.bin")
+        val beforeEvaluation = checkpointFile.readBytes()
+
+        val validationLoss = engine.evaluateLoss(sample)
+        val validationPerplexity = engine.evaluatePerplexity(sample)
+
+        assertTrue("Validation loss must be finite", validationLoss.isFinite())
+        assertTrue("Validation perplexity must be finite", validationPerplexity.isFinite())
+        assertEquals(
+            "Perplexity must be exp(cross-entropy loss)",
+            kotlin.math.exp(validationLoss),
+            validationPerplexity,
+            0.0001f
+        )
+        assertTrue("Checkpoint must still be writable", engine.saveCheckpoint())
+        val afterEvaluation = checkpointFile.readBytes()
+        assertArrayEquals(
+            "Evaluation must not mutate model or optimizer checkpoint state",
+            beforeEvaluation,
+            afterEvaluation
         )
     }
 
@@ -183,6 +434,48 @@ class ArgusAppRobolectricTest {
             trainingManager.close()
         }
     }
+
+    @Test
+    fun testClearQueueSerializesBehindPendingPersistenceWrites() =
+        kotlinx.coroutines.runBlocking<Unit> {
+            val engine = ArgusNeuralEngine.createBlocking(context)
+            val guard = DeviceGuard(context)
+            val worldModel = WorldModel(context)
+            val repository = com.argus.agi.data.repository.ArgusRepository(context)
+            repository.clearPendingQueue()
+
+            val manager = TrainingManager(
+                context = context,
+                neuralEngine = engine,
+                deviceGuard = guard,
+                worldModel = worldModel,
+                repository = repository
+            )
+
+            try {
+                manager.pauseTraining()
+                repeat(12) { index ->
+                    manager.enqueueData(
+                        source = "Queue persistence test",
+                        title = "Item $index",
+                        content = "Unique training sample number $index for persistence ordering."
+                    )
+                }
+                assertEquals(12, manager.nextQueue.value.size)
+
+                manager.clearQueue()
+                assertTrue(manager.nextQueue.value.isEmpty())
+
+                manager.awaitQueuePersistenceIdle()
+
+                assertTrue(
+                    "Clearing the queue must win over earlier pending save operations.",
+                    repository.getPendingQueueSnapshot().isEmpty()
+                )
+            } finally {
+                manager.close()
+            }
+        }
 
     @Test
     fun testExcludedAppsManagerSensitivityHeuristic() {

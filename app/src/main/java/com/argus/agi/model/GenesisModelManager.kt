@@ -232,23 +232,21 @@ class GenesisModelManager(
         publish(GenesisLifecycleStage.SELECTING_CONFIGURATION,
             "Memilih konfigurasi tensor berdasarkan budget komputasi perangkat...")
 
-        val archTier = when {
-            hardwareInfo.totalRamGb >= 12 ->
-                "Flagship Dynamic Core (LoRA Rank 4, d_model 128, d_ff 512)"
-            hardwareInfo.totalRamGb >= 6 ->
-                "Balanced Neural Core (LoRA Rank 4, d_model 128, d_ff 512)"
-            else ->
-                "Compact Neural Core (LoRA Rank 2, d_model 48, d_ff 96)"
-        }
-        val computeTarget = when {
-            hardwareInfo.npuApuDetected.contains("NPU", true) ||
-                    hardwareInfo.npuApuDetected.contains("Hexagon", true) ||
-                    hardwareInfo.npuApuDetected.contains("TPU", true) -> "NPU DETECTED"
-            hardwareInfo.vulkanSupported -> "VULKAN ACCELERATOR DETECTED"
-            else -> "MULTI-CORE CPU ACCELERATED"
+        val archTier = neuralEngine.config.architectureLabel
+        val detectedAccelerators = buildList {
+            if (hardwareInfo.npuApuDetected.isNotBlank()) add(hardwareInfo.npuApuDetected)
+            if (hardwareInfo.vulkanSupported) add("Vulkan ${hardwareInfo.vulkanVersionName}")
+        }.distinct()
+
+        // NeuralEngine currently executes its tensor operations in Kotlin CPU loops.
+        // Detection must not be reported as an active NPU/Vulkan training backend.
+        val computeTarget = if (detectedAccelerators.isEmpty()) {
+            "Kotlin CPU backend"
+        } else {
+            "Kotlin CPU backend; detected but unused: ${detectedAccelerators.joinToString()}"
         }
         logs += "Konfigurasi Terpilih: $archTier"
-        logs += "Akselerator Eksekusi: $computeTarget | Context Length: 128 Token"
+        logs += "Backend Eksekusi: $computeTarget | Context Length: ${neuralEngine.maxSeqLen} Token"
         throttleStage()
 
         publish(GenesisLifecycleStage.PREPARING_TOKENIZER,
@@ -284,9 +282,9 @@ class GenesisModelManager(
         publish(GenesisLifecycleStage.COMMITTING_INITIAL_GENERATION,
             "Memvalidasi numerik forward pass & menyimpan checkpoint awal ARG3...")
 
-        val sanityLoss = neuralEngine.trainStep("A.R.G.U.S Genesis origin test.")
+        val sanityLoss = neuralEngine.evaluateLoss("A.R.G.U.S Genesis origin test.")
         if (!sanityLoss.isFinite()) {
-            throw GenesisException("Forward pass menghasilkan nilai tidak valid: $sanityLoss")
+            throw GenesisException("Forward validation menghasilkan nilai tidak valid: $sanityLoss")
         }
         val checkpointSaved = neuralEngine.saveCheckpoint()
         if (!checkpointSaved) {
@@ -307,7 +305,7 @@ class GenesisModelManager(
         )
         saveIdentity(identity)
 
-        logs += "Validasi numerik selesai: loss awal = " +
+        logs += "Validasi forward pass selesai tanpa optimizer update: loss awal = " +
                 String.format(Locale.US, "%.4f", sanityLoss)
         logs += "Checkpoint 'argus_model_weights.bin' (Format ARG3) diverifikasi tersimpan permanen."
         logs += "Model Origin Identity Dikomit: $originId"
