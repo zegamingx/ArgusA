@@ -104,36 +104,7 @@ internal object VulkanTrainingBackend {
             return false
         }
 
-        val batchedInput = floatArrayOf(
-            1f, 2f, 3f,
-            4f, 5f, 6f,
-            1f, 2f, 3f,
-            4f, 5f, 6f
-        )
-        val batchedWeights = floatArrayOf(
-            1f, 2f,
-            3f, 4f,
-            5f, 6f,
-            2f, 0f,
-            0f, 3f,
-            1f, 1f
-        )
-        val batchedOutput = FloatArray(8)
-        if (!nativeApplyLinear(
-                batchedInput,
-                batchedWeights,
-                batchedOutput,
-                rows = 4,
-                batchCount = 2,
-                rowsPerBatch = 2,
-                inputColumns = 3,
-                outputColumns = 2,
-                transposeWeights = false
-            ) || !approximatelyEqual(
-                batchedOutput,
-                floatArrayOf(22f, 28f, 49f, 64f, 5f, 9f, 14f, 21f),
-                1e-4f
-            )) {
+        if (!verifyBatchedLinearKernel()) {
             return false
         }
 
@@ -160,6 +131,59 @@ internal object VulkanTrainingBackend {
             approximatelyEqual(parameters, floatArrayOf(0.99f, 2.01f), 1e-4f) &&
             approximatelyEqual(firstMoments, floatArrayOf(0.01f, -0.02f), 1e-5f) &&
             approximatelyEqual(secondMoments, floatArrayOf(0.00001f, 0.00004f), 1e-7f)
+    }
+
+    /**
+     * Compares one non-square, multi-batch Vulkan dispatch with a Kotlin CPU reference.
+     * 72 outputs deliberately cross the 64-invocation workgroup boundary.
+     */
+    private fun verifyBatchedLinearKernel(): Boolean {
+        val batchCount = 3
+        val rowsPerBatch = 3
+        val inputColumns = 5
+        val outputColumns = 8
+        val rowCount = batchCount * rowsPerBatch
+        val input = FloatArray(rowCount * inputColumns) { index ->
+            ((index % 17) - 8) * 0.125f
+        }
+        val weightsPerBatch = inputColumns * outputColumns
+        val weights = FloatArray(batchCount * weightsPerBatch) { index ->
+            ((index % 13) - 6) * 0.0625f
+        }
+        val expected = FloatArray(rowCount * outputColumns)
+
+        for (batchIndex in 0 until batchCount) {
+            val batchInputOffset = batchIndex * rowsPerBatch * inputColumns
+            val batchWeightOffset = batchIndex * weightsPerBatch
+            for (row in 0 until rowsPerBatch) {
+                val inputRowOffset = batchInputOffset + row * inputColumns
+                val outputRowOffset = (batchIndex * rowsPerBatch + row) * outputColumns
+                for (column in 0 until outputColumns) {
+                    var sum = 0f
+                    for (inner in 0 until inputColumns) {
+                        val inputValue = input[inputRowOffset + inner]
+                        val weightValue = weights[
+                            batchWeightOffset + inner * outputColumns + column
+                        ]
+                        sum += inputValue * weightValue
+                    }
+                    expected[outputRowOffset + column] = sum
+                }
+            }
+        }
+
+        val actual = FloatArray(expected.size)
+        return nativeApplyLinear(
+            input,
+            weights,
+            actual,
+            rows = rowCount,
+            batchCount = batchCount,
+            rowsPerBatch = rowsPerBatch,
+            inputColumns = inputColumns,
+            outputColumns = outputColumns,
+            transposeWeights = false
+        ) && approximatelyEqual(actual, expected, 1e-4f)
     }
 
     private fun approximatelyEqual(
