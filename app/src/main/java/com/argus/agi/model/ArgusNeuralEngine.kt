@@ -538,7 +538,7 @@ class ArgusNeuralEngine private constructor(
     }
 
     // =====================================================================
-    // Training: True Full-Parameter Backprop with Minibatch Accumulation
+    // Training: Full-Parameter Backprop with Per-Window Gradient Accumulation
     // =====================================================================
     /**
      * Computes next-token cross-entropy without changing weights, optimizer state,
