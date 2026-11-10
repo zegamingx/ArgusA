@@ -621,12 +621,16 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 } ?: Pair(0, 0L)
 
                 if (chunkCount == 0 || charsRead == 0L) {
+                    val reason = when {
+                        charsRead == 0L -> "File kosong atau tidak bisa dibaca."
+                        else -> "Konten tidak menghasilkan blok baru; kemungkinan dokumen identik sudah tersimpan di corpus lokal."
+                    }
                     withContext(Dispatchers.Main) {
                         appendMessage(
                             ChatMessage(
                                 isUser = false,
-                                text = "File '$docDisplayName' kosong atau tidak bisa dibaca.",
-                                thinkReasoning = "Empty content or stream read returned 0 chunks."
+                                text = "File '$docDisplayName' dilewati. $reason",
+                                thinkReasoning = "Buffered import produced $charsRead characters and $chunkCount new training chunks."
                             )
                         )
                     }
