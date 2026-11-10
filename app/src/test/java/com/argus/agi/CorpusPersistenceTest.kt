@@ -14,8 +14,8 @@ import com.argus.agi.model.WorldModel
 import com.argus.agi.sensor.DeviceGuard
 import java.io.StringReader
 import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -48,6 +48,8 @@ class CorpusPersistenceTest {
             val sample = "Argus learns local language"
             val initialTrainingLoss = engine.trainStep(sample)
             assertTrue("The setup step must produce a finite loss.", initialTrainingLoss.isFinite())
+            assertTrue("The diagnostic baseline checkpoint must be writable.", engine.saveCheckpoint())
+            val baselineCheckpoint = checkpointFile.readBytes()
             val lossOnlyEvaluation = engine.evaluateLoss(sample)
             val parameterGroups = listOf(
                 "wHead",
@@ -94,9 +96,11 @@ class CorpusPersistenceTest {
                 )
             }
 
-            assertFalse(
-                "Gradient diagnostics must not create or write a model checkpoint.",
-                checkpointFile.exists()
+            assertTrue("The diagnostic checkpoint must remain writable.", engine.saveCheckpoint())
+            assertArrayEquals(
+                "Gradient diagnostics must not mutate parameters, optimizer state, or tokenizer state.",
+                baselineCheckpoint,
+                checkpointFile.readBytes()
             )
         } finally {
             if (previousCheckpoint == null) {
