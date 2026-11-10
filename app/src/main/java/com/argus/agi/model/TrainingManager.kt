@@ -22,6 +22,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
@@ -107,12 +109,16 @@ class TrainingManager(
         const val MAX_COMPLETED_SIZE = 100
         const val MAX_LOSS_HISTORY = 100
         const val MAX_DOCUMENT_EPOCHS = 5
+        const val MAX_CORPUS_REPLAY_DOCUMENTS = 500
+        const val DEFAULT_MAX_CORPUS_REPLAY_CHUNKS = 4_096
+        const val MAX_CORPUS_REPLAY_CHUNKS = 50_000
         private const val IDLE_POLL_MS = 500L
     }
 
     // StateFlow<List<TrainingData>> sebagai satu-satunya sumber kebenaran untuk queue.
     // Channel hanya berfungsi sebagai wakeup signal, bukan storage.
     private val queueLock = Any()
+    private val corpusSchedulingMutex = Mutex()
     private var lastScheduledTimestamp: Long = System.currentTimeMillis()
     private var queueGeneration: Long = 0L
     private val persistenceOperations =
@@ -611,65 +617,195 @@ class TrainingManager(
     }
 
     /**
-     * Re-enqueues retained corpus chunks without re-reading the original file or web page.
-     * Queue clearing therefore does not delete the data needed for another training pass.
+     * Schedules every eligible TRAIN document in stable corpus order, then applies the
+     * requested deterministic replay policy. The same seed and corpus snapshot reproduce
+     * the same queue order. Validation documents are excluded by the DAO and planner.
      */
-    suspend fun replayCorpusDocument(
-        documentId: String,
-        epochs: Int = 1
-    ): Int {
+    suspend fun scheduleCorpusReplay(
+        seed: Long,
+        epochs: Int = 1,
+        policy: CorpusReplayPolicy = CorpusReplayPolicy.INTERLEAVED_DOCUMENTS,
+        maxDocuments: Int = MAX_CORPUS_REPLAY_DOCUMENTS,
+        maxQueuedChunks: Int = DEFAULT_MAX_CORPUS_REPLAY_CHUNKS
+    ): CorpusReplayResult = corpusSchedulingMutex.withLock {
+        require(maxDocuments in 1..MAX_CORPUS_REPLAY_DOCUMENTS) {
+            "maxDocuments must be in 1..$MAX_CORPUS_REPLAY_DOCUMENTS."
+        }
+        require(maxQueuedChunks in 1..MAX_CORPUS_REPLAY_CHUNKS) {
+            "maxQueuedChunks must be in 1..$MAX_CORPUS_REPLAY_CHUNKS."
+        }
         require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
             "epochs must be in 1..$MAX_DOCUMENT_EPOCHS."
         }
-        if (closed) return 0
+        if (closed) {
+            return@withLock CorpusReplayResult(0, 0, epochs, seed, policy)
+        }
 
         val activeRepository = requireNotNull(repo) {
             "Local corpus storage is unavailable; corpus replay cannot be scheduled."
         }
-        val document = activeRepository.getCorpusDocument(documentId) ?: return 0
+        val documents = activeRepository.getTrainingCorpusDocuments(maxDocuments)
+        if (documents.isEmpty()) {
+            return@withLock CorpusReplayResult(0, 0, epochs, seed, policy)
+        }
+
+        val requestedChunkCount = documents.sumOf { it.chunkCount.toLong() } * epochs.toLong()
+        require(requestedChunkCount <= maxQueuedChunks.toLong()) {
+            "Corpus replay requires $requestedChunkCount queue items, exceeding the configured limit of $maxQueuedChunks. Reduce epochs or import fewer documents per replay."
+        }
+
+        val sources = documents.map { document ->
+            CorpusReplaySource(
+                document = document,
+                chunks = activeRepository.getCorpusChunks(document.id)
+            )
+        }
+        enqueueCorpusReplay(
+            sources = sources,
+            epochs = epochs,
+            seed = seed,
+            policy = policy,
+            maxQueuedChunks = maxQueuedChunks
+        )
+    }
+
+    /**
+     * Re-enqueues one retained document without re-reading the original source.
+     * Existing callers retain sequential replay by default. A seeded policy may also
+     * be selected without changing the stored chunk order.
+     */
+    suspend fun replayCorpusDocument(
+        documentId: String,
+        epochs: Int = 1,
+        seed: Long = 0L,
+        policy: CorpusReplayPolicy = CorpusReplayPolicy.SEQUENTIAL_DOCUMENTS,
+        maxQueuedChunks: Int = DEFAULT_MAX_CORPUS_REPLAY_CHUNKS
+    ): Int = corpusSchedulingMutex.withLock {
+        require(maxQueuedChunks in 1..MAX_CORPUS_REPLAY_CHUNKS) {
+            "maxQueuedChunks must be in 1..$MAX_CORPUS_REPLAY_CHUNKS."
+        }
+        if (closed) return@withLock 0
+
+        val activeRepository = requireNotNull(repo) {
+            "Local corpus storage is unavailable; corpus replay cannot be scheduled."
+        }
+        val document = activeRepository.getCorpusDocument(documentId)
+            ?: return@withLock 0
         require(document.datasetSplit == "TRAIN") {
             "Validation-only documents cannot be replayed into the training queue."
         }
-        val chunks = activeRepository.getCorpusChunks(documentId)
-        if (chunks.size != document.chunkCount || chunks.isEmpty()) {
-            throw IllegalStateException(
-                "Corpus document $documentId is incomplete: expected ${document.chunkCount} chunks, found ${chunks.size}."
+
+        val source = CorpusReplaySource(
+            document = document,
+            chunks = activeRepository.getCorpusChunks(documentId)
+        )
+        val result = enqueueCorpusReplay(
+            sources = listOf(source),
+            epochs = epochs,
+            seed = seed,
+            policy = policy,
+            maxQueuedChunks = maxQueuedChunks
+        )
+        result.scheduledChunkCount
+    }
+
+    private suspend fun enqueueCorpusReplay(
+        sources: List<CorpusReplaySource>,
+        epochs: Int,
+        seed: Long,
+        policy: CorpusReplayPolicy,
+        maxQueuedChunks: Int
+    ): CorpusReplayResult {
+        require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
+            "epochs must be in 1..$MAX_DOCUMENT_EPOCHS."
+        }
+        require(sources.isNotEmpty()) { "No eligible training corpus documents were found." }
+
+        val requestedChunkCount = sources.sumOf { it.document.chunkCount.toLong() } * epochs.toLong()
+        require(requestedChunkCount in 1..maxQueuedChunks.toLong()) {
+            "Corpus replay requires $requestedChunkCount queue items; configured limit is $maxQueuedChunks."
+        }
+
+        val activeRepository = requireNotNull(repo) {
+            "Local corpus storage is unavailable; corpus replay cannot be scheduled."
+        }
+        val requestedDocumentIds = sources.map { it.document.id }.toSet()
+        val activeDocumentIds = activeRepository.getActiveCorpusTrainingDocumentIds()
+        val databaseConflicts = requestedDocumentIds.intersect(activeDocumentIds)
+        check(databaseConflicts.isEmpty()) {
+            "Corpus replay would duplicate documents that already have queued or active training work: ${databaseConflicts.joinToString()}."
+        }
+
+        val schedule = CorpusReplayScheduler.createSchedule(
+            sources = sources,
+            epochs = epochs,
+            seed = seed,
+            policy = policy
+        )
+        check(schedule.size.toLong() == requestedChunkCount) {
+            "Replay scheduler produced an unexpected number of queue items."
+        }
+
+        val items = schedule.map { scheduled ->
+            TrainingData(
+                source = scheduled.document.source,
+                title = buildString {
+                    append(scheduled.document.title)
+                    append(" [Epoch ").append(scheduled.epochNumber).append('/').append(epochs).append(']')
+                    append(" [Chunk ")
+                    append(scheduled.chunk.chunkIndex).append('/').append(scheduled.document.chunkCount)
+                    append(']')
+                },
+                content = scheduled.chunk.content,
+                chunkIndex = scheduled.documentChunkIndex,
+                totalChunks = scheduled.documentTotalChunks,
+                documentTitle = scheduled.document.title,
+                status = TrainingStatus.QUEUED,
+                documentId = scheduled.document.id
             )
         }
 
-        val totalScheduledChunks = Math.multiplyExact(chunks.size, epochs)
-        val items = ArrayList<TrainingData>(totalScheduledChunks)
-        for (epochIndex in 0 until epochs) {
-            chunks.forEachIndexed { index, chunk ->
-                items += TrainingData(
-                    source = document.source,
-                    title = "${document.title} [Replay ${index + 1}/${chunks.size}] [Epoch ${epochIndex + 1}/$epochs]",
-                    content = chunk.content,
-                    chunkIndex = epochIndex * chunks.size + index + 1,
-                    totalChunks = totalScheduledChunks,
-                    documentTitle = document.title,
-                    status = TrainingStatus.QUEUED,
-                    documentId = document.id
-                )
+        activeRepository.markCorpusDocumentsQueued(requestedDocumentIds)
+
+        val orderedItems = synchronized(queueLock) {
+            if (closed) {
+                emptyList()
+            } else {
+                val memoryActiveDocumentIds = buildSet {
+                    _nextQueue.value.mapNotNullTo(this) { it.documentId }
+                    _currentTrainingItem.value?.documentId?.let { add(it) }
+                }
+                val memoryConflicts = requestedDocumentIds.intersect(memoryActiveDocumentIds)
+                check(memoryConflicts.isEmpty()) {
+                    "Corpus replay would duplicate in-memory training work: ${memoryConflicts.joinToString()}."
+                }
+
+                appendPersistingQueueItems(items).also { queued ->
+                    val firstItem = queued.firstOrNull()
+                    if (_activeDocument.value == null && firstItem != null) {
+                        val firstDocumentId = requireNotNull(firstItem.documentId)
+                        val firstDocument = sources.first {
+                            it.document.id == firstDocumentId
+                        }.document
+                        _activeDocument.value = ActiveDocumentTraining(
+                            docTitle = firstDocument.title,
+                            totalCharacters = firstDocument.characterCount,
+                            totalChunks = firstItem.totalChunks,
+                            completedChunks = firstItem.chunkIndex - 1,
+                            currentChunkIndex = firstItem.chunkIndex
+                        )
+                    }
+                }
             }
         }
 
-        activeRepository.markCorpusDocumentQueued(document.id)
-
-        synchronized(queueLock) {
-            if (closed) return 0
-            val orderedItems = appendPersistingQueueItems(items)
-            if (_activeDocument.value == null && orderedItems.isNotEmpty()) {
-                _activeDocument.value = ActiveDocumentTraining(
-                    docTitle = document.title,
-                    totalCharacters = document.characterCount,
-                    totalChunks = orderedItems.size,
-                    completedChunks = 0,
-                    currentChunkIndex = 1
-                )
-            }
-            return orderedItems.size
-        }
+        return CorpusReplayResult(
+            scheduledDocumentCount = if (orderedItems.isEmpty()) 0 else requestedDocumentIds.size,
+            scheduledChunkCount = orderedItems.size,
+            epochs = epochs,
+            seed = seed,
+            policy = policy
+        )
     }
 
     fun enqueueData(source: String, title: String, content: String) {
