@@ -57,6 +57,15 @@ class ArgusAppRobolectricTest {
         assertEquals(128, flagship.dModel)
         assertEquals(512, flagship.dFf)
         assertEquals(128, flagship.maxSeqLen)
+
+        val memoryConstrainedFlagship = EngineConfig.forDevice(
+            totalRamGb = 12,
+            maxHeapMb = 512L,
+            availableRamGb = 1.5f
+        )
+        assertEquals(48, memoryConstrainedFlagship.dModel)
+        assertEquals(128, memoryConstrainedFlagship.dFf)
+        assertEquals(64, memoryConstrainedFlagship.maxSeqLen)
     }
 
     @Test
