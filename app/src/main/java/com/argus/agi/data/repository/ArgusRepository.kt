@@ -18,9 +18,12 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
-class ArgusRepository(context: Context) {
+class ArgusRepository(
+    context: Context,
+    database: ArgusDatabase = ArgusDatabase.getInstance(context)
+) {
 
-    private val db = ArgusDatabase.getInstance(context)
+    private val db = database
     private val chatMessageDao = db.chatMessageDao()
     private val worldMemoryDao = db.worldMemoryDao()
     private val trainingQueueDao = db.trainingQueueDao()
