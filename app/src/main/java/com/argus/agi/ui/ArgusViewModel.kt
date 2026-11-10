@@ -436,7 +436,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 var finalAnswer = rawOutput
                 val thinking = StringBuilder()
                 thinking.append("Self-Reflection: ").append(reflection.reasoningNote)
-                thinking.append(" | Keyakinan: ")
+                thinking.append(" | Confidence: ")
                     .append(String.format("%.0f%%", reflection.confidenceScore * 100))
 
                 val shouldSearchWeb = explicitWebQuery != null ||
@@ -459,17 +459,15 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
                     _searchResults.value = webItems
                     if (webItems.isNotEmpty()) {
-                        finalAnswer = "Saya menemukan beberapa sumber web untuk \"$searchQuery\". " +
-                                "Ringkasan di bawah hanya cuplikan pencarian, belum isi artikel dan belum " +
-                                "dimasukkan ke training:\n\n" +
+                        finalAnswer = "I found several web sources for \"$searchQuery\". " +
+                                "The items below are search snippets, not full articles, and have not been added to training:\n\n" +
                                 webItems.take(2).joinToString("\n\n") {
                                     "• ${it.title}\n${it.snippet}\n${it.sourceUrl}"
                                 } +
-                                "\n\nBuka bagian Skill Agent untuk mengekstrak artikel, meninjau sumber, " +
-                                "lalu menyatakan hak penggunaan sebelum memasukkannya ke antrean training lokal."
+                                "\n\nOpen Skills & Settings to extract an article, review its source, and confirm usage rights before adding it to the local training queue."
                     } else {
-                        finalAnswer = "Pencarian web untuk \"$searchQuery\" belum menemukan sumber yang dapat digunakan. " +
-                                "Query pencarian saja tidak disimpan sebagai data training."
+                        finalAnswer = "Web search did not find usable sources for \"$searchQuery\". " +
+                                "Search queries alone are not stored as training data."
                     }
                 }
 
@@ -1255,7 +1253,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         _cameraLuminance.value = luminance
         worldModel.updateCameraContext(
             lightLevel = luminance,
-            visualSummary = "Kamera aktif. Luminansi: ${String.format("%.1f", luminance)} lx"
+            visualSummary = "Camera active. Luminance: ${String.format("%.1f", luminance)} lx"
         )
     }
 
@@ -1457,7 +1455,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             val parser = ExpressionParser(cleaned)
             val result = parser.parse()
             if (!result.isFinite()) null
-            else "Hasil penalaran logika matematika: ${parser.normalized} = " +
+            else "Arithmetic evaluation result: ${parser.normalized} = " +
                     formatNumber(result)
         } catch (_: Exception) {
             null
@@ -1576,7 +1574,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             if (remaining <= 0L) {
                 if (delegate.read() >= 0) {
                     throw IOException(
-                        "Dokumen teks melewati batas " + maximumCharacters + " karakter."
+                        "Text document exceeds the limit of " + maximumCharacters + " characters."
                     )
                 }
                 return -1

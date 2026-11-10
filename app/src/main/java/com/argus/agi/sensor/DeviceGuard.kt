@@ -75,7 +75,7 @@ class DeviceGuard(private val context: Context) {
                     Log.d(TAG, "Android OS Thermal status changed: $status")
                     refreshState()
                 }
-            }.onFailure { Log.w(TAG, "Gagal mendaftarkan ThermalStatusListener", it) }
+            }.onFailure { Log.w(TAG, "Failed to register the thermal status listener", it) }
         }
     }
 

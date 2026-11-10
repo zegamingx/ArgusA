@@ -85,7 +85,7 @@ class AudioVoiceManager(
         try {
             tts = TextToSpeech(context.applicationContext, this)
         } catch (e: Exception) {
-            Log.e(TAG, "Gagal menginisialisasi TextToSpeech", e)
+            Log.e(TAG, "Failed to initialize TextToSpeech", e)
         }
     }
 
@@ -115,7 +115,7 @@ class AudioVoiceManager(
             _isTtsReady.value = true
             Log.i(TAG, "TTS on-device siap digunakan.")
         } else {
-            Log.w(TAG, "Inisialisasi TTS gagal dengan kode status: $status")
+            Log.w(TAG, "TextToSpeech initialization failed with status code: $status")
             _isTtsReady.value = false
         }
     }
@@ -385,7 +385,7 @@ class AudioVoiceManager(
                     kotlinx.coroutines.delay(500)
                 }
             } catch (e: SecurityException) {
-                Log.w(TAG, "Izin AudioRecord tidak tersedia untuk monitoring akustik", e)
+                Log.w(TAG, "AudioRecord permission is unavailable for acoustic monitoring", e)
             } catch (e: Exception) {
                 Log.e(TAG, "Acoustic monitoring error", e)
             } finally {
