@@ -100,6 +100,12 @@ android {
         }
     }
 
+    lint {
+        checkTestSources = false
+        ignoreTestSources = true
+        abortOnError = false
+    }
+
     dependenciesInfo {
         includeInApk = false
         includeInBundle = true

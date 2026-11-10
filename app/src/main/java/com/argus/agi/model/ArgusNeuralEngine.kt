@@ -75,7 +75,7 @@ data class EngineConfig(
             totalRamGb >= 8 && maxHeapMb >= 384L && availableRamGb >= 2.0f ->
                 EngineConfig(dModel = 96, nHeads = 4, dFf = 384, maxSeqLen = 128, loraRank = 4)
 
-            totalRamGb >= 6 && maxHeapMb >= 256L && availableRamGb >= 1.0f ->
+            totalRamGb >= 6 && maxHeapMb >= 256L && availableRamGb >= 2.0f ->
                 EngineConfig(dModel = 64, nHeads = 4, dFf = 256, maxSeqLen = 96, loraRank = 2)
 
             else ->
