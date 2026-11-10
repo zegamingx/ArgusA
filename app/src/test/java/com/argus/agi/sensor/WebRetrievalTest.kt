@@ -1,10 +1,51 @@
 package com.argus.agi.sensor
 
+import java.io.ByteArrayInputStream
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WebRetrievalTest {
+
+    @Test
+    fun boundedResponseReaderRejectsOversizedContentLengthBeforeReading() {
+        val input = ByteArrayInputStream("oversized".toByteArray())
+
+        val result = readBoundedResponseBody(
+            input = input,
+            contentLength = 100L,
+            maxBytes = 8
+        )
+
+        assertNull(result)
+    }
+
+    @Test
+    fun boundedResponseReaderRejectsChunkedBodyThatExceedsLimit() {
+        val input = ByteArrayInputStream("123456789".toByteArray())
+
+        val result = readBoundedResponseBody(
+            input = input,
+            contentLength = -1L,
+            maxBytes = 8
+        )
+
+        assertNull(result)
+    }
+
+    @Test
+    fun boundedResponseReaderAcceptsBodyWithinLimit() {
+        val input = ByteArrayInputStream("Argus search".toByteArray())
+
+        val result = readBoundedResponseBody(
+            input = input,
+            contentLength = 12L,
+            maxBytes = 12
+        )
+
+        assertEquals("Argus search", result)
+    }
 
     @Test
     fun duckDuckGoParserUsesActualResultHrefAndTitle() {
