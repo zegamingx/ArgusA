@@ -165,14 +165,33 @@ class ArgusRepository(context: Context) {
             corpusDao.getChunks(documentId)
         }
 
+    suspend fun markCorpusDocumentTraining(documentId: String) =
+        withContext(Dispatchers.IO) {
+            corpusDao.updateTrainingState(
+                documentId = documentId,
+                status = "TRAINING",
+                trainedAtEpochMs = null,
+                completedPassCount = 0
+            )
+        }
+
+    suspend fun markCorpusDocumentPartial(documentId: String) =
+        withContext(Dispatchers.IO) {
+            corpusDao.updateTrainingState(
+                documentId = documentId,
+                status = "PARTIAL",
+                trainedAtEpochMs = null,
+                completedPassCount = 0
+            )
+        }
+
     suspend fun markCorpusDocumentTrained(
         documentId: String,
         completedPassCount: Int
     ) = withContext(Dispatchers.IO) {
         require(completedPassCount >= 0) { "completedPassCount cannot be negative." }
-        corpusDao.updateTrainingState(
+        corpusDao.markTrainedIfNoChunkFailed(
             documentId = documentId,
-            status = "TRAINED",
             trainedAtEpochMs = System.currentTimeMillis(),
             completedPassCount = completedPassCount
         )
