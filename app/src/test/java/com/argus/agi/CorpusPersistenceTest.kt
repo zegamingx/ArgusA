@@ -63,6 +63,7 @@ class CorpusPersistenceTest {
             val document = documents.single()
             val storedChunks = repository.getCorpusChunks(document.id)
             assertEquals(document.chunkCount, storedChunks.size)
+            assertEquals(1, repository.getCorpusSources(document.id).size)
             assertEquals(queuedCount, repository.getPendingQueueSnapshot().size)
 
             val duplicateCount = manager.enqueueDocument(
@@ -75,6 +76,7 @@ class CorpusPersistenceTest {
             )
             assertEquals("Identical content must not be queued twice.", 0, duplicateCount)
             assertEquals(1, repository.getCorpusDocumentCount())
+            assertEquals(2, repository.getCorpusSources(document.id).size)
 
             val streamDuplicate = manager.enqueueDocumentStream(
                 source = "Stream duplicate source",
@@ -86,6 +88,7 @@ class CorpusPersistenceTest {
             )
             assertEquals("Stream and string ingestion must share the same fingerprint.", 0, streamDuplicate.first)
             assertEquals(1, repository.getCorpusDocumentCount())
+            assertEquals(3, repository.getCorpusSources(document.id).size)
 
             manager.clearQueue()
             manager.awaitQueuePersistenceIdle()
