@@ -306,12 +306,7 @@ class ArgusRepository(
 
     suspend fun markCorpusDocumentTraining(documentId: String) =
         withContext(Dispatchers.IO) {
-            corpusDao.updateTrainingState(
-                documentId = documentId,
-                status = "TRAINING",
-                trainedAtEpochMs = null,
-                completedPassCount = 0
-            )
+            corpusDao.markTrainingIfNotPartial(documentId)
         }
 
     suspend fun markCorpusDocumentPartial(documentId: String) =
