@@ -1053,43 +1053,112 @@ class ArgusNeuralEngine private constructor(
         }
 
         // (2) SwiGLU MLP & Residual Backward
+        // The final sequence row has no next-token target, so its backward buffers
+        // remain zero. Keeping it in the batch preserves the original t < seqLen - 1
+        // gradient-accumulation boundary.
         for (t in 0 until seqLen - 1) {
             layerNormBackward(dL_dh2PostLN[t], h2PreLN[t], dL_dh2PreLN[t], dModel)
+        }
 
-            // Akumulasi gradien wDown: act[t] x dL_dh2PreLN[t]
-            for (r in 0 until dFf) {
-                val actVal = act[t][r]
-                val rOff = r * dModel
-                for (c in 0 until dModel) {
-                    gradWDown[rOff + c] += actVal * dL_dh2PreLN[t][c]
-                }
+        // dAct = dL_dh2PreLN × transpose(wDown).
+        val dActRows = Array(seqLen) { FloatArray(dFf) }
+        computeLinearBatch(
+            inputs = dL_dh2PreLN,
+            weights = wDown,
+            inputColumns = dModel,
+            outputColumns = dFf,
+            outputs = dActRows,
+            transposeWeights = true
+        )
+
+        val dUpRows = Array(seqLen) { FloatArray(dFf) }
+        val dGateRows = Array(seqLen) { FloatArray(dFf) }
+        for (t in 0 until seqLen - 1) {
+            for (dimension in 0 until dFf) {
+                val sigmoid = 1.0f / (1.0f + exp(-gate[t][dimension]))
+                val swish = gate[t][dimension] * sigmoid
+                val dActValue = dActRows[t][dimension]
+                dUpRows[t][dimension] = dActValue * swish
+                val dSwish = dActValue * up[t][dimension]
+                dGateRows[t][dimension] =
+                    dSwish * (sigmoid * (1f + gate[t][dimension] * (1f - sigmoid)))
             }
+        }
 
-            val dAct = FloatArray(dFf)
-            for (r in 0 until dFf) {
-                var sum = 0f
-                val rOff = r * dModel
-                for (c in 0 until dModel) sum += dL_dh2PreLN[t][c] * wDown[rOff + c]
-                dAct[r] = sum
+        // Accumulate all three FFN weight gradients as batched matrix products.
+        // gradWDown = transpose(act) × dL_dh2PreLN.
+        val actTransposed = transposeRows(act)
+        val gradWDownRows = Array(dFf) { FloatArray(dModel) }
+        computeLinearBatch(
+            inputs = actTransposed,
+            weights = flattenRows(dL_dh2PreLN),
+            inputColumns = seqLen,
+            outputColumns = dModel,
+            outputs = gradWDownRows
+        )
+        for (row in gradWDownRows.indices) {
+            System.arraycopy(gradWDownRows[row], 0, gradWDown, row * dModel, dModel)
+        }
+
+        // gradWUp = transpose(h1) × dUp; gradWGate = transpose(h1) × dGate.
+        val h1Transposed = transposeRows(h1)
+        val gradWUpRows = Array(dModel) { FloatArray(dFf) }
+        computeLinearBatch(
+            inputs = h1Transposed,
+            weights = flattenRows(dUpRows),
+            inputColumns = seqLen,
+            outputColumns = dFf,
+            outputs = gradWUpRows
+        )
+        for (row in gradWUpRows.indices) {
+            System.arraycopy(gradWUpRows[row], 0, gradWUp, row * dFf, dFf)
+        }
+
+        val gradWGateRows = Array(dModel) { FloatArray(dFf) }
+        computeLinearBatch(
+            inputs = h1Transposed,
+            weights = flattenRows(dGateRows),
+            inputColumns = seqLen,
+            outputColumns = dFf,
+            outputs = gradWGateRows
+        )
+        for (row in gradWGateRows.indices) {
+            System.arraycopy(gradWGateRows[row], 0, gradWGate, row * dFf, dFf)
+        }
+
+        // Propagate dGate and dUp through their corresponding FFN projections.
+        val dHiddenFromGate = Array(seqLen) { FloatArray(dModel) }
+        computeLinearBatch(
+            inputs = dGateRows,
+            weights = wGate,
+            inputColumns = dFf,
+            outputColumns = dModel,
+            outputs = dHiddenFromGate,
+            transposeWeights = true
+        )
+
+        val dHiddenFromUp = Array(seqLen) { FloatArray(dModel) }
+        computeLinearBatch(
+            inputs = dUpRows,
+            weights = wUp,
+            inputColumns = dFf,
+            outputColumns = dModel,
+            outputs = dHiddenFromUp,
+            transposeWeights = true
+        )
+
+        for (t in 0 until seqLen - 1) {
+            for (dimension in 0 until dModel) {
+                dL_dh1PostLN[t][dimension] =
+                    dHiddenFromGate[t][dimension] +
+                    dHiddenFromUp[t][dimension] +
+                    dL_dh2PreLN[t][dimension]
             }
-
-            for (d in 0 until dFf) {
-                val sig = 1.0f / (1.0f + exp(-gate[t][d]))
-                val swish = gate[t][d] * sig
-                val dUp = dAct[d] * swish
-                val dSwish = dAct[d] * up[t][d]
-                val dGate = dSwish * (sig * (1f + gate[t][d] * (1f - sig)))
-
-                for (c in 0 until dModel) {
-                    gradWUp[c * dFf + d] += h1[t][c] * dUp
-                    gradWGate[c * dFf + d] += h1[t][c] * dGate
-                    dL_dh1PostLN[t][c] += dGate * wGate[c * dFf + d] + dUp * wUp[c * dFf + d]
-                }
-            }
-            for (c in 0 until dModel) dL_dh1PostLN[t][c] += dL_dh2PreLN[t][c]
             layerNormBackward(dL_dh1PostLN[t], h1PreLN[t], dL_dh1PreLN[t], dModel)
+        }
 
-            // Akumulasi gradien wO
+        for (t in 0 until seqLen - 1) {
+            // Accumulate gradW O and propagate through the attention output projection.
             for (r in 0 until dModel) {
                 val aVal = attnOut[t][r]
                 val rOff = r * dModel
@@ -1428,6 +1497,17 @@ class ArgusNeuralEngine private constructor(
                     columnCount
                 )
             }
+        }
+    }
+
+    private fun transposeRows(rows: Array<FloatArray>): Array<FloatArray> {
+        if (rows.isEmpty()) return emptyArray()
+        val columnCount = rows[0].size
+        require(rows.all { row -> row.size == columnCount }) {
+            "Matrix rows must have a consistent width."
+        }
+        return Array(columnCount) { column ->
+            FloatArray(rows.size) { row -> rows[row][column] }
         }
     }
 
