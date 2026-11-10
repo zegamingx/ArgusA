@@ -537,7 +537,7 @@ class ArgusNeuralEngine private constructor(
             )
         }
 
-        val overlapTokens = min(24, maxSeqLen - 2)
+        val overlapTokens = min(24, maxSeqLen - 1)
         val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
         var weightedLoss = 0f
         var evaluatedTargets = 0
@@ -590,7 +590,7 @@ class ArgusNeuralEngine private constructor(
             val result = if (tokens.size <= maxSeqLen) {
                 trainSingleWindow(tokens, currentVocab)
             } else {
-                val overlapTokens = min(24, maxSeqLen - 2)
+                val overlapTokens = min(24, maxSeqLen - 1)
                 val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
                 var weightedLoss = 0f
                 var trainedTargets = 0
