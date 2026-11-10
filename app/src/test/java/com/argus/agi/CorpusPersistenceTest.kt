@@ -22,6 +22,90 @@ import org.robolectric.annotation.Config
 @Config(sdk = [33])
 class CorpusPersistenceTest {
 
+
+    @Test
+    fun validationDocumentsStayHeldOutAndEvaluateWithoutChangingWeights() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val engine = ArgusNeuralEngine.createBlocking(context)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = engine,
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            assertTrue("Baseline checkpoint must be writable.", engine.saveCheckpoint())
+            val checkpoint = java.io.File(context.filesDir, "argus_model_weights.bin").readBytes()
+            val validationText = (
+                "Held out documents must remain separate from the training corpus. " +
+                    "Evaluation computes next token cross entropy without changing model weights. "
+                ).repeat(20)
+
+            assertTrue(
+                manager.importValidationDocument(
+                    source = "Validation test",
+                    title = "Held-out document",
+                    fullText = validationText,
+                    language = "en"
+                )
+            )
+
+            val heldOut = repository.getCorpusDocuments().single()
+            assertEquals("VALIDATION", heldOut.datasetSplit)
+            assertEquals(validationText.trim(), heldOut.validationText)
+            assertEquals(0, heldOut.chunkCount)
+            assertTrue(repository.getCorpusChunks(heldOut.id).isEmpty())
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+
+            val evaluation = manager.evaluateValidationCorpus()
+            assertEquals(1, evaluation.corpusDocumentCount)
+            assertEquals(1, evaluation.evaluatedDocumentCount)
+            assertTrue(evaluation.targetTokenCount > 0)
+            assertTrue(evaluation.meanLoss.isFinite())
+            assertTrue(evaluation.perplexity.isFinite())
+
+            assertTrue(
+                "Validation evaluation must not mutate the model checkpoint.",
+                checkpoint.contentEquals(
+                    java.io.File(context.filesDir, "argus_model_weights.bin").readBytes()
+                )
+            )
+
+            val replayFailure = runCatching {
+                manager.replayCorpusDocument(heldOut.id, epochs = 1)
+            }.exceptionOrNull()
+            assertTrue("Validation documents must never be replayed for training.", replayFailure != null)
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+
+            val trainingCollision = runCatching {
+                manager.enqueueDocument(
+                    source = "Attempted training duplicate",
+                    title = "Same held-out content",
+                    fullText = validationText,
+                    chunkSize = 180,
+                    overlap = 30,
+                    epochs = 1
+                )
+            }.exceptionOrNull()
+            assertTrue(
+                "Identical validation content must not be imported into the training split.",
+                trainingCollision != null
+            )
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
     @Test
     fun retainedCorpusSurvivesQueueClearAndCanBeReplayed() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
