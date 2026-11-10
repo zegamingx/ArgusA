@@ -8,7 +8,6 @@ import org.junit.Test
 
 class WebRetrievalTest {
 
-
     @Test
     fun boundedResponseReaderRejectsOversizedContentLengthBeforeReading() {
         val input = ByteArrayInputStream("oversized".toByteArray())
