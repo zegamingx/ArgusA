@@ -262,6 +262,9 @@ class TrainingManager(
         require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
             "Unsupported corpus rights status: $rightsStatus"
         }
+        requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
+        requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
+        requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
 
         val clean = fullText.trim()
         if (clean.isBlank() || closed) return 0
@@ -870,6 +873,18 @@ class TrainingManager(
             if (nonDuplicates.isNotEmpty()) {
                 appendPersistingQueueItems(nonDuplicates)
             }
+        }
+    }
+
+    private fun requireDeclaredRightsForWebContent(
+        source: String,
+        canonicalUrl: String?,
+        rightsStatus: String
+    ) {
+        val isWebContent = source.startsWith("web_article", ignoreCase = true) ||
+            canonicalUrl != null
+        require(!isWebContent || rightsStatus != "UNVERIFIED") {
+            "Web article content must be reviewed and explicitly declared before it can be stored."
         }
     }
 
