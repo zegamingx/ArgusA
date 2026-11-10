@@ -2,6 +2,7 @@ package com.argus.agi.sensor
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.jsoup.Jsoup
@@ -9,8 +10,11 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.URI
+import java.net.UnknownHostException
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -41,7 +45,8 @@ class ArticleExtractor(
         .callTimeout(25, TimeUnit.SECONDS)
         .followRedirects(false)
         .followSslRedirects(false)
-        .build()
+        .build(),
+    private val dns: Dns = Dns.SYSTEM
 ) {
     companion object {
         private const val MAX_REDIRECTS = 4
@@ -53,6 +58,22 @@ class ArticleExtractor(
     suspend fun extract(sourceUrl: String): ExtractedWebArticle = withContext(Dispatchers.IO) {
         var currentUri = validatePublicHttpUrl(sourceUrl)
             ?: throw ArticleExtractionException("URL sumber tidak valid atau tidak diizinkan.")
+
+        // Resolve once through the guarded resolver used by OkHttp itself. This prevents
+        // a second DNS lookup from changing a previously validated public address.
+        val guardedClient = client.newBuilder()
+            .dns { hostname ->
+                val addresses = try {
+                    dns.lookup(hostname)
+                } catch (error: Exception) {
+                    throw UnknownHostException("DNS lookup failed for $hostname: ${error.message}")
+                }
+                if (addresses.isEmpty() || addresses.any { !isPubliclyRoutableAddress(it) }) {
+                    throw UnknownHostException("Host resolves to a non-public address: $hostname")
+                }
+                addresses
+            }
+            .build()
 
         repeat(MAX_REDIRECTS + 1) { redirectCount ->
             val request = Request.Builder()
@@ -67,7 +88,7 @@ class ArticleExtractor(
             var extracted: ExtractedWebArticle? = null
 
             try {
-                client.newCall(request).execute().use { response ->
+                guardedClient.newCall(request).execute().use { response ->
                     if (response.code in 300..399) {
                         if (redirectCount >= MAX_REDIRECTS) {
                             throw ArticleExtractionException("Terlalu banyak pengalihan halaman.")
@@ -304,19 +325,61 @@ private fun validatePublicHttpUrl(rawUrl: String): URI? {
         host.endsWith(".invalid")
     ) return null
 
-    val lookupHost = host.removePrefix("[").removeSuffix("]")
-    val resolvedAddresses = runCatching { InetAddress.getAllByName(lookupHost) }.getOrNull()
-        ?: return null
-    if (resolvedAddresses.isEmpty()) return null
-
-    if (resolvedAddresses.any { address ->
-            address.isAnyLocalAddress ||
-                address.isLoopbackAddress ||
-                address.isLinkLocalAddress ||
-                address.isSiteLocalAddress ||
-                address.isMulticastAddress
-        }
-    ) return null
-
     return uri
+}
+
+/**
+ * Accept only globally routable unicast addresses. This check is applied to the exact
+ * address list returned to OkHttp, rather than to a separate preliminary DNS lookup.
+ */
+internal fun isPubliclyRoutableAddress(address: InetAddress): Boolean {
+    if (
+        address.isAnyLocalAddress ||
+        address.isLoopbackAddress ||
+        address.isLinkLocalAddress ||
+        address.isSiteLocalAddress ||
+        address.isMulticastAddress
+    ) return false
+
+    val bytes = address.address
+    if (address is Inet4Address || bytes.size == 4) {
+        val first = bytes[0].toInt() and 0xFF
+        val second = bytes[1].toInt() and 0xFF
+        val third = bytes[2].toInt() and 0xFF
+
+        return when {
+            first == 0 -> false
+            first == 10 -> false
+            first == 100 && second in 64..127 -> false
+            first == 127 -> false
+            first == 169 && second == 254 -> false
+            first == 172 && second in 16..31 -> false
+            first == 192 && second == 0 && third == 0 -> false
+            first == 192 && second == 0 && third == 2 -> false
+            first == 192 && second == 88 && third == 99 -> false
+            first == 192 && second == 168 -> false
+            first == 198 && second in 18..19 -> false
+            first == 198 && second == 51 && third == 100 -> false
+            first == 203 && second == 0 && third == 113 -> false
+            first >= 224 -> false
+            else -> true
+        }
+    }
+
+    if (address !is Inet6Address || bytes.size != 16) return false
+
+    val first = bytes[0].toInt() and 0xFF
+    val second = bytes[1].toInt() and 0xFF
+
+    // Global unicast currently occupies 2000::/3. This excludes ULA,
+    // link-local, multicast, unspecified, loopback, and IPv4-compatible ranges.
+    if (first and 0xE0 != 0x20) return false
+
+    // Documentation prefix 2001:db8::/32 is not globally routable.
+    if (first == 0x20 && second == 0x01 &&
+        (bytes[2].toInt() and 0xFF) == 0x0D &&
+        (bytes[3].toInt() and 0xFF) == 0xB8
+    ) return false
+
+    return true
 }
