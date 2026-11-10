@@ -84,11 +84,27 @@ data class EngineConfig(
     }
 }
 
+/** Aggregate next-token loss and the exact number of scored validation targets. */
+data class LossEvaluation(
+    val meanLoss: Float,
+    val targetCount: Int,
+    val evaluatedDocumentCount: Int
+)
+
+internal data class GradientCheckResult(
+    val parameterName: String,
+    val parameterIndex: Int,
+    val meanLoss: Float,
+    val analyticalGradient: Float,
+    val numericalGradient: Float,
+    val absoluteError: Float,
+    val relativeError: Float
+)
+
 /**
  * On-Device Neural Engine A.R.G.U.S:
- * Micro-Transformer SwiGLU dengan True Full-Parameter Backpropagation & LoRA Adapters.
- * Menggunakan akumulasi gradien sekuensial (minibatch sliding window) dan optimizer Adam
- * tanpa mutasi in-place prematur di tengah sekuens token.
+ * Micro-Transformer SwiGLU with full-parameter backpropagation and LoRA adapters.
+ * Uses sequential gradient accumulation and Adam without premature in-place mutation.
  */
 class ArgusNeuralEngine private constructor(
     private val context: Context,
@@ -183,6 +199,12 @@ class ArgusNeuralEngine private constructor(
         Array(nHeads) { Array(maxSeqLen) { FloatArray(maxSeqLen) } }
 
     private val modelLock = Any()
+
+    private data class GradientProbe(
+        val parameterName: String,
+        var parameterIndex: Int,
+        var analyticalGradient: Float = Float.NaN
+    )
 
     companion object {
         private const val TAG = "ArgusNeuralEngine"
@@ -516,24 +538,35 @@ class ArgusNeuralEngine private constructor(
     }
 
     // =====================================================================
-    // Training: True Full-Parameter Backprop with Minibatch Accumulation
+    // Training: Full-Parameter Backprop with Per-Window Gradient Accumulation
     // =====================================================================
     /**
      * Computes next-token cross-entropy without changing weights, optimizer state,
      * tokenizer vocabulary, or checkpoint files. Use only on held-out validation text.
      */
-    fun evaluateLoss(text: String): Float = synchronized(modelLock) {
+    fun evaluateLoss(text: String): Float = evaluateLossWithTargetCount(text).meanLoss
+
+    /**
+     * Computes held-out next-token cross-entropy and the exact number of scored targets.
+     * No parameters, optimizer state, tokenizer vocabulary, or checkpoint files are changed.
+     */
+    fun evaluateLossWithTargetCount(text: String): LossEvaluation = synchronized(modelLock) {
         val tokens = tokenizer.encode(text, autoRegister = false)
         if (tokens.size < 2 || tokenizer.vocabSize > vocabCap) {
-            return@synchronized Float.NaN
+            return@synchronized LossEvaluation(Float.NaN, 0, 0)
         }
 
         val currentVocab = tokenizer.vocabSize
         if (tokens.size <= maxSeqLen) {
-            return@synchronized trainSingleWindow(
+            val loss = trainSingleWindow(
                 tokens,
                 currentVocab,
                 updateParameters = false
+            )
+            return@synchronized LossEvaluation(
+                meanLoss = loss,
+                targetCount = if (loss.isFinite()) tokens.size - 1 else 0,
+                evaluatedDocumentCount = if (loss.isFinite()) 1 else 0
             )
         }
 
@@ -566,7 +599,40 @@ class ArgusNeuralEngine private constructor(
             start += stride
         }
 
-        if (evaluatedTargets > 0) weightedLoss / evaluatedTargets else Float.NaN
+        val meanLoss = if (evaluatedTargets > 0) {
+            weightedLoss / evaluatedTargets
+        } else {
+            Float.NaN
+        }
+        LossEvaluation(
+            meanLoss = meanLoss,
+            targetCount = evaluatedTargets,
+            evaluatedDocumentCount = if (evaluatedTargets > 0) 1 else 0
+        )
+    }
+
+    /**
+     * Aggregates document losses by scored next-token targets, not by document count.
+     * The model lock prevents training from changing weights between validation documents.
+     */
+    fun evaluateCorpusLoss(texts: List<String>): LossEvaluation = synchronized(modelLock) {
+        var weightedLoss = 0.0
+        var targetCount = 0
+        var evaluatedDocumentCount = 0
+        texts.forEach { text ->
+            val result = evaluateLossWithTargetCount(text)
+            if (result.targetCount > 0 && result.meanLoss.isFinite()) {
+                weightedLoss += result.meanLoss.toDouble() * result.targetCount
+                targetCount += result.targetCount
+                evaluatedDocumentCount += result.evaluatedDocumentCount
+            }
+        }
+        val meanLoss = if (targetCount > 0) {
+            (weightedLoss / targetCount).toFloat()
+        } else {
+            Float.NaN
+        }
+        LossEvaluation(meanLoss, targetCount, evaluatedDocumentCount)
     }
 
     /**
@@ -575,6 +641,100 @@ class ArgusNeuralEngine private constructor(
     fun evaluatePerplexity(text: String): Float {
         val loss = evaluateLoss(text)
         return if (loss.isFinite()) exp(loss) else Float.NaN
+    }
+
+    /**
+     * Compares one analytic backprop gradient with a central finite-difference estimate.
+     * This diagnostic is internal to the module, only supports short single-window inputs,
+     * and never applies Adam, changes the tokenizer, or writes a checkpoint. Pass -1 as the
+     * parameter index to inspect the coordinate with the largest absolute analytic gradient.
+     */
+    internal fun checkGradient(
+        text: String,
+        parameterName: String,
+        parameterIndex: Int,
+        epsilon: Float = 1e-2f
+    ): GradientCheckResult = synchronized(modelLock) {
+        require(epsilon.isFinite() && epsilon > 0f) {
+            "Finite-difference epsilon must be finite and positive."
+        }
+        val tokens = tokenizer.encode(text, autoRegister = false)
+        require(tokens.size in 2..maxSeqLen) {
+            "Gradient checking requires 2..${maxSeqLen} encoded tokens; got ${tokens.size}."
+        }
+
+        val parameter = gradientParameterArray(parameterName)
+        require(parameterIndex == -1 || parameterIndex in parameter.indices) {
+            "Parameter index must be -1 (largest-magnitude gradient) or a valid index in ${parameterName}."
+        }
+
+        val probe = GradientProbe(parameterName, parameterIndex)
+        val currentVocab = tokenizer.vocabSize
+        val baseLoss = trainSingleWindow(
+            seq = tokens,
+            currentVocab = currentVocab,
+            updateParameters = false,
+            gradientProbe = probe
+        )
+        check(baseLoss.isFinite() && probe.analyticalGradient.isFinite()) {
+            "Analytic gradient computation returned a non-finite value."
+        }
+
+        val resolvedIndex = probe.parameterIndex
+        val originalValue = parameter[resolvedIndex]
+        var plusLoss = Float.NaN
+        var minusLoss = Float.NaN
+        try {
+            parameter[resolvedIndex] = originalValue + epsilon
+            plusLoss = trainSingleWindow(tokens, currentVocab, updateParameters = false)
+
+            parameter[resolvedIndex] = originalValue - epsilon
+            minusLoss = trainSingleWindow(tokens, currentVocab, updateParameters = false)
+        } finally {
+            parameter[resolvedIndex] = originalValue
+        }
+
+        check(plusLoss.isFinite() && minusLoss.isFinite()) {
+            "Finite-difference loss evaluation returned a non-finite value."
+        }
+        val numericalGradient = (plusLoss - minusLoss) / (2f * epsilon)
+        val absoluteError = kotlin.math.abs(probe.analyticalGradient - numericalGradient)
+        val magnitude = max(
+            kotlin.math.abs(probe.analyticalGradient),
+            kotlin.math.abs(numericalGradient)
+        )
+        val relativeError = if (magnitude > 1e-8f) {
+            absoluteError / magnitude
+        } else {
+            absoluteError
+        }
+
+        GradientCheckResult(
+            parameterName = parameterName,
+            parameterIndex = resolvedIndex,
+            meanLoss = baseLoss,
+            analyticalGradient = probe.analyticalGradient,
+            numericalGradient = numericalGradient,
+            absoluteError = absoluteError,
+            relativeError = relativeError
+        )
+    }
+
+    private fun gradientParameterArray(parameterName: String): FloatArray = when (parameterName) {
+        "wHead" -> wHead
+        "wEmbed" -> wEmbed
+        "wDown" -> wDown
+        "wUp" -> wUp
+        "wGate" -> wGate
+        "wO" -> wO
+        "wQ" -> wQ
+        "wK" -> wK
+        "wV" -> wV
+        "loraQa" -> loraQa
+        "loraQb" -> loraQb
+        "loraVa" -> loraVa
+        "loraVb" -> loraVb
+        else -> throw IllegalArgumentException("Unsupported gradient-check parameter: $parameterName")
     }
 
     fun trainStep(text: String): Float {
@@ -632,11 +792,55 @@ class ArgusNeuralEngine private constructor(
         return loss
     }
 
+    private fun computeCrossEntropyLoss(
+        logits: Array<FloatArray>,
+        sequence: List<Int>,
+        currentVocab: Int,
+        firstTargetIndex: Int
+    ): Float {
+        require(sequence.size >= 2) { "A validation window must contain at least two tokens." }
+        require(firstTargetIndex in 0 until sequence.size - 1) {
+            "firstTargetIndex must identify at least one next-token target."
+        }
+
+        var totalLoss = 0f
+        var validTargets = 0
+
+        for (timeIndex in firstTargetIndex until sequence.size - 1) {
+            val target = sequence[timeIndex + 1]
+            if (target !in 0 until currentVocab) continue
+
+            val row = logits[timeIndex]
+            var maxLogit = -Float.MAX_VALUE
+            for (vocabularyIndex in 0 until currentVocab) {
+                if (row[vocabularyIndex] > maxLogit) {
+                    maxLogit = row[vocabularyIndex]
+                }
+            }
+
+            var sumExp = 0f
+            for (vocabularyIndex in 0 until currentVocab) {
+                sumExp += exp(row[vocabularyIndex] - maxLogit)
+            }
+
+            val logProbability =
+                (row[target] - maxLogit) - ln(max(sumExp, 1e-9f))
+            val loss = -logProbability
+            if (loss.isFinite()) {
+                totalLoss += loss
+                validTargets++
+            }
+        }
+
+        return if (validTargets > 0) totalLoss / validTargets else Float.NaN
+    }
+
     private fun trainSingleWindow(
         seq: List<Int>,
         currentVocab: Int,
         updateParameters: Boolean = true,
-        firstTargetIndex: Int = 0
+        firstTargetIndex: Int = 0,
+        gradientProbe: GradientProbe? = null
     ): Float {
         val seqLen = seq.size
         if (seqLen < 2) return Float.NaN
@@ -728,7 +932,23 @@ class ArgusNeuralEngine private constructor(
         }
 
         // ============================ BACKWARD ============================
-        // Alokasi Gradient Accumulators untuk seluruh tensor (Minibatch Pattern)
+        // Loss-only evaluation exits before allocating gradient or backpropagation buffers.
+        if (!updateParameters && gradientProbe == null) {
+            return computeCrossEntropyLoss(
+                logits = logits,
+                sequence = seq,
+                currentVocab = currentVocab,
+                firstTargetIndex = firstTargetIndex
+            )
+        }
+
+        var totalLoss = 0f
+        var validSteps = 0
+        require(firstTargetIndex in 0 until seqLen - 1) {
+            "firstTargetIndex must identify at least one next-token target."
+        }
+
+        // Backpropagation buffers are allocated only for optimizer updates or explicit diagnostics.
         val gradWHead = FloatArray(currentVocab * dModel)
         val gradWEmbed = FloatArray(vocabCap * dModel)
         val gradWDown = FloatArray(dFf * dModel)
@@ -753,40 +973,42 @@ class ArgusNeuralEngine private constructor(
         val dK = Array(seqLen) { FloatArray(dModel) }
         val dV = Array(seqLen) { FloatArray(dModel) }
 
-        var totalLoss = 0f
-        var validSteps = 0
-
-        // (1) Cross-Entropy & Akumulasi Gradien Head (TANPA mutasi in-place)
-        require(firstTargetIndex in 0 until seqLen - 1) {
-            "firstTargetIndex must identify at least one next-token target."
-        }
+        // (1) Cross-Entropy & Gradient Accumulation for the Output Head.
         for (t in firstTargetIndex until seqLen - 1) {
             val target = seq[t + 1]
             if (target !in 0 until currentVocab) continue
-            val logitRow = logits[t]
-            var maxL = -Float.MAX_VALUE
-            for (vI in 0 until currentVocab) if (logitRow[vI] > maxL) maxL = logitRow[vI]
-            var sumExp = 0f
-            for (vI in 0 until currentVocab) sumExp += exp(logitRow[vI] - maxL)
-            val logProb = (logitRow[target] - maxL) - ln(max(sumExp, 1e-9f))
-            val loss = -logProb
-            if (loss.isFinite()) { totalLoss += loss; validSteps++ }
 
-            val invSumExp = 1f / max(sumExp, 1e-9f)
-            for (vI in 0 until currentVocab) {
-                val p = exp(logitRow[vI] - maxL) * invSumExp
-                val g = if (vI == target) p - 1f else p
-                val wOff = vI * dModel
-                for (d in 0 until dModel) {
-                    gradWHead[wOff + d] += g * h2[t][d]
-                    // Propagasi mundur menggunakan bobot wHead yang belum dimutasi
-                    dL_dh2PostLN[t][d] += g * wHead[wOff + d]
+            val logitRow = logits[t]
+            var maxLogit = -Float.MAX_VALUE
+            for (vocabIndex in 0 until currentVocab) {
+                if (logitRow[vocabIndex] > maxLogit) maxLogit = logitRow[vocabIndex]
+            }
+
+            var sumExp = 0f
+            for (vocabIndex in 0 until currentVocab) {
+                sumExp += exp(logitRow[vocabIndex] - maxLogit)
+            }
+
+            val logProbability =
+                (logitRow[target] - maxLogit) - ln(max(sumExp, 1e-9f))
+            val loss = -logProbability
+            if (loss.isFinite()) {
+                totalLoss += loss
+                validSteps++
+            }
+
+            val inverseSumExp = 1f / max(sumExp, 1e-9f)
+            for (vocabIndex in 0 until currentVocab) {
+                val probability = exp(logitRow[vocabIndex] - maxLogit) * inverseSumExp
+                val gradient = if (vocabIndex == target) probability - 1f else probability
+                val weightOffset = vocabIndex * dModel
+                for (dimension in 0 until dModel) {
+                    gradWHead[weightOffset + dimension] += gradient * h2[t][dimension]
+                    // Backpropagate using the unmodified output-head weights.
+                    dL_dh2PostLN[t][dimension] +=
+                        gradient * wHead[weightOffset + dimension]
                 }
             }
-        }
-
-        if (!updateParameters) {
-            return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
 
         // (2) SwiGLU MLP & Residual Backward
@@ -963,6 +1185,43 @@ class ArgusNeuralEngine private constructor(
         normalizeGradient(gradLoraQb, stepDiv)
         normalizeGradient(gradLoraVa, stepDiv)
         normalizeGradient(gradLoraVb, stepDiv)
+
+        if (gradientProbe != null) {
+            val selectedGradient = when (gradientProbe.parameterName) {
+                "wHead" -> gradWHead
+                "wEmbed" -> gradWEmbed
+                "wDown" -> gradWDown
+                "wUp" -> gradWUp
+                "wGate" -> gradWGate
+                "wO" -> gradWO
+                "wQ" -> gradWQ
+                "wK" -> gradWK
+                "wV" -> gradWV
+                "loraQa" -> gradLoraQa
+                "loraQb" -> gradLoraQb
+                "loraVa" -> gradLoraVa
+                "loraVb" -> gradLoraVb
+                else -> throw IllegalArgumentException(
+                    "Unsupported gradient-check parameter: ${gradientProbe.parameterName}"
+                )
+            }
+            val resolvedIndex = if (gradientProbe.parameterIndex == -1) {
+                selectedGradient.indices.maxByOrNull {
+                    kotlin.math.abs(selectedGradient[it])
+                } ?: throw IllegalStateException("Cannot inspect an empty gradient tensor.")
+            } else {
+                gradientProbe.parameterIndex
+            }
+            require(resolvedIndex in selectedGradient.indices) {
+                "Gradient index ${resolvedIndex} is outside ${gradientProbe.parameterName}."
+            }
+            gradientProbe.parameterIndex = resolvedIndex
+            gradientProbe.analyticalGradient = selectedGradient[resolvedIndex]
+        }
+
+        if (!updateParameters) {
+            return if (validSteps > 0) totalLoss / validSteps else Float.NaN
+        }
 
         // Hitung total L2 Norm untuk Gradient Clipping
         var sumSquares = 0f

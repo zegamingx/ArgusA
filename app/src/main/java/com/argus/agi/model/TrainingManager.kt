@@ -2,6 +2,8 @@ package com.argus.agi.model
 
 import android.content.Context
 import android.util.Log
+import com.argus.agi.data.local.entity.CorpusChunkEntity
+import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.sensor.DeviceGuard
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -20,14 +22,17 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.Closeable
 import java.io.Reader
 import java.io.StringReader
+import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
+import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 
@@ -44,7 +49,8 @@ data class TrainingData(
     val timestamp: Long = System.currentTimeMillis(),
     val status: TrainingStatus = TrainingStatus.QUEUED,
     val finalLoss: Float? = null,
-    val stepDurationMs: Long = 0L
+    val stepDurationMs: Long = 0L,
+    val documentId: String? = null
 )
 
 data class ActiveDocumentTraining(
@@ -55,6 +61,14 @@ data class ActiveDocumentTraining(
     val currentChunkIndex: Int,
     val latestLoss: Float? = null,
     val runningAverageLoss: Float? = null
+)
+
+data class ValidationCorpusEvaluation(
+    val corpusDocumentCount: Int,
+    val evaluatedDocumentCount: Int,
+    val targetTokenCount: Int,
+    val meanLoss: Float,
+    val perplexity: Float
 )
 
 class TrainingManager(
@@ -79,6 +93,11 @@ class TrainingManager(
             val generation: Long
         ) : QueuePersistenceOperation
 
+        data class Start(
+            val itemId: String,
+            val completion: CompletableDeferred<Unit>
+        ) : QueuePersistenceOperation
+
         data class Barrier(
             val completion: CompletableDeferred<Unit>
         ) : QueuePersistenceOperation
@@ -89,12 +108,16 @@ class TrainingManager(
         const val MAX_COMPLETED_SIZE = 100
         const val MAX_LOSS_HISTORY = 100
         const val MAX_DOCUMENT_EPOCHS = 5
+        const val MAX_CORPUS_REPLAY_DOCUMENTS = 500
+        const val MAX_DEFAULT_CORPUS_REPLAY_CHUNKS = 4_096
+        const val MAX_CORPUS_REPLAY_CHUNKS = 50_000
         private const val IDLE_POLL_MS = 500L
     }
 
     // StateFlow<List<TrainingData>> sebagai satu-satunya sumber kebenaran untuk queue.
     // Channel hanya berfungsi sebagai wakeup signal, bukan storage.
     private val queueLock = Any()
+    private val corpusSchedulingMutex = Mutex()
     private var lastScheduledTimestamp: Long = System.currentTimeMillis()
     private var queueGeneration: Long = 0L
     private val persistenceOperations =
@@ -142,7 +165,10 @@ class TrainingManager(
         val restoreGeneration = synchronized(queueLock) { queueGeneration }
         scope.launch {
             repo?.let { repository ->
-                runCatching { repository.getPendingQueueSnapshot() }
+                runCatching {
+                    repository.recoverInterruptedTrainingItems()
+                    repository.getPendingQueueSnapshot()
+                }
                     .onSuccess { pending ->
                         if (pending.isNotEmpty()) {
                             synchronized(queueLock) {
@@ -162,7 +188,7 @@ class TrainingManager(
                         }
                     }
                     .onFailure { error ->
-                        Log.e(TAG, "Failed to restore persisted training queue", error)
+                        Log.e(TAG, "Failed to recover and restore persisted training queue", error)
                     }
             }
         }
@@ -216,13 +242,16 @@ class TrainingManager(
     // Enqueue API
     // =====================================================================
 
-    fun enqueueDocument(
+    suspend fun enqueueDocument(
         source: String,
         title: String,
         fullText: String,
         chunkSize: Int = 380,
         overlap: Int = 50,
-        epochs: Int = 1
+        epochs: Int = 1,
+        language: String? = null,
+        canonicalUrl: String? = null,
+        rightsStatus: String = "UNVERIFIED"
     ): Int {
         require(chunkSize > overlap) {
             "chunkSize ($chunkSize) harus > overlap ($overlap) agar iterasi maju"
@@ -230,12 +259,54 @@ class TrainingManager(
         require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
             "epochs harus berada pada rentang 1..$MAX_DOCUMENT_EPOCHS"
         }
+        require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
+            "Unsupported corpus rights status: $rightsStatus"
+        }
+        requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
+
         val clean = fullText.trim()
         if (clean.isBlank() || closed) return 0
 
         val processedChunks = TextModalityProcessor.process(clean, title, chunkSize, overlap)
         val chunksPerEpoch = processedChunks.size
         if (chunksPerEpoch == 0) return 0
+
+        val documentId = sha256Utf16Be(fullText)
+        val corpusDocument = CorpusDocumentEntity(
+            id = documentId,
+            contentFingerprint = documentId,
+            fingerprintAlgorithm = "SHA-256/UTF-16BE",
+            source = source,
+            title = title,
+            language = language,
+            canonicalUrl = canonicalUrl,
+            characterCount = clean.length,
+            chunkCount = chunksPerEpoch,
+            plannedEpochs = epochs,
+            rightsStatus = rightsStatus,
+            status = "READY",
+            createdAtEpochMs = System.currentTimeMillis(),
+            lastTrainedAtEpochMs = null,
+            completedPassCount = 0
+        )
+        val corpusChunks = processedChunks.mapIndexed { index, chunk ->
+            CorpusChunkEntity(
+                id = "$documentId:${index + 1}",
+                documentId = documentId,
+                chunkIndex = index + 1,
+                content = chunk.content,
+                characterCount = chunk.content.length
+            )
+        }
+
+        val activeRepository = requireNotNull(repo) {
+            "Local corpus storage is unavailable; document training was not queued."
+        }
+        val stored = activeRepository.storeCorpusDocument(corpusDocument, corpusChunks)
+        if (!stored) {
+            Log.i(TAG, "Duplicate corpus document skipped: $documentId")
+            return 0
+        }
 
         val totalScheduledChunks = Math.multiplyExact(chunksPerEpoch, epochs)
         val newItems = ArrayList<TrainingData>(totalScheduledChunks)
@@ -256,7 +327,8 @@ class TrainingManager(
                     chunkIndex = epochIndex * chunksPerEpoch + chunkIndex + 1,
                     totalChunks = totalScheduledChunks,
                     documentTitle = title,
-                    status = TrainingStatus.QUEUED
+                    status = TrainingStatus.QUEUED,
+                    documentId = documentId
                 )
             }
         }
@@ -279,21 +351,28 @@ class TrainingManager(
     }
 
     /**
-     * Reads the source incrementally with a 4 KB input buffer and a sliding text window.
+     * Reads a source incrementally with a 4 KB input buffer and a sliding text window.
      *
-     * The generated chunk strings and queue items are still accumulated in memory until
-     * they are scheduled and persisted. Callers must apply file/decompression limits.
-     * This method is buffered ingestion, not a fully disk-backed or constant-memory queue.
+     * Corpus chunks are retained in Room independently from the transient training queue.
+     * The generated chunk strings are still accumulated in memory during this operation;
+     * this is buffered ingestion, not a constant-memory disk-backed queue.
+     *
+     * The fingerprint is computed over the exact UTF-16 code units read from the Reader,
+     * using SHA-256/UTF-16BE. This produces the same identity as enqueueDocument for the
+     * same character sequence, including when surrogate pairs cross read-buffer boundaries.
      *
      * @return Pair(number of generated chunks, total characters read)
      */
-    fun enqueueDocumentStream(
+    suspend fun enqueueDocumentStream(
         source: String,
         title: String,
         reader: Reader,
         chunkSize: Int = 380,
         overlap: Int = 50,
-        epochs: Int = 1
+        epochs: Int = 1,
+        language: String? = null,
+        canonicalUrl: String? = null,
+        rightsStatus: String = "UNVERIFIED"
     ): Pair<Int, Long> {
         require(chunkSize > overlap) {
             "chunkSize ($chunkSize) harus > overlap ($overlap) agar iterasi maju"
@@ -304,18 +383,27 @@ class TrainingManager(
         require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
             "epochs harus berada pada rentang 1..$MAX_DOCUMENT_EPOCHS"
         }
+        require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
+            "Unsupported corpus rights status: $rightsStatus"
+        }
+        requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
         if (closed) return Pair(0, 0L)
 
         val rawChunks = mutableListOf<String>()
         val buffer = CharArray(4096)
         val window = StringBuilder()
+        val fingerprintDigest = MessageDigest.getInstance("SHA-256")
         var totalCharsRead = 0L
 
         while (true) {
             val readCount = reader.read(buffer)
             if (readCount < 0) break
-            if (closed) break
+            if (closed) {
+                rawChunks.clear()
+                return Pair(0, totalCharsRead)
+            }
 
+            updateUtf16BeDigest(fingerprintDigest, buffer, readCount)
             window.append(buffer, 0, readCount)
             totalCharsRead += readCount.toLong()
 
@@ -356,6 +444,11 @@ class TrainingManager(
             }
         }
 
+        if (closed) {
+            rawChunks.clear()
+            return Pair(0, totalCharsRead)
+        }
+
         val trailingRaw = TextModalityProcessor.normalizeTypography(window.toString().trim())
         val trailing = trailingRaw.lines().joinToString("\n") {
             TextModalityProcessor.formatStructuredLineIfJson(it)
@@ -364,6 +457,44 @@ class TrainingManager(
 
         val chunksPerEpoch = rawChunks.size
         if (chunksPerEpoch == 0) return Pair(0, totalCharsRead)
+
+        val documentId = fingerprintDigest.digest().toHexString()
+        val corpusDocument = CorpusDocumentEntity(
+            id = documentId,
+            contentFingerprint = documentId,
+            fingerprintAlgorithm = "SHA-256/UTF-16BE",
+            source = source,
+            title = title,
+            language = language,
+            canonicalUrl = canonicalUrl,
+            characterCount = totalCharsRead.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            chunkCount = chunksPerEpoch,
+            plannedEpochs = epochs,
+            rightsStatus = rightsStatus,
+            status = "READY",
+            createdAtEpochMs = System.currentTimeMillis(),
+            lastTrainedAtEpochMs = null,
+            completedPassCount = 0
+        )
+        val corpusChunks = rawChunks.mapIndexed { index, chunkText ->
+            CorpusChunkEntity(
+                id = "$documentId:${index + 1}",
+                documentId = documentId,
+                chunkIndex = index + 1,
+                content = chunkText,
+                characterCount = chunkText.length
+            )
+        }
+
+        val activeRepository = requireNotNull(repo) {
+            "Local corpus storage is unavailable; document training was not queued."
+        }
+        val stored = activeRepository.storeCorpusDocument(corpusDocument, corpusChunks)
+        if (!stored) {
+            Log.i(TAG, "Duplicate corpus document skipped: $documentId")
+            rawChunks.clear()
+            return Pair(0, totalCharsRead)
+        }
 
         val totalScheduledChunks = Math.multiplyExact(chunksPerEpoch, epochs)
         val newItems = ArrayList<TrainingData>(totalScheduledChunks)
@@ -383,7 +514,8 @@ class TrainingManager(
                     chunkIndex = epochIndex * chunksPerEpoch + chunkIndex + 1,
                     totalChunks = totalScheduledChunks,
                     documentTitle = title,
-                    status = TrainingStatus.QUEUED
+                    status = TrainingStatus.QUEUED,
+                    documentId = documentId
                 )
             }
         }
@@ -406,12 +538,316 @@ class TrainingManager(
         }
     }
 
+    /**
+     * Imports one complete document into the held-out validation split.
+     *
+     * Validation content is persisted as one source text, not split into overlapping
+     * training chunks. It is never appended to the training queue. An identical document
+     * already present in the training split is rejected by the repository.
+     */
+    suspend fun importValidationDocument(
+        source: String,
+        title: String,
+        fullText: String,
+        language: String? = null,
+        canonicalUrl: String? = null,
+        rightsStatus: String = "UNVERIFIED"
+    ): Boolean {
+        require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
+            "Unsupported corpus rights status: $rightsStatus"
+        }
+        requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
+        val clean = fullText.trim()
+        if (clean.isBlank() || closed) return false
+
+        val normalizedText = TextModalityProcessor.normalizeTypography(clean)
+            .lines()
+            .joinToString("\n") { TextModalityProcessor.formatStructuredLineIfJson(it) }
+        if (normalizedText.isBlank()) return false
+
+        val documentId = sha256Utf16Be(fullText)
+        val document = CorpusDocumentEntity(
+            id = documentId,
+            contentFingerprint = documentId,
+            fingerprintAlgorithm = "SHA-256/UTF-16BE",
+            source = source,
+            title = title,
+            language = language,
+            canonicalUrl = canonicalUrl,
+            characterCount = clean.length,
+            chunkCount = 0,
+            datasetSplit = "VALIDATION",
+            validationText = normalizedText,
+            plannedEpochs = 0,
+            rightsStatus = rightsStatus,
+            status = "READY",
+            createdAtEpochMs = System.currentTimeMillis(),
+            lastTrainedAtEpochMs = null,
+            completedPassCount = 0
+        )
+
+        val activeRepository = requireNotNull(repo) {
+            "Local corpus storage is unavailable; validation data was not imported."
+        }
+        return activeRepository.storeCorpusDocument(document, emptyList())
+    }
+
+    /**
+     * Evaluates held-out documents as one token-weighted corpus.
+     * The neural engine holds its model lock for the whole evaluation and does not update weights.
+     */
+    suspend fun evaluateValidationCorpus(limit: Int = 500): ValidationCorpusEvaluation {
+        require(limit in 1..500) { "Validation document limit must be in 1..500." }
+        val activeRepository = requireNotNull(repo) {
+            "Local corpus storage is unavailable; validation cannot be evaluated."
+        }
+        val documents = activeRepository.getValidationCorpusDocuments(limit)
+        val texts = documents.mapNotNull { it.validationText }
+        val evaluation = neuralEngine.evaluateCorpusLoss(texts)
+        val perplexity = if (evaluation.meanLoss.isFinite()) {
+            exp(evaluation.meanLoss)
+        } else {
+            Float.NaN
+        }
+        return ValidationCorpusEvaluation(
+            corpusDocumentCount = documents.size,
+            evaluatedDocumentCount = evaluation.evaluatedDocumentCount,
+            targetTokenCount = evaluation.targetCount,
+            meanLoss = evaluation.meanLoss,
+            perplexity = perplexity
+        )
+    }
+
+    /**
+     * Estimates a conservative queue cap from the current app heap.
+     *
+     * The estimate reserves most of the heap for model tensors, activations, and the UI.
+     * The 4 KiB item estimate includes the retained chunk string and queue object overhead.
+     */
+    private fun recommendedReplayQueueLimit(): Int {
+        val runtime = Runtime.getRuntime()
+        val maxHeapBytes = runtime.maxMemory().coerceAtLeast(1L)
+        val allocatedBytes = runtime.totalMemory()
+        val usedBytes = (allocatedBytes - runtime.freeMemory()).coerceAtLeast(0L)
+        val availableHeapBytes = (maxHeapBytes - usedBytes).coerceAtLeast(0L)
+        val safeBudgetBytes = min(maxHeapBytes / 16L, availableHeapBytes / 3L)
+        val estimatedBytesPerItem = 4_096L
+        val estimatedLimit = safeBudgetBytes / estimatedBytesPerItem
+
+        return estimatedLimit
+            .coerceIn(1L, MAX_DEFAULT_CORPUS_REPLAY_CHUNKS.toLong())
+            .toInt()
+    }
+
+    /**
+     * Schedules every eligible TRAIN document in stable corpus order, then applies the
+     * requested deterministic replay policy. The same seed and corpus snapshot reproduce
+     * the same queue order. Validation documents are excluded by the DAO and planner.
+     */
+    suspend fun scheduleCorpusReplay(
+        seed: Long,
+        epochs: Int = 1,
+        policy: CorpusReplayPolicy = CorpusReplayPolicy.INTERLEAVED_DOCUMENTS,
+        maxDocuments: Int = MAX_CORPUS_REPLAY_DOCUMENTS,
+        maxQueuedChunks: Int = recommendedReplayQueueLimit()
+    ): CorpusReplayResult {
+        corpusSchedulingMutex.lock()
+        try {
+            require(maxDocuments in 1..MAX_CORPUS_REPLAY_DOCUMENTS) {
+                "maxDocuments must be in 1..$MAX_CORPUS_REPLAY_DOCUMENTS."
+            }
+            require(maxQueuedChunks in 1..MAX_CORPUS_REPLAY_CHUNKS) {
+                "maxQueuedChunks must be in 1..$MAX_CORPUS_REPLAY_CHUNKS."
+            }
+            require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
+                "epochs must be in 1..$MAX_DOCUMENT_EPOCHS."
+            }
+            if (closed) {
+                return CorpusReplayResult(0, 0, epochs, seed, policy)
+            }
+
+            val activeRepository = requireNotNull(repo) {
+                "Local corpus storage is unavailable; corpus replay cannot be scheduled."
+            }
+            val documents = activeRepository.getTrainingCorpusDocuments(maxDocuments)
+            if (documents.isEmpty()) {
+                return CorpusReplayResult(0, 0, epochs, seed, policy)
+            }
+
+            val requestedChunkCount = documents.sumOf { it.chunkCount.toLong() } * epochs.toLong()
+            require(requestedChunkCount <= maxQueuedChunks.toLong()) {
+                "Corpus replay requires $requestedChunkCount queue items, exceeding the configured limit of $maxQueuedChunks. Reduce epochs or import fewer documents per replay."
+            }
+
+            val sources = documents.map { document ->
+                CorpusReplaySource(
+                    document = document,
+                    chunks = activeRepository.getCorpusChunks(document.id)
+                )
+            }
+            return enqueueCorpusReplay(
+                sources = sources,
+                epochs = epochs,
+                seed = seed,
+                policy = policy,
+                maxQueuedChunks = maxQueuedChunks
+            )
+        } finally {
+            corpusSchedulingMutex.unlock()
+        }
+    }
+
+    suspend fun replayCorpusDocument(
+        documentId: String,
+        epochs: Int = 1,
+        seed: Long = 0L,
+        policy: CorpusReplayPolicy = CorpusReplayPolicy.SEQUENTIAL_DOCUMENTS,
+        maxQueuedChunks: Int = recommendedReplayQueueLimit()
+    ): Int {
+        corpusSchedulingMutex.lock()
+        try {
+            require(maxQueuedChunks in 1..MAX_CORPUS_REPLAY_CHUNKS) {
+                "maxQueuedChunks must be in 1..$MAX_CORPUS_REPLAY_CHUNKS."
+            }
+            if (closed) return 0
+
+            val activeRepository = requireNotNull(repo) {
+                "Local corpus storage is unavailable; corpus replay cannot be scheduled."
+            }
+            val document = activeRepository.getCorpusDocument(documentId) ?: return 0
+            require(document.datasetSplit == "TRAIN") {
+                "Validation-only documents cannot be replayed into the training queue."
+            }
+
+            val source = CorpusReplaySource(
+                document = document,
+                chunks = activeRepository.getCorpusChunks(documentId)
+            )
+            val result = enqueueCorpusReplay(
+                sources = listOf(source),
+                epochs = epochs,
+                seed = seed,
+                policy = policy,
+                maxQueuedChunks = maxQueuedChunks
+            )
+            return result.scheduledChunkCount
+        } finally {
+            corpusSchedulingMutex.unlock()
+        }
+    }
+
+    private suspend fun enqueueCorpusReplay(
+        sources: List<CorpusReplaySource>,
+        epochs: Int,
+        seed: Long,
+        policy: CorpusReplayPolicy,
+        maxQueuedChunks: Int
+    ): CorpusReplayResult {
+        require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
+            "epochs must be in 1..$MAX_DOCUMENT_EPOCHS."
+        }
+        require(sources.isNotEmpty()) { "No eligible training corpus documents were found." }
+
+        val requestedChunkCount = sources.sumOf { it.document.chunkCount.toLong() } * epochs.toLong()
+        require(requestedChunkCount in 1..maxQueuedChunks.toLong()) {
+            "Corpus replay requires $requestedChunkCount queue items; configured limit is $maxQueuedChunks."
+        }
+
+        val activeRepository = requireNotNull(repo) {
+            "Local corpus storage is unavailable; corpus replay cannot be scheduled."
+        }
+        val requestedDocumentIds = sources.map { it.document.id }.toSet()
+        val activeDocumentIds = activeRepository.getActiveCorpusTrainingDocumentIds()
+        val databaseConflicts = requestedDocumentIds.intersect(activeDocumentIds)
+        check(databaseConflicts.isEmpty()) {
+            "Corpus replay would duplicate documents that already have queued or active training work: ${databaseConflicts.joinToString()}."
+        }
+
+        val schedule = CorpusReplayScheduler.createSchedule(
+            sources = sources,
+            epochs = epochs,
+            seed = seed,
+            policy = policy
+        )
+        check(schedule.size.toLong() == requestedChunkCount) {
+            "Replay scheduler produced an unexpected number of queue items."
+        }
+
+        val items = schedule.map { scheduled ->
+            TrainingData(
+                source = scheduled.document.source,
+                title = buildString {
+                    append(scheduled.document.title)
+                    append(" [Epoch ").append(scheduled.epochNumber).append('/').append(epochs).append(']')
+                    append(" [Chunk ")
+                    append(scheduled.chunk.chunkIndex).append('/').append(scheduled.document.chunkCount)
+                    append(']')
+                },
+                content = scheduled.chunk.content,
+                chunkIndex = scheduled.documentChunkIndex,
+                totalChunks = scheduled.documentTotalChunks,
+                documentTitle = scheduled.document.title,
+                status = TrainingStatus.QUEUED,
+                documentId = scheduled.document.id
+            )
+        }
+
+        val memoryConflicts = synchronized(queueLock) {
+            val memoryActiveDocumentIds = _nextQueue.value
+                .mapNotNull { it.documentId }
+                .toMutableSet()
+            _currentTrainingItem.value?.documentId?.let { memoryActiveDocumentIds.add(it) }
+            requestedDocumentIds.intersect(memoryActiveDocumentIds)
+        }
+        check(memoryConflicts.isEmpty()) {
+            "Corpus replay would duplicate in-memory training work: ${memoryConflicts.joinToString()}."
+        }
+
+        activeRepository.markCorpusDocumentsQueued(requestedDocumentIds)
+
+        val orderedItems = synchronized(queueLock) {
+            if (closed) {
+                emptyList()
+            } else {
+                appendPersistingQueueItems(items).also { queued ->
+                    val firstItem = queued.firstOrNull()
+                    if (_activeDocument.value == null && firstItem != null) {
+                        val firstDocumentId = requireNotNull(firstItem.documentId)
+                        val firstDocument = sources.first {
+                            it.document.id == firstDocumentId
+                        }.document
+                        _activeDocument.value = ActiveDocumentTraining(
+                            docTitle = firstDocument.title,
+                            totalCharacters = firstDocument.characterCount,
+                            totalChunks = firstItem.totalChunks,
+                            completedChunks = firstItem.chunkIndex - 1,
+                            currentChunkIndex = firstItem.chunkIndex
+                        )
+                    }
+                }
+            }
+        }
+
+        return CorpusReplayResult(
+            scheduledDocumentCount = if (orderedItems.isEmpty()) 0 else requestedDocumentIds.size,
+            scheduledChunkCount = orderedItems.size,
+            epochs = epochs,
+            seed = seed,
+            policy = policy
+        )
+    }
+
     fun enqueueData(source: String, title: String, content: String) {
         val trimmed = content.trim()
         if (trimmed.isBlank() || closed) return
 
         if (trimmed.length > 380) {
-            enqueueDocument(source, title, trimmed)
+            scope.launch {
+                runCatching { enqueueDocument(source, title, trimmed) }
+                    .onFailure { error ->
+                        Log.e(TAG, "Failed to persist long-form training input", error)
+                    }
+            }
             return
         }
 
@@ -436,6 +872,49 @@ class TrainingManager(
             }
             if (nonDuplicates.isNotEmpty()) {
                 appendPersistingQueueItems(nonDuplicates)
+            }
+        }
+    }
+
+    private fun requireDeclaredRightsForWebContent(
+        source: String,
+        canonicalUrl: String?,
+        rightsStatus: String
+    ) {
+        val isWebContent = source.startsWith("web_article", ignoreCase = true) ||
+            canonicalUrl != null
+        require(!isWebContent || rightsStatus != "UNVERIFIED") {
+            "Web article content must be reviewed and explicitly declared before it can be stored."
+        }
+    }
+
+    private fun sha256Utf16Be(text: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val bytes = text.toByteArray(Charsets.UTF_16BE)
+        return digest.digest(bytes).toHexString()
+    }
+
+    private fun updateUtf16BeDigest(
+        digest: MessageDigest,
+        chars: CharArray,
+        length: Int
+    ) {
+        val bytes = ByteArray(length * 2)
+        for (index in 0 until length) {
+            val value = chars[index].code
+            bytes[index * 2] = (value ushr 8).toByte()
+            bytes[index * 2 + 1] = value.toByte()
+        }
+        digest.update(bytes)
+    }
+
+    private fun ByteArray.toHexString(): String {
+        val alphabet = "0123456789abcdef"
+        return buildString(size * 2) {
+            for (byte in this@toHexString) {
+                val value = byte.toInt() and 0xFF
+                append(alphabet[value ushr 4])
+                append(alphabet[value and 0x0F])
             }
         }
     }
@@ -487,7 +966,18 @@ class TrainingManager(
                     val failed = activeItem.copy(status = TrainingStatus.FAILED)
                     pushCompleted(failed)
                     scope.launch {
-                        repo?.let { runCatching { it.markTrainingFailed(failed.id) } }
+                        repo?.let { repository ->
+                            runCatching { repository.markTrainingFailed(failed.id) }
+                                .onFailure { error ->
+                                    Log.w(TAG, "Failed to persist exception-failed training item", error)
+                                }
+                            failed.documentId?.let { documentId ->
+                                runCatching { repository.markCorpusDocumentPartial(documentId) }
+                                    .onFailure { error ->
+                                        Log.w(TAG, "Failed to mark exception-failed corpus document partial", error)
+                                    }
+                            }
+                        }
                     }
                 } finally {
                     // PENTING: Jangan set _currentTrainingItem.value = null di sini!
@@ -539,10 +1029,30 @@ class TrainingManager(
         when (operation) {
             is QueuePersistenceOperation.Clear -> {
                 repo?.let { repository ->
-                    runCatching { repository.clearPendingQueue() }
+                    runCatching {
+                        repository.clearPendingQueueAndMarkInterruptedCorpusDocumentsPartial()
+                    }
                         .onFailure { error ->
                             Log.e(TAG, "Failed to clear persisted training queue", error)
                         }
+                }
+            }
+
+            is QueuePersistenceOperation.Start -> {
+                try {
+                    repo?.let { repository ->
+                        runCatching {
+                            repository.markTrainingStarted(operation.itemId)
+                        }.onFailure { error ->
+                            Log.e(
+                                TAG,
+                                "Failed to persist active training state for '${operation.itemId}'",
+                                error
+                            )
+                        }
+                    }
+                } finally {
+                    operation.completion.complete(Unit)
                 }
             }
 
@@ -605,13 +1115,32 @@ class TrainingManager(
         return ordered
     }
 
-    private fun popNext(): TrainingData? = synchronized(queueLock) {
-        val list = _nextQueue.value
-        val first = list.firstOrNull() ?: return@synchronized null
-        if (first.status != TrainingStatus.QUEUED) return@synchronized null
+    private suspend fun popNext(): TrainingData? {
+        val startCompletion = CompletableDeferred<Unit>()
+        val item = synchronized(queueLock) {
+            val list = _nextQueue.value
+            val first = list.firstOrNull() ?: return@synchronized null
+            if (first.status != TrainingStatus.QUEUED) return@synchronized null
 
-        _nextQueue.value = list.drop(1)
-        first
+            val sendResult = persistenceOperations.trySend(
+                QueuePersistenceOperation.Start(
+                    itemId = first.id,
+                    completion = startCompletion
+                )
+            )
+            if (sendResult.isFailure) {
+                Log.e(TAG, "Could not persist training start for '${first.id}'.")
+                return@synchronized null
+            }
+
+            _nextQueue.value = list.drop(1)
+            first
+        }
+
+        // Start is ordered in the same persistence channel as Clear. The worker waits for
+        // that update so a concurrent clear cannot delete an already-active queue row.
+        if (item != null) startCompletion.await()
+        return item
     }
 
     private fun updateActiveDocumentEntering(item: TrainingData) {
@@ -632,18 +1161,40 @@ class TrainingManager(
         }
     }
 
-    private fun processItem(item: TrainingData) {
+    private suspend fun processItem(item: TrainingData) {
+        if (item.chunkIndex == 1) {
+            item.documentId?.let { documentId ->
+                repo?.let { repository ->
+                    runCatching { repository.markCorpusDocumentTraining(documentId) }
+                        .onFailure { error ->
+                            Log.w(TAG, "Failed to mark corpus document as training", error)
+                        }
+                }
+            }
+        }
+
         val startNs = System.nanoTime()
         val stepLoss = neuralEngine.trainStep(item.content)
         val durationMs = (System.nanoTime() - startNs) / 1_000_000L
 
-        // Loss tidak valid → FAILED, bukan COMPLETED
+        // Loss tidak valid → FAILED, bukan COMPLETED.
         if (!stepLoss.isFinite()) {
             Log.w(TAG, "trainStep return non-finite loss=$stepLoss untuk '${item.title}'")
             val failed = item.copy(status = TrainingStatus.FAILED, stepDurationMs = durationMs)
             pushCompleted(failed)
             scope.launch {
-                repo?.let { runCatching { it.markTrainingFailed(failed.id) } }
+                repo?.let { repository ->
+                    runCatching { repository.markTrainingFailed(failed.id) }
+                        .onFailure { error ->
+                            Log.w(TAG, "Failed to persist failed training item", error)
+                        }
+                    failed.documentId?.let { documentId ->
+                        runCatching { repository.markCorpusDocumentPartial(documentId) }
+                            .onFailure { error ->
+                                Log.w(TAG, "Failed to mark corpus document as partial", error)
+                            }
+                    }
+                }
             }
             return
         }
@@ -693,14 +1244,37 @@ class TrainingManager(
                         "Document Trainer"
                     )
                 }.onFailure { Log.w(TAG, "Gagal mencatat telemetri docCompleted", it) }
-                // Corpus Aktif sudah selesai: bersihkan dari UI agar tidak terus muncul!
                 _activeDocument.value = null
             }
         }
 
         pushCompleted(finished)
         scope.launch {
-            repo?.let { runCatching { it.markTrainingCompleted(finished.id, stepLoss, durationMs) } }
+            repo?.let { repository ->
+                runCatching {
+                    repository.markTrainingCompleted(finished.id, stepLoss, durationMs)
+                }.onFailure { error ->
+                    Log.w(TAG, "Failed to persist completed training item", error)
+                }
+
+                if (
+                    finished.documentId != null &&
+                    finished.chunkIndex >= finished.totalChunks
+                ) {
+                    runCatching {
+                        val document = repository.getCorpusDocument(finished.documentId)
+                        if (document != null && document.chunkCount > 0) {
+                            val completedPasses = finished.totalChunks / document.chunkCount
+                            repository.markCorpusDocumentTrained(
+                                documentId = document.id,
+                                completedPassCount = completedPasses
+                            )
+                        }
+                    }.onFailure { error ->
+                        Log.w(TAG, "Failed to update completed corpus document state", error)
+                    }
+                }
+            }
         }
     }
 

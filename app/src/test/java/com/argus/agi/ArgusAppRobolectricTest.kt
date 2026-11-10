@@ -224,7 +224,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testEnqueueDocumentSchedulesCompleteEpochPassesInOrder() {
+    fun testEnqueueDocumentSchedulesCompleteEpochPassesInOrder() = runTest {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val deviceGuard = DeviceGuard(context)
         val worldModel = WorldModel(context)
@@ -277,7 +277,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testEnqueueDocumentStreamSchedulesMultipleCompletePasses() {
+    fun testEnqueueDocumentStreamSchedulesMultipleCompletePasses() = runTest {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val guard = DeviceGuard(context)
         val worldModel = WorldModel(context)
@@ -290,6 +290,8 @@ class ArgusAppRobolectricTest {
                     "Training passes repeat the document blocks without modifying their token IDs. "
                 ).repeat(10)
 
+            val multiPassDocument = document.replaceFirst("Argus parses", "Argus copies")
+
             val firstPass = manager.enqueueDocumentStream(
                 source = "Single pass test",
                 title = "Single pass",
@@ -301,7 +303,7 @@ class ArgusAppRobolectricTest {
             val multiPass = manager.enqueueDocumentStream(
                 source = "Multi pass test",
                 title = "Multi pass",
-                reader = StringReader(document),
+                reader = StringReader(multiPassDocument),
                 chunkSize = 180,
                 overlap = 30,
                 epochs = 3
@@ -535,7 +537,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testEnqueueDocumentMultiChunk() {
+    fun testEnqueueDocumentMultiChunk() = runTest {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val deviceGuard = DeviceGuard(context)
         val worldModel = WorldModel(context)
@@ -589,7 +591,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testEnqueueDocumentStreamLargeCorpus() {
+    fun testEnqueueDocumentStreamLargeCorpus() = runTest {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val deviceGuard = DeviceGuard(context)
         val worldModel = WorldModel(context)
@@ -620,7 +622,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testZipStreamingExtractionInMemory() {
+    fun testZipStreamingExtractionInMemory() = runTest {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val deviceGuard = DeviceGuard(context)
         val worldModel = WorldModel(context)
@@ -807,7 +809,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testUnboundedDocumentAndStreamTrainingBlocks() {
+    fun testUnboundedDocumentAndStreamTrainingBlocks() = runTest {
         val engine = ArgusNeuralEngine.createBlocking(context)
         val guard = DeviceGuard(context)
         val world = WorldModel(context)

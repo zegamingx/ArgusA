@@ -621,12 +621,16 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 } ?: Pair(0, 0L)
 
                 if (chunkCount == 0 || charsRead == 0L) {
+                    val reason = when {
+                        charsRead == 0L -> "File kosong atau tidak bisa dibaca."
+                        else -> "Konten tidak menghasilkan blok baru; kemungkinan dokumen identik sudah tersimpan di corpus lokal."
+                    }
                     withContext(Dispatchers.Main) {
                         appendMessage(
                             ChatMessage(
                                 isUser = false,
-                                text = "File '$docDisplayName' kosong atau tidak bisa dibaca.",
-                                thinkReasoning = "Empty content or stream read returned 0 chunks."
+                                text = "File '$docDisplayName' dilewati. $reason",
+                                thinkReasoning = "Buffered import produced $charsRead characters and $chunkCount new training chunks."
                             )
                         )
                     }
@@ -712,7 +716,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             maxQueuedTextMemoryBudgetBytes()
         )
 
-    private fun enqueueExtractedDocument(
+    private suspend fun enqueueExtractedDocument(
         extracted: ExtractedDocument,
         source: String,
         epochs: Int = recommendedTrainingPasses(extracted.characterCount.toLong())
@@ -871,6 +875,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 val contentResolver = getApplication<Application>().contentResolver
                 var processedFiles = 0
                 var failedFiles = 0
+                var duplicateFilesSkipped = 0
                 var totalChunksEnqueued = 0
                 var totalCharsExtracted = 0L
                 var totalExpandedBytes = 0L
@@ -992,13 +997,21 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                 }
 
                                 extraction.onSuccess { result ->
-                                    if (result.first > 0 && result.second > 0L) {
-                                        processedFiles++
-                                        totalChunksEnqueued += result.first
-                                        totalCharsExtracted += result.second
-                                    } else {
-                                        failedFiles++
-                                        Log.w(TAG, "Tidak ada teks yang dapat diimpor dari " + normalizedName)
+                                    when {
+                                        result.first > 0 && result.second > 0L -> {
+                                            processedFiles++
+                                            totalChunksEnqueued += result.first
+                                            totalCharsExtracted += result.second
+                                        }
+                                        result.first == 0 && result.second > 0L -> {
+                                            duplicateFilesSkipped++
+                                            totalCharsExtracted += result.second
+                                            Log.i(TAG, "Corpus duplicate skipped: $normalizedName")
+                                        }
+                                        else -> {
+                                            failedFiles++
+                                            Log.w(TAG, "Tidak ada teks yang dapat diimpor dari " + normalizedName)
+                                        }
                                     }
                                 }.onFailure { error ->
                                     failedFiles++
@@ -1029,7 +1042,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 } ?: throw IOException("Tidak dapat membuka arsip ZIP.")
 
                 withContext(Dispatchers.Main) {
-                    if (processedFiles == 0) {
+                    if (processedFiles == 0 && duplicateFilesSkipped == 0) {
                         appendMessage(
                             ChatMessage(
                                 isUser = false,
@@ -1041,8 +1054,13 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     } else {
                         val charsDisplay = String.format(Locale.US, "%,d", totalCharsExtracted)
+                        val duplicateSummary = if (duplicateFilesSkipped > 0) {
+                            "\nDokumen identik yang sudah tersimpan: " + duplicateFilesSkipped + "."
+                        } else {
+                            ""
+                        }
                         val failureSummary = if (failedFiles > 0) {
-                            "\nFile dilewati/gagal: " + failedFiles + "."
+                            "\nFile gagal/tidak dapat diekstrak: " + failedFiles + "."
                         } else {
                             ""
                         }
@@ -1060,9 +1078,11 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                 isUser = false,
                                 text = "Arsip ZIP '" + displayName + "' selesai diproses secara lokal.\n\n" +
                                     "• File berhasil diproses: " + processedFiles + "\n" +
-                                    "• File dilewati/gagal: " + failedFiles + "\n" +
+                                    "• File gagal/tidak dapat diekstrak: " + failedFiles + "\n" +
+                                    "• Duplikat yang dilewati: " + duplicateFilesSkipped + "\n" +
                                     "• Total karakter: " + charsDisplay + "\n" +
                                     "• Blok training dijadwalkan: " + totalChunksEnqueued +
+                                    duplicateSummary +
                                     failureSummary,
                                 thinkReasoning = "Bounded ZIP extraction: " +
                                     processedFiles + " files → " + totalChunksEnqueued + " blocks."
@@ -1285,7 +1305,10 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     fullText = article.text,
                     chunkSize = 700,
                     overlap = 80,
-                    epochs = epochs
+                    epochs = epochs,
+                    language = article.language,
+                    canonicalUrl = article.canonicalUrl,
+                    rightsStatus = "USER_DECLARED"
                 )
             }
 
@@ -1297,7 +1320,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         _articleExtractionError.value = null
                         _articleQueueStatus.value = "Artikel dijadwalkan menjadi $queuedChunks blok training dalam $epochs pass, disesuaikan dengan RAM dan heap aplikasi."
                     } else {
-                        _articleQueueStatus.value = "Tidak ada blok yang dapat dibuat dari artikel ini."
+                        _articleQueueStatus.value =
+                            "Artikel ini sudah ada di corpus lokal. Tidak ada salinan training baru yang dibuat."
                     }
                 }.onFailure { error ->
                     Log.e(TAG, "Failed to queue reviewed web article", error)
