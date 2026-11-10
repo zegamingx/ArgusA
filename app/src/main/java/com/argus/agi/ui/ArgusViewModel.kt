@@ -875,6 +875,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 val contentResolver = getApplication<Application>().contentResolver
                 var processedFiles = 0
                 var failedFiles = 0
+                var duplicateFilesSkipped = 0
                 var totalChunksEnqueued = 0
                 var totalCharsExtracted = 0L
                 var totalExpandedBytes = 0L
@@ -996,13 +997,21 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                 }
 
                                 extraction.onSuccess { result ->
-                                    if (result.first > 0 && result.second > 0L) {
-                                        processedFiles++
-                                        totalChunksEnqueued += result.first
-                                        totalCharsExtracted += result.second
-                                    } else {
-                                        failedFiles++
-                                        Log.w(TAG, "Tidak ada teks yang dapat diimpor dari " + normalizedName)
+                                    when {
+                                        result.first > 0 && result.second > 0L -> {
+                                            processedFiles++
+                                            totalChunksEnqueued += result.first
+                                            totalCharsExtracted += result.second
+                                        }
+                                        result.first == 0 && result.second > 0L -> {
+                                            duplicateFilesSkipped++
+                                            totalCharsExtracted += result.second
+                                            Log.i(TAG, "Corpus duplicate skipped: $normalizedName")
+                                        }
+                                        else -> {
+                                            failedFiles++
+                                            Log.w(TAG, "Tidak ada teks yang dapat diimpor dari " + normalizedName)
+                                        }
                                     }
                                 }.onFailure { error ->
                                     failedFiles++
@@ -1045,8 +1054,13 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     } else {
                         val charsDisplay = String.format(Locale.US, "%,d", totalCharsExtracted)
+                        val duplicateSummary = if (duplicateFilesSkipped > 0) {
+                            "\nDokumen identik yang sudah tersimpan: " + duplicateFilesSkipped + "."
+                        } else {
+                            ""
+                        }
                         val failureSummary = if (failedFiles > 0) {
-                            "\nFile dilewati/gagal: " + failedFiles + "."
+                            "\nFile gagal/tidak dapat diekstrak: " + failedFiles + "."
                         } else {
                             ""
                         }
@@ -1064,9 +1078,11 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                 isUser = false,
                                 text = "Arsip ZIP '" + displayName + "' selesai diproses secara lokal.\n\n" +
                                     "• File berhasil diproses: " + processedFiles + "\n" +
-                                    "• File dilewati/gagal: " + failedFiles + "\n" +
+                                    "• File gagal/tidak dapat diekstrak: " + failedFiles + "\n" +
+                                    "• Duplikat yang dilewati: " + duplicateFilesSkipped + "\n" +
                                     "• Total karakter: " + charsDisplay + "\n" +
                                     "• Blok training dijadwalkan: " + totalChunksEnqueued +
+                                    duplicateSummary +
                                     failureSummary,
                                 thinkReasoning = "Bounded ZIP extraction: " +
                                     processedFiles + " files → " + totalChunksEnqueued + " blocks."
