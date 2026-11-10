@@ -3,9 +3,12 @@ package com.argus.agi.sensor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
+import okhttp3.ResponseBody
 import okhttp3.Request
 import org.json.JSONArray
 import org.jsoup.Jsoup
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.net.URI
 import java.net.URLDecoder
 import java.net.URLEncoder
@@ -32,7 +35,8 @@ class WebSearchEngine(
     companion object {
         private const val MAX_QUERY_LENGTH = 300
         private const val MAX_RESULTS = 8
-        private const val MAX_WIKI_RESPONSE_CHARS = 512_000
+        private const val MAX_WIKI_RESPONSE_BYTES = 512_000
+        private const val MAX_DDG_RESPONSE_BYTES = 1_500_000
         private const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
     }
@@ -67,7 +71,9 @@ class WebSearchEngine(
 
                 client.newCall(request).execute().use { response ->
                     if (response.isSuccessful) {
-                        val html = response.body?.string().orEmpty()
+                        val html = response.body
+                            ?.let { body -> readBoundedResponseBody(body.byteStream(), body.contentLength(), MAX_DDG_RESPONSE_BYTES) }
+                            .orEmpty()
                         parseDdgHtml(html).forEach { item ->
                             collected.putIfAbsent(item.sourceUrl, item)
                         }
@@ -90,8 +96,15 @@ class WebSearchEngine(
         return client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return@use emptyList()
 
-            val body = response.body?.string().orEmpty()
-            if (body.length > MAX_WIKI_RESPONSE_CHARS) return@use emptyList()
+            val body = response.body
+                ?.let { responseBody ->
+                    readBoundedResponseBody(
+                        responseBody.byteStream(),
+                        responseBody.contentLength(),
+                        MAX_WIKI_RESPONSE_BYTES
+                    )
+                }
+                ?: return@use emptyList()
 
             val json = JSONArray(body)
             if (json.length() < 4) return@use emptyList()
@@ -205,4 +218,34 @@ class WebSearchEngine(
             null
         ).toASCIIString()
     }
+}
+
+
+/**
+ * Reads an HTTP response with a hard byte ceiling. Content-Length is only an early
+ * rejection hint; the streaming counter remains authoritative for chunked responses.
+ */
+internal fun readBoundedResponseBody(
+    input: InputStream,
+    contentLength: Long,
+    maxBytes: Int
+): String? {
+    require(maxBytes > 0) { "maxBytes must be positive." }
+    if (contentLength > maxBytes.toLong()) return null
+
+    val output = ByteArrayOutputStream()
+    val buffer = ByteArray(8_192)
+    var totalBytes = 0
+
+    input.use { stream ->
+        while (true) {
+            val count = stream.read(buffer)
+            if (count < 0) break
+            totalBytes += count
+            if (totalBytes > maxBytes) return null
+            output.write(buffer, 0, count)
+        }
+    }
+
+    return output.toString(StandardCharsets.UTF_8.name())
 }
