@@ -84,19 +84,14 @@ data class EngineConfig(
     }
 }
 
-/**
- * On-Device Neural Engine A.R.G.U.S:
- * Micro-Transformer SwiGLU dengan True Full-Parameter Backpropagation & LoRA Adapters.
- * Menggunakan akumulasi gradien sekuensial (minibatch sliding window) dan optimizer Adam
- * tanpa mutasi in-place prematur di tengah sekuens token.
- */
+/** Aggregate next-token loss and the exact number of scored validation targets. */
 data class LossEvaluation(
     val meanLoss: Float,
     val targetCount: Int,
     val evaluatedDocumentCount: Int
 )
 
-data class GradientCheckResult(
+internal data class GradientCheckResult(
     val parameterName: String,
     val parameterIndex: Int,
     val analyticalGradient: Float,
@@ -105,6 +100,11 @@ data class GradientCheckResult(
     val relativeError: Float
 )
 
+/**
+ * On-Device Neural Engine A.R.G.U.S:
+ * Micro-Transformer SwiGLU with full-parameter backpropagation and LoRA adapters.
+ * Uses sequential gradient accumulation and Adam without premature in-place mutation.
+ */
 class ArgusNeuralEngine private constructor(
     private val context: Context,
     val config: EngineConfig = EngineConfig()
