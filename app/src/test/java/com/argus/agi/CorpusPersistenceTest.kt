@@ -222,6 +222,126 @@ class CorpusPersistenceTest {
         }
     }
 
+
+    @Test
+    fun seededCorpusReplayIsRepeatableAndPreservesPerDocumentChunkOrder() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(context),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val documents = listOf(
+                "Research document alpha preserves its own source sequence. ".repeat(24),
+                "Research document beta contributes another ordered token stream. ".repeat(19),
+                "Research document gamma is interleaved only at chunk boundaries. ".repeat(16)
+            )
+
+            documents.forEachIndexed { index, text ->
+                val queued = manager.enqueueDocument(
+                    source = "Replay scheduler test",
+                    title = "Replay document ${index + 1}",
+                    fullText = text,
+                    chunkSize = 170,
+                    overlap = 25,
+                    epochs = 1
+                )
+                assertTrue("Each source document must produce more than one chunk.", queued > 1)
+            }
+            manager.awaitQueuePersistenceIdle()
+            manager.clearQueue()
+            manager.awaitQueuePersistenceIdle()
+
+            val trainingDocuments = repository.getTrainingCorpusDocuments()
+            assertEquals(3, trainingDocuments.size)
+            val expectedChunkCount =
+                trainingDocuments.sumOf { it.chunkCount.toLong() } * 2L
+
+            val firstRun = manager.scheduleCorpusReplay(
+                seed = 42L,
+                epochs = 2,
+                policy = CorpusReplayPolicy.INTERLEAVED_DOCUMENTS
+            )
+            assertEquals(3, firstRun.scheduledDocumentCount)
+            assertEquals(expectedChunkCount.toInt(), firstRun.scheduledChunkCount)
+            manager.awaitQueuePersistenceIdle()
+
+            val firstQueue = repository.getPendingQueueSnapshot()
+            assertEquals(expectedChunkCount.toInt(), firstQueue.size)
+            val firstOrder = firstQueue.map { item ->
+                Triple(
+                    requireNotNull(item.documentId),
+                    item.chunkIndex,
+                    item.content
+                )
+            }
+
+            val orderedByDocument = firstQueue.groupBy { requireNotNull(it.documentId) }
+            assertEquals(3, orderedByDocument.size)
+            orderedByDocument.values.forEach { documentItems ->
+                assertEquals(
+                    "Each document must retain a contiguous chunk order over all epochs.",
+                    (1..documentItems.size).toList(),
+                    documentItems.map { it.chunkIndex }
+                )
+            }
+            assertTrue(
+                "Interleaved replay must mix at least two document streams.",
+                firstQueue.zipWithNext().any { (first, second) ->
+                    first.documentId != second.documentId
+                }
+            )
+
+            val duplicateRunFailure = runCatching {
+                manager.scheduleCorpusReplay(
+                    seed = 42L,
+                    epochs = 2,
+                    policy = CorpusReplayPolicy.INTERLEAVED_DOCUMENTS
+                )
+            }.exceptionOrNull()
+            assertTrue(
+                "A corpus document with active queue work must not be scheduled twice.",
+                duplicateRunFailure != null
+            )
+            assertEquals(firstQueue.size, repository.getPendingQueueSnapshot().size)
+
+            manager.clearQueue()
+            manager.awaitQueuePersistenceIdle()
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+
+            val repeatedRun = manager.scheduleCorpusReplay(
+                seed = 42L,
+                epochs = 2,
+                policy = CorpusReplayPolicy.INTERLEAVED_DOCUMENTS
+            )
+            manager.awaitQueuePersistenceIdle()
+            val repeatedQueue = repository.getPendingQueueSnapshot()
+            val repeatedOrder = repeatedQueue.map { item ->
+                Triple(
+                    requireNotNull(item.documentId),
+                    item.chunkIndex,
+                    item.content
+                )
+            }
+
+            assertEquals(firstRun, repeatedRun)
+            assertEquals("The same seed and corpus snapshot must reproduce the exact queue order.", firstOrder, repeatedOrder)
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
     @Test
     fun retainedCorpusSurvivesQueueClearAndCanBeReplayed() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
