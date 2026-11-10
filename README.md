@@ -27,7 +27,7 @@ A release build requires the Argus release signing key at `signing/argus-release
 
 ## GitHub releases
 
-Publishing a versioned GitHub Release (for example, `v1.0.7`) runs lint, unit tests, a signed release build, certificate verification, and APK publication.
+Publishing a versioned GitHub Release (for example, `v1.0.7`) runs release lint, Robolectric unit tests, a signed release build, certificate verification, and APK publication. The legacy `v1.0.6` tag is intentionally excluded; update `version.properties` before publishing the next versioned tag.
 
 The private repository keeps the CI signing-key backup in the private GitHub Release named `argus-signing-key`. Repository access therefore also grants access to the app-signing identity. Keep this repository private and restrict collaborator access. Never redistribute the signing-key asset.
 
@@ -63,6 +63,8 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 ## On-device training scope
 
 Fresh model initialization selects tensor dimensions using total RAM, app heap, and current available RAM. Existing ARG3 checkpoints retain their saved tensor dimensions so an application update does not silently discard the user's model.
+
+Genesis currently seeds three short foundation notes as retained TRAIN corpus documents. Their scheduling is idempotent: already queued, active, or trained notes are not duplicated, while a cleared or interrupted note can be replayed from Room. These notes are a small bootstrap seed, not a general-purpose language dataset; no C4 or other broad offline language corpus is bundled.
 
 Training currently uses causal next-token cross-entropy, full-parameter backpropagation, gradient clipping, and Adam. Imported documents can be scheduled for up to three passes on devices that meet the memory thresholds; smaller or larger documents use fewer passes. Loss-only validation skips backpropagation gradient-buffer allocation and does not update model weights or optimizer state. An internal central finite-difference diagnostic and test cover representative output-head, embedding, MLP, attention, and LoRA parameter groups; execution remains part of final verification.
 
