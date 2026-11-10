@@ -2,8 +2,11 @@ package com.argus.agi.data.repository
 
 import android.content.Context
 import android.net.Uri
+import androidx.room.withTransaction
 import com.argus.agi.data.local.ArgusDatabase
 import com.argus.agi.data.local.entity.ChatMessageEntity
+import com.argus.agi.data.local.entity.CorpusChunkEntity
+import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.TrainingItemEntity
 import com.argus.agi.data.local.entity.WorldMemoryEntity
 import com.argus.agi.model.TrainingData
@@ -21,6 +24,7 @@ class ArgusRepository(context: Context) {
     private val chatMessageDao = db.chatMessageDao()
     private val worldMemoryDao = db.worldMemoryDao()
     private val trainingQueueDao = db.trainingQueueDao()
+    private val corpusDao = db.corpusDao()
 
     // =========================================================================
     // Chat Messages
@@ -108,6 +112,88 @@ class ArgusRepository(context: Context) {
     }
 
     // =========================================================================
+    // Persistent Local Corpus
+    // =========================================================================
+
+    val corpusDocuments: Flow<List<CorpusDocumentEntity>> =
+        corpusDao.observeDocuments(limit = 500)
+
+    suspend fun storeCorpusDocument(
+        document: CorpusDocumentEntity,
+        chunks: List<CorpusChunkEntity>
+    ): Boolean = withContext(Dispatchers.IO) {
+        require(chunks.size == document.chunkCount) {
+            "Corpus chunk count does not match document metadata."
+        }
+        require(chunks.all { it.documentId == document.id }) {
+            "Every corpus chunk must reference the document being stored."
+        }
+
+        db.withTransaction {
+            val insertedRowId = corpusDao.insertDocument(document)
+            if (insertedRowId == -1L) {
+                false
+            } else {
+                corpusDao.insertChunks(chunks)
+                true
+            }
+        }
+    }
+
+    suspend fun getCorpusDocument(documentId: String): CorpusDocumentEntity? =
+        withContext(Dispatchers.IO) {
+            corpusDao.getDocument(documentId)
+        }
+
+    suspend fun getCorpusDocumentByFingerprint(fingerprint: String): CorpusDocumentEntity? =
+        withContext(Dispatchers.IO) {
+            corpusDao.getDocumentByFingerprint(fingerprint)
+        }
+
+    suspend fun getCorpusDocuments(limit: Int = 500): List<CorpusDocumentEntity> =
+        withContext(Dispatchers.IO) {
+            require(limit > 0) { "limit must be positive." }
+            corpusDao.getDocuments(limit)
+        }
+
+    suspend fun getCorpusDocumentCount(): Int = withContext(Dispatchers.IO) {
+        corpusDao.getDocumentCount()
+    }
+
+    suspend fun getCorpusChunks(documentId: String): List<CorpusChunkEntity> =
+        withContext(Dispatchers.IO) {
+            corpusDao.getChunks(documentId)
+        }
+
+    suspend fun markCorpusDocumentTrained(
+        documentId: String,
+        completedPassCount: Int
+    ) = withContext(Dispatchers.IO) {
+        require(completedPassCount >= 0) { "completedPassCount cannot be negative." }
+        corpusDao.updateTrainingState(
+            documentId = documentId,
+            status = "TRAINED",
+            trainedAtEpochMs = System.currentTimeMillis(),
+            completedPassCount = completedPassCount
+        )
+    }
+
+    suspend fun markCorpusDocumentQueued(documentId: String) =
+        withContext(Dispatchers.IO) {
+            corpusDao.updateTrainingState(
+                documentId = documentId,
+                status = "READY",
+                trainedAtEpochMs = null,
+                completedPassCount = 0
+            )
+        }
+
+    suspend fun deleteCorpusDocument(documentId: String): Boolean =
+        withContext(Dispatchers.IO) {
+            corpusDao.deleteDocument(documentId) > 0
+        }
+
+    // =========================================================================
     // Converters
     // =========================================================================
 
@@ -156,7 +242,8 @@ class ArgusRepository(context: Context) {
         timestamp = timestamp,
         status = runCatching { TrainingStatus.valueOf(status) }.getOrDefault(TrainingStatus.QUEUED),
         finalLoss = finalLoss,
-        stepDurationMs = stepDurationMs
+        stepDurationMs = stepDurationMs,
+        documentId = documentId
     )
 
     private fun TrainingData.toEntity() = TrainingItemEntity(
@@ -170,6 +257,7 @@ class ArgusRepository(context: Context) {
         timestamp = timestamp,
         status = status.name,
         finalLoss = finalLoss,
-        stepDurationMs = stepDurationMs
+        stepDurationMs = stepDurationMs,
+        documentId = documentId
     )
 }
