@@ -95,6 +95,11 @@ class ArgusRepository(
         trainingQueueDao.getPendingQueueSnapshot().map { it.toDomain() }
     }
 
+    suspend fun getActiveCorpusTrainingDocumentIds(): Set<String> =
+        withContext(Dispatchers.IO) {
+            trainingQueueDao.getActiveCorpusDocumentIds().toSet()
+        }
+
     suspend fun saveTrainingItem(item: TrainingData) = withContext(Dispatchers.IO) {
         db.withTransaction {
             validateTrainingDocumentReferences(listOf(item))
@@ -248,6 +253,12 @@ class ArgusRepository(
             corpusDao.getValidationDocuments(limit)
         }
 
+    suspend fun getTrainingCorpusDocuments(limit: Int = 500): List<CorpusDocumentEntity> =
+        withContext(Dispatchers.IO) {
+            require(limit in 1..500) { "Training document limit must be in 1..500." }
+            corpusDao.getTrainingDocuments(limit)
+        }
+
     suspend fun getCorpusChunks(documentId: String): List<CorpusChunkEntity> =
         withContext(Dispatchers.IO) {
             corpusDao.getChunks(documentId)
@@ -298,6 +309,21 @@ class ArgusRepository(
                 trainedAtEpochMs = null,
                 completedPassCount = 0
             )
+        }
+
+    suspend fun markCorpusDocumentsQueued(documentIds: Collection<String>) =
+        withContext(Dispatchers.IO) {
+            val stableIds = documentIds.distinct()
+            db.withTransaction {
+                stableIds.forEach { documentId ->
+                    corpusDao.updateTrainingState(
+                        documentId = documentId,
+                        status = "READY",
+                        trainedAtEpochMs = null,
+                        completedPassCount = 0
+                    )
+                }
+            }
         }
 
     suspend fun deleteCorpusDocument(documentId: String): Boolean =
