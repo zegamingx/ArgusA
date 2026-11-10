@@ -156,6 +156,14 @@ class ArgusRepository(
                     importedAtEpochMs = document.createdAtEpochMs
                 )
             )
+            corpusDao.updateSourceMetadata(
+                sourceId = sourceId,
+                source = document.source,
+                canonicalUrl = document.canonicalUrl,
+                language = document.language,
+                rightsStatus = document.rightsStatus,
+                importedAtEpochMs = document.createdAtEpochMs
+            )
             insertedRowId != -1L
         }
     }
