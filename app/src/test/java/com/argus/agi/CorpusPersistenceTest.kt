@@ -689,17 +689,18 @@ class CorpusPersistenceTest {
                 loraRank = 2
             )
         )
+        val deviceGuard = DeviceGuard(context)
         val trainingManager = TrainingManager(
             context = context,
             neuralEngine = engine,
-            deviceGuard = DeviceGuard(context),
+            deviceGuard = deviceGuard,
             worldModel = WorldModel(context),
             repository = repository
         )
         val genesisManager = com.argus.agi.model.GenesisModelManager(
             context = context,
             neuralEngine = engine,
-            deviceGuard = DeviceGuard(context)
+            deviceGuard = deviceGuard
         )
 
         try {
