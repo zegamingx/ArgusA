@@ -765,21 +765,23 @@ class TrainingManager(
             )
         }
 
+        val memoryConflicts = synchronized(queueLock) {
+            val memoryActiveDocumentIds = _nextQueue.value
+                .mapNotNull { it.documentId }
+                .toMutableSet()
+            _currentTrainingItem.value?.documentId?.let { memoryActiveDocumentIds.add(it) }
+            requestedDocumentIds.intersect(memoryActiveDocumentIds)
+        }
+        check(memoryConflicts.isEmpty()) {
+            "Corpus replay would duplicate in-memory training work: ${memoryConflicts.joinToString()}."
+        }
+
         activeRepository.markCorpusDocumentsQueued(requestedDocumentIds)
 
         val orderedItems = synchronized(queueLock) {
             if (closed) {
                 emptyList()
             } else {
-                val memoryActiveDocumentIds = buildSet {
-                    _nextQueue.value.mapNotNullTo(this) { it.documentId }
-                    _currentTrainingItem.value?.documentId?.let { add(it) }
-                }
-                val memoryConflicts = requestedDocumentIds.intersect(memoryActiveDocumentIds)
-                check(memoryConflicts.isEmpty()) {
-                    "Corpus replay would duplicate in-memory training work: ${memoryConflicts.joinToString()}."
-                }
-
                 appendPersistingQueueItems(items).also { queued ->
                     val firstItem = queued.firstOrNull()
                     if (_activeDocument.value == null && firstItem != null) {
