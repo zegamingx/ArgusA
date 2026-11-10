@@ -15,6 +15,12 @@ interface TrainingQueueDao {
     @Query("SELECT * FROM training_items WHERE status = 'QUEUED' ORDER BY timestamp ASC")
     suspend fun getPendingQueueSnapshot(): List<TrainingItemEntity>
 
+    @Query(
+        "SELECT DISTINCT documentId FROM training_items " +
+            "WHERE documentId IS NOT NULL AND status IN ('QUEUED', 'TRAINING')"
+    )
+    suspend fun getActiveCorpusDocumentIds(): List<String>
+
     @Query("SELECT * FROM training_items WHERE status = 'COMPLETED' ORDER BY timestamp DESC LIMIT :limit")
     fun getCompletedItems(limit: Int = 50): Flow<List<TrainingItemEntity>>
 
