@@ -1042,7 +1042,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 } ?: throw IOException("Tidak dapat membuka arsip ZIP.")
 
                 withContext(Dispatchers.Main) {
-                    if (processedFiles == 0) {
+                    if (processedFiles == 0 && duplicateFilesSkipped == 0) {
                         appendMessage(
                             ChatMessage(
                                 isUser = false,
