@@ -11,6 +11,14 @@ plugins {
 android {
     namespace = "com.argus.agi"
     compileSdk { version = release(37) }
+    ndkVersion = "30.0.16248370"
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
 
     val versionFile = rootProject.file("version.properties")
     check(versionFile.isFile) {
@@ -32,6 +40,16 @@ android {
         versionCode = readVersion("VERSION_BUILD")
         versionName = "${readVersion("VERSION_MAJOR")}.${readVersion("VERSION_MINOR")}.${readVersion("VERSION_PATCH")}"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags += listOf("-std=c++20")
+            }
+        }
     }
 
     val jksFile = rootProject.file("my-upload-key.jks")
@@ -103,7 +121,7 @@ android {
     lint {
         checkTestSources = false
         ignoreTestSources = true
-        abortOnError = false
+        abortOnError = true
     }
 
     dependenciesInfo {

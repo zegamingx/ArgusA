@@ -92,7 +92,7 @@ class AudioVoiceManager(
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             val t = tts ?: return
-            val idLocale = Locale("id", "ID")
+            val idLocale = Locale.forLanguageTag("id-ID")
             val result = t.setLanguage(idLocale)
             if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
                 // Fallback ke default perangkat
@@ -134,7 +134,7 @@ class AudioVoiceManager(
      */
     fun detectLanguageLocale(text: String): Locale {
         val words = text.lowercase(Locale.ROOT).split(Regex("[\\s.,!?:;\"'()\\[\\]{}]+")).filter { it.length >= 2 }
-        if (words.isEmpty()) return Locale("id", "ID")
+        if (words.isEmpty()) return Locale.forLanguageTag("id-ID")
 
         val idMarkers = setOf(
             "yang", "dan", "di", "ini", "itu", "ke", "dari", "untuk", "pada", "adalah", "dengan",
@@ -158,8 +158,8 @@ class AudioVoiceManager(
 
         return when {
             enCount > idCount -> Locale.US
-            idCount > enCount -> Locale("id", "ID")
-            else -> Locale("id", "ID")
+            idCount > enCount -> Locale.forLanguageTag("id-ID")
+            else -> Locale.forLanguageTag("id-ID")
         }
     }
 

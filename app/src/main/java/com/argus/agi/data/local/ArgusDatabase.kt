@@ -42,16 +42,16 @@ abstract class ArgusDatabase : RoomDatabase() {
          * This migration is additive; it does not erase any existing user data.
          */
         val MIGRATION_1_2: Migration = object : Migration(1, 2) {
-            override fun migrate(database: SupportSQLiteDatabase) {
-                database.execSQL(
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
                     "ALTER TABLE `training_items` ADD COLUMN `documentId` TEXT"
                 )
-                database.execSQL(
+                db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_training_items_documentId` " +
                         "ON `training_items` (`documentId`)"
                 )
 
-                database.execSQL(
+                db.execSQL(
                     """
                     CREATE TABLE IF NOT EXISTS `corpus_documents` (
                         `id` TEXT NOT NULL,
@@ -75,21 +75,21 @@ abstract class ArgusDatabase : RoomDatabase() {
                     )
                     """.trimIndent()
                 )
-                database.execSQL(
+                db.execSQL(
                     "CREATE UNIQUE INDEX IF NOT EXISTS " +
                         "`index_corpus_documents_contentFingerprint` " +
                         "ON `corpus_documents` (`contentFingerprint`)"
                 )
-                database.execSQL(
+                db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_corpus_documents_createdAtEpochMs` " +
                         "ON `corpus_documents` (`createdAtEpochMs`)"
                 )
-                database.execSQL(
+                db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_corpus_documents_datasetSplit_createdAtEpochMs` " +
                         "ON `corpus_documents` (`datasetSplit`, `createdAtEpochMs`)"
                 )
 
-                database.execSQL(
+                db.execSQL(
                     """
                     CREATE TABLE IF NOT EXISTS `corpus_sources` (
                         `id` TEXT NOT NULL,
@@ -105,12 +105,12 @@ abstract class ArgusDatabase : RoomDatabase() {
                     )
                     """.trimIndent()
                 )
-                database.execSQL(
+                db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_corpus_sources_documentId` " +
                         "ON `corpus_sources` (`documentId`)"
                 )
 
-                database.execSQL(
+                db.execSQL(
                     """
                     CREATE TABLE IF NOT EXISTS `corpus_chunks` (
                         `id` TEXT NOT NULL,
@@ -124,11 +124,11 @@ abstract class ArgusDatabase : RoomDatabase() {
                     )
                     """.trimIndent()
                 )
-                database.execSQL(
+                db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_corpus_chunks_documentId` " +
                         "ON `corpus_chunks` (`documentId`)"
                 )
-                database.execSQL(
+                db.execSQL(
                     "CREATE UNIQUE INDEX IF NOT EXISTS " +
                         "`index_corpus_chunks_documentId_chunkIndex` " +
                         "ON `corpus_chunks` (`documentId`, `chunkIndex`)"

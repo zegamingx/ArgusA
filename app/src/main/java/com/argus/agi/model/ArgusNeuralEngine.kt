@@ -123,6 +123,9 @@ class ArgusNeuralEngine private constructor(
     val maxSeqLen = config.maxSeqLen
     val loraRank = config.loraRank
     val isFullTrainingEnabled = config.isFullTrainingEnabled
+
+    val optimizerBackend: String
+        get() = VulkanTrainingBackend.currentBackend
     private val scale = 1.0f / sqrt(headDim.toFloat())
 
     private var vocabCap = max(tokenizer.vocabSize + 32, 160)
@@ -1243,40 +1246,78 @@ class ArgusNeuralEngine private constructor(
         if (!totalNorm.isFinite()) { adamStep--; return Float.NaN }
         val clipFactor = if (totalNorm > maxGradNorm) maxGradNorm / (totalNorm + 1e-6f) else 1.0f
 
-        applyClip(gradWHead, clipFactor)
-        applyClip(gradWEmbed, clipFactor)
-        applyClip(gradWDown, clipFactor)
-        applyClip(gradWUp, clipFactor)
-        applyClip(gradWGate, clipFactor)
-        applyClip(gradWO, clipFactor)
-        applyClip(gradWQ, clipFactor)
-        applyClip(gradWK, clipFactor)
-        applyClip(gradWV, clipFactor)
-        applyClip(gradLoraQa, clipFactor)
-        applyClip(gradLoraQb, clipFactor)
-        applyClip(gradLoraVa, clipFactor)
-        applyClip(gradLoraVb, clipFactor)
-
-        // Adam Step terpusat dengan koreksi bias
+        // Keep the existing clipped-gradient AdamW math available as the exact CPU fallback.
         val beta1Pow = Math.pow(beta1.toDouble(), adamStep.toDouble()).toFloat()
         val beta2Pow = Math.pow(beta2.toDouble(), adamStep.toDouble()).toFloat()
         val biasCorr1 = 1f - beta1Pow
         val biasCorr2 = 1f - beta2Pow
 
-        adamUpdate(wHead, gradWHead, mHead, vHead, lr, biasCorr1, biasCorr2)
-        adamUpdate(wEmbed, gradWEmbed, mEmbed, vEmbed, lr, biasCorr1, biasCorr2)
-        adamUpdate(wDown, gradWDown, mWDown, vWDown, lr, biasCorr1, biasCorr2, weightDecay)
-        adamUpdate(wUp, gradWUp, mWUp, vWUp, lr, biasCorr1, biasCorr2, weightDecay)
-        adamUpdate(wGate, gradWGate, mWGate, vWGate, lr, biasCorr1, biasCorr2, weightDecay)
-        adamUpdate(wO, gradWO, mWO, vWO, lr, biasCorr1, biasCorr2, weightDecay)
-        adamUpdate(wQ, gradWQ, mWQ, vWQ, lr, biasCorr1, biasCorr2, weightDecay)
-        adamUpdate(wK, gradWK, mWK, vWK, lr, biasCorr1, biasCorr2, weightDecay)
-        adamUpdate(wV, gradWV, mWV, vWV, lr, biasCorr1, biasCorr2, weightDecay)
+        val parameterGroups = arrayOf(
+            wHead, wEmbed, wDown, wUp, wGate, wO, wQ, wK, wV,
+            loraQa, loraQb, loraVa, loraVb
+        )
+        val gradientGroups = arrayOf(
+            gradWHead, gradWEmbed, gradWDown, gradWUp, gradWGate, gradWO,
+            gradWQ, gradWK, gradWV, gradLoraQa, gradLoraQb, gradLoraVa, gradLoraVb
+        )
+        val firstMomentGroups = arrayOf(
+            mHead, mEmbed, mWDown, mWUp, mWGate, mWO, mWQ, mWK, mWV,
+            mLoraQa, mLoraQb, mLoraVa, mLoraVb
+        )
+        val secondMomentGroups = arrayOf(
+            vHead, vEmbed, vWDown, vWUp, vWGate, vWO, vWQ, vWK, vWV,
+            vLoraQa, vLoraQb, vLoraVa, vLoraVb
+        )
+        val weightDecayByGroup = floatArrayOf(
+            0f, 0f,
+            weightDecay, weightDecay, weightDecay, weightDecay, weightDecay, weightDecay, weightDecay,
+            0f, 0f, 0f, 0f
+        )
 
-        adamUpdate(loraQa, gradLoraQa, mLoraQa, vLoraQa, lr, biasCorr1, biasCorr2)
-        adamUpdate(loraQb, gradLoraQb, mLoraQb, vLoraQb, lr, biasCorr1, biasCorr2)
-        adamUpdate(loraVa, gradLoraVa, mLoraVa, vLoraVa, lr, biasCorr1, biasCorr2)
-        adamUpdate(loraVb, gradLoraVb, mLoraVb, vLoraVb, lr, biasCorr1, biasCorr2)
+        val updatedByVulkan = VulkanTrainingBackend.tryApplyAdamWUpdate(
+            parameters = parameterGroups,
+            gradients = gradientGroups,
+            firstMoments = firstMomentGroups,
+            secondMoments = secondMomentGroups,
+            weightDecayByGroup = weightDecayByGroup,
+            learningRate = lr,
+            beta1 = beta1,
+            beta2 = beta2,
+            biasCorrection1 = biasCorr1,
+            biasCorrection2 = biasCorr2,
+            epsilon = epsilon,
+            gradientClipFactor = clipFactor
+        )
+
+        if (!updatedByVulkan) {
+            applyClip(gradWHead, clipFactor)
+            applyClip(gradWEmbed, clipFactor)
+            applyClip(gradWDown, clipFactor)
+            applyClip(gradWUp, clipFactor)
+            applyClip(gradWGate, clipFactor)
+            applyClip(gradWO, clipFactor)
+            applyClip(gradWQ, clipFactor)
+            applyClip(gradWK, clipFactor)
+            applyClip(gradWV, clipFactor)
+            applyClip(gradLoraQa, clipFactor)
+            applyClip(gradLoraQb, clipFactor)
+            applyClip(gradLoraVa, clipFactor)
+            applyClip(gradLoraVb, clipFactor)
+
+            adamUpdate(wHead, gradWHead, mHead, vHead, lr, biasCorr1, biasCorr2)
+            adamUpdate(wEmbed, gradWEmbed, mEmbed, vEmbed, lr, biasCorr1, biasCorr2)
+            adamUpdate(wDown, gradWDown, mWDown, vWDown, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(wUp, gradWUp, mWUp, vWUp, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(wGate, gradWGate, mWGate, vWGate, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(wO, gradWO, mWO, vWO, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(wQ, gradWQ, mWQ, vWQ, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(wK, gradWK, mWK, vWK, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(wV, gradWV, mWV, vWV, lr, biasCorr1, biasCorr2, weightDecay)
+            adamUpdate(loraQa, gradLoraQa, mLoraQa, vLoraQa, lr, biasCorr1, biasCorr2)
+            adamUpdate(loraQb, gradLoraQb, mLoraQb, vLoraQb, lr, biasCorr1, biasCorr2)
+            adamUpdate(loraVa, gradLoraVa, mLoraVa, vLoraVa, lr, biasCorr1, biasCorr2)
+            adamUpdate(loraVb, gradLoraVb, mLoraVb, vLoraVb, lr, biasCorr1, biasCorr2)
+        }
 
         return if (validSteps > 0) totalLoss / validSteps else Float.NaN
     }

@@ -62,9 +62,7 @@ class HardwareProfile(private val context: Context) {
         )
 
         // ---------- 4. Primary Accelerator Decision ----------
-        val primaryAccelerator = resolvePrimaryAccelerator(
-            vulkanInfo, isSnapdragon, isMediaTek, npuApuDetected
-        )
+        val primaryAccelerator = resolvePrimaryAccelerator(vulkanInfo)
 
         // ---------- 5. Memory Detection (Accurate) ----------
         val memInfo = ActivityManager.MemoryInfo()
@@ -216,6 +214,7 @@ class HardwareProfile(private val context: Context) {
         val versionName = when {
             pm.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_VERSION, 0x404000) -> "1.4"
             pm.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_VERSION, 0x403000) -> "1.3"
+            pm.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_VERSION, 0x402000) -> "1.2"
             pm.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_VERSION, 0x401000) -> "1.1"
             else -> "1.0"
         }
@@ -275,31 +274,11 @@ class HardwareProfile(private val context: Context) {
     // 4. Primary Accelerator
     // =====================================================================
 
-    private fun resolvePrimaryAccelerator(
-        vulkan: VulkanInfo,
-        isSnapdragon: Boolean,
-        isMediaTek: Boolean,
-        npuInfo: String
-    ): String {
-        val hasNpu = npuInfo != "Tidak terdeteksi (kemungkinan CPU/GPU fallback)"
-
-        return when {
-            // Prioritas 1: NPU jika terdeteksi dan Vulkan tinggi
-            hasNpu && vulkan.supported && vulkan.versionCode >= 0x401000 -> {
-                "$npuInfo + Vulkan ${vulkan.versionName} Compute"
-            }
-            // Prioritas 2: NPU saja
-            hasNpu -> npuInfo
-            // Prioritas 3: Vulkan tinggi tanpa NPU yang pasti
-            vulkan.supported && vulkan.versionCode >= 0x401000 -> {
-                if (isSnapdragon) "Adreno GPU + Vulkan ${vulkan.versionName}"
-                else if (isMediaTek) "Mali/Immortalis GPU + Vulkan ${vulkan.versionName}"
-                else "Vulkan ${vulkan.versionName} High-Performance Compute"
-            }
-            // Prioritas 4: Vulkan dasar
-            vulkan.supported -> "Vulkan ${vulkan.versionName} Hardware Compute"
-            // Prioritas 5: CPU fallback
-            else -> "Multi-Threaded SIMD CPU (${Runtime.getRuntime().availableProcessors()} Cores)"
+    private fun resolvePrimaryAccelerator(vulkan: VulkanInfo): String {
+        return if (vulkan.supported) {
+            "Vulkan ${vulkan.versionName} GPU Compute (AdamW optimizer; forward/backprop Kotlin CPU)"
+        } else {
+            "Multi-Threaded Kotlin CPU (${Runtime.getRuntime().availableProcessors()} Cores)"
         }
     }
 }

@@ -4,7 +4,9 @@ Argus is a native Android application built with Kotlin and Jetpack Compose.
 
 ## Requirements
 
-- JDK 17
+- JDK 21
+- Android NDK r30 (30.0.16248370)
+- CMake 3.22.1
 - Android SDK Platform 37
 - Android SDK Build Tools 36.0.0
 - Gradle Wrapper (repository-pinned)
@@ -30,6 +32,29 @@ A release build requires the Argus release signing key at `signing/argus-release
 Publishing a versioned GitHub Release (for example, `v1.0.7`) runs release lint, Robolectric unit tests, a signed release build, certificate verification, and APK publication. The legacy `v1.0.6` tag is intentionally excluded; update `version.properties` before publishing the next versioned tag.
 
 The private repository keeps the CI signing-key backup in the private GitHub Release named `argus-signing-key`. Repository access therefore also grants access to the app-signing identity. Keep this repository private and restrict collaborator access. Never redistribute the signing-key asset.
+
+## Vulkan training backend
+
+The native training module is built with Android NDK r30 and CMake 3.22.1 for
+arm64-v8a, armeabi-v7a, and x86_64. It uses the NDK-bundled glslc compiler to
+compile the AdamW compute shader to SPIR-V during the native build.
+
+When a compatible Vulkan GPU and compute queue are available, workloads with at
+least 49,152 optimizer elements can offload gradient clipping and the fused
+AdamW parameter/moment update to Vulkan Compute. Forward propagation and
+backpropagation remain in the Kotlin engine; this is an optimizer offload, not
+a claim that the complete training graph runs on the GPU.
+
+Vulkan is declared as an optional device feature. Devices without a compatible
+Vulkan driver, compute queue, shader pipeline, suitable storage memory, or
+sufficiently large optimizer workload use the existing Kotlin CPU optimizer.
+The CPU path preserves the same AdamW update and remains the required fallback.
+NPU/APU detection is informational only; no vendor-specific NPU training
+runtime is currently integrated.
+
+The CI pull-request workflow builds the native library and verifies that the
+APK contains the configured ABI libraries. Main/release workflows use JDK 21
+and the pinned NDK/CMake versions before packaging.
 
 ## Background training service
 
