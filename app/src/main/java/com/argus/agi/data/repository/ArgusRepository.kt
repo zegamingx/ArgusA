@@ -201,6 +201,14 @@ class ArgusRepository(
         document: CorpusDocumentEntity,
         chunks: List<CorpusChunkEntity>
     ): Boolean = withContext(Dispatchers.IO) {
+        require(document.rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
+            "Unsupported corpus rights status: ${document.rightsStatus}"
+        }
+        val isWebContent = document.source.startsWith("web_article", ignoreCase = true) ||
+            document.canonicalUrl != null
+        require(!isWebContent || document.rightsStatus != "UNVERIFIED") {
+            "Web article content must be reviewed and explicitly declared before it can be stored."
+        }
         require(document.datasetSplit == "TRAIN" || document.datasetSplit == "VALIDATION") {
             "Unsupported corpus dataset split: ${document.datasetSplit}"
         }
