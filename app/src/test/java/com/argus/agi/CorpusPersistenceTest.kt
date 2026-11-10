@@ -482,6 +482,7 @@ class CorpusPersistenceTest {
             )
 
             val activeQueueItem = repository.getPendingQueueSnapshot().first()
+            assertTrue(activeQueueItem.chunkIndex < activeQueueItem.totalChunks)
             assertTrue(repository.markTrainingStarted(activeQueueItem.id))
 
             manager.clearQueue()
@@ -495,6 +496,11 @@ class CorpusPersistenceTest {
                 "An already active training row must survive queue clearing.",
                 com.argus.agi.model.TrainingStatus.TRAINING,
                 repository.getTrainingItem(activeQueueItem.id)?.status
+            )
+            assertEquals(
+                "A document with remaining chunks removed from the queue must become partial.",
+                "PARTIAL",
+                repository.getCorpusDocument(document.id)?.status
             )
 
             assertEquals(
