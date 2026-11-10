@@ -30,6 +30,7 @@ class CorpusPersistenceTest {
 
     @Test
     fun analyticalBackpropGradientsMatchCentralFiniteDifferences() {
+        val context: Context = ApplicationProvider.getApplicationContext()
         val checkpointFile = java.io.File(context.filesDir, "argus_model_weights.bin")
         val previousCheckpoint = checkpointFile.takeIf { it.isFile }?.readBytes()
 
