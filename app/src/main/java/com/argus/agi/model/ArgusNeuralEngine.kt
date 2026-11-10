@@ -96,6 +96,15 @@ data class LossEvaluation(
     val evaluatedDocumentCount: Int
 )
 
+data class GradientCheckResult(
+    val parameterName: String,
+    val parameterIndex: Int,
+    val analyticalGradient: Float,
+    val numericalGradient: Float,
+    val absoluteError: Float,
+    val relativeError: Float
+)
+
 class ArgusNeuralEngine private constructor(
     private val context: Context,
     val config: EngineConfig = EngineConfig()
@@ -189,6 +198,12 @@ class ArgusNeuralEngine private constructor(
         Array(nHeads) { Array(maxSeqLen) { FloatArray(maxSeqLen) } }
 
     private val modelLock = Any()
+
+    private data class GradientProbe(
+        val parameterName: String,
+        val parameterIndex: Int,
+        var analyticalGradient: Float = Float.NaN
+    )
 
     companion object {
         private const val TAG = "ArgusNeuralEngine"
@@ -627,6 +642,97 @@ class ArgusNeuralEngine private constructor(
         return if (loss.isFinite()) exp(loss) else Float.NaN
     }
 
+    /**
+     * Compares one analytic backprop gradient with a central finite-difference estimate.
+     * This diagnostic is internal to the module, only supports short single-window inputs,
+     * and never applies Adam, changes the tokenizer, or writes a checkpoint.
+     */
+    internal fun checkGradient(
+        text: String,
+        parameterName: String,
+        parameterIndex: Int,
+        epsilon: Float = 1e-2f
+    ): GradientCheckResult = synchronized(modelLock) {
+        require(epsilon.isFinite() && epsilon > 0f) {
+            "Finite-difference epsilon must be finite and positive."
+        }
+        val tokens = tokenizer.encode(text, autoRegister = false)
+        require(tokens.size in 2..maxSeqLen) {
+            "Gradient checking requires 2..${maxSeqLen} encoded tokens; got ${tokens.size}."
+        }
+
+        val parameter = gradientParameterArray(parameterName)
+        require(parameterIndex in parameter.indices) {
+            "Parameter index ${parameterIndex} is outside ${parameterName} (${parameter.size})."
+        }
+
+        val probe = GradientProbe(parameterName, parameterIndex)
+        val currentVocab = tokenizer.vocabSize
+        val baseLoss = trainSingleWindow(
+            seq = tokens,
+            currentVocab = currentVocab,
+            updateParameters = false,
+            gradientProbe = probe
+        )
+        check(baseLoss.isFinite() && probe.analyticalGradient.isFinite()) {
+            "Analytic gradient computation returned a non-finite value."
+        }
+
+        val originalValue = parameter[parameterIndex]
+        var plusLoss = Float.NaN
+        var minusLoss = Float.NaN
+        try {
+            parameter[parameterIndex] = originalValue + epsilon
+            plusLoss = trainSingleWindow(tokens, currentVocab, updateParameters = false)
+
+            parameter[parameterIndex] = originalValue - epsilon
+            minusLoss = trainSingleWindow(tokens, currentVocab, updateParameters = false)
+        } finally {
+            parameter[parameterIndex] = originalValue
+        }
+
+        check(plusLoss.isFinite() && minusLoss.isFinite()) {
+            "Finite-difference loss evaluation returned a non-finite value."
+        }
+        val numericalGradient = (plusLoss - minusLoss) / (2f * epsilon)
+        val absoluteError = kotlin.math.abs(probe.analyticalGradient - numericalGradient)
+        val magnitude = max(
+            kotlin.math.abs(probe.analyticalGradient),
+            kotlin.math.abs(numericalGradient)
+        )
+        val relativeError = if (magnitude > 1e-8f) {
+            absoluteError / magnitude
+        } else {
+            absoluteError
+        }
+
+        GradientCheckResult(
+            parameterName = parameterName,
+            parameterIndex = parameterIndex,
+            analyticalGradient = probe.analyticalGradient,
+            numericalGradient = numericalGradient,
+            absoluteError = absoluteError,
+            relativeError = relativeError
+        )
+    }
+
+    private fun gradientParameterArray(parameterName: String): FloatArray = when (parameterName) {
+        "wHead" -> wHead
+        "wEmbed" -> wEmbed
+        "wDown" -> wDown
+        "wUp" -> wUp
+        "wGate" -> wGate
+        "wO" -> wO
+        "wQ" -> wQ
+        "wK" -> wK
+        "wV" -> wV
+        "loraQa" -> loraQa
+        "loraQb" -> loraQb
+        "loraVa" -> loraVa
+        "loraVb" -> loraVb
+        else -> throw IllegalArgumentException("Unsupported gradient-check parameter: $parameterName")
+    }
+
     fun trainStep(text: String): Float {
         var pendingSnapshot: ByteArray? = null
         val loss = synchronized(modelLock) {
@@ -686,7 +792,8 @@ class ArgusNeuralEngine private constructor(
         seq: List<Int>,
         currentVocab: Int,
         updateParameters: Boolean = true,
-        firstTargetIndex: Int = 0
+        firstTargetIndex: Int = 0,
+        gradientProbe: GradientProbe? = null
     ): Float {
         val seqLen = seq.size
         if (seqLen < 2) return Float.NaN
@@ -835,7 +942,7 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
-        if (!updateParameters) {
+        if (!updateParameters && gradientProbe == null) {
             return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
 
@@ -1013,6 +1120,35 @@ class ArgusNeuralEngine private constructor(
         normalizeGradient(gradLoraQb, stepDiv)
         normalizeGradient(gradLoraVa, stepDiv)
         normalizeGradient(gradLoraVb, stepDiv)
+
+        if (gradientProbe != null) {
+            val selectedGradient = when (gradientProbe.parameterName) {
+                "wHead" -> gradWHead
+                "wEmbed" -> gradWEmbed
+                "wDown" -> gradWDown
+                "wUp" -> gradWUp
+                "wGate" -> gradWGate
+                "wO" -> gradWO
+                "wQ" -> gradWQ
+                "wK" -> gradWK
+                "wV" -> gradWV
+                "loraQa" -> gradLoraQa
+                "loraQb" -> gradLoraQb
+                "loraVa" -> gradLoraVa
+                "loraVb" -> gradLoraVb
+                else -> throw IllegalArgumentException(
+                    "Unsupported gradient-check parameter: ${gradientProbe.parameterName}"
+                )
+            }
+            require(gradientProbe.parameterIndex in selectedGradient.indices) {
+                "Gradient index ${gradientProbe.parameterIndex} is outside ${gradientProbe.parameterName}."
+            }
+            gradientProbe.analyticalGradient = selectedGradient[gradientProbe.parameterIndex]
+        }
+
+        if (!updateParameters) {
+            return if (validSteps > 0) totalLoss / validSteps else Float.NaN
+        }
 
         // Hitung total L2 Norm untuk Gradient Clipping
         var sumSquares = 0f
