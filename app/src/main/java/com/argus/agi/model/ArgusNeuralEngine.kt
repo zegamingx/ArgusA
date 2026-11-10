@@ -201,7 +201,7 @@ class ArgusNeuralEngine private constructor(
 
     private data class GradientProbe(
         val parameterName: String,
-        val parameterIndex: Int,
+        var parameterIndex: Int,
         var analyticalGradient: Float = Float.NaN
     )
 
@@ -662,8 +662,8 @@ class ArgusNeuralEngine private constructor(
         }
 
         val parameter = gradientParameterArray(parameterName)
-        require(parameterIndex in parameter.indices) {
-            "Parameter index ${parameterIndex} is outside ${parameterName} (${parameter.size})."
+        require(parameterIndex == -1 || parameterIndex in parameter.indices) {
+            "Parameter index must be -1 (largest-magnitude gradient) or a valid index in ${parameterName}."
         }
 
         val probe = GradientProbe(parameterName, parameterIndex)
@@ -678,17 +678,18 @@ class ArgusNeuralEngine private constructor(
             "Analytic gradient computation returned a non-finite value."
         }
 
-        val originalValue = parameter[parameterIndex]
+        val resolvedIndex = probe.parameterIndex
+        val originalValue = parameter[resolvedIndex]
         var plusLoss = Float.NaN
         var minusLoss = Float.NaN
         try {
-            parameter[parameterIndex] = originalValue + epsilon
+            parameter[resolvedIndex] = originalValue + epsilon
             plusLoss = trainSingleWindow(tokens, currentVocab, updateParameters = false)
 
-            parameter[parameterIndex] = originalValue - epsilon
+            parameter[resolvedIndex] = originalValue - epsilon
             minusLoss = trainSingleWindow(tokens, currentVocab, updateParameters = false)
         } finally {
-            parameter[parameterIndex] = originalValue
+            parameter[resolvedIndex] = originalValue
         }
 
         check(plusLoss.isFinite() && minusLoss.isFinite()) {
@@ -708,7 +709,7 @@ class ArgusNeuralEngine private constructor(
 
         GradientCheckResult(
             parameterName = parameterName,
-            parameterIndex = parameterIndex,
+            parameterIndex = resolvedIndex,
             analyticalGradient = probe.analyticalGradient,
             numericalGradient = numericalGradient,
             absoluteError = absoluteError,
@@ -1140,10 +1141,18 @@ class ArgusNeuralEngine private constructor(
                     "Unsupported gradient-check parameter: ${gradientProbe.parameterName}"
                 )
             }
-            require(gradientProbe.parameterIndex in selectedGradient.indices) {
-                "Gradient index ${gradientProbe.parameterIndex} is outside ${gradientProbe.parameterName}."
+            val resolvedIndex = if (gradientProbe.parameterIndex == -1) {
+                selectedGradient.indices.maxByOrNull {
+                    kotlin.math.abs(selectedGradient[it])
+                } ?: throw IllegalStateException("Cannot inspect an empty gradient tensor.")
+            } else {
+                gradientProbe.parameterIndex
             }
-            gradientProbe.analyticalGradient = selectedGradient[gradientProbe.parameterIndex]
+            require(resolvedIndex in selectedGradient.indices) {
+                "Gradient index ${resolvedIndex} is outside ${gradientProbe.parameterName}."
+            }
+            gradientProbe.parameterIndex = resolvedIndex
+            gradientProbe.analyticalGradient = selectedGradient[resolvedIndex]
         }
 
         if (!updateParameters) {
