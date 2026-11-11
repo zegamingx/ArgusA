@@ -66,6 +66,10 @@ import kotlin.random.Random
 
 @Composable
 fun NeuralCoreScreen(viewModel: ArgusViewModel) {
+    LaunchedEffect(viewModel) {
+        viewModel.refreshDeviceMemorySnapshot()
+    }
+
     val totalParams = viewModel.getTotalParameters()
     val adapterBytes = viewModel.getAdapterSizeBytes()
     val isPaused by viewModel.isTrainingPaused.collectAsState()
