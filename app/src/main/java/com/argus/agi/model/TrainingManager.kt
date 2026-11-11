@@ -550,12 +550,25 @@ class TrainingManager(
                 // Never cut a JSON object/array in the middle. JSONL records are
                 // handled individually; pretty-printed values are buffered as one
                 // bounded value before the dataset formatter sees them.
-                val currentLineStart = window.lastIndexOf('\n', splitPosition - 1) + 1
-                var jsonStart = currentLineStart
-                while (jsonStart < splitPosition && window[jsonStart].isWhitespace()) {
+                val firstNonWhitespaceIndex = window.indexOfFirst { !it.isWhitespace() }
+                val windowStartsWithJson = firstNonWhitespaceIndex >= 0 &&
+                    window[firstNonWhitespaceIndex] in charArrayOf('{', '[')
+                var jsonStart = if (windowStartsWithJson) {
+                    firstNonWhitespaceIndex
+                } else {
+                    window.lastIndexOf('\n', splitPosition - 1) + 1
+                }
+                while (
+                    !windowStartsWithJson &&
+                    jsonStart < splitPosition &&
+                    window[jsonStart].isWhitespace()
+                ) {
                     jsonStart++
                 }
-                if (jsonStart < splitPosition && window[jsonStart] in charArrayOf('{', '[')) {
+                if (
+                    jsonStart < splitPosition &&
+                    window[jsonStart] in charArrayOf('{', '[')
+                ) {
                     if (jsonStart > 0) {
                         splitPosition = jsonStart
                         structuredBoundary = true

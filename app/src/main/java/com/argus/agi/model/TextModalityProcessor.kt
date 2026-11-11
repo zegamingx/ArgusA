@@ -126,8 +126,7 @@ object TextModalityProcessor {
         return text
     }
 
-    private fun firstNonBlankText(obj: JSONObject, keys: List<String>): String {
-    /**
+        /**
      * Returns the exclusive end offset of one complete JSON object or array.
      * Braces inside quoted strings and escaped quotes do not affect nesting.
      */
@@ -145,7 +144,7 @@ object TextModalityProcessor {
             if (insideString) {
                 when {
                     escaped -> escaped = false
-                    character == '\\\\' -> escaped = true
+                    character == '\\' -> escaped = true
                     character == '"' -> insideString = false
                 }
                 continue
@@ -192,7 +191,7 @@ object TextModalityProcessor {
         }
     }
 
-    private fun firstNonBlankText(obj: JSONObject, keys: List<String>): String {
+private fun firstNonBlankText(obj: JSONObject, keys: List<String>): String {
         for (key in keys) {
             val value = obj.opt(key)
             if (value is String && value.isNotBlank()) return value.trim()

@@ -119,14 +119,18 @@ class ReasoningTrainingTest {
     }
 
     @Test
-    fun legacyInstructionResponseFormatRemainsUnchangedWithoutReasoning() {    @Test
     fun streamedJsonBoundaryScannerIgnoresBracesInsideQuotedStrings() {
-        val json = """{"instruction":"Explain the symbols { and } and escaped quote \\".","reasoning":["Keep nested [brackets] as text."],"response":"Done."} trailing text"""
+        val json = """{"instruction":"Symbols { } and an escaped quote: \"","reasoning":["Nested [brackets] are text."],"response":"Done."} trailing text"""
         val start = json.indexOf('{')
         val end = TextModalityProcessor.findCompleteJsonValueEnd(json, start)
 
         assertEquals(json.indexOf(" trailing text"), end)
-        assertEquals(null, TextModalityProcessor.findCompleteJsonValueEnd("""{"instruction":"unfinished"""", 0))
+
+        val incompleteJson = "{\"instruction\":\"unfinished"
+        assertEquals(
+            null,
+            TextModalityProcessor.findCompleteJsonValueEnd(incompleteJson, 0)
+        )
     }
 
     @Test
