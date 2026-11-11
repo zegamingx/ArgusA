@@ -168,7 +168,7 @@ class WorldModel(
         storeEntities(
             WorldEntity("visual_environment", visualSummary.take(200), "Camera Vision Sensor"),
             WorldEntity(
-                "ambient_luminance",
+                "camera_luma",
                 String.format(Locale.US, "%.1f/255 relative luminance", safeLuma),
                 "Camera Y-plane Sensor",
             ),

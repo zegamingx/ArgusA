@@ -566,7 +566,7 @@ fun CameraViewfinder(
                                             for (column in 0 until width step sampleStep) {
                                                 val index = rowOffset + column * yPlane.pixelStride
                                                 if (index < buffer.limit()) {
-                                                    luminanceSum += buffer.get(index).toInt() and 0xFF
+                                                    luminanceSum += (buffer.get(index).toInt() and 0xFF).toLong()
                                                     sampleCount += 1
                                                 }
                                             }
