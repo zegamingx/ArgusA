@@ -5,6 +5,7 @@ import android.util.Log
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.sensor.DeviceGuard
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -63,12 +64,33 @@ data class ActiveDocumentTraining(
     val runningAverageLoss: Float? = null
 )
 
+/** Runtime counters for this app session; they are not presented as lifetime corpus totals. */
+data class TrainingSessionMetrics(
+    val completedChunks: Long = 0L,
+    val completedDocuments: Long = 0L,
+    val inputTokens: Long = 0L,
+    val predictionTargets: Long = 0L,
+    val contextWindows: Long = 0L,
+    val optimizerUpdates: Long = 0L,
+    val reasoningExamples: Long = 0L,
+    val reasoningTokens: Long = 0L,
+    val vocabularySize: Int = 0,
+    val vocabularyCapacity: Int = 0,
+    val vocabularyTokensAdded: Int = 0,
+    val tokenizerMerges: Int = 0
+)
+
 data class ValidationCorpusEvaluation(
     val corpusDocumentCount: Int,
     val evaluatedDocumentCount: Int,
     val targetTokenCount: Int,
     val meanLoss: Float,
-    val perplexity: Float
+    val perplexity: Float,
+    val reasoningDocumentCount: Int = 0,
+    val reasoningSequenceCount: Int = 0,
+    val reasoningTargetTokenCount: Int = 0,
+    val reasoningMeanLoss: Float = Float.NaN,
+    val reasoningPerplexity: Float = Float.NaN
 )
 
 class TrainingManager(
@@ -111,7 +133,18 @@ class TrainingManager(
         const val MAX_CORPUS_REPLAY_DOCUMENTS = 500
         const val MAX_DEFAULT_CORPUS_REPLAY_CHUNKS = 4_096
         const val MAX_CORPUS_REPLAY_CHUNKS = 50_000
+        private const val MAX_TOKENIZER_SAMPLE_CHUNKS = 256
+        private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
+        private const val MAX_STREAMED_JSON_VALUE_CHARACTERS = 256 * 1024
         private const val IDLE_POLL_MS = 500L
+        private val REASONING_BLOCK_PATTERN = Regex(
+            "<THINK>(.*?)</THINK>",
+            RegexOption.DOT_MATCHES_ALL
+        )
+        private val REASONING_SEQUENCE_PATTERN = Regex(
+            "<USER>.*?<THINK>.*?</THINK>",
+            RegexOption.DOT_MATCHES_ALL
+        )
     }
 
     // StateFlow<List<TrainingData>> sebagai satu-satunya sumber kebenaran untuk queue.
@@ -147,6 +180,17 @@ class TrainingManager(
     private val _totalStepsExecuted = MutableStateFlow(0)
     val totalStepsExecuted: StateFlow<Int> = _totalStepsExecuted.asStateFlow()
 
+    private val preparedTokenizerDocuments = HashSet<String>()
+
+    private val _trainingMetrics = MutableStateFlow(
+        TrainingSessionMetrics(
+            vocabularySize = neuralEngine.tokenizer.vocabSize,
+            vocabularyCapacity = neuralEngine.config.tokenizerConfig.maxVocabularySize,
+            tokenizerMerges = neuralEngine.tokenizer.mergeCount
+        )
+    )
+    val trainingMetrics: StateFlow<TrainingSessionMetrics> = _trainingMetrics.asStateFlow()
+
     @Volatile private var closed = false
 
     private val exceptionHandler = CoroutineExceptionHandler { _, t ->
@@ -166,7 +210,7 @@ class TrainingManager(
         val restoreGeneration = synchronized(queueLock) { queueGeneration }
         scope.launch {
             repo?.let { repository ->
-                runCatching {
+                runSuspendCatching {
                     repository.recoverInterruptedTrainingItems()
                     repository.getPendingQueueSnapshot()
                 }
@@ -453,6 +497,27 @@ class TrainingManager(
         val fingerprintDigest = MessageDigest.getInstance("SHA-256")
         var totalCharsRead = 0L
 
+        fun appendSegment(rawSegment: String) {
+            val normalizedSegment = TextModalityProcessor.normalizeTypography(rawSegment)
+            if (normalizedSegment.isBlank()) return
+
+            val formattedRecords =
+                TextModalityProcessor.formatTrainingDatasetRecords(normalizedSegment)
+            if (formattedRecords != null) {
+                appendFormattedTrainingRecords(
+                    records = formattedRecords,
+                    destination = rawChunks,
+                    chunkSize = chunkSize
+                )
+                return
+            }
+
+            val formattedText = normalizedSegment.lines().joinToString("\n") { line ->
+                TextModalityProcessor.formatStructuredLineIfJson(line)
+            }
+            if (formattedText.isNotBlank()) rawChunks.add(formattedText)
+        }
+
         while (true) {
             val readCount = reader.read(buffer)
             if (readCount < 0) break
@@ -475,23 +540,81 @@ class TrainingManager(
                 )
                 val punctuationBreak = max(lastNewLine, lastSentenceBreak)
 
-                val splitPosition = if (punctuationBreak >= 0) {
+                var splitPosition = if (punctuationBreak >= 0) {
                     minimumBreakPosition + punctuationBreak + 1
                 } else {
                     val lastSpace = searchText.lastIndexOf(' ')
                     if (lastSpace >= 0) minimumBreakPosition + lastSpace + 1 else chunkSize
                 }.coerceIn(1, chunkSize)
+                var structuredBoundary = false
 
-                val rawSegment = TextModalityProcessor.normalizeTypography(
-                    window.substring(0, splitPosition)
-                )
-                val normalizedSegment = rawSegment.lines().joinToString("\n") {
-                    TextModalityProcessor.formatStructuredLineIfJson(it)
+                // Never cut a JSON object/array in the middle. JSONL records are
+                // handled individually; pretty-printed values are buffered as one
+                // bounded value before the dataset formatter sees them.
+                var jsonStart = -1
+                var lineStart = 0
+                while (lineStart < splitPosition) {
+                    var candidateStart = lineStart
+                    while (
+                        candidateStart < splitPosition &&
+                        window[candidateStart] != '\n' &&
+                        window[candidateStart].isWhitespace()
+                    ) {
+                        candidateStart++
+                    }
+                    if (
+                        candidateStart < splitPosition &&
+                        window[candidateStart] in charArrayOf('{', '[')
+                    ) {
+                        jsonStart = candidateStart
+                        break
+                    }
+
+                    var nextLineStart = lineStart
+                    while (nextLineStart < splitPosition && window[nextLineStart] != '\n') {
+                        nextLineStart++
+                    }
+                    if (nextLineStart >= splitPosition) break
+                    lineStart = nextLineStart + 1
                 }
-                if (normalizedSegment.isNotBlank()) rawChunks.add(normalizedSegment)
 
-                val nextStart = (splitPosition - overlap).coerceAtLeast(0)
-                val safeNextStart = if (nextStart == 0 && splitPosition > 0) {
+                if (jsonStart >= 0) {
+                    if (jsonStart > 0) {
+                        splitPosition = jsonStart
+                        structuredBoundary = true
+                    } else {
+                        val jsonEnd = TextModalityProcessor.findCompleteJsonValueEnd(
+                            text = window.toString(),
+                            startIndex = jsonStart
+                        )
+                        if (jsonEnd == null) {
+                            val bufferedCharacters = window.length - jsonStart
+                            require(bufferedCharacters <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
+                                "A streamed JSON training value exceeds " +
+                                    "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
+                                    "Use JSONL with one training record per line."
+                            }
+                            break
+                        }
+                        val jsonLength = jsonEnd - jsonStart
+                        require(jsonLength <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
+                            "A streamed JSON training value exceeds " +
+                                "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
+                                "Use JSONL with one training record per line."
+                        }
+                        splitPosition = jsonEnd
+                        structuredBoundary = true
+                    }
+                }
+
+                appendSegment(window.substring(0, splitPosition))
+
+                val nextStart = if (structuredBoundary) {
+                    splitPosition
+                } else {
+                    (splitPosition - overlap).coerceAtLeast(0)
+                }
+                val safeNextStart = if (!structuredBoundary && nextStart == 0 && splitPosition > 0) {
                     splitPosition
                 } else {
                     nextStart
@@ -507,11 +630,24 @@ class TrainingManager(
             return Pair(0, totalCharsRead)
         }
 
-        val trailingRaw = TextModalityProcessor.normalizeTypography(window.toString().trim())
-        val trailing = trailingRaw.lines().joinToString("\n") {
-            TextModalityProcessor.formatStructuredLineIfJson(it)
+        val trailingRaw = window.toString().trim()
+        if (trailingRaw.isNotBlank()) {
+            val firstContentIndex = trailingRaw.indexOfFirst { !it.isWhitespace() }
+            if (
+                firstContentIndex >= 0 &&
+                trailingRaw[firstContentIndex] in charArrayOf('{', '[') &&
+                TextModalityProcessor.findCompleteJsonValueEnd(
+                    text = trailingRaw,
+                    startIndex = firstContentIndex
+                ) == null
+            ) {
+                throw IllegalArgumentException(
+                    "The streamed JSON training value is incomplete. " +
+                        "Check the final JSONL record or closing JSON brackets."
+                )
+            }
+            appendSegment(trailingRaw)
         }
-        if (trailing.isNotBlank()) rawChunks.add(trailing)
 
         val chunksPerEpoch = rawChunks.size
         if (chunksPerEpoch == 0) return Pair(0, totalCharsRead)
@@ -618,9 +754,7 @@ class TrainingManager(
         val clean = fullText.trim()
         if (clean.isBlank() || closed) return false
 
-        val normalizedText = TextModalityProcessor.normalizeTypography(clean)
-            .lines()
-            .joinToString("\n") { TextModalityProcessor.formatStructuredLineIfJson(it) }
+        val normalizedText = TextModalityProcessor.formatTrainingDocument(clean)
         if (normalizedText.isBlank()) return false
 
         val documentId = sha256Utf16Be(fullText)
@@ -660,20 +794,77 @@ class TrainingManager(
             "Local corpus storage is unavailable; validation cannot be evaluated."
         }
         val documents = activeRepository.getValidationCorpusDocuments(limit)
-        val texts = documents.mapNotNull { it.validationText }
+        // Keep one complete validation sequence per source document. The neural
+        // engine owns context-windowing so overlapping ingestion chunks cannot
+        // duplicate prediction targets or distort corpus-level loss weighting.
+        val processedDocuments = documents.map { document ->
+            TextModalityProcessor.formatTrainingDocument(document.validationText.orEmpty())
+        }
+        val texts = processedDocuments.filter { it.isNotBlank() }
         val evaluation = neuralEngine.evaluateCorpusLoss(texts)
         val perplexity = if (evaluation.meanLoss.isFinite()) {
             exp(evaluation.meanLoss)
         } else {
             Float.NaN
         }
+
+        // Evaluate prompt + reasoning prefixes without scoring their final answers.
+        // This is a language-model fit diagnostic, not a reasoning correctness score.
+        val reasoningSequences = texts.flatMap { text ->
+            REASONING_SEQUENCE_PATTERN.findAll(text).map { it.value }.toList()
+        }
+        val reasoningEvaluation = neuralEngine.evaluateCorpusLoss(reasoningSequences)
+        val reasoningPerplexity = if (reasoningEvaluation.meanLoss.isFinite()) {
+            exp(reasoningEvaluation.meanLoss)
+        } else {
+            Float.NaN
+        }
+        val reasoningDocumentCount = texts.count { text ->
+            text.contains(Tokenizer.THINK_START) && text.contains(Tokenizer.THINK_END)
+        }
+
         return ValidationCorpusEvaluation(
             corpusDocumentCount = documents.size,
             evaluatedDocumentCount = evaluation.evaluatedDocumentCount,
             targetTokenCount = evaluation.targetCount,
             meanLoss = evaluation.meanLoss,
-            perplexity = perplexity
+            perplexity = perplexity,
+            reasoningDocumentCount = reasoningDocumentCount,
+            reasoningSequenceCount = reasoningSequences.size,
+            reasoningTargetTokenCount = reasoningEvaluation.targetCount,
+            reasoningMeanLoss = reasoningEvaluation.meanLoss,
+            reasoningPerplexity = reasoningPerplexity
         )
+    }
+
+    private fun appendFormattedTrainingRecords(
+        records: List<String>,
+        destination: MutableList<String>,
+        chunkSize: Int
+    ) {
+        val buffer = StringBuilder()
+
+        fun flushBuffer() {
+            if (buffer.isNotEmpty()) {
+                destination.add(buffer.toString())
+                buffer.setLength(0)
+            }
+        }
+
+        for (record in records) {
+            if (record.isBlank()) continue
+            if (record.length > chunkSize) {
+                flushBuffer()
+                destination.add(record)
+                continue
+            }
+            if (buffer.isNotEmpty() && buffer.length + record.length + 1 > chunkSize) {
+                flushBuffer()
+            }
+            if (buffer.isNotEmpty()) buffer.append('\n')
+            buffer.append(record)
+        }
+        flushBuffer()
     }
 
     /**
@@ -901,7 +1092,7 @@ class TrainingManager(
 
         if (trimmed.length > 380) {
             scope.launch {
-                runCatching { enqueueDocument(source, title, trimmed) }
+                runSuspendCatching { enqueueDocument(source, title, trimmed) }
                     .onFailure { error ->
                         Log.e(TAG, "Failed to persist long-form training input", error)
                     }
@@ -1019,18 +1210,20 @@ class TrainingManager(
 
                 try {
                     processItem(activeItem)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (t: Throwable) {
                     Log.e(TAG, "processItem gagal untuk '${item.title}'", t)
                     val failed = activeItem.copy(status = TrainingStatus.FAILED)
                     pushCompleted(failed)
                     scope.launch {
                         repo?.let { repository ->
-                            runCatching { repository.markTrainingFailed(failed.id) }
+                            runSuspendCatching { repository.markTrainingFailed(failed.id) }
                                 .onFailure { error ->
                                     Log.w(TAG, "Failed to persist exception-failed training item", error)
                                 }
                             failed.documentId?.let { documentId ->
-                                runCatching { repository.markCorpusDocumentPartial(documentId) }
+                                runSuspendCatching { repository.markCorpusDocumentPartial(documentId) }
                                     .onFailure { error ->
                                         Log.w(TAG, "Failed to mark exception-failed corpus document partial", error)
                                     }
@@ -1087,7 +1280,7 @@ class TrainingManager(
         when (operation) {
             is QueuePersistenceOperation.Clear -> {
                 repo?.let { repository ->
-                    runCatching {
+                    runSuspendCatching {
                         repository.clearPendingQueueAndMarkInterruptedCorpusDocumentsPartial()
                     }
                         .onFailure { error ->
@@ -1099,7 +1292,7 @@ class TrainingManager(
             is QueuePersistenceOperation.Start -> {
                 try {
                     repo?.let { repository ->
-                        runCatching {
+                        runSuspendCatching {
                             repository.markTrainingStarted(operation.itemId)
                         }.onFailure { error ->
                             Log.e(
@@ -1125,7 +1318,7 @@ class TrainingManager(
                 if (!isCurrentGeneration) return
 
                 val persistenceFailure = repo?.let { repository ->
-                    runCatching {
+                    runSuspendCatching {
                         repository.saveTrainingItems(operation.items)
                     }.exceptionOrNull()
                 }
@@ -1202,7 +1395,7 @@ class TrainingManager(
     }
 
     private fun updateActiveDocumentEntering(item: TrainingData) {
-        if (item.documentTitle == null || item.totalChunks <= 1) return
+        if (item.documentTitle == null) return
         _activeDocument.update { current ->
             if (current != null && current.docTitle == item.documentTitle) {
                 current.copy(currentChunkIndex = item.chunkIndex)
@@ -1219,35 +1412,82 @@ class TrainingManager(
         }
     }
 
+    private suspend fun prepareTokenizerForDocument(item: TrainingData) {
+        val documentId = item.documentId ?: return
+        if (!preparedTokenizerDocuments.add(documentId)) return
+
+        try {
+            val storedSamples = repo?.getTokenizerCorpusSample(
+                documentId = documentId,
+                limit = MAX_TOKENIZER_SAMPLE_CHUNKS
+            ).orEmpty()
+
+            var remainingCharacters = MAX_TOKENIZER_SAMPLE_CHARACTERS
+            val corpusSample = ArrayList<String>(storedSamples.size)
+            for (chunk in storedSamples) {
+                if (remainingCharacters <= 0) break
+                val sample = chunk.take(remainingCharacters)
+                if (sample.isNotBlank()) corpusSample.add(sample)
+                remainingCharacters -= sample.length
+            }
+            if (corpusSample.isEmpty() && item.content.isNotBlank()) {
+                corpusSample.add(item.content.take(MAX_TOKENIZER_SAMPLE_CHARACTERS))
+            }
+
+            val update = neuralEngine.trainTokenizerFromCorpus(corpusSample)
+            _trainingMetrics.update { current ->
+                current.copy(
+                    vocabularySize = update.vocabularySize,
+                    vocabularyTokensAdded = current.vocabularyTokensAdded + update.tokensAdded,
+                    tokenizerMerges = update.mergeCount
+                )
+            }
+            Log.i(
+                TAG,
+                "Tokenizer corpus prepared for '${item.documentTitle ?: item.title}': " +
+                    "${update.previousVocabularySize} -> ${update.vocabularySize} tokens, " +
+                    "${update.mergeCount - update.previousMergeCount} new merges."
+            )
+        } catch (cancelled: CancellationException) {
+            preparedTokenizerDocuments.remove(documentId)
+            throw cancelled
+        } catch (error: Exception) {
+            preparedTokenizerDocuments.remove(documentId)
+            Log.w(TAG, "Tokenizer preparation failed for document $documentId; existing vocabulary will be used.", error)
+        }
+    }
+
     private suspend fun processItem(item: TrainingData) {
-        if (item.chunkIndex == 1) {
-            item.documentId?.let { documentId ->
+        item.documentId?.let { documentId ->
+            if (item.chunkIndex == 1) {
                 repo?.let { repository ->
-                    runCatching { repository.markCorpusDocumentTraining(documentId) }
+                    runSuspendCatching { repository.markCorpusDocumentTraining(documentId) }
                         .onFailure { error ->
                             Log.w(TAG, "Failed to mark corpus document as training", error)
                         }
                 }
             }
+            prepareTokenizerForDocument(item)
         }
 
         val startNs = System.nanoTime()
-        val stepLoss = neuralEngine.trainStep(item.content)
+        val stepResult = neuralEngine.trainStepDetailed(item.content)
+        val stepLoss = stepResult.loss
         val durationMs = (System.nanoTime() - startNs) / 1_000_000L
 
-        // Loss tidak valid → FAILED, bukan COMPLETED.
+        // Invalid loss is a failed step, never a completed training item.
         if (!stepLoss.isFinite()) {
-            Log.w(TAG, "trainStep return non-finite loss=$stepLoss untuk '${item.title}'")
+            Log.w(TAG, "trainStep returned non-finite loss=$stepLoss for '${item.title}'")
             val failed = item.copy(status = TrainingStatus.FAILED, stepDurationMs = durationMs)
             pushCompleted(failed)
             scope.launch {
                 repo?.let { repository ->
-                    runCatching { repository.markTrainingFailed(failed.id) }
+                    runSuspendCatching { repository.markTrainingFailed(failed.id) }
                         .onFailure { error ->
                             Log.w(TAG, "Failed to persist failed training item", error)
                         }
                     failed.documentId?.let { documentId ->
-                        runCatching { repository.markCorpusDocumentPartial(documentId) }
+                        runSuspendCatching { repository.markCorpusDocumentPartial(documentId) }
                             .onFailure { error ->
                                 Log.w(TAG, "Failed to mark corpus document as partial", error)
                             }
@@ -1255,6 +1495,13 @@ class TrainingManager(
                 }
             }
             return
+        }
+
+        val reasoningSpans = REASONING_BLOCK_PATTERN.findAll(item.content)
+            .map { it.groupValues[1] }
+            .toList()
+        val reasoningTokenCount = reasoningSpans.sumOf { reasoningText ->
+            neuralEngine.tokenizer.encode(reasoningText, autoRegister = false).size.toLong()
         }
 
         val finished = item.copy(
@@ -1265,6 +1512,23 @@ class TrainingManager(
 
         _lossHistory.update { (it + stepLoss).takeLast(MAX_LOSS_HISTORY) }
         _totalStepsExecuted.update { it + 1 }
+
+        val documentCompleted = item.documentId != null &&
+            item.chunkIndex >= item.totalChunks
+        _trainingMetrics.update { current ->
+            current.copy(
+                completedChunks = current.completedChunks + 1L,
+                completedDocuments = current.completedDocuments +
+                    if (documentCompleted) 1L else 0L,
+                inputTokens = current.inputTokens + stepResult.inputTokenCount,
+                predictionTargets = current.predictionTargets + stepResult.predictionTargetCount,
+                contextWindows = current.contextWindows + stepResult.contextWindowCount,
+                optimizerUpdates = current.optimizerUpdates + stepResult.optimizerUpdateCount,
+                reasoningExamples = current.reasoningExamples + reasoningSpans.size.toLong(),
+                reasoningTokens = current.reasoningTokens + reasoningTokenCount,
+                vocabularySize = stepResult.vocabularySize
+            )
+        }
 
         runCatching {
             worldModel.storeEntity(
@@ -1277,31 +1541,36 @@ class TrainingManager(
                 _totalStepsExecuted.value.toString(),
                 "On-Device Neural Core"
             )
-        }.onFailure { Log.w(TAG, "Gagal mencatat telemetri loss/steps", it) }
+        }.onFailure { Log.w(TAG, "Failed to record training telemetry.", it) }
 
-        if (item.documentTitle != null && item.totalChunks > 1) {
-            var docCompleted = false
+        if (item.documentTitle != null) {
+            var documentCompletedInUi = false
             _activeDocument.update { current ->
-                if (current == null || current.docTitle != item.documentTitle) current
-                else {
-                    val avg = current.runningAverageLoss
-                    val newAvg = if (avg != null) (avg * 0.7f + stepLoss * 0.3f) else stepLoss
-                    if (item.chunkIndex >= item.totalChunks) docCompleted = true
+                if (current == null || current.docTitle != item.documentTitle) {
+                    current
+                } else {
+                    val previousAverage = current.runningAverageLoss
+                    val updatedAverage = if (previousAverage != null) {
+                        previousAverage * 0.7f + stepLoss * 0.3f
+                    } else {
+                        stepLoss
+                    }
+                    if (documentCompleted) documentCompletedInUi = true
                     current.copy(
                         completedChunks = item.chunkIndex,
                         latestLoss = stepLoss,
-                        runningAverageLoss = newAvg
+                        runningAverageLoss = updatedAverage
                     )
                 }
             }
-            if (docCompleted) {
+            if (documentCompletedInUi) {
                 runCatching {
                     worldModel.storeEntity(
                         "doc_trained_${System.currentTimeMillis()}",
-                        "Dokumen '${item.documentTitle}' selesai diasimilasi (${item.totalChunks} blok).",
+                        "Document '${item.documentTitle}' completed assimilation (${item.totalChunks} training items).",
                         "Document Trainer"
                     )
-                }.onFailure { Log.w(TAG, "Gagal mencatat telemetri docCompleted", it) }
+                }.onFailure { Log.w(TAG, "Failed to record document completion telemetry.", it) }
                 _activeDocument.value = null
             }
         }
@@ -1309,7 +1578,7 @@ class TrainingManager(
         pushCompleted(finished)
         scope.launch {
             repo?.let { repository ->
-                runCatching {
+                runSuspendCatching {
                     repository.markTrainingCompleted(finished.id, stepLoss, durationMs)
                 }.onFailure { error ->
                     Log.w(TAG, "Failed to persist completed training item", error)
@@ -1319,7 +1588,7 @@ class TrainingManager(
                     finished.documentId != null &&
                     finished.chunkIndex >= finished.totalChunks
                 ) {
-                    runCatching {
+                    runSuspendCatching {
                         val document = repository.getCorpusDocument(finished.documentId)
                         if (document != null && document.chunkCount > 0) {
                             val completedPasses = finished.totalChunks / document.chunkCount
@@ -1333,6 +1602,22 @@ class TrainingManager(
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Preserve coroutine cancellation while converting ordinary persistence failures
+     * into Result values for logging and queue recovery.
+     */
+    private suspend fun <T> runSuspendCatching(
+        block: suspend () -> T
+    ): Result<T> {
+        return try {
+            Result.success(block())
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            Result.failure(error)
         }
     }
 

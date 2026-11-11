@@ -273,7 +273,7 @@ class GenesisModelManager(
             "Preparing the tokenizer vocabulary and control tokens before tensor allocation...")
 
         val tokenizer = neuralEngine.tokenizer
-        logs += "Tokenizer initialized with ${tokenizer.vocabSize} base tokens."
+        logs += "Tokenizer initialized with ${tokenizer.vocabSize} base tokens; capacity ${tokenizer.config.maxVocabularySize}; algorithm ${tokenizer.config.algorithm.name}."
         logs += "Special Tokens: <pad>, <unk>, <s>, </s>, <user>, <assistant>, <think>, </think>"
         throttleStage()
 

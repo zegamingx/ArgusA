@@ -83,8 +83,9 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
     val completedQueue by viewModel.completedQueue.collectAsState()
     val lossHistory by viewModel.lossHistory.collectAsState()
     val totalSteps by viewModel.totalStepsExecuted.collectAsState()
+    val trainingMetrics by viewModel.trainingMetrics.collectAsState()
     val activeDoc by viewModel.activeDocument.collectAsState()
-    val vocabSize = viewModel.getVocabSize()
+    val vocabSize = trainingMetrics.vocabularySize
     val worldEntities by viewModel.worldEntities.collectAsState()
     val modelConfig = viewModel.engineConfig
     val backendState = viewModel.activeComputeBackend
@@ -127,6 +128,13 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
         "Not available"
     }
     val lastLoss = lossHistory.lastOrNull()?.let { String.format(Locale.US, "%.4f", it) } ?: "--"
+    val inputTokensLabel = NumberFormat.getNumberInstance(Locale.US).format(trainingMetrics.inputTokens)
+    val predictionTargetsLabel = NumberFormat.getNumberInstance(Locale.US).format(trainingMetrics.predictionTargets)
+    val contextWindowsLabel = NumberFormat.getNumberInstance(Locale.US).format(trainingMetrics.contextWindows)
+    val optimizerUpdatesLabel = NumberFormat.getNumberInstance(Locale.US).format(trainingMetrics.optimizerUpdates)
+    val reasoningExamplesLabel = NumberFormat.getNumberInstance(Locale.US).format(trainingMetrics.reasoningExamples)
+    val reasoningTokensLabel = NumberFormat.getNumberInstance(Locale.US).format(trainingMetrics.reasoningTokens)
+    val memoryRecordsLabel = NumberFormat.getNumberInstance(Locale.US).format(worldEntities.size)
 
     // Only completed chunks contribute to document progress.
     val docProgress = activeDocument?.let { document ->
@@ -261,10 +269,76 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        StatMetricBox(label = "LAST LOSS", value = lastLoss, unit = "latest completed item", valueColor = ArgusCyanPrimary, modifier = Modifier.weight(1f))
-                        StatMetricBox(label = "VOCABULARY", value = "$vocabSize", unit = "tokens", valueColor = ArgusCyanGlow, modifier = Modifier.weight(1f))
-                        StatMetricBox(label = "WORLD MODEL", value = "${worldEntities.size}", unit = "records", valueColor = ArgusSuccess, modifier = Modifier.weight(1f))
+                        StatMetricBox(
+                            label = "LAST LOSS",
+                            value = lastLoss,
+                            unit = "latest completed chunk",
+                            valueColor = ArgusCyanPrimary,
+                            modifier = Modifier.weight(1f)
+                        )
+                        StatMetricBox(
+                            label = "VOCABULARY",
+                            value = "$vocabSize / ${trainingMetrics.vocabularyCapacity}",
+                            unit = "learned tokens / capacity",
+                            valueColor = ArgusCyanGlow,
+                            modifier = Modifier.weight(1f)
+                        )
+                        StatMetricBox(
+                            label = "INPUT TOKENS",
+                            value = inputTokensLabel,
+                            unit = "session total",
+                            valueColor = ArgusSuccess,
+                            modifier = Modifier.weight(1f)
+                        )
                     }
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        StatMetricBox(
+                            label = "CONTEXT WINDOWS",
+                            value = contextWindowsLabel,
+                            unit = "processed windows",
+                            valueColor = ArgusCyanPrimary,
+                            modifier = Modifier.weight(1f)
+                        )
+                        StatMetricBox(
+                            label = "OPTIMIZER UPDATES",
+                            value = optimizerUpdatesLabel,
+                            unit = "weight updates",
+                            valueColor = ArgusCyanGlow,
+                            modifier = Modifier.weight(1f)
+                        )
+                        StatMetricBox(
+                            label = "MEMORY RECORDS",
+                            value = memoryRecordsLabel,
+                            unit = "World Model entries",
+                            valueColor = ArgusSuccess,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        StatMetricBox(
+                            label = "REASONING EXAMPLES",
+                            value = reasoningExamplesLabel,
+                            unit = "structured training samples",
+                            valueColor = ArgusCyanPrimary,
+                            modifier = Modifier.weight(1f)
+                        )
+                        StatMetricBox(
+                            label = "REASONING TOKENS",
+                            value = reasoningTokensLabel,
+                            unit = "tokens inside reasoning spans",
+                            valueColor = ArgusCyanGlow,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Text(
+                        text = "$predictionTargetsLabel next-token targets scored in this session. " +
+                            "${trainingMetrics.completedDocuments} documents completed across " +
+                            "${trainingMetrics.completedChunks} training chunks.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ArgusTextMuted
+                    )
                 }
             }
 
@@ -410,6 +484,18 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                                 fontFamily = FontFamily.Monospace
                             )
                         }
+                        Text(
+                            text = "> Tokenizer: ${modelConfig.tokenizerConfig.algorithm.name} • ${vocabSize}/${trainingMetrics.vocabularyCapacity} tokens • +${trainingMetrics.vocabularyTokensAdded} this session • ${trainingMetrics.tokenizerMerges} BPE rules",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = ArgusCyanGlow,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Text(
+                            text = "> Learning totals: $inputTokensLabel input tokens • $contextWindowsLabel context windows • $optimizerUpdatesLabel optimizer updates",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = ArgusTextSecondary,
+                            fontFamily = FontFamily.Monospace
+                        )
                         Text(
                             text = "> Checkpoint cadence: every ${viewModel.checkpointInterval} optimizer updates",
                             style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),

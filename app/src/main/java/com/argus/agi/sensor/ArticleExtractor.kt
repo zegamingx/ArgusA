@@ -107,7 +107,6 @@ class ArticleExtractor(
                         }
 
                         val body = response.body
-                            ?: throw ArticleExtractionException("Halaman tidak memiliki body.")
                         val mediaType = body.contentType()?.let {
                             "${it.type.lowercase(Locale.ROOT)}/${it.subtype.lowercase(Locale.ROOT)}"
                         }.orEmpty()

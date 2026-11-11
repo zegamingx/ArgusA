@@ -5,7 +5,9 @@ import android.content.pm.ServiceInfo
 import androidx.test.core.app.ApplicationProvider
 import com.argus.agi.model.ArgusNeuralEngine
 import com.argus.agi.model.EngineConfig
+import com.argus.agi.model.ArgusTokenizerAlgorithm
 import com.argus.agi.model.Tokenizer
+import com.argus.agi.model.TokenizerConfig
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.WorldModel
 import com.argus.agi.sensor.DeviceGuard
@@ -166,7 +168,9 @@ class ArgusAppRobolectricTest {
 
     @Test
     fun testTokenizerImportVocabValidation() {
-        val tokenizer = Tokenizer()
+        val tokenizer = Tokenizer(
+            TokenizerConfig(algorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1)
+        )
         val validEntries = listOf(
             Pair("test1", 10),
             Pair("test2", 11)

@@ -15,7 +15,7 @@ enum class ArgusTokenizerAlgorithm(val checkpointId: Int) {
 
 data class TokenizerConfig(
     val schemaVersion: Int = CURRENT_SCHEMA_VERSION,
-    val algorithm: ArgusTokenizerAlgorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
+    val algorithm: ArgusTokenizerAlgorithm = ArgusTokenizerAlgorithm.LEARNED_BPE_V1,
     val maxVocabularySize: Int = DEFAULT_MAX_VOCAB_SIZE,
     val maxTokenLength: Int = DEFAULT_MAX_TOKEN_LENGTH
 ) {
@@ -67,6 +67,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         const val ASSISTANT_ID = 6
         const val THINK_START_ID = 7
         const val THINK_END_ID = 8
+        private const val DEFAULT_MAX_MERGES_PER_TRAINING_PASS = 64
 
         const val MAX_TOKEN_LEN = TokenizerConfig.DEFAULT_MAX_TOKEN_LENGTH
         const val MAX_VOCAB_SIZE = TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE
@@ -90,11 +91,14 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
         private val CONTROL_TOKENS: Set<String> = SPECIAL_IDS.keys +
                 setOf(PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, UNK_TOKEN)
+        private val REASONING_TOKENS: Set<String> = setOf(THINK_START, THINK_END)
     }
 
     // Atomic mutation via synchronized; reads are safe via CHM
     private val tokenToId = ConcurrentHashMap<String, Int>()
     private val idToToken = ConcurrentHashMap<Int, String>()
+    private val merges = mutableListOf<Pair<String, String>>()
+    private val mergeRanks = ConcurrentHashMap<Pair<String, String>, Int>()
 
     @Volatile private var nextId = 0
     @Volatile private var maxRegisteredLen = 1
@@ -117,8 +121,30 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             "training", "data", "layar", "kamera", "the", "and", "is", "in", "to", "of", "for",
             "nama", "kita", "kami", "aneh", "dimana", "kenapa", "siapa", "serius", "bener"
         )
-        for (w in seedWords) {
-            runCatching { registerToken(w) }
+        for (word in seedWords) {
+            runCatching { registerToken(word) }
+        }
+        if (config.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1) {
+            initializeSeedMerges(seedWords)
+        }
+    }
+
+    /**
+     * Seed merges make the bundled base-word tokens usable by BPE without
+     * allocating additional vocabulary entries or changing their stable IDs.
+     */
+    private fun initializeSeedMerges(seedWords: List<String>) {
+        for (word in seedWords) {
+            val pieces = word.map { character -> character.toString() }.toMutableList()
+            while (pieces.size > 1) {
+                val pair = pieces[0] to pieces[1]
+                if (!mergeRanks.containsKey(pair)) {
+                    merges.add(pair)
+                    mergeRanks[pair] = merges.lastIndex
+                }
+                pieces[0] = pair.first + pair.second
+                pieces.removeAt(1)
+            }
         }
     }
 
@@ -245,11 +271,11 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         maxRegisteredLen = newMaxLen
     }
 
-    private val merges = mutableListOf<Pair<String, String>>()
-    private val mergeRanks = ConcurrentHashMap<Pair<String, String>, Int>()
-
     @Synchronized
     fun exportMerges(): List<Pair<String, String>> = ArrayList(merges)
+
+    val mergeCount: Int
+        get() = synchronized(this) { merges.size }
 
     @Synchronized
     fun importMerges(importedMerges: List<Pair<String, String>>) {
@@ -265,76 +291,113 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
     }
 
     /**
-     * Trains learned BPE merge rules from corpus text until targetVocabSize is reached.
+     * Learns deterministic BPE merge rules from a bounded corpus sample.
+     *
+     * Existing merge rules are replayed before new pairs are counted. This makes
+     * incremental corpus learning safe: previously learned token IDs and merge
+     * priorities remain stable, and the same corpus does not append duplicate rules.
      */
     @Synchronized
-    fun trainBpe(corpus: List<String>, targetVocabSize: Int = config.maxVocabularySize): Int {
+    fun trainBpe(
+        corpus: List<String>,
+        targetVocabSize: Int = config.maxVocabularySize,
+        maxNewMerges: Int = DEFAULT_MAX_MERGES_PER_TRAINING_PASS
+    ): Int {
+        require(maxNewMerges > 0) { "maxNewMerges must be positive." }
         val target = minOf(targetVocabSize, config.maxVocabularySize)
-        if (vocabSize >= target) return vocabSize
+        if (vocabSize >= target || corpus.isEmpty()) return vocabSize
 
-        val wordFreqs = LinkedHashMap<String, Int>()
-        for (doc in corpus) {
-            val normalized = TextModalityProcessor.normalizeTypography(doc)
-            val tokens = normalized.split(Regex("\\s+"))
-            for (token in tokens) {
-                if (token.isEmpty() || token in SPECIAL_TOKENS) continue
-                wordFreqs[token] = (wordFreqs[token] ?: 0) + 1
+        val wordFrequencies = LinkedHashMap<String, Int>()
+        for (document in corpus) {
+            var normalized = TextModalityProcessor.normalizeTypography(document)
+            // Control tokens already have fixed IDs and are split atomically during
+            // encoding. Do not spend BPE merges learning fragments of their markup,
+            // including when a marker touches the surrounding text.
+            for (specialToken in SPECIAL_TOKENS) {
+                normalized = normalized.replace(specialToken, " ")
+            }
+            for (word in normalized.split(Regex("\\s+"))) {
+                if (word.isEmpty()) continue
+                val frequency = wordFrequencies[word] ?: 0
+                wordFrequencies[word] = if (frequency == Int.MAX_VALUE) frequency else frequency + 1
             }
         }
+        if (wordFrequencies.isEmpty()) return vocabSize
 
-        val wordSymbols = LinkedHashMap<String, MutableList<String>>()
-        for (w in wordFreqs.keys) {
+        val wordSymbols = LinkedHashMap<String, MutableList<String>>(wordFrequencies.size)
+        for (word in wordFrequencies.keys) {
             val symbols = mutableListOf<String>()
-            var idx = 0
-            while (idx < w.length) {
-                val cp = Character.codePointAt(w, idx)
-                val len = Character.charCount(cp)
-                symbols.add(w.substring(idx, idx + len))
-                idx += len
+            var index = 0
+            while (index < word.length) {
+                val codePoint = Character.codePointAt(word, index)
+                val codePointLength = Character.charCount(codePoint)
+                symbols.add(word.substring(index, index + codePointLength))
+                index += codePointLength
             }
-            wordSymbols[w] = symbols
+            wordSymbols[word] = symbols
         }
 
-        while (vocabSize < target) {
-            val pairCounts = HashMap<Pair<String, String>, Int>()
-            for ((word, freq) in wordFreqs) {
+        // Continue from the existing BPE state instead of relearning old merges.
+        for (merge in merges) {
+            val combined = merge.first + merge.second
+            for (symbols in wordSymbols.values) {
+                applyMerge(symbols, merge.first, merge.second, combined)
+            }
+        }
+
+        var newMergeCount = 0
+        while (vocabSize < target && newMergeCount < maxNewMerges) {
+            val pairCounts = LinkedHashMap<Pair<String, String>, Int>()
+            for ((word, frequency) in wordFrequencies) {
                 val symbols = wordSymbols[word] ?: continue
-                for (i in 0 until symbols.size - 1) {
-                    val pair = symbols[i] to symbols[i + 1]
-                    val combinedLen = pair.first.length + pair.second.length
-                    if (combinedLen <= config.maxTokenLength) {
-                        pairCounts[pair] = (pairCounts[pair] ?: 0) + freq
+                for (index in 0 until symbols.size - 1) {
+                    val pair = symbols[index] to symbols[index + 1]
+                    if (mergeRanks.containsKey(pair)) continue
+                    if (pair.first.length + pair.second.length > config.maxTokenLength) continue
+                    val previous = pairCounts[pair] ?: 0
+                    pairCounts[pair] = if (previous > Int.MAX_VALUE - frequency) {
+                        Int.MAX_VALUE
+                    } else {
+                        previous + frequency
                     }
                 }
             }
 
-            if (pairCounts.isEmpty()) break
             val bestEntry = pairCounts.entries.maxByOrNull { it.value } ?: break
-            if (bestEntry.value <= 1 && vocabSize >= 256) break
+            if (bestEntry.value < 2) break
             val bestPair = bestEntry.key
             val combined = bestPair.first + bestPair.second
             if (combined.length > config.maxTokenLength) break
 
-            val registeredId = registerToken(combined)
-            if (registeredId == UNK_ID && vocabSize >= target) break
+            val tokenId = tokenToId[combined] ?: registerToken(combined)
+            if (tokenId == UNK_ID && combined != UNK_TOKEN) break
 
             merges.add(bestPair)
             mergeRanks[bestPair] = merges.lastIndex
-
-            for ((_, symbols) in wordSymbols) {
-                var i = 0
-                while (i < symbols.size - 1) {
-                    if (symbols[i] == bestPair.first && symbols[i + 1] == bestPair.second) {
-                        symbols[i] = combined
-                        symbols.removeAt(i + 1)
-                    } else {
-                        i++
-                    }
-                }
+            newMergeCount++
+            for (symbols in wordSymbols.values) {
+                applyMerge(symbols, bestPair.first, bestPair.second, combined)
             }
         }
 
         return vocabSize
+    }
+
+    private fun applyMerge(
+        symbols: MutableList<String>,
+        left: String,
+        right: String,
+        combined: String
+    ) {
+        var index = 0
+        while (index < symbols.size - 1) {
+            if (symbols[index] == left && symbols[index + 1] == right) {
+                symbols[index] = combined
+                symbols.removeAt(index + 1)
+            } else {
+                index++
+            }
+        }
     }
 
     private fun encodeLearnedBpe(cleanText: String, autoRegister: Boolean): List<Int> {
@@ -522,16 +585,22 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
      * Decode token ID → teks.
      *
      * @param keepControlTokens jika false (default), semua special token
-     *        (<PAD>, <BOS>, <EOS>, <UNK>, <SYSTEM>, <USER>, <ASSISTANT>,
-     *        <THINK>, </THINK>) dihapus dari output user-facing.
-     *        Set true jika ingin merekonstruksi prompt terstruktur.
+     *        selain penanda reasoning yang diminta secara eksplisit dihapus.
+     * @param keepReasoningTokens jika true, hanya <THINK> dan </THINK> yang
+     *        dipertahankan sementara token kontrol lain tetap disembunyikan.
      */
-    fun decode(tokenIds: List<Int>, keepControlTokens: Boolean = false): String {
+    fun decode(
+        tokenIds: List<Int>,
+        keepControlTokens: Boolean = false,
+        keepReasoningTokens: Boolean = false
+    ): String {
         val sb = StringBuilder(tokenIds.size * 2)
         for (id in tokenIds) {
             val token = idToToken[id] ?: continue
             if (token.isEmpty()) continue
-            if (!keepControlTokens && token in CONTROL_TOKENS) continue
+            val preserveToken = keepControlTokens ||
+                (keepReasoningTokens && token in REASONING_TOKENS)
+            if (!preserveToken && token in CONTROL_TOKENS) continue
             sb.append(token)
         }
         return decodeUnicodeFallbacks(sb.toString())

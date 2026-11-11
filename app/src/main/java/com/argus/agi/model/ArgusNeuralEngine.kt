@@ -149,6 +149,25 @@ data class LossEvaluation(
     val evaluatedDocumentCount: Int
 )
 
+/** Result of a corpus-driven tokenizer vocabulary update. */
+data class TokenizerTrainingResult(
+    val previousVocabularySize: Int,
+    val vocabularySize: Int,
+    val tokensAdded: Int,
+    val previousMergeCount: Int,
+    val mergeCount: Int
+)
+
+/** Exact accounting for one text passed through the neural optimizer. */
+data class NeuralTrainingStepResult(
+    val loss: Float,
+    val inputTokenCount: Int,
+    val predictionTargetCount: Int,
+    val contextWindowCount: Int,
+    val optimizerUpdateCount: Int,
+    val vocabularySize: Int
+)
+
 internal data class GradientCheckResult(
     val parameterName: String,
     val parameterIndex: Int,
@@ -329,6 +348,29 @@ class ArgusNeuralEngine private constructor(
         private const val CHECKPOINT_INTERVAL = 8
 
         /**
+         * Builds the assistant prefix used for ordinary completion or reasoning generation.
+         * Reasoning mode starts at the dedicated THINK token so the model is prompted with
+         * the same serialized sequence used by reasoning training examples.
+         */
+        internal fun formatGenerationPrompt(prompt: String, reasoningMode: Boolean): String {
+            val assistantPrompt = when {
+                prompt.endsWith(Tokenizer.THINK_START) -> prompt
+                prompt.contains(Tokenizer.USER_TOKEN) &&
+                    prompt.endsWith(Tokenizer.ASSISTANT_TOKEN) -> prompt
+                prompt.contains(Tokenizer.USER_TOKEN) ->
+                    "$prompt ${Tokenizer.ASSISTANT_TOKEN}"
+                else ->
+                    "${Tokenizer.USER_TOKEN}$prompt${Tokenizer.ASSISTANT_TOKEN}"
+            }
+
+            return if (reasoningMode && !assistantPrompt.endsWith(Tokenizer.THINK_START)) {
+                "$assistantPrompt${Tokenizer.THINK_START}"
+            } else {
+                assistantPrompt
+            }
+        }
+
+        /**
          * Preserve an existing ARG3 model's tensor dimensions when reopening the app.
          * Fresh installations use a deterministic RAM/heap tier instead.
          */
@@ -408,7 +450,9 @@ class ArgusNeuralEngine private constructor(
                 maxSeqLen = savedMaxSeq,
                 loraRank = savedLoraRank,
                 isFullTrainingEnabled = true,
-                tokenizerConfig = TokenizerConfig()
+                tokenizerConfig = TokenizerConfig(
+                    algorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1
+                )
             )
         }
 
@@ -606,6 +650,43 @@ class ArgusNeuralEngine private constructor(
         resizeVocabCapacityTo(newCap)
     }
 
+    /**
+     * Learns tokenizer merges from a document sample before its first neural update.
+     * Existing token IDs and all existing tensor rows are retained when the vocabulary grows.
+     */
+    fun trainTokenizerFromCorpus(corpus: List<String>): TokenizerTrainingResult {
+        val result = synchronized(modelLock) {
+            val previousVocabularySize = tokenizer.vocabSize
+            val usesLearnedBpe =
+                config.tokenizerConfig.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1
+            val previousMergeCount = if (usesLearnedBpe) tokenizer.mergeCount else 0
+            val mergeBudget = when {
+                dModel < 64 -> 32
+                dModel < 96 -> 64
+                else -> 96
+            }
+            val updatedVocabularySize = tokenizer.trainBpe(
+                corpus = corpus,
+                maxNewMerges = mergeBudget
+            )
+            ensureVocabCapacity(updatedVocabularySize)
+            TokenizerTrainingResult(
+                previousVocabularySize = previousVocabularySize,
+                vocabularySize = tokenizer.vocabSize,
+                tokensAdded = (tokenizer.vocabSize - previousVocabularySize).coerceAtLeast(0),
+                previousMergeCount = previousMergeCount,
+                mergeCount = if (usesLearnedBpe) tokenizer.mergeCount else 0
+            )
+        }
+
+        if (result.tokensAdded > 0 || result.mergeCount > result.previousMergeCount) {
+            if (!saveCheckpoint()) {
+                Log.w(TAG, "Tokenizer vocabulary changed but the updated checkpoint could not be saved.")
+            }
+        }
+        return result
+    }
+
     private fun resizeVocabCapacityTo(targetCap: Int) {
         if (targetCap <= 0 || targetCap == vocabCap) return
         requireSafeVocabularyCapacity(targetCap)
@@ -647,15 +728,12 @@ class ArgusNeuralEngine private constructor(
     suspend fun generate(
         prompt: String,
         maxNewTokens: Int = 60,
-        temperature: Float = 0.7f
+        temperature: Float = 0.7f,
+        includeReasoningMarkers: Boolean = false,
+        reasoningMode: Boolean = false
     ): String = withContext(Dispatchers.Default) {
         synchronized(modelLock) {
-            val formattedPrompt = if (prompt.contains(Tokenizer.USER_TOKEN)) {
-                if (prompt.endsWith(Tokenizer.ASSISTANT_TOKEN)) prompt
-                else "$prompt ${Tokenizer.ASSISTANT_TOKEN}"
-            } else {
-                "${Tokenizer.USER_TOKEN}$prompt${Tokenizer.ASSISTANT_TOKEN}"
-            }
+            val formattedPrompt = formatGenerationPrompt(prompt, reasoningMode)
 
             // PENTING: autoRegister = false saat inference agar kamus token stabil
             val rawTokens = tokenizer.encode(formattedPrompt, autoRegister = false)
@@ -834,10 +912,30 @@ class ArgusNeuralEngine private constructor(
                 currentPos++
             }
 
-            val decoded = tokenizer.decode(generatedTokens)
+            val decoded = tokenizer.decode(
+                generatedTokens,
+                keepReasoningTokens = includeReasoningMarkers || reasoningMode
+            )
             if (decoded.isBlank()) "..." else decoded
         }
     }
+
+    /**
+     * Generates a response beginning at the trained THINK prefix. The returned text
+     * retains <THINK> and </THINK> so callers can distinguish the reasoning trace
+     * from the final assistant answer.
+     */
+    suspend fun generateReasoning(
+        prompt: String,
+        maxNewTokens: Int = 120,
+        temperature: Float = 0.7f
+    ): String = generate(
+        prompt = prompt,
+        maxNewTokens = maxNewTokens,
+        temperature = temperature,
+        includeReasoningMarkers = true,
+        reasoningMode = true
+    )
 
     // =====================================================================
     // Training: Full-Parameter Backprop with Per-Window Gradient Accumulation
@@ -1055,17 +1153,32 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
-    fun trainStep(text: String): Float {
+    fun trainStep(text: String): Float = trainStepDetailed(text).loss
+
+    fun trainStepDetailed(text: String): NeuralTrainingStepResult {
         var shouldSaveCheckpoint = false
-        val loss = synchronized(modelLock) {
-            // Keep token IDs stable while training; unknown Unicode uses the tokenizer's deterministic Unicode escape.
+        val result = synchronized(modelLock) {
+            val initialAdamStep = adamStep
             val tokens = tokenizer.encode(text, autoRegister = false)
-            if (tokens.size < 2) return@synchronized Float.NaN
+            if (tokens.size < 2) {
+                return@synchronized NeuralTrainingStepResult(
+                    loss = Float.NaN,
+                    inputTokenCount = tokens.size,
+                    predictionTargetCount = 0,
+                    contextWindowCount = 0,
+                    optimizerUpdateCount = 0,
+                    vocabularySize = tokenizer.vocabSize
+                )
+            }
 
             ensureVocabCapacity(tokenizer.vocabSize)
             val currentVocab = tokenizer.vocabSize
+            var contextWindowCount = 0
+            var predictionTargetCount = 0
 
-            val result = if (tokens.size <= maxSeqLen) {
+            val meanLoss = if (tokens.size <= maxSeqLen) {
+                contextWindowCount = 1
+                predictionTargetCount = tokens.size - 1
                 trainSingleWindow(tokens, currentVocab)
             } else {
                 val overlapTokens = min(24, maxSeqLen - 1)
@@ -1076,19 +1189,23 @@ class ArgusNeuralEngine private constructor(
 
                 while (start < tokens.size - 1) {
                     val end = min(start + maxSeqLen, tokens.size)
-                    val windowSeq = tokens.subList(start, end)
-                    if (windowSeq.size >= 2) {
-                        val firstTargetIndex = if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
-                        val targetCount = (windowSeq.size - 1 - firstTargetIndex).coerceAtLeast(0)
+                    val windowSequence = tokens.subList(start, end)
+                    if (windowSequence.size >= 2) {
+                        val firstTargetIndex =
+                            if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
+                        val targetCount =
+                            (windowSequence.size - 1 - firstTargetIndex).coerceAtLeast(0)
                         if (targetCount > 0) {
                             val windowLoss = trainSingleWindow(
-                                seq = windowSeq,
+                                seq = windowSequence,
                                 currentVocab = currentVocab,
                                 firstTargetIndex = firstTargetIndex
                             )
+                            contextWindowCount++
                             if (windowLoss.isFinite()) {
                                 weightedLoss += windowLoss * targetCount
                                 trainedTargets += targetCount
+                                predictionTargetCount += targetCount
                             }
                         }
                     }
@@ -1099,15 +1216,25 @@ class ArgusNeuralEngine private constructor(
                 if (trainedTargets > 0) weightedLoss / trainedTargets else Float.NaN
             }
 
-            if (adamStep % CHECKPOINT_INTERVAL == 0) shouldSaveCheckpoint = true
-            result
+            if (adamStep / CHECKPOINT_INTERVAL > initialAdamStep / CHECKPOINT_INTERVAL) {
+                shouldSaveCheckpoint = true
+            }
+
+            NeuralTrainingStepResult(
+                loss = meanLoss,
+                inputTokenCount = tokens.size,
+                predictionTargetCount = predictionTargetCount,
+                contextWindowCount = contextWindowCount,
+                optimizerUpdateCount = (adamStep - initialAdamStep).coerceAtLeast(0),
+                vocabularySize = currentVocab
+            )
         }
 
         if (shouldSaveCheckpoint) {
             runCatching { saveCheckpoint() }
                 .onFailure { Log.e(TAG, "Auto-checkpoint save failed", it) }
         }
-        return loss
+        return result
     }
 
     private fun computeCrossEntropyLoss(

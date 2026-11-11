@@ -27,6 +27,7 @@ class ArgusCheckpointCompatibilityTest {
         try {
             checkpoint.delete()
             val tokenizerConfig = TokenizerConfig(
+                algorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
                 maxVocabularySize = 512,
                 maxTokenLength = 32
             )
@@ -142,6 +143,10 @@ class ArgusCheckpointCompatibilityTest {
             assertEquals(
                 TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE,
                 restoredConfig.tokenizerConfig.maxVocabularySize
+            )
+            assertEquals(
+                ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
+                restoredConfig.tokenizerConfig.algorithm
             )
         } finally {
             restoreCheckpoint(checkpoint, previousCheckpoint)
@@ -324,6 +329,7 @@ class ArgusTokenizerConfigTest {
     @Test
     fun configurableLongTokensSurviveVocabularyExportAndImport() {
         val config = TokenizerConfig(
+            algorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
             maxVocabularySize = 512,
             maxTokenLength = 32
         )

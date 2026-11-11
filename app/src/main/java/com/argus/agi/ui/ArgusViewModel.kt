@@ -12,6 +12,8 @@ import com.argus.agi.model.BenchmarkResult
 import com.argus.agi.model.GenesisLifecycleStage
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingManager
+import com.argus.agi.model.ReasoningOutputParser
+import com.argus.agi.model.TrainingSessionMetrics
 import com.argus.agi.model.WorldEntity
 import android.media.MediaMetadataRetriever
 import com.argus.agi.sensor.ArticleExtractor
@@ -33,6 +35,7 @@ import com.argus.agi.skill.WebArticleExtractionSkillOutput
 import com.argus.agi.skill.WebSearchIntentRouter
 import com.argus.agi.skill.WebSearchSkill
 import com.argus.agi.skill.WebSearchSkillOutput
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -116,6 +119,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     val lossHistory: StateFlow<List<Float>> = trainingManager.lossHistory
     val isTrainingPaused: StateFlow<Boolean> = trainingManager.isTrainingPaused
     val totalStepsExecuted: StateFlow<Int> = trainingManager.totalStepsExecuted
+    val trainingMetrics: StateFlow<TrainingSessionMetrics> = trainingManager.trainingMetrics
     val engineConfig get() = neuralEngine.config
     val activeComputeBackend get() = neuralEngine.optimizerBackend
     val isVulkanRuntimeReady get() = neuralEngine.isVulkanRuntimeReady
@@ -418,7 +422,10 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         generationJob = viewModelScope.launch {
             try {
                 val worldSummary = worldModel.currentContextSummary.value
-                val priorMessages = _messages.value.takeLast(6).filter { it.text.isNotBlank() }
+                // The current user message was appended before generation starts.
+                // Exclude it here because it is appended explicitly below.
+                val priorMessages = _messages.value.dropLast(1).takeLast(6)
+                    .filter { it.text.isNotBlank() }
                 val multiTurnPrompt = buildString {
                     if (worldSummary.isNotBlank()) {
                         append("<SYSTEM> ").append(worldSummary.take(120)).append(" ")
@@ -438,18 +445,34 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         explicitWebQuery != null ->
                             "Web search request: $explicitWebQuery"
                         mathResult != null -> mathResult
-                        else -> neuralEngine.generate(multiTurnPrompt, maxNewTokens = 60)
+                        else -> neuralEngine.generate(
+                            multiTurnPrompt,
+                            maxNewTokens = minOf(
+                                96,
+                                (neuralEngine.maxSeqLen - 1).coerceAtLeast(1)
+                            ),
+                            includeReasoningMarkers = true,
+                            reasoningMode = true
+                        )
                     }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (e: Exception) {
                     Log.e(TAG, "Generation failed", e)
                     "The local model is busy or encountered an error (${e.javaClass.simpleName}). " +
                             "Please try again shortly."
                 }
 
-                val reflection = worldModel.reflectOnResponse(text, rawOutput)
+                val parsedOutput = ReasoningOutputParser.parse(rawOutput)
+                val reflection = worldModel.reflectOnResponse(text, parsedOutput.answer)
 
-                var finalAnswer = rawOutput
+                var finalAnswer = parsedOutput.answer
                 val thinking = StringBuilder()
+                parsedOutput.reasoning?.takeIf { it.isNotBlank() }?.let { modelReasoning ->
+                    thinking.append("Model reasoning:\n")
+                        .append(modelReasoning)
+                        .append("\n\n")
+                }
                 thinking.append("Self-Reflection: ").append(reflection.reasoningNote)
                 thinking.append(" | Confidence: ")
                     .append(String.format("%.0f%%", reflection.confidenceScore * 100))
@@ -468,9 +491,14 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     )
 
-                    val webItems = runCatching { executeWebSearchSkill(searchQuery) }
-                        .onFailure { Log.w(TAG, "Web search failed", it) }
-                        .getOrDefault(emptyList())
+                    val webItems = try {
+                        executeWebSearchSkill(searchQuery)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        Log.w(TAG, "Web search failed", error)
+                        emptyList()
+                    }
 
                     _searchResults.value = webItems
                     if (webItems.isNotEmpty()) {

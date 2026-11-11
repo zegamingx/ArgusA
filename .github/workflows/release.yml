@@ -28,11 +28,11 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.release.tag_name }}
 
-      - name: Set up JDK 21
+      - name: Set up JDK 25
         uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "25"
           cache: gradle
 
       - name: Verify runner Android SDK
@@ -50,7 +50,7 @@ jobs:
           test -x "${sdk_root}/build-tools/36.0.0/apksigner"
           test -x "${sdk_root}/platform-tools/adb"
 
-          # Android 17/API 37 is installed as android-37.0, while AGP 9.1
+          # Android 17/API 37 is installed as android-37.0, while AGP 9.5
           # looks up compileSdk 37 using the android-37 directory name.
           platform_alias="${sdk_root}/platforms/android-37"
           if [[ ! -s "${platform_alias}/android.jar" ]]; then

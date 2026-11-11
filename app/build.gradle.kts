@@ -54,19 +54,21 @@ android {
 
     val jksFile = rootProject.file("my-upload-key.jks")
     val p12File = rootProject.file("signing/argus-release.p12")
+    // A release must never silently fall back to the Android debug identity.
+    // Keep the expected upload-key path so release packaging fails closed when
+    // the official signing material has not been provisioned.
     val defaultKeystore = when {
-        jksFile.exists() -> jksFile
-        p12File.exists() -> p12File
-        else -> rootProject.file("debug.keystore")
+        jksFile.isFile -> jksFile
+        p12File.isFile -> p12File
+        else -> jksFile
     }
 
     val releaseKeystorePath = providers.environmentVariable("KEYSTORE_PATH")
         .orElse(defaultKeystore.absolutePath)
         .get()
 
-    val isDebugFallback = releaseKeystorePath.endsWith("debug.keystore")
-    val defaultPass = if (isDebugFallback) "android" else "arguspassword"
-    val defaultAlias = if (isDebugFallback) "androiddebugkey" else "upload"
+    val defaultPass = "arguspassword"
+    val defaultAlias = "upload"
 
     val releaseStorePassword = providers.environmentVariable("STORE_PASSWORD")
         .orElse(defaultPass)
@@ -103,7 +105,6 @@ android {
     }
 
     compileOptions {
-        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
@@ -131,7 +132,6 @@ android {
 }
 
 dependencies {
-    coreLibraryDesugaring(libs.desugar.jdk.libs.nio)
     implementation(platform(libs.androidx.compose.bom))
 
     implementation(libs.androidx.activity.compose)
@@ -155,7 +155,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.logging.interceptor)
-    implementation(libs.moshi.kotlin)
+    implementation(libs.moshi)
     implementation(libs.okhttp)
     implementation(libs.jsoup)
     implementation(libs.pdfbox.android)
@@ -179,7 +179,6 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     ksp(libs.androidx.room.compiler)
-    ksp(libs.moshi.kotlin.codegen)
 }
 
 // =====================================================================
