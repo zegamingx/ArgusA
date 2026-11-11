@@ -550,25 +550,34 @@ class TrainingManager(
                 // Never cut a JSON object/array in the middle. JSONL records are
                 // handled individually; pretty-printed values are buffered as one
                 // bounded value before the dataset formatter sees them.
-                val firstNonWhitespaceIndex = window.indexOfFirst { !it.isWhitespace() }
-                val windowStartsWithJson = firstNonWhitespaceIndex >= 0 &&
-                    window[firstNonWhitespaceIndex] in charArrayOf('{', '[')
-                var jsonStart = if (windowStartsWithJson) {
-                    firstNonWhitespaceIndex
-                } else {
-                    window.lastIndexOf('\n', splitPosition - 1) + 1
+                var jsonStart = -1
+                var lineStart = 0
+                while (lineStart < splitPosition) {
+                    var candidateStart = lineStart
+                    while (
+                        candidateStart < splitPosition &&
+                        window[candidateStart] != '\n' &&
+                        window[candidateStart].isWhitespace()
+                    ) {
+                        candidateStart++
+                    }
+                    if (
+                        candidateStart < splitPosition &&
+                        window[candidateStart] in charArrayOf('{', '[')
+                    ) {
+                        jsonStart = candidateStart
+                        break
+                    }
+
+                    var nextLineStart = lineStart
+                    while (nextLineStart < splitPosition && window[nextLineStart] != '\n') {
+                        nextLineStart++
+                    }
+                    if (nextLineStart >= splitPosition) break
+                    lineStart = nextLineStart + 1
                 }
-                while (
-                    !windowStartsWithJson &&
-                    jsonStart < splitPosition &&
-                    window[jsonStart].isWhitespace()
-                ) {
-                    jsonStart++
-                }
-                if (
-                    jsonStart < splitPosition &&
-                    window[jsonStart] in charArrayOf('{', '[')
-                ) {
+
+                if (jsonStart >= 0) {
                     if (jsonStart > 0) {
                         splitPosition = jsonStart
                         structuredBoundary = true
@@ -836,8 +845,7 @@ class TrainingManager(
         )
     }
 
-    /**
-     * Estimates a conservative queue cap from the current app heap.    private fun appendFormattedTrainingRecords(
+    private fun appendFormattedTrainingRecords(
         records: List<String>,
         destination: MutableList<String>,
         chunkSize: Int
