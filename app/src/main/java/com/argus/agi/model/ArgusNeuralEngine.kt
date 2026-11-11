@@ -2121,6 +2121,11 @@ class ArgusNeuralEngine private constructor(
     )
 
     private fun writeArg4Checkpoint() {
+        ensureVocabCapacity(tokenizer.vocabSize)
+        require(vocabCap >= tokenizer.vocabSize) {
+            "Embedding capacity is smaller than the active tokenizer vocabulary."
+        }
+
         val target = File(context.filesDir, "argus_model_weights.bin")
         val temporary = File(context.filesDir, "argus_model_weights.bin.tmp")
         val vocabEntries = tokenizer.exportVocab()
