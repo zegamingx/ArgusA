@@ -60,6 +60,49 @@ class ArgusBatchTrainingTest {
     }
 
     @Test
+    fun legacyCheckpointFallbackKeepsBatchSizeAtOne() {
+        val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
+        val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
+
+        try {
+            checkpoint.delete()
+            val engine = ArgusNeuralEngine.createBlocking(
+                context,
+                EngineConfig(
+                    dModel = 16,
+                    nHeads = 4,
+                    dFf = 32,
+                    maxSeqLen = 32,
+                    loraRank = 2,
+                    layerCount = 1,
+                    tokenizerConfig = TokenizerConfig(
+                        maxVocabularySize = 512,
+                        maxTokenLength = 16
+                    ),
+                    trainingBatchSize = 1,
+                    gradientAccumulationEnabled = false
+                )
+            )
+
+            val failure = runCatching {
+                engine.trainBatchDetailed(
+                    listOf("First legacy training sample.", "Second legacy training sample.")
+                )
+            }.exceptionOrNull()
+            assertTrue(failure is IllegalArgumentException)
+
+            val result = engine.trainBatchDetailed(
+                listOf("The saved legacy checkpoint continues with one training sample.")
+            )
+            assertEquals(1, result.samples.size)
+            assertEquals(1, result.optimizerUpdateCount)
+            assertTrue(result.samples.single().loss.isFinite())
+        } finally {
+            restoreCheckpoint(checkpoint, previousCheckpoint)
+        }
+    }
+
+    @Test
     fun rejectsBatchesLargerThanEightSamples() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
