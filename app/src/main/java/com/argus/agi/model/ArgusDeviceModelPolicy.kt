@@ -35,6 +35,7 @@ data class ArgusDeviceModelProfile(
 
     companion object {
         const val MINIMUM_MODEL_PARAMETERS = 1_000_000L
+        const val MINIMUM_EXECUTABLE_PARAMETER_BUDGET = 1_050_000L
         const val MAXIMUM_MODEL_PARAMETERS = 7_000_000_000L
         const val MINIMUM_TRAINING_BATCH_SIZE = 1
         const val MAXIMUM_TRAINING_BATCH_SIZE = 8
@@ -83,7 +84,7 @@ object ArgusDeviceModelPolicy {
                 TrainingMemoryPlanner.ACCUMULATED_BYTES_PER_PARAMETER
             ).toLong()
         require(
-            conservativeParameterBudget >= ArgusDeviceModelProfile.MINIMUM_MODEL_PARAMETERS
+            conservativeParameterBudget >= ArgusDeviceModelProfile.MINIMUM_EXECUTABLE_PARAMETER_BUDGET
         ) {
             "This device does not currently have enough safe memory to train Argus's minimum 1M-parameter model."
         }
