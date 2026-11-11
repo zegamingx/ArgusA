@@ -28,8 +28,8 @@ data class TokenizerConfig(
         require(maxVocabularySize <= MAX_SUPPORTED_VOCAB_SIZE) {
             "Tokenizer capacity cannot exceed $MAX_SUPPORTED_VOCAB_SIZE."
         }
-        require(maxTokenLength in 1..MAX_SUPPORTED_TOKEN_LENGTH) {
-            "Tokenizer token length must be between 1 and $MAX_SUPPORTED_TOKEN_LENGTH."
+        require(maxTokenLength in MINIMUM_TOKEN_LENGTH..MAX_SUPPORTED_TOKEN_LENGTH) {
+            "Tokenizer token length must be between $MINIMUM_TOKEN_LENGTH and $MAX_SUPPORTED_TOKEN_LENGTH."
         }
     }
 
@@ -38,6 +38,7 @@ data class TokenizerConfig(
         const val DEFAULT_MAX_VOCAB_SIZE = 1024
         const val DEFAULT_MAX_TOKEN_LENGTH = 16
         const val MINIMUM_VOCAB_SIZE = 256
+        const val MINIMUM_TOKEN_LENGTH = 11
         const val MAX_SUPPORTED_VOCAB_SIZE = 1_000_000
         const val MAX_SUPPORTED_TOKEN_LENGTH = 256
     }

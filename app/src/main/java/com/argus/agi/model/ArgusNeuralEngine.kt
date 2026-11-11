@@ -301,7 +301,7 @@ class ArgusNeuralEngine private constructor(
             val savedVocabCap = header.int
             header.int // optimizer step
             header.int // reserved
-            require(savedVocabSize >= TokenizerConfig.MINIMUM_VOCAB_SIZE) {
+            require(savedVocabSize > 0) {
                 "ARG3 vocabulary size is invalid."
             }
             require(savedVocabCap >= savedVocabSize) {
@@ -365,7 +365,7 @@ class ArgusNeuralEngine private constructor(
             require(layerCount == 1) {
                 "This engine version can restore one Transformer block only."
             }
-            require(savedVocabSize >= TokenizerConfig.MINIMUM_VOCAB_SIZE) {
+            require(savedVocabSize > 0) {
                 "ARG4 vocabulary size is invalid."
             }
             require(savedVocabCap >= savedVocabSize) {
@@ -2216,6 +2216,29 @@ class ArgusNeuralEngine private constructor(
     private fun readLongLittleEndian(input: InputStream): Long =
         ByteBuffer.wrap(input.readFully(8)).order(ByteOrder.LITTLE_ENDIAN).long
 
+    private fun readFloatArrayLittleEndian(
+        input: InputStream,
+        values: FloatArray,
+        tensorName: String
+    ) {
+        val floatsPerChunk = TENSOR_WRITE_BUFFER_BYTES / Float.SIZE_BYTES
+        var offset = 0
+        while (offset < values.size) {
+            val chunkCount = min(floatsPerChunk, values.size - offset)
+            val byteCount = chunkCount * Float.SIZE_BYTES
+            val chunk = ByteBuffer.wrap(input.readFully(byteCount))
+                .order(ByteOrder.LITTLE_ENDIAN)
+            for (index in 0 until chunkCount) {
+                val value = chunk.float
+                require(value.isFinite()) {
+                    "ARG4 contains a non-finite value in tensor $tensorName."
+                }
+                values[offset + index] = value
+            }
+            offset += chunkCount
+        }
+    }
+
     private fun expectedCheckpointTensorSizes(targetVocabCap: Int): Map<String, Long> {
         val current = checkpointTensors()
         val dynamicVocabularyTensors = setOf(
@@ -2286,7 +2309,7 @@ class ArgusNeuralEngine private constructor(
                     savedDFf == dFf && savedMaxSeq == maxSeqLen &&
                     savedLoraRank == loraRank
             ) { "ARG4 architecture dimensions do not match the active engine." }
-            require(savedVocabSize >= TokenizerConfig.MINIMUM_VOCAB_SIZE) {
+            require(savedVocabSize > 0) {
                 "ARG4 vocabulary size is invalid."
             }
             require(savedVocabCap >= savedVocabSize) {
@@ -2320,6 +2343,9 @@ class ArgusNeuralEngine private constructor(
                 "ARG4 payload length is invalid."
             }
             require(flags == 0) { "ARG4 checkpoint contains unsupported flags." }
+            require(savedPayloadBytes >= 0L) {
+                "ARG4 payload byte count cannot be negative."
+            }
             require(
                 file.length() == ARG4_HEADER_SIZE.toLong() + savedPayloadBytes
             ) { "ARG4 checkpoint length does not match its payload metadata." }
@@ -2434,14 +2460,7 @@ class ArgusNeuralEngine private constructor(
                         require(targetTensor.values.size.toLong() == descriptor.elementCount) {
                             "ARG4 tensor target size changed during restoration."
                         }
-                        val values = targetTensor.values
-                        for (index in values.indices) {
-                            val value = Float.fromBits(readIntLittleEndian(input))
-                            require(value.isFinite()) {
-                                "ARG4 contains a non-finite value in tensor ${descriptor.name}."
-                            }
-                            values[index] = value
-                        }
+                        readFloatArrayLittleEndian(input, targetTensor.values, descriptor.name)
                     }
                     adamStep = savedAdamStep
                 }
@@ -2501,7 +2520,7 @@ class ArgusNeuralEngine private constructor(
                             savedNHeads == nHeads && savedDFf == dFf &&
                             savedMaxSeq == maxSeqLen
                     ) { "ARG3 architecture dimensions do not match the active engine." }
-                    require(savedVocabSize >= TokenizerConfig.MINIMUM_VOCAB_SIZE) {
+                    require(savedVocabSize > 0) {
                         "ARG3 vocabulary size is invalid."
                     }
                     require(savedVocabCap >= savedVocabSize) {
