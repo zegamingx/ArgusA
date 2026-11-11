@@ -2612,10 +2612,8 @@ class ArgusNeuralEngine private constructor(
                     require(savedVocabCap >= savedVocabSize) {
                         "ARG3 vocabulary capacity is invalid."
                     }
-                    require(savedVocabCap <= config.tokenizerConfig.maxVocabularySize + 64) {
-                        "ARG3 vocabulary capacity exceeds the configured limit."
-                    }
                     require(savedAdamStep >= 0) { "ARG3 optimizer step cannot be negative." }
+                    requireSafeVocabularyCapacity(savedVocabCap)
 
                     val vocabCount = readIntLittleEndian(input)
                     require(vocabCount in 1..config.tokenizerConfig.maxVocabularySize) {
@@ -2652,17 +2650,12 @@ class ArgusNeuralEngine private constructor(
                             wGate, wUp, wDown,
                             mWGate, vWGate, mWUp, vWUp, mWDown, vWDown
                         )
-                        val totalFloats = arrays.sumOf { it.size }
-                        val floatBytes = input.readFully(Math.multiplyExact(totalFloats, 4))
-                        val floatBuffer = ByteBuffer.wrap(floatBytes).order(ByteOrder.LITTLE_ENDIAN)
-                        arrays.forEach { values ->
-                            for (index in values.indices) {
-                                val value = floatBuffer.float
-                                require(value.isFinite()) {
-                                    "ARG3 contains a non-finite tensor value."
-                                }
-                                values[index] = value
-                            }
+                        arrays.forEachIndexed { index, values ->
+                            readFloatArrayLittleEndian(
+                                input = input,
+                                values = values,
+                                tensorName = "ARG3 tensor $index"
+                            )
                         }
                         adamStep = savedAdamStep
                     }
