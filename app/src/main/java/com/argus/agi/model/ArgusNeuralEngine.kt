@@ -2046,7 +2046,7 @@ class ArgusNeuralEngine private constructor(
     }
 
     // =====================================================================
-    // Checkpoint (Format ARG3 dengan Verifikasi Transaksional)
+    // Checkpoint (ARG4 streaming writer with ARG3 compatibility reader)
     // =====================================================================
     fun saveCheckpoint(): Boolean {
         return try {
@@ -2304,6 +2304,28 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
+    private fun requireSafeVocabularyCapacity(targetVocabCap: Int) {
+        require(targetVocabCap > 0) {
+            "Checkpoint vocabulary capacity must be positive."
+        }
+        if (targetVocabCap == vocabCap) return
+
+        val targetElements = Math.multiplyExact(targetVocabCap.toLong(), dModel.toLong())
+        require(targetElements <= Int.MAX_VALUE.toLong()) {
+            "Checkpoint vocabulary tensor dimensions exceed JVM array limits."
+        }
+        val newVocabularyArrayBytes = Math.multiplyExact(
+            targetElements,
+            6L * Float.SIZE_BYTES.toLong()
+        )
+        val runtime = Runtime.getRuntime()
+        val availableHeap = runtime.maxMemory() -
+            (runtime.totalMemory() - runtime.freeMemory())
+        require(newVocabularyArrayBytes.toDouble() <= availableHeap.toDouble() * 0.7) {
+            "Checkpoint vocabulary tensors exceed the safe available heap budget."
+        }
+    }
+
     private fun expectedCheckpointTensorSizes(targetVocabCap: Int): Map<String, Long> {
         val current = checkpointTensors()
         val dynamicVocabularyTensors = setOf(
@@ -2380,12 +2402,7 @@ class ArgusNeuralEngine private constructor(
             require(savedVocabCap >= savedVocabSize) {
                 "ARG4 vocabulary capacity is invalid."
             }
-            require(savedVocabCap <= config.tokenizerConfig.maxVocabularySize + 64) {
-                "ARG4 vocabulary capacity exceeds the configured limit."
-            }
-            require(savedVocabCap.toLong() * dModel.toLong() <= Int.MAX_VALUE.toLong()) {
-                "ARG4 vocabulary tensor dimensions exceed JVM array limits."
-            }
+            requireSafeVocabularyCapacity(savedVocabCap)
             require(savedAdamStep >= 0) { "ARG4 optimizer step cannot be negative." }
             require(savedTokenizerSchema == config.tokenizerConfig.schemaVersion) {
                 "ARG4 tokenizer schema mismatch."
@@ -2417,17 +2434,6 @@ class ArgusNeuralEngine private constructor(
             )
             require(file.length() == expectedFileLength) {
                 "ARG4 checkpoint length does not match its payload metadata."
-            }
-
-            val heapRuntime = Runtime.getRuntime()
-            val availableHeap = heapRuntime.maxMemory() -
-                (heapRuntime.totalMemory() - heapRuntime.freeMemory())
-            val requiredVocabularyArrayBytes = Math.multiplyExact(
-                Math.multiplyExact(savedVocabCap.toLong(), dModel.toLong()),
-                6L * Float.SIZE_BYTES.toLong()
-            )
-            require(requiredVocabularyArrayBytes <= availableHeap * 0.7) {
-                "ARG4 vocabulary tensors exceed the safe available heap budget."
             }
 
             val checksum = CRC32()
@@ -2520,8 +2526,8 @@ class ArgusNeuralEngine private constructor(
                 }
 
                 synchronized(modelLock) {
-                    tokenizer.importVocab(vocabulary)
                     resizeVocabCapacityTo(savedVocabCap)
+                    tokenizer.importVocab(vocabulary)
                     val tensorsByName = checkpointTensors().associateBy { it.name }
                     for (descriptor in descriptors) {
                         val targetTensor = tensorsByName[descriptor.name]

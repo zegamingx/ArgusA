@@ -91,7 +91,7 @@ class ArgusCheckpointCompatibilityTest {
             while (header.hasRemaining()) {
                 header.put(0)
             }
-            checkpoint.writeBytes(String(header.array(), Charsets.ISO_8859_1))
+            checkpoint.writeBytes(header.array())
 
             val restoredConfig = ArgusNeuralEngine.resolveConfig(
                 context = context,
@@ -139,6 +139,23 @@ class ArgusCheckpointCompatibilityTest {
 }
 
 class ArgusTokenizerConfigTest {
+
+    @Test
+    fun configurableVocabularyCapacityStopsAtItsDeclaredBoundary() {
+        val tokenizer = Tokenizer(
+            TokenizerConfig(
+                maxVocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+                maxTokenLength = TokenizerConfig.MINIMUM_TOKEN_LENGTH
+            )
+        )
+        var tokenIndex = 0
+        while (tokenizer.vocabSize < TokenizerConfig.MINIMUM_VOCAB_SIZE) {
+            tokenizer.registerToken("v${tokenIndex++}")
+        }
+
+        assertEquals(TokenizerConfig.MINIMUM_VOCAB_SIZE, tokenizer.vocabSize)
+        assertEquals(Tokenizer.UNK_ID, tokenizer.registerToken("overflow"))
+    }
 
     @Test
     fun configurableLongTokensSurviveVocabularyExportAndImport() {

@@ -137,7 +137,7 @@ Within each context window, gradients are accumulated over its scored next-token
 
 Current limitations:
 
-- The tokenizer uses a fixed seed vocabulary and deterministic Unicode fallback. A learned BPE/Unigram tokenizer is not implemented.
+- The tokenizer uses the versioned greedy-longest-match algorithm, fixed seed vocabulary, and deterministic Unicode fallback. Its capacity and maximum token length are configurable and persisted, but learned BPE/Unigram training and merge-state storage are not implemented.
 - Corpus documents use a document-level TRAIN or VALIDATION split. Validation documents retain one normalized source-text payload, create no training chunks, never enter the training queue, and cannot be replayed into training.
 - Held-out evaluation uses evaluateValidationCorpus, aggregates cross-entropy by the exact number of scored next-token targets, and computes perplexity without updating model weights or optimizer state.
 - A content fingerprint cannot exist in both splits. Importing identical source text into the opposite split is rejected to prevent train/validation leakage.
