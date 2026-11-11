@@ -24,6 +24,9 @@ internal object VulkanTrainingBackend {
     val currentBackend: String
         get() = _currentBackend
 
+    val isRuntimeAvailable: Boolean
+        get() = nativeReady && !disabledAfterRuntimeFailure
+
     private val nativeReady: Boolean = try {
         System.loadLibrary("argus_training")
         val initialized = nativeInitialize()

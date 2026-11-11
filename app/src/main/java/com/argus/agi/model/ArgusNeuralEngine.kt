@@ -126,6 +126,10 @@ class ArgusNeuralEngine private constructor(
 
     val optimizerBackend: String
         get() = VulkanTrainingBackend.currentBackend
+    val isVulkanRuntimeReady: Boolean
+        get() = VulkanTrainingBackend.isRuntimeAvailable
+    val checkpointInterval: Int
+        get() = CHECKPOINT_INTERVAL
     private val scale = 1.0f / sqrt(headDim.toFloat())
 
     private var vocabCap = max(tokenizer.vocabSize + 32, 160)

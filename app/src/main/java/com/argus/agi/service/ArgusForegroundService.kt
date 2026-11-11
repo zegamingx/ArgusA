@@ -112,7 +112,7 @@ class ArgusForegroundService : Service() {
     private fun buildNotification(): Notification {
         val trainingManager = ArgusApp.trainingManager
         val deviceGuard = ArgusApp.deviceGuard
-        val hardware = ArgusApp.hardwareProfile.getHardwareInfo()
+        val neuralEngine = ArgusApp.neuralEngine
 
         val isPaused = trainingManager.isTrainingPaused.value
         val safety = deviceGuard.safetyState.value
@@ -120,14 +120,19 @@ class ArgusForegroundService : Service() {
         val latestLoss = trainingManager.lossHistory.value.lastOrNull()
 
         val title = "A.R.G.U.S Core: " + when {
-            isPaused -> "Training Dijeda"
-            !safety.isSafeToTrain -> "Thermal/Baterai Guard Aktif"
-            currentItem != null -> "Sedang Melatih (${currentItem.source})"
-            else -> "Memantau Stimulus & Layar"
+            isPaused -> "Training paused"
+            !safety.isSafeToTrain -> "Device safety hold active"
+            currentItem != null -> "Training: ${currentItem.source}"
+            else -> "Monitoring local activity"
         }
 
-        val lossText = if (latestLoss != null) "Loss: ${String.format("%.4f", latestLoss)}" else "Loss: belum ada"
-        val content = "$lossText | ${safety.batteryPct}% (${String.format("%.1f", safety.temperatureCelsius)}°C) | ${hardware.primaryAccelerator.substringBefore('+')}"
+        val lossText = if (latestLoss != null) "Loss: ${String.format("%.4f", latestLoss)}" else "Loss: not available"
+        val computeStatus = if (neuralEngine.isVulkanRuntimeReady) {
+            "Vulkan runtime verified"
+        } else {
+            "Kotlin CPU fallback"
+        }
+        val content = "$lossText | ${safety.batteryPct}% (${String.format("%.1f", safety.temperatureCelsius)}°C) | $computeStatus"
 
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -145,7 +150,7 @@ class ArgusForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val pauseResumeLabel = if (isPaused) "Lanjutkan Training" else "Jeda Training"
+        val pauseResumeLabel = if (isPaused) "Resume training" else "Pause training"
 
         return NotificationCompat.Builder(this, ArgusApp.CHANNEL_ID)
             .setContentTitle(title)

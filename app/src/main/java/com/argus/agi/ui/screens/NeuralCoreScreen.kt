@@ -60,7 +60,7 @@ import java.util.Locale
 import kotlin.random.Random
 
 // =====================================================================
-// MAIN SCREEN - VERSI BERSIH CYBERNETIC
+// NEURAL CORE SCREEN
 // =====================================================================
 
 @Composable
@@ -73,30 +73,60 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
     val nextQueue by viewModel.nextQueue.collectAsState()
     val completedQueue by viewModel.completedQueue.collectAsState()
     val lossHistory by viewModel.lossHistory.collectAsState()
-    val hardwareInfo by viewModel.hardwareInfo.collectAsState()
     val totalSteps by viewModel.totalStepsExecuted.collectAsState()
     val activeDoc by viewModel.activeDocument.collectAsState()
     val vocabSize = viewModel.getVocabSize()
     val worldEntities by viewModel.worldEntities.collectAsState()
+    val modelConfig = viewModel.engineConfig
+    val backendState = viewModel.activeComputeBackend
+    val isVulkanRuntimeReady = viewModel.isVulkanRuntimeReady
+    val activeDocument = activeDoc
+    val activeTrainingItem = currentItem
 
-    val trainingEtaMs = remainingTrainingEtaMs(currentItem, nextQueue, completedQueue, safetyState, isPaused)
+    val trainingEtaMs = remainingTrainingEtaMs(
+        activeTrainingItem,
+        nextQueue,
+        completedQueue,
+        safetyState,
+        isPaused
+    )
     val trainingEtaLabel = when {
-        isPaused -> "Jeda"
-        !safetyState.isSafeToTrain -> "Tertahan Guard"
-        trainingEtaMs == null -> "--"
-        trainingEtaMs == 0L -> "Tidak ada antrean"
+        isPaused -> "Paused"
+        !safetyState.isSafeToTrain -> "Blocked by device safety"
+        trainingEtaMs == null -> "Calculating"
+        trainingEtaMs == 0L -> "Queue empty"
         else -> "~${formatEta(trainingEtaMs)}"
+    }
+    val trainingStatusLabel = when {
+        isPaused -> "TRAINING PAUSED"
+        !safetyState.isSafeToTrain -> "TRAINING BLOCKED"
+        activeTrainingItem != null -> "TRAINING IN PROGRESS"
+        nextQueue.isNotEmpty() -> "TRAINING QUEUED"
+        else -> "TRAINING IDLE"
+    }
+    val trainingIndicatorColor = when {
+        isPaused || !safetyState.isSafeToTrain -> ArgusWarning
+        activeTrainingItem != null -> ArgusSuccess
+        else -> ArgusTextMuted
     }
 
     val formattedParams = NumberFormat.getNumberInstance(Locale.US).format(totalParams)
     val adapterSizeKb = adapterBytes / 1024.0
-    val adapterSizeStr = if (adapterBytes > 0) String.format(Locale.US, "%.2f KB", adapterSizeKb) else "belum ada"
+    val adapterSizeStr = if (adapterBytes > 0) {
+        String.format(Locale.US, "%.2f KB", adapterSizeKb)
+    } else {
+        "Not available"
+    }
     val lastLoss = lossHistory.lastOrNull()?.let { String.format(Locale.US, "%.4f", it) } ?: "--"
 
-    // Progress dari dokumen aktif, bukan hardcode
-    val docProgress = if (activeDoc != null && activeDoc!!.totalChunks > 0) {
-        activeDoc!!.currentChunkIndex.toFloat() / activeDoc!!.totalChunks.toFloat()
-    } else 0f
+    // Only completed chunks contribute to document progress.
+    val docProgress = activeDocument?.let { document ->
+        if (document.totalChunks > 0) {
+            document.completedChunks.toFloat() / document.totalChunks.toFloat()
+        } else {
+            0f
+        }
+    } ?: 0f
     val docPct = (docProgress * 100).toInt()
 
     Box(
@@ -105,10 +135,10 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
             .background(ArgusDarkBg)
             .testTag("neural_core_screen")
     ) {
-        // Lapis 1: Neuron jadi background
+        // Decorative neural background
         NeuronBackground()
 
-        // Lapis 2: Konten, tanpa garis, tanpa border
+        // Main screen content
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -116,7 +146,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
             contentPadding = PaddingValues(vertical = 16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // HEADER + MATA GLOW
+            // HEADER
             item {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     ArgusEyeGlow()
@@ -144,7 +174,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             fontSize = 10.sp
                         )
                         Text(
-                            text = "On-Device Training • Neural Protocol v2.1 • NPU Accelerated",
+                            text = "Local Model Training • Device-Adaptive Architecture",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextSecondary,
                             fontSize = 10.sp
@@ -153,7 +183,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                 }
             }
 
-            // PROSES TRAINING
+            // TRAINING STATUS
             item {
                 Box(
                     Modifier
@@ -168,7 +198,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "PROSES TRAINING BERJALAN...",
+                                text = trainingStatusLabel,
                                 style = MaterialTheme.typography.titleSmall,
                                 color = ArgusCyanGlow,
                                 fontWeight = FontWeight.Bold
@@ -176,7 +206,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             Box(
                                 Modifier
                                     .size(10.dp)
-                                    .background(if (safetyState.isSafeToTrain && !isPaused) ArgusSuccess else ArgusWarning, CircleShape)
+                                    .background(trainingIndicatorColor, CircleShape)
                             )
                         }
                         Spacer(modifier = Modifier.height(10.dp))
@@ -192,7 +222,9 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                         Spacer(modifier = Modifier.height(8.dp))
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text(
-                                text = if (activeDoc != null) "Blok ${activeDoc!!.currentChunkIndex} / ${activeDoc!!.totalChunks} • $docPct% selesai" else "Idle • Menunggu stimulus",
+                                text = activeDocument?.let { "Completed ${it.completedChunks} of ${it.totalChunks} chunks • $docPct%" }
+                                    ?: if (activeTrainingItem != null) "Processing a single training item"
+                                    else "No active training document",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ArgusTextPrimary,
                                 fontFamily = FontFamily.Monospace
@@ -209,25 +241,25 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                 }
             }
 
-            // METRICS - tanpa border
+            // TRAINING METRICS
             item {
                 Column {
                     Text(
-                        text = "METRICS PELATIHAN",
+                        text = "TRAINING METRICS",
                         style = MaterialTheme.typography.titleSmall,
                         color = ArgusTextPrimary,
                         fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        StatMetricBox(label = "LOSS", value = lastLoss, unit = "$totalSteps langkah", valueColor = ArgusCyanPrimary, modifier = Modifier.weight(1f))
-                        StatMetricBox(label = "KOSAKATA", value = "$vocabSize Token", unit = "Kamus aktif", valueColor = ArgusCyanGlow, modifier = Modifier.weight(1f))
-                        StatMetricBox(label = "MEMORI", value = "${worldEntities.size} Entitas", unit = "World Model", valueColor = ArgusSuccess, modifier = Modifier.weight(1f))
+                        StatMetricBox(label = "LAST LOSS", value = lastLoss, unit = "latest completed item", valueColor = ArgusCyanPrimary, modifier = Modifier.weight(1f))
+                        StatMetricBox(label = "VOCABULARY", value = "$vocabSize", unit = "tokens", valueColor = ArgusCyanGlow, modifier = Modifier.weight(1f))
+                        StatMetricBox(label = "WORLD MODEL", value = "${worldEntities.size}", unit = "records", valueColor = ArgusSuccess, modifier = Modifier.weight(1f))
                     }
                 }
             }
 
-            // TRAINING CONTROL - cuma Jeda / Lanjutkan
+            // TRAINING CONTROL
             item {
                 Box(
                     Modifier
@@ -243,13 +275,13 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                         ) {
                             Column(Modifier.weight(1f)) {
                                 Text(
-                                    text = "Autonomous Training Loop",
+                                    text = "Background Training Worker",
                                     style = MaterialTheme.typography.titleMedium,
                                     color = ArgusTextPrimary,
                                     fontWeight = FontWeight.Bold
                                 )
                                 Text(
-                                    text = "Total Step: $totalSteps • ETA: $trainingEtaLabel",
+                                    text = "Completed items: $totalSteps • Estimated remaining: $trainingEtaLabel",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = if (isPaused || !safetyState.isSafeToTrain) ArgusWarning else ArgusCyanGlow,
                                     fontFamily = FontFamily.Monospace
@@ -272,19 +304,19 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                                 shape = RoundedCornerShape(12.dp),
                                 modifier = Modifier.testTag("toggle_training_pause_button")
                             ) {
-                                Text(text = if (isPaused) "Lanjutkan" else "Jeda", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                Text(text = if (isPaused) "Resume" else "Pause", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                             }
                         }
                         Spacer(modifier = Modifier.height(10.dp))
                         Text(
-                            text = "Arsitektur: Micro-Transformer SwiGLU | D_Model=128 | Heads=4 | D_FF=512 | LoRA Q/V Rank 4",
+                            text = "Architecture: Micro-Transformer · dModel=${modelConfig.dModel} · Heads=${modelConfig.nHeads} · FFN=${modelConfig.dFf} · Context=${modelConfig.maxSeqLen} · LoRA rank=${modelConfig.loraRank}",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted,
                             fontFamily = FontFamily.Monospace,
                             fontSize = 10.sp
                         )
                         Text(
-                            text = "Params: $formattedParams • Adapter: $adapterSizeStr • Backend: ${hardwareInfo.primaryAccelerator}",
+                            text = "Parameters: $formattedParams • LoRA adapter: $adapterSizeStr • Backend state: $backendState • Vulkan runtime: ${if (isVulkanRuntimeReady) "SELF-CHECKED" else "UNAVAILABLE"}",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted,
                             fontFamily = FontFamily.Monospace,
@@ -294,7 +326,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                 }
             }
 
-            // REALTIME LOG SISTEM - dari data beneran
+            // TRAINING ACTIVITY
             item {
                 Box(
                     Modifier
@@ -303,63 +335,90 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                         .padding(14.dp)
                 ) {
                     Column {
-                        Text(text = "REALTIME LOG SISTEM:", style = MaterialTheme.typography.titleSmall, color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
+                        Text(text = "TRAINING ACTIVITY", style = MaterialTheme.typography.titleSmall, color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(8.dp))
-                        if (currentItem != null) {
-                            Text(text = "> Training: ${currentItem!!.title.take(60)}", style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp), color = ArgusTextSecondary, fontFamily = FontFamily.Monospace)
-                            Text(text = "> Sumber: ${currentItem!!.source} | Loss: $lastLoss", style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp), color = ArgusTextSecondary, fontFamily = FontFamily.Monospace)
-                        } else {
-                            Text(text = "> Idle - menunggu data baru", style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp), color = ArgusTextMuted, fontFamily = FontFamily.Monospace)
+                        Text(
+                            text = "> Status: $trainingStatusLabel",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = ArgusTextSecondary,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Text(
+                            text = "> Current item: ${activeTrainingItem?.let { displayTrainingItemTitle(it.title).take(60) } ?: "None"}",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = ArgusTextSecondary,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Text(
+                            text = "> Source: ${activeTrainingItem?.source ?: "—"} • Loss: $lastLoss",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = ArgusTextSecondary,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        activeDocument?.let { document ->
+                            Text(
+                                text = "> Active corpus: ${document.docTitle}",
+                                style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                                color = ArgusCyanGlow,
+                                fontFamily = FontFamily.Monospace
+                            )
                         }
-                        if (activeDoc != null) {
-                            Text(text = "> Corpus aktif: ${activeDoc!!.docTitle}", style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp), color = ArgusCyanGlow, fontFamily = FontFamily.Monospace)
-                        }
-                        Text(text = "> Checkpoint: auto-save tiap blok selesai", style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp), color = ArgusSuccess, fontFamily = FontFamily.Monospace)
+                        Text(
+                            text = "> Checkpoint cadence: every ${viewModel.checkpointInterval} optimizer updates",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = ArgusSuccess,
+                            fontFamily = FontFamily.Monospace
+                        )
                         Spacer(modifier = Modifier.height(8.dp))
-                        Text(text = "STATUS MODEL: A.R.G.U.S v2.0 • Stabil • Safety Guardrails: AKTIF", style = MaterialTheme.typography.labelSmall, color = ArgusSuccess, fontWeight = FontWeight.Bold)
+                        Text(
+                            text = "DEVICE SAFETY: ${if (safetyState.isSafeToTrain) "CLEAR" else "HOLD"} • $trainingStatusLabel",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (safetyState.isSafeToTrain && !isPaused) ArgusSuccess else ArgusWarning,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
             }
 
-            // ANTREAN
+            // TRAINING QUEUE
             item {
-                Text(text = "ANTREAN & HISTORI TRAINING", style = MaterialTheme.typography.titleMedium, color = ArgusCyanPrimary, fontWeight = FontWeight.Bold)
+                Text(text = "TRAINING QUEUE & RECENT ACTIVITY", style = MaterialTheme.typography.titleMedium, color = ArgusCyanPrimary, fontWeight = FontWeight.Bold)
             }
 
             item {
-                QueueSectionHeader(title = "1. Sedang Ditraining", count = if (currentItem != null) 1 else 0)
+                QueueSectionHeader(title = "1. Currently Processing", count = if (activeTrainingItem != null) 1 else 0)
                 Spacer(modifier = Modifier.height(8.dp))
-                if (currentItem != null) ActiveTrainingCard(currentItem!!)
-                else EmptyQueueCard("Tidak ada data yang sedang aktif (Idle)")
+                if (activeTrainingItem != null) ActiveTrainingCard(activeTrainingItem)
+                else EmptyQueueCard("No training item is currently active.")
             }
 
             item {
-                QueueSectionHeader(title = "2. Selanjutnya", count = nextQueue.size, onClear = { viewModel.clearTrainingQueue() })
+                QueueSectionHeader(title = "2. Next in Queue", count = nextQueue.size, onClear = { viewModel.clearTrainingQueue() })
                 Spacer(modifier = Modifier.height(8.dp))
                 if (nextQueue.isNotEmpty()) {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         nextQueue.take(5).forEach { QueuedItemCard(it) }
-                        if (nextQueue.size > 5) Text(text = "+ ${nextQueue.size - 5} blok lagi di antrean", style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted)
+                        if (nextQueue.size > 5) Text(text = "+ ${nextQueue.size - 5} more queued items", style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted)
                     }
-                } else EmptyQueueCard("Antrean kosong. Buka aplikasi lain / kirim dokumen di chat.")
+                } else EmptyQueueCard("The queue is empty. Add text or import a document from the Terminal.")
             }
 
             item {
-                QueueSectionHeader(title = "3. Sudah Ditraining", count = completedQueue.size, onClear = { viewModel.clearCompletedTraining() })
+                QueueSectionHeader(title = "3. Recently Completed", count = completedQueue.size, onClear = { viewModel.clearCompletedTraining() })
                 Spacer(modifier = Modifier.height(8.dp))
                 if (completedQueue.isNotEmpty()) {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         completedQueue.take(5).forEach { CompletedItemCard(it) }
-                        if (completedQueue.size > 5) Text(text = "+ ${completedQueue.size - 5} blok lagi di histori", style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted)
+                        if (completedQueue.size > 5) Text(text = "+ ${completedQueue.size - 5} more completed items", style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted)
                     }
-                } else EmptyQueueCard("Histori belum ada.")
+                } else EmptyQueueCard("No completed training items yet.")
             }
         }
     }
 }
 
 // =====================================================================
-// NEURON BACKGROUND - 45 titik agar performa ringan & lancar
+// DECORATIVE NEURAL BACKGROUND
 // =====================================================================
 @Composable
 fun NeuronBackground() {
@@ -392,7 +451,7 @@ fun NeuronBackground() {
 }
 
 // =====================================================================
-// MATA GLOW - 3 lapis efek cybernetic
+// ARGUS EYE INDICATOR
 // =====================================================================
 @Composable
 fun ArgusEyeGlow() {
@@ -419,7 +478,7 @@ fun ArgusEyeGlow() {
 }
 
 // =====================================================================
-// KOMPONEN CARD & METRICS
+// METRIC AND QUEUE COMPONENTS
 // =====================================================================
 @Composable
 fun StatMetricBox(label: String, value: String, unit: String, valueColor: Color, modifier: Modifier = Modifier) {
@@ -442,14 +501,26 @@ fun QueueSectionHeader(title: String, count: Int, onClear: (() -> Unit)? = null)
         Text(text = title, style = MaterialTheme.typography.titleMedium.copy(fontSize = 14.sp), color = ArgusCyanGlow, fontWeight = FontWeight.SemiBold)
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.clip(CircleShape).background(Color.White.copy(alpha = 0.07f)).padding(horizontal = 8.dp, vertical = 2.dp)) {
-                Text(text = "$count item", style = MaterialTheme.typography.labelSmall, color = ArgusCyanPrimary)
+                Text(text = "$count ${if (count == 1) "item" else "items"}", style = MaterialTheme.typography.labelSmall, color = ArgusCyanPrimary)
             }
             if (onClear != null && count > 0) {
                 Spacer(modifier = Modifier.width(6.dp))
-                Text(text = "Bersihkan", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = ArgusTextMuted, modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable { onClear() }.padding(horizontal = 4.dp, vertical = 2.dp))
+                Text(text = "Clear", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = ArgusTextMuted, modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable { onClear() }.padding(horizontal = 4.dp, vertical = 2.dp))
             }
         }
     }
+}
+
+
+/**
+ * Translates built-in Genesis seed titles for display only.
+ * Corpus content, fingerprints, and persisted document metadata remain unchanged.
+ */
+private fun displayTrainingItemTitle(title: String): String = when (title) {
+    "Prinsip Kemandirian AGI" -> "AGI Independence Principles"
+    "Privasi dan Sensor" -> "Privacy and Sensors"
+    "Arsitektur Transformer On-Device" -> "On-Device Transformer Architecture"
+    else -> title
 }
 
 @Composable
@@ -459,16 +530,16 @@ fun ActiveTrainingCard(item: TrainingData) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(modifier = Modifier.size(16.dp), color = ArgusCyanPrimary, strokeWidth = 2.dp)
                 Spacer(modifier = Modifier.width(8.dp))
-                Text(text = "AKTIF: ${item.source}", style = MaterialTheme.typography.labelSmall, color = ArgusCyanPrimary, fontWeight = FontWeight.Bold)
+                Text(text = "IN PROGRESS • ${item.source}", style = MaterialTheme.typography.labelSmall, color = ArgusCyanPrimary, fontWeight = FontWeight.Bold)
             }
             Spacer(modifier = Modifier.height(6.dp))
-            Text(text = item.title, style = MaterialTheme.typography.titleMedium.copy(fontSize = 13.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Medium)
+            Text(text = displayTrainingItemTitle(item.title), style = MaterialTheme.typography.titleMedium.copy(fontSize = 13.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Medium)
             if (item.totalChunks > 1) {
                 Spacer(modifier = Modifier.height(6.dp))
-                val progress = item.chunkIndex.toFloat() / item.totalChunks.toFloat()
+                val progress = (item.chunkIndex - 1).coerceAtLeast(0).toFloat() / item.totalChunks.toFloat()
                 LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)), color = ArgusCyanPrimary, trackColor = Color.White.copy(alpha = 0.08f))
                 Spacer(modifier = Modifier.height(4.dp))
-                Text(text = "Blok ${item.chunkIndex} dari ${item.totalChunks}", style = MaterialTheme.typography.labelSmall, color = ArgusCyanGlow, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+                Text(text = "Working on chunk ${item.chunkIndex} of ${item.totalChunks}", style = MaterialTheme.typography.labelSmall, color = ArgusCyanGlow, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
             }
             Spacer(modifier = Modifier.height(4.dp))
             Text(text = item.content.take(160) + if (item.content.length > 160) "..." else "", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp), color = ArgusTextSecondary)
@@ -480,8 +551,8 @@ fun ActiveTrainingCard(item: TrainingData) {
 fun QueuedItemCard(item: TrainingData) {
     Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color.White.copy(alpha = 0.04f)).padding(10.dp)) {
         Column {
-            Text(text = item.title, style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary)
-            Text(text = "Sumber: ${item.source} (${item.content.length} karakter)", style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted)
+            Text(text = displayTrainingItemTitle(item.title), style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary)
+            Text(text = "Source: ${item.source} (${item.content.length} characters)", style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted)
         }
     }
 }
@@ -491,8 +562,8 @@ fun CompletedItemCard(item: TrainingData) {
     val isFailed = item.status == TrainingStatus.FAILED
     Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color.White.copy(alpha = 0.03f)).padding(10.dp)) {
         Column {
-            Text(text = item.title, style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary)
-            val lossStr = if (isFailed) "Status: Gagal diproses" else item.finalLoss?.let { String.format(Locale.US, "Loss: %.4f", it) } ?: "Loss: belum ada"
+            Text(text = displayTrainingItemTitle(item.title), style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary)
+            val lossStr = if (isFailed) "Status: Failed" else item.finalLoss?.let { String.format(Locale.US, "Loss: %.4f", it) } ?: "Loss: unavailable"
             Text(text = "$lossStr | ${item.stepDurationMs}ms | ${item.source}", style = MaterialTheme.typography.labelSmall, color = if (isFailed) ArgusError else ArgusTextSecondary, fontFamily = FontFamily.Monospace)
         }
     }
@@ -506,7 +577,7 @@ fun EmptyQueueCard(text: String) {
 }
 
 // =====================================================================
-// ESTIMASI WAKTU (ETA)
+// ESTIMATED REMAINING TIME
 // =====================================================================
 private fun avgStepMsFrom(completed: List<TrainingData>): Long {
     val valid = completed.filter { it.status == TrainingStatus.COMPLETED && it.stepDurationMs > 0 }.take(20)
@@ -537,11 +608,11 @@ private fun remainingTrainingEtaMs(
 }
 
 private fun formatEta(ms: Long): String {
-    if (ms <= 0L) return "0 dtk"
+    if (ms <= 0L) return "0s"
     val s = ms / 1000
     return when {
-        s < 60 -> "$s dtk"
-        s < 3600 -> "${s / 60} mnt ${s % 60} dtk"
-        else -> "${s / 3600} jam ${(s % 3600) / 60} mnt"
+        s < 60 -> "${s}s"
+        s < 3600 -> "${s / 60}m ${s % 60}s"
+        else -> "${s / 3600}h ${(s % 3600) / 60}m"
     }
 }

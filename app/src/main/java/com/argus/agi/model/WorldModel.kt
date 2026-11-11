@@ -61,13 +61,17 @@ class WorldModel(
     val entitiesFlow: StateFlow<List<WorldEntity>> = _entitiesFlow.asStateFlow()
 
     private val _currentContextSummary =
-        MutableStateFlow("Sistem Siap. Menunggu stimulus lingkungan & layar.")
+        MutableStateFlow("System ready. Waiting for environment and screen input.")
     val currentContextSummary: StateFlow<String> = _currentContextSummary.asStateFlow()
 
     init {
         storeEntities(
             WorldEntity("identity_name", "A.R.G.U.S", "Core Architecture"),
-            WorldEntity("privacy_boundary", "100% On-Device, Zero Cloud Telemetry", "System Policy"),
+            WorldEntity(
+                "privacy_boundary",
+                "Local model inference and training; web, article, and speech services may contact external providers",
+                "System Policy"
+            ),
             WorldEntity("architecture_type",
                 "Autonomous Micro-Transformer with LoRA Adapters", "Neural Specification")
         )
@@ -79,9 +83,18 @@ class WorldModel(
                     val saved = r.getMemoriesSnapshot()
                     if (saved.isNotEmpty()) {
                         saved.forEach { entities[it.key] = it }
-                        pruneIfNeeded()
-                        publishSnapshot()
                     }
+
+                    // A persisted legacy policy must not restore the old "zero cloud" claim.
+                    val currentPrivacyPolicy = WorldEntity(
+                        key = "privacy_boundary",
+                        value = "Local model inference and training; web, article, and speech services may contact external providers",
+                        source = "System Policy"
+                    )
+                    entities[currentPrivacyPolicy.key] = currentPrivacyPolicy
+                    pruneIfNeeded()
+                    publishSnapshot()
+                    r.saveMemories(listOf(currentPrivacyPolicy))
                 }
             }
         }
@@ -136,7 +149,7 @@ class WorldModel(
         )
         val timeStr = TIME_FORMATTER.format(Instant.now().atZone(ZoneId.systemDefault()))
         _currentContextSummary.value =
-            "App: $packageName | Deteksi: \"$cleanSnippet\" ($timeStr)"
+            "App: $packageName | Detected: \"$cleanSnippet\" ($timeStr)"
     }
 
     private fun sanitizeSnippet(raw: String): String {
@@ -167,7 +180,7 @@ class WorldModel(
             return ReflectionEvaluation(
                 isConfident = false,
                 confidenceScore = 0.05f,
-                reasoningNote = "Respon kosong atau terlalu pendek untuk dievaluasi.",
+                reasoningNote = "Response is empty or too short to evaluate.",
                 suggestedAction = "RETRY_RESPONSE"
             )
         }
@@ -183,7 +196,7 @@ class WorldModel(
             return ReflectionEvaluation(
                 isConfident = false,
                 confidenceScore = 0.25f,
-                reasoningNote = "Model menyatakan ketidaktahuan. Perlu internalisasi.",
+                reasoningNote = "The model expressed uncertainty. Further internal review may be needed.",
                 suggestedAction = "AUTO_LEARN_QUERY"
             )
         }
@@ -195,9 +208,9 @@ class WorldModel(
                 isConfident = hasNumericAnswer,
                 confidenceScore = if (hasNumericAnswer) 0.90f else 0.40f,
                 reasoningNote = if (hasNumericAnswer)
-                    "Query aritmatika; respon memuat angka hasil."
+                    "Arithmetic query; the response contains a numeric result."
                 else
-                    "Query aritmatika, tapi respon tidak memuat angka.",
+                    "Arithmetic query; the response does not contain a numeric result.",
                 suggestedAction = if (hasNumericAnswer) null else "VERIFY_ARITHMETIC"
             )
         }
@@ -218,8 +231,8 @@ class WorldModel(
             isConfident = finalScore >= 0.60f,
             confidenceScore = finalScore,
             reasoningNote = buildString {
-                append("Skor panjang respon %.2f.".format(lengthScore))
-                if (mentionsKnownEntity) append(" Merujuk entitas world-model.")
+                append("Response length score %.2f.".format(lengthScore))
+                if (mentionsKnownEntity) append(" References a World Model entity.")
             },
             suggestedAction = if (finalScore < 0.60f) "AUTO_LEARN_QUERY" else null
         )
@@ -251,6 +264,6 @@ class WorldModel(
     ) {
         entities.keys.removeIf { key -> prefixes.any { key.startsWith(it) } }
         publishSnapshot()
-        _currentContextSummary.value = "Sistem Siap."
+        _currentContextSummary.value = "System ready."
     }
 }

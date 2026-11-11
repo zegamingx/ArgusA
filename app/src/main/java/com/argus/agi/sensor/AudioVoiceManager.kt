@@ -85,7 +85,7 @@ class AudioVoiceManager(
         try {
             tts = TextToSpeech(context.applicationContext, this)
         } catch (e: Exception) {
-            Log.e(TAG, "Gagal menginisialisasi TextToSpeech", e)
+            Log.e(TAG, "Failed to initialize TextToSpeech", e)
         }
     }
 
@@ -115,7 +115,7 @@ class AudioVoiceManager(
             _isTtsReady.value = true
             Log.i(TAG, "TTS on-device siap digunakan.")
         } else {
-            Log.w(TAG, "Inisialisasi TTS gagal dengan kode status: $status")
+            Log.w(TAG, "TextToSpeech initialization failed with status code: $status")
             _isTtsReady.value = false
         }
     }
@@ -220,7 +220,7 @@ class AudioVoiceManager(
         scope.launch(Dispatchers.Main) {
             try {
                 if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-                    onError("Pengenal suara on-device tidak tersedia di perangkat ini.")
+                    onError("On-device speech recognition is unavailable on this device.")
                     return@launch
                 }
 
@@ -264,21 +264,21 @@ class AudioVoiceManager(
                         }
 
                         val msg = when (error) {
-                            SpeechRecognizer.ERROR_AUDIO -> "Gangguan perekaman mikrofon audio. Pastikan tidak ada aplikasi lain memakai mic."
-                            SpeechRecognizer.ERROR_CLIENT -> "Sesi mikrofon sebelumnya sedang diatur ulang. Silakan tekan tombol mic sekali lagi."
-                            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Izin mikrofon diperlukan untuk perintah suara."
-                            SpeechRecognizer.ERROR_NETWORK -> "Koneksi jaringan suara terputus. Pastikan model bahasa offline telah terpasang di pengaturan perangkat."
-                            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Batas waktu koneksi pengenal suara habis."
-                            SpeechRecognizer.ERROR_NO_MATCH -> "Tidak ada suara atau kata yang terdengar jelas. Silakan bicara lebih dekat."
-                            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Layanan suara sedang sibuk. Mengatur ulang..."
-                            SpeechRecognizer.ERROR_SERVER -> "Layanan pengenal suara perangkat belum siap."
-                            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Waktu bicara selesai (tidak ada suara terdeteksi)."
-                            10 -> "Terlalu banyak permintaan suara dalam waktu singkat."
-                            11 -> "Model bahasa suara offline belum terunduh di perangkat. Silakan instal paket bahasa Indonesia di Pengaturan -> Google Suara."
-                            12 -> "Bahasa Indonesia belum didukung oleh mesin suara perangkat."
-                            13 -> "Paket bahasa suara sedang tidak tersedia."
-                            14 -> "Gagal memeriksa dukungan suara on-device."
-                            else -> "Pengenalan suara gagal (kode $error). Silakan coba lagi."
+                            SpeechRecognizer.ERROR_AUDIO -> "Microphone audio capture failed. Make sure another app is not using the microphone."
+                            SpeechRecognizer.ERROR_CLIENT -> "The previous microphone session is being reset. Tap the microphone button again."
+                            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission is required for voice input."
+                            SpeechRecognizer.ERROR_NETWORK -> "The speech service lost its network connection. Check the device speech service and installed language packs."
+                            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Speech recognition timed out while connecting to the service."
+                            SpeechRecognizer.ERROR_NO_MATCH -> "No clear speech was detected. Move closer to the microphone and try again."
+                            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "The speech service is busy. Resetting the session..."
+                            SpeechRecognizer.ERROR_SERVER -> "The device speech recognition service is not ready."
+                            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "The speech timeout expired because no voice was detected."
+                            10 -> "Too many voice requests were submitted in a short period."
+                            11 -> "The Indonesian offline speech model is not installed. Install the Indonesian language pack in the device speech settings."
+                            12 -> "Indonesian is not supported by the device speech engine."
+                            13 -> "The speech language pack is currently unavailable."
+                            14 -> "Could not check on-device speech recognition support."
+                            else -> "Speech recognition failed (error $error). Please try again."
                         }
                         onError(msg)
                     }
@@ -313,9 +313,9 @@ class AudioVoiceManager(
 
                 recognizer.startListening(intent)
             } catch (e: Exception) {
-                Log.e(TAG, "Gagal memulai speech listening", e)
+                Log.e(TAG, "Failed to start speech recognition", e)
                 _isListening.value = false
-                onError("Gagal mengaktifkan mikrofon: ${e.message}")
+                onError("Failed to activate the microphone: ${e.message}")
             }
         }
     }
@@ -385,7 +385,7 @@ class AudioVoiceManager(
                     kotlinx.coroutines.delay(500)
                 }
             } catch (e: SecurityException) {
-                Log.w(TAG, "Izin AudioRecord tidak tersedia untuk monitoring akustik", e)
+                Log.w(TAG, "AudioRecord permission is unavailable for acoustic monitoring", e)
             } catch (e: Exception) {
                 Log.e(TAG, "Acoustic monitoring error", e)
             } finally {

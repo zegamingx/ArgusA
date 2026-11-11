@@ -266,7 +266,7 @@ class HardwareProfile(private val context: Context) {
                     socModel.contains("sdm", true)) -> "Qualcomm Hexagon NPU"
 
             // Deteksi generik: jika tidak yakin, jangan klaim NPU secara spesifik
-            else -> "Tidak terdeteksi (kemungkinan CPU/GPU fallback)"
+            else -> "Not detected"
         }
     }
 
@@ -274,11 +274,10 @@ class HardwareProfile(private val context: Context) {
     // 4. Primary Accelerator
     // =====================================================================
 
-    private fun resolvePrimaryAccelerator(vulkan: VulkanInfo): String {
-        return if (vulkan.supported) {
-            "Vulkan ${vulkan.versionName} GPU Compute (AdamW optimizer; forward/backprop Kotlin CPU)"
+    private fun resolvePrimaryAccelerator(vulkan: VulkanInfo): String =
+        if (vulkan.supported) {
+            "Vulkan ${vulkan.versionName} GPU feature advertised (runtime verification required)"
         } else {
-            "Multi-Threaded Kotlin CPU (${Runtime.getRuntime().availableProcessors()} Cores)"
+            "Vulkan GPU feature not advertised; Kotlin CPU fallback"
         }
-    }
 }

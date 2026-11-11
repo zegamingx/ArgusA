@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">A.R.G.U.S</string>
-    <string name="accessibility_service_description">A.R.G.U.S Autonomous Screen Perception: Membaca teks pada layar secara lokal untuk melatih model AGI dan mengeksekusi aksi cerdas tanpa mengirim data ke server mana pun.</string>
+    <string name="accessibility_service_description">A.R.G.U.S Screen Text Perception: Reads accessible text from the active app window on this device and supports user-requested accessibility actions. Apps excluded in Argus settings are skipped.</string>
 </resources>

@@ -78,13 +78,13 @@ private data class NeuronNode3D(
 )
 
 private enum class BrainRegion(val label: String, val baseColor: Color) {
-    LEFT_CORTEX("Korteks Kiri", Color(0xFF00E5FF)),
-    RIGHT_CORTEX("Korteks Kanan", Color(0xFF00B0FF)),
-    FRONTAL_LOBE("Lobus Frontal", Color(0xFF18FFFF)),
-    OCCIPITAL_LOBE("Lobus Oksipital", Color(0xFF7C4DFF)),
-    TEMPORAL_LOBE("Lobus Temporal", Color(0xFF00BFA5)),
-    CORPUS_CALLOSUM("Jembatan Sinapsis", Color(0xFFFFD54F)),
-    CEREBELLUM("Serebelum", Color(0xFF64FFDA))
+    LEFT_CORTEX("Left Cortex", Color(0xFF00E5FF)),
+    RIGHT_CORTEX("Right Cortex", Color(0xFF00B0FF)),
+    FRONTAL_LOBE("Frontal Lobe", Color(0xFF18FFFF)),
+    OCCIPITAL_LOBE("Occipital Lobe", Color(0xFF7C4DFF)),
+    TEMPORAL_LOBE("Temporal Lobe", Color(0xFF00BFA5)),
+    CORPUS_CALLOSUM("Corpus Callosum", Color(0xFFFFD54F)),
+    CEREBELLUM("Cerebellum", Color(0xFF64FFDA))
 }
 
 private data class SynapseEdge(
@@ -186,7 +186,7 @@ fun NeuronBrain3DCard(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "3D NEURAL CORTEX NETWORK",
+                            text = "3D NEURAL NETWORK VISUALIZATION",
                             style = MaterialTheme.typography.titleMedium,
                             color = ArgusCyanPrimary,
                             fontWeight = FontWeight.Bold,
@@ -194,7 +194,7 @@ fun NeuronBrain3DCard(
                         )
                     }
                     Text(
-                        text = if (isTrainingActive) "Propagasi Sinapsis Aktif (Backpropagation Live)" else "Korteks Siap | Alpha Wave Istirahat",
+                        text = if (isTrainingActive) "Training active • visualization follows training state" else "Idle visualization",
                         style = MaterialTheme.typography.labelSmall,
                         color = if (isTrainingActive) ArgusCyanGlow else ArgusTextSecondary
                     )
@@ -374,7 +374,7 @@ fun NeuronBrain3DCard(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = "56 NEURAL CLUSTERS | 108 SYNAPSE AXONS",
+                            text = "VISUALIZATION • 56 NODES • 108 CONNECTIONS",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusCyanPrimary.copy(alpha = 0.8f),
                             fontFamily = FontFamily.Monospace,
@@ -395,7 +395,7 @@ fun NeuronBrain3DCard(
                         verticalAlignment = Alignment.Bottom
                     ) {
                         Text(
-                            text = "Sentuh & geser untuk memutar otak 3D",
+                            text = "Touch and drag to rotate the 3D visualization",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted.copy(alpha = 0.7f),
                             fontSize = 9.sp
@@ -431,7 +431,7 @@ fun NeuronBrain3DCard(
                 ) {
                     Column {
                         Text(
-                            text = "RAM PERANGKAT: ${hardwareInfo.totalRamGb} GB (Tersedia ${String.format(java.util.Locale.US, "%.1f", hardwareInfo.availRamGb)} GB)",
+                            text = "DEVICE RAM: ${hardwareInfo.totalRamGb} GB (${String.format(java.util.Locale.US, "%.1f", hardwareInfo.availRamGb)} GB available)",
                             style = MaterialTheme.typography.bodyMedium,
                             color = ArgusTextPrimary,
                             fontWeight = FontWeight.Bold,
@@ -439,7 +439,7 @@ fun NeuronBrain3DCard(
                             fontSize = 11.sp
                         )
                         Text(
-                            text = "Akselerator: ${hardwareInfo.primaryAccelerator} | Heap: ${hardwareInfo.maxHeapMb} MB",
+                            text = "Compute capability: ${hardwareInfo.primaryAccelerator} | App heap: ${hardwareInfo.maxHeapMb} MB",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusCyanGlow,
                             fontSize = 10.sp
@@ -473,7 +473,7 @@ fun NeuronBrain3DCard(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "PUTAR ULANG BOOT SEQUENCE GENESIS",
+                            text = "REPLAY GENESIS BOOT SEQUENCE",
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
                             letterSpacing = 0.5.sp

@@ -24,7 +24,7 @@ data class DeviceSafetyState(
     val isBatteryOptimizedIgnored: Boolean = false,
     val isForceOverrideActive: Boolean = false,
     val isSafeToTrain: Boolean = true,
-    val statusMessage: String = "Kondisi Aman"
+    val statusMessage: String = "Device is safe"
 )
 
 /**
@@ -75,7 +75,7 @@ class DeviceGuard(private val context: Context) {
                     Log.d(TAG, "Android OS Thermal status changed: $status")
                     refreshState()
                 }
-            }.onFailure { Log.w(TAG, "Gagal mendaftarkan ThermalStatusListener", it) }
+            }.onFailure { Log.w(TAG, "Failed to register the thermal status listener", it) }
         }
     }
 
@@ -163,17 +163,17 @@ class DeviceGuard(private val context: Context) {
 
         val statusMsg = when {
             isPhysicalThermalHazard ->
-                "BAHAYA SUHU: ${String.format(Locale.US, "%.1f", tempCelsius)}°C (Batas ${THERMAL_CEILING_CELSIUS}°C) — " +
-                        "Training ditangguhkan demi proteksi hardware (Mode Paksa ditolak demi keselamatan fisik)."
+                "THERMAL HAZARD: ${String.format(Locale.US, "%.1f", tempCelsius)}°C (limit ${THERMAL_CEILING_CELSIUS}°C). " +
+                        "Training is suspended to protect the device; force override cannot bypass thermal safety."
             isBatteryLow && isForce ->
-                "Mode Paksa Aktif: Baterai Rendah ($batteryPct%) dilewati atas izin pengguna."
+                "Force override active: the user allowed training to continue at low battery ($batteryPct%)."
             isBatteryLow ->
-                "Baterai Rendah ($batteryPct% < ${MIN_BATTERY_PCT}%) — Menunggu pengisi daya atau aktifkan Mode Paksa."
+                "Battery is low ($batteryPct% < ${MIN_BATTERY_PCT}%). Connect a charger or enable force override."
             isForce ->
-                "Mode Paksa Aktif (${batteryPct}%, ${String.format(Locale.US, "%.1f", tempCelsius)}°C)"
+                "Force override active (${batteryPct}%, ${String.format(Locale.US, "%.1f", tempCelsius)}°C)"
             else ->
-                "Kondisi Aman (${batteryPct}%, ${String.format(Locale.US, "%.1f", tempCelsius)}°C)" +
-                        (if (isCharging) " [Mengisi Daya]" else "")
+                "Device is safe (${batteryPct}%, ${String.format(Locale.US, "%.1f", tempCelsius)}°C)" +
+                        (if (isCharging) " [Charging]" else "")
         }
 
         _safetyState.value = DeviceSafetyState(
