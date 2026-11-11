@@ -191,7 +191,7 @@ object TextModalityProcessor {
         }
     }
 
-private fun firstNonBlankText(obj: JSONObject, keys: List<String>): String {
+    private fun firstNonBlankText(obj: JSONObject, keys: List<String>): String {
         for (key in keys) {
             val value = obj.opt(key)
             if (value is String && value.isNotBlank()) return value.trim()
