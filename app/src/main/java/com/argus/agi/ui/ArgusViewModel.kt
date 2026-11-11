@@ -441,7 +441,11 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         explicitWebQuery != null ->
                             "Web search request: $explicitWebQuery"
                         mathResult != null -> mathResult
-                        else -> neuralEngine.generate(multiTurnPrompt, maxNewTokens = 60)
+                        else -> neuralEngine.generate(
+                            multiTurnPrompt,
+                            maxNewTokens = 60,
+                            includeReasoningMarkers = true
+                        )
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Generation failed", e)

@@ -91,6 +91,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
         private val CONTROL_TOKENS: Set<String> = SPECIAL_IDS.keys +
                 setOf(PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, UNK_TOKEN)
+        private val REASONING_TOKENS: Set<String> = setOf(THINK_START, THINK_END)
     }
 
     // Atomic mutation via synchronized; reads are safe via CHM
@@ -582,12 +583,18 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
      *        <THINK>, </THINK>) dihapus dari output user-facing.
      *        Set true jika ingin merekonstruksi prompt terstruktur.
      */
-    fun decode(tokenIds: List<Int>, keepControlTokens: Boolean = false): String {
+    fun decode(
+        tokenIds: List<Int>,
+        keepControlTokens: Boolean = false,
+        keepReasoningTokens: Boolean = false
+    ): String {
         val sb = StringBuilder(tokenIds.size * 2)
         for (id in tokenIds) {
             val token = idToToken[id] ?: continue
             if (token.isEmpty()) continue
-            if (!keepControlTokens && token in CONTROL_TOKENS) continue
+            val preserveToken = keepControlTokens ||
+                (keepReasoningTokens && token in REASONING_TOKENS)
+            if (!preserveToken && token in CONTROL_TOKENS) continue
             sb.append(token)
         }
         return decodeUnicodeFallbacks(sb.toString())

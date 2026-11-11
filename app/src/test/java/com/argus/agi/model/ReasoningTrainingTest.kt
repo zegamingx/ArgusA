@@ -54,6 +54,11 @@ class ReasoningTrainingTest {
         val ids = tokenizer.encode(formatted, autoRegister = false)
         assertTrue(ids.contains(Tokenizer.THINK_START_ID))
         assertTrue(ids.contains(Tokenizer.THINK_END_ID))
+        assertFalse(tokenizer.decode(ids).contains(Tokenizer.THINK_START))
+        val decodedWithReasoning = tokenizer.decode(ids, keepReasoningTokens = true)
+        assertTrue(decodedWithReasoning.contains(Tokenizer.THINK_START))
+        assertTrue(decodedWithReasoning.contains(Tokenizer.THINK_END))
+        assertFalse(decodedWithReasoning.contains(Tokenizer.USER_TOKEN))
     }
 
     @Test

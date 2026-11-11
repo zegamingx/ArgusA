@@ -98,9 +98,6 @@ object TextModalityProcessor {
     }
 
     /**
-     * Mendeteksi modalitas konten teks.
-     */
-    /**
      * Canonicalizes a pretty-printed training object or an array of JSONL-style
      * records. Other JSON documents are left untouched.
      */
@@ -154,18 +151,8 @@ object TextModalityProcessor {
         }
     }
 
-    /**
-     * Accepts a plain reasoning string, an array of strings, or an array of
-     * objects containing step/text/content/reasoning/explanation.
-     */
-    private fun extractReasoningText(obj: JSONObject): String? {
-        val raw = when {
-            obj.has("reasoning") && !obj.isNull("reasoning") -> obj.opt("reasoning")
-            obj.has("steps") && !obj.isNull("steps") -> obj.opt("steps")
-            else -> null
-        }
-
-        val reasoning = when (raw) {
+    private fun normalizeReasoningValue(raw: Any?): String {
+        return when (raw) {
             is String -> raw.trim()
             is JSONArray -> {
                 val steps = mutableListOf<String>()
@@ -178,7 +165,19 @@ object TextModalityProcessor {
             is JSONObject -> readReasoningStep(raw)
             else -> ""
         }
-        return reasoning.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Accepts a plain reasoning string, an array of strings, or an array of
+     * objects containing step/text/content/reasoning/explanation.
+     * An empty reasoning field falls back to the alternative steps field.
+     */
+    private fun extractReasoningText(obj: JSONObject): String? {
+        val reasoning = normalizeReasoningValue(obj.opt("reasoning"))
+        val resolved = reasoning.ifBlank {
+            normalizeReasoningValue(obj.opt("steps"))
+        }
+        return resolved.takeIf { it.isNotBlank() }
     }
 
     private fun formatInstructionResponse(
@@ -204,6 +203,9 @@ object TextModalityProcessor {
         }
     }
 
+    /**
+     * Mendeteksi modalitas konten teks.
+     */
     fun detectModality(text: String): TextModality {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return TextModality.GENERAL_PROSE
@@ -574,27 +576,26 @@ object TextModalityProcessor {
                         val extra = if (sumber.isNotBlank()) " [sumber: $sumber]" else ""
                         "Kata: $kata -> Kata dasar: $dasar$extra"
                     }
-                    obj.has("prompt") && obj.has("completion") ->
+                    isTrainingRecord(obj) -> {
+                        val explicitInstruction = firstNonBlankText(
+                            obj,
+                            listOf("instruction", "prompt")
+                        )
+                        val question = firstNonBlankText(obj, listOf("question"))
+                        val isQuestionAnswer = explicitInstruction.isBlank() && question.isNotBlank()
+                        val instruction = if (isQuestionAnswer) "Tanya: $question" else explicitInstruction
+                        val responseText = firstNonBlankText(
+                            obj,
+                            listOf("response", "completion", "answer")
+                        )
+                        val response = if (isQuestionAnswer) "Jawab: $responseText" else responseText
                         formatInstructionResponse(
-                            instruction = obj.optString("prompt"),
+                            instruction = instruction,
                             input = obj.optString("input"),
                             reasoning = reasoning,
-                            response = obj.optString("completion")
+                            response = response
                         )
-                    obj.has("instruction") && obj.has("response") ->
-                        formatInstructionResponse(
-                            instruction = obj.optString("instruction"),
-                            input = obj.optString("input"),
-                            reasoning = reasoning,
-                            response = obj.optString("response")
-                        )
-                    obj.has("question") && obj.has("answer") ->
-                        formatInstructionResponse(
-                            instruction = "Tanya: ${obj.optString("question")}",
-                            input = "",
-                            reasoning = reasoning,
-                            response = "Jawab: ${obj.optString("answer")}"
-                        )
+                    }
                     else -> {
                         val pairs = mutableListOf<String>()
                         val keys = obj.keys()

@@ -705,7 +705,8 @@ class ArgusNeuralEngine private constructor(
     suspend fun generate(
         prompt: String,
         maxNewTokens: Int = 60,
-        temperature: Float = 0.7f
+        temperature: Float = 0.7f,
+        includeReasoningMarkers: Boolean = false
     ): String = withContext(Dispatchers.Default) {
         synchronized(modelLock) {
             val formattedPrompt = if (prompt.contains(Tokenizer.USER_TOKEN)) {
@@ -892,7 +893,10 @@ class ArgusNeuralEngine private constructor(
                 currentPos++
             }
 
-            val decoded = tokenizer.decode(generatedTokens)
+            val decoded = tokenizer.decode(
+                generatedTokens,
+                keepReasoningTokens = includeReasoningMarkers
+            )
             if (decoded.isBlank()) "..." else decoded
         }
     }
