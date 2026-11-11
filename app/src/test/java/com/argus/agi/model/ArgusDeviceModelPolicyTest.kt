@@ -84,6 +84,20 @@ class ArgusDeviceModelPolicyTest {
     }
 
     @Test
+    fun rejectsDeviceMemoryBudgetsBelowTheMinimumExecutableModel() {
+        val failure = runCatching {
+            ArgusDeviceModelPolicy.select(
+                totalRamGb = 2,
+                maxHeapMb = 64L,
+                availableRamGb = 0.1f,
+                cpuCores = 4
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+    }
+
+    @Test
     fun neverReturnsTrainingBatchOutsideOneThroughEight() {
         val profiles = listOf(
             ArgusDeviceModelPolicy.select(2, 128L, 0.3f, 4),
