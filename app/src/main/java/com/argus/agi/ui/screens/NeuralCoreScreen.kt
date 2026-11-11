@@ -42,6 +42,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.argus.agi.model.DeviceModelCapacityPolicy
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingStatus
 import com.argus.agi.sensor.DeviceSafetyState
@@ -69,6 +70,10 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
     val adapterBytes = viewModel.getAdapterSizeBytes()
     val isPaused by viewModel.isTrainingPaused.collectAsState()
     val safetyState by viewModel.safetyState.collectAsState()
+    val hardwareInfo by viewModel.hardwareInfo.collectAsState()
+    val inferenceCapacity = remember(hardwareInfo.availRamGb) {
+        DeviceModelCapacityPolicy.recommend(hardwareInfo.availRamGb.toDouble())
+    }
     val currentItem by viewModel.currentTrainingItem.collectAsState()
     val nextQueue by viewModel.nextQueue.collectAsState()
     val completedQueue by viewModel.completedQueue.collectAsState()
@@ -256,6 +261,44 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                         StatMetricBox(label = "VOCABULARY", value = "$vocabSize", unit = "tokens", valueColor = ArgusCyanGlow, modifier = Modifier.weight(1f))
                         StatMetricBox(label = "WORLD MODEL", value = "${worldEntities.size}", unit = "records", valueColor = ArgusSuccess, modifier = Modifier.weight(1f))
                     }
+                }
+            }
+
+            // INFERENCE CAPACITY — informational target only; not the active training model.
+            item {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.White.copy(alpha = 0.04f), RoundedCornerShape(18.dp))
+                        .padding(14.dp)
+                ) {
+                    Text(
+                        text = "INFERENCE CAPACITY ESTIMATE",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = ArgusTextPrimary,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Available system RAM: " +
+                            String.format(Locale.US, "%.1f GB", hardwareInfo.availRamGb),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ArgusTextSecondary,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        text = inferenceCapacity.parameterRangeLabel,
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = ArgusCyanGlow,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "RAM-only Q4 planning range. The active model remains the separate " +
+                            "FP32 training engine. A model-specific memory and backend check is required " +
+                            "before any quantized model can be loaded.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = ArgusTextMuted
+                    )
                 }
             }
 

@@ -97,6 +97,15 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - Corpus status records whether training is ready, active, complete, or partial after a failed chunk.
 - Room schema version 2 adds corpus tables and an optional training-item document reference through an additive version 1 to 2 migration. Existing chat, memory, and training-queue rows are preserved; destructive migration fallback is not enabled. Legacy queue rows remain valid but are not retroactively grouped into corpus documents because their original document boundaries and fingerprints were not stored.
 
+## Device-adaptive inference capacity
+
+- The initial RAM-to-parameter policy uses conservative currently available system memory (Android available memory minus the low-memory threshold), not installed RAM.
+- The planning anchors are 1 GB: 0.5B–1B; 2 GB: 1.5B–2.5B; 3 GB: 2.5B–3.5B; 4 GB: 3B–5B; 5 GB: 4B–6B; 6 GB: 5B–7B; 7 GB: 6B–8B; 8 GB: 7B–9B; 10 GB: 9B–12B; 12 GB: 12B–14B; 16 GB: 18B–21B; 24 GB: 28B–32B; and 32 GB: 38B–42B.
+- Values between anchors are linearly interpolated. Above 32 GB, the estimate grows by 1.3B–1.5B parameters per additional GB.
+- These values are RAM-only planning targets, not guaranteed model-load limits. A future inference loader must inspect the actual model quantization and architecture metadata, estimate KV cache and runtime workspace, and enforce a memory safety reserve before loading.
+- The existing custom FP32 training engine remains independent from inference sizing. Its 16-byte-per-parameter state floor accounts for parameters, gradients, and two Adam moments; activation and temporary-buffer memory are additional.
+- A GGUF/llama.cpp inference loader is not yet integrated. The current custom neural engine is not a multi-billion-parameter quantized inference runtime.
+
 ## On-device training scope
 
 Fresh model initialization selects tensor dimensions using total RAM, app heap, and current available RAM. Existing ARG3 checkpoints retain their saved tensor dimensions so an application update does not silently discard the user's model.
