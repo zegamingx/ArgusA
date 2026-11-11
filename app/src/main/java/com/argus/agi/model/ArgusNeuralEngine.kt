@@ -557,12 +557,14 @@ class ArgusNeuralEngine private constructor(
 
     private fun resizeVocabCapacityTo(targetCap: Int) {
         if (targetCap <= 0 || targetCap == vocabCap) return
-        val newEmbed = FloatArray(targetCap * dModel)
-        val newHead = FloatArray(targetCap * dModel)
-        val newMEmbed = FloatArray(targetCap * dModel)
-        val newVEmbed = FloatArray(targetCap * dModel)
-        val newMHead = FloatArray(targetCap * dModel)
-        val newVHead = FloatArray(targetCap * dModel)
+        requireSafeVocabularyCapacity(targetCap)
+        val targetElements = Math.multiplyExact(targetCap, dModel)
+        val newEmbed = FloatArray(targetElements)
+        val newHead = FloatArray(targetElements)
+        val newMEmbed = FloatArray(targetElements)
+        val newVEmbed = FloatArray(targetElements)
+        val newMHead = FloatArray(targetElements)
+        val newVHead = FloatArray(targetElements)
 
         System.arraycopy(wEmbed, 0, newEmbed, 0, min(wEmbed.size, newEmbed.size))
         System.arraycopy(wHead, 0, newHead, 0, min(wHead.size, newHead.size))
@@ -573,7 +575,7 @@ class ArgusNeuralEngine private constructor(
 
         if (targetCap > vocabCap) {
             val stdEmbed = 1.0f / sqrt(dModel.toFloat())
-            for (i in (vocabCap * dModel) until (targetCap * dModel)) {
+            for (i in (vocabCap * dModel) until targetElements) {
                 newEmbed[i] = (Random.nextFloat() * 2f - 1f) * stdEmbed
                 newHead[i] = (Random.nextFloat() * 2f - 1f) * stdEmbed
             }

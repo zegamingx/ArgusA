@@ -60,10 +60,13 @@ class ArgusCheckpointCompatibilityTest {
             )
 
             val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
+            assertTrue(restored.loadCheckpointIfExists())
             assertEquals(original.tokenizer.exportVocab(), restored.tokenizer.exportVocab())
             assertEquals(learnedTokenId, restored.tokenizer.encode(learnedToken).single())
             assertEquals(original.countTrainableParameters(), restored.countTrainableParameters())
             assertEquals(original.countTotalParameters(), restored.countTotalParameters())
+            assertTrue(restored.saveCheckpoint())
+            assertTrue(checkpoint.readBytes().contentEquals(checkpointBytes))
         } finally {
             restoreCheckpoint(checkpoint, previousCheckpoint)
         }
