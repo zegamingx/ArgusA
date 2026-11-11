@@ -348,6 +348,29 @@ class ArgusNeuralEngine private constructor(
         private const val CHECKPOINT_INTERVAL = 8
 
         /**
+         * Builds the assistant prefix used for ordinary completion or reasoning generation.
+         * Reasoning mode starts at the dedicated THINK token so the model is prompted with
+         * the same serialized sequence used by reasoning training examples.
+         */
+        internal fun formatGenerationPrompt(prompt: String, reasoningMode: Boolean): String {
+            val assistantPrompt = if (prompt.contains(Tokenizer.USER_TOKEN)) {
+                if (prompt.endsWith(Tokenizer.ASSISTANT_TOKEN)) {
+                    prompt
+                } else {
+                    "$prompt ${Tokenizer.ASSISTANT_TOKEN}"
+                }
+            } else {
+                "${Tokenizer.USER_TOKEN}$prompt${Tokenizer.ASSISTANT_TOKEN}"
+            }
+
+            return if (reasoningMode && !assistantPrompt.endsWith(Tokenizer.THINK_START)) {
+                "$assistantPrompt${Tokenizer.THINK_START}"
+            } else {
+                assistantPrompt
+            }
+        }
+
+        /**
          * Preserve an existing ARG3 model's tensor dimensions when reopening the app.
          * Fresh installations use a deterministic RAM/heap tier instead.
          */
@@ -706,15 +729,11 @@ class ArgusNeuralEngine private constructor(
         prompt: String,
         maxNewTokens: Int = 60,
         temperature: Float = 0.7f,
-        includeReasoningMarkers: Boolean = false
+        includeReasoningMarkers: Boolean = false,
+        reasoningMode: Boolean = false
     ): String = withContext(Dispatchers.Default) {
         synchronized(modelLock) {
-            val formattedPrompt = if (prompt.contains(Tokenizer.USER_TOKEN)) {
-                if (prompt.endsWith(Tokenizer.ASSISTANT_TOKEN)) prompt
-                else "$prompt ${Tokenizer.ASSISTANT_TOKEN}"
-            } else {
-                "${Tokenizer.USER_TOKEN}$prompt${Tokenizer.ASSISTANT_TOKEN}"
-            }
+            val formattedPrompt = formatGenerationPrompt(prompt, reasoningMode)
 
             // PENTING: autoRegister = false saat inference agar kamus token stabil
             val rawTokens = tokenizer.encode(formattedPrompt, autoRegister = false)
@@ -895,7 +914,7 @@ class ArgusNeuralEngine private constructor(
 
             val decoded = tokenizer.decode(
                 generatedTokens,
-                keepReasoningTokens = includeReasoningMarkers
+                keepReasoningTokens = includeReasoningMarkers || reasoningMode
             )
             if (decoded.isBlank()) "..." else decoded
         }
