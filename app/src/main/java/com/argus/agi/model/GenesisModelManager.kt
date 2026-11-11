@@ -289,8 +289,9 @@ class GenesisModelManager(
         logs += "LoRA adapters: ${String.format(Locale.US, "%.2f KB", adapterBytes / 1024.0)} " +
                 "(Rank ${neuralEngine.loraRank})."
         logs += "Total structured parameters: $totalParams (FP32)."
-        val trainingStateFloorBytes = TrainingMemoryPlanner.minimumTrainingStateBytes(totalParams)
-        logs += "Full-parameter FP32 training-state floor: " +
+        val trainingStateFloorBytes =
+            TrainingMemoryPlanner.minimumAccumulatedTrainingStateBytes(totalParams)
+        logs += "Full-parameter FP32 training-state floor including the batch-gradient buffer: " +
                 String.format(Locale.US, "%.1f MiB", trainingStateFloorBytes / (1024.0 * 1024.0)) +
                 " (weights, gradients, Adam moments; excludes activations and workspaces)."
         throttleStage()
