@@ -41,7 +41,10 @@ data class EngineConfig(
     val loraRank: Int = 4,
     val layerCount: Int = 1,
     val isFullTrainingEnabled: Boolean = true,
-    val tokenizerConfig: TokenizerConfig = TokenizerConfig()
+    val tokenizerConfig: TokenizerConfig = TokenizerConfig(),
+    val modelTier: ArgusDeviceModelTier = ArgusDeviceModelTier.COMPACT,
+    val trainingBatchSize: Int = modelTier.defaultTrainingBatchSize,
+    val gradientAccumulationEnabled: Boolean = true
 ) {
     init {
         require(dModel > 0) { "dModel must be positive." }
@@ -55,6 +58,9 @@ data class EngineConfig(
         }
         require(layerCount in 1..32) {
             "layerCount must be between 1 and 32."
+        }
+        require(trainingBatchSize in 1..8) {
+            "Training batch size must be between 1 and 8."
         }
 
         // This FP32 training engine still uses JVM arrays. Reject checkpoint
@@ -73,7 +79,11 @@ data class EngineConfig(
         val parameterCount = ArgusArchitectureParameterEstimator
             .estimate(estimatedArchitecture)
             .totalTrainableParameters
-        val trainingFloorBytes = TrainingMemoryPlanner.minimumTrainingStateBytes(parameterCount)
+        val trainingFloorBytes = if (gradientAccumulationEnabled) {
+            TrainingMemoryPlanner.minimumAccumulatedTrainingStateBytes(parameterCount)
+        } else {
+            TrainingMemoryPlanner.minimumTrainingStateBytes(parameterCount)
+        }
         val positionElements = Math.multiplyExact(maxSeqLen.toLong(), hidden)
         require(positionElements <= Int.MAX_VALUE.toLong()) {
             "Position tensor dimensions exceed JVM array limits."
@@ -106,16 +116,8 @@ data class EngineConfig(
     }
 
     val architectureLabel: String
-        get() = when {
-            dModel >= 128 && dFf >= 512 ->
-                "Flagship Dynamic Core"
-            dModel >= 96 && dFf >= 384 ->
-                "High Memory Neural Core"
-            dModel >= 64 && dFf >= 256 ->
-                "Balanced Neural Core"
-            else ->
-                "Compact Neural Core"
-        } + " (${layerCount}L, d_model $dModel, d_ff $dFf, context $maxSeqLen, LoRA rank $loraRank)"
+        get() = "${modelTier.displayName} (${layerCount}L, d_model $dModel, d_ff $dFf, " +
+            "context $maxSeqLen, LoRA rank $loraRank, batch $trainingBatchSize)"
 
     companion object {
         /**
@@ -125,19 +127,98 @@ data class EngineConfig(
         fun forDevice(
             totalRamGb: Int,
             maxHeapMb: Long,
-            availableRamGb: Float = totalRamGb.toFloat()
-        ): EngineConfig = when {
-            totalRamGb >= 12 && maxHeapMb >= 512L && availableRamGb >= 3.0f ->
-                EngineConfig(dModel = 128, nHeads = 4, dFf = 512, maxSeqLen = 128, loraRank = 4)
+            availableRamGb: Float = totalRamGb.toFloat(),
+            cpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+        ): EngineConfig {
+            val profile = ArgusDeviceModelPolicy.select(
+                totalRamGb = totalRamGb,
+                maxHeapMb = maxHeapMb,
+                availableRamGb = availableRamGb,
+                cpuCores = cpuCores
+            )
+            val shape = selectExecutableShape(profile.targetParameterCount)
+            return EngineConfig(
+                dModel = shape.dModel,
+                nHeads = shape.nHeads,
+                dFf = shape.dFf,
+                maxSeqLen = when (profile.tier) {
+                    ArgusDeviceModelTier.COMPACT -> 64
+                    ArgusDeviceModelTier.BALANCED -> 96
+                    ArgusDeviceModelTier.PERFORMANCE,
+                    ArgusDeviceModelTier.FLAGSHIP -> 128
+                },
+                loraRank = shape.loraRank,
+                layerCount = shape.layerCount,
+                modelTier = profile.tier,
+                trainingBatchSize = profile.trainingBatchSize
+            )
+        }
 
-            totalRamGb >= 8 && maxHeapMb >= 384L && availableRamGb >= 2.0f ->
-                EngineConfig(dModel = 96, nHeads = 4, dFf = 384, maxSeqLen = 128, loraRank = 4)
+        private data class ExecutableShape(
+            val dModel: Int,
+            val nHeads: Int,
+            val dFf: Int,
+            val layerCount: Int,
+            val loraRank: Int,
+            val parameterCount: Long
+        )
 
-            totalRamGb >= 6 && maxHeapMb >= 256L && availableRamGb >= 2.0f ->
-                EngineConfig(dModel = 64, nHeads = 4, dFf = 256, maxSeqLen = 96, loraRank = 2)
+        /**
+         * Chooses the largest executable Transformer shape below the device's safe
+         * parameter target. The full 1M–7B family range is a design envelope; the
+         * active FP32 engine is deliberately constrained by its JVM heap budget.
+         */
+        private fun selectExecutableShape(targetParameters: Long): ExecutableShape {
+            val minimumParameters = ArgusDeviceModelProfile.MINIMUM_MODEL_PARAMETERS
+            val candidates = ArrayList<ExecutableShape>()
+            val hiddenSizes = intArrayOf(
+                128, 160, 192, 256, 320, 384, 512, 640, 768, 1024,
+                1280, 1536, 2048, 2560, 3072, 4096
+            )
+            val feedForwardMultipliers = intArrayOf(2, 3, 4)
+            val adapterRanks = intArrayOf(2, 4, 8)
 
-            else ->
-                EngineConfig(dModel = 48, nHeads = 4, dFf = 128, maxSeqLen = 64, loraRank = 2)
+            for (hidden in hiddenSizes) {
+                val heads = (hidden / 64).coerceIn(2, 16)
+                if (hidden % heads != 0) continue
+                for (multiplier in feedForwardMultipliers) {
+                    val feedForward = Math.multiplyExact(hidden, multiplier)
+                    for (rank in adapterRanks) {
+                        if (rank > hidden) continue
+                        for (layers in 1..32) {
+                            val architecture = ArgusArchitectureConfig(
+                                layerCount = layers,
+                                hiddenSize = hidden,
+                                attentionHeadCount = heads,
+                                feedForwardSize = feedForward,
+                                vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+                                contextLength = 64,
+                                adapterRank = rank
+                            )
+                            val parameterCount = ArgusArchitectureParameterEstimator
+                                .estimate(architecture)
+                                .totalTrainableParameters
+                            if (
+                                parameterCount in minimumParameters..targetParameters
+                            ) {
+                                candidates += ExecutableShape(
+                                    dModel = hidden,
+                                    nHeads = heads,
+                                    dFf = feedForward,
+                                    layerCount = layers,
+                                    loraRank = rank,
+                                    parameterCount = parameterCount
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            return candidates.maxByOrNull(ExecutableShape::parameterCount)
+                ?: throw IllegalArgumentException(
+                    "The device budget cannot fit Argus's minimum 1M-parameter FP32 training model."
+                )
         }
     }
 }
@@ -168,6 +249,13 @@ data class NeuralTrainingStepResult(
     val vocabularySize: Int
 )
 
+/** Metrics for one real optimizer update over a serial micro-batch of independent samples. */
+data class NeuralTrainingBatchResult(
+    val samples: List<NeuralTrainingStepResult>,
+    val optimizerUpdateCount: Int,
+    val totalPredictionTargetCount: Int
+)
+
 internal data class GradientCheckResult(
     val parameterName: String,
     val parameterIndex: Int,
@@ -179,9 +267,9 @@ internal data class GradientCheckResult(
 )
 
 /**
- * On-Device Neural Engine A.R.G.U.S:
- * Micro-Transformer SwiGLU with full-parameter backpropagation and LoRA adapters.
- * Uses sequential gradient accumulation and Adam without premature in-place mutation.
+ * Argus-native on-device causal Transformer with configurable SwiGLU blocks and Q/V LoRA.
+ * Supports full-parameter backpropagation, serial micro-batch gradient accumulation,
+ * AdamW updates, and Argus-owned checkpoint serialization.
  */
 class ArgusNeuralEngine private constructor(
     private val context: Context,
@@ -325,6 +413,12 @@ class ArgusNeuralEngine private constructor(
 
     private val modelLock = Any()
 
+    private class BatchGradientAccumulator(
+        val gradients: Array<FloatArray>
+    ) {
+        var targetCount: Int = 0
+    }
+
     private data class GradientProbe(
         val parameterName: String,
         var parameterIndex: Int,
@@ -378,7 +472,8 @@ class ArgusNeuralEngine private constructor(
             context: Context,
             totalRamGb: Int,
             maxHeapMb: Long,
-            availableRamGb: Float = totalRamGb.toFloat()
+            availableRamGb: Float = totalRamGb.toFloat(),
+            cpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
         ): EngineConfig {
             val checkpoint = File(context.filesDir, "argus_model_weights.bin")
             val savedConfig = runCatching {
@@ -397,7 +492,65 @@ class ArgusNeuralEngine private constructor(
                 }
             }.getOrNull()
 
-            return savedConfig ?: EngineConfig.forDevice(totalRamGb, maxHeapMb, availableRamGb)
+            val deviceConfig = runCatching {
+                EngineConfig.forDevice(
+                    totalRamGb = totalRamGb,
+                    maxHeapMb = maxHeapMb,
+                    availableRamGb = availableRamGb,
+                    cpuCores = cpuCores
+                )
+            }.getOrNull()
+
+            val resolvedConfig = savedConfig ?: requireNotNull(deviceConfig) {
+                "This device cannot currently allocate the minimum 1M-parameter Argus model safely."
+            }
+            val savedParameterCount = savedConfig?.let { saved ->
+                ArgusArchitectureParameterEstimator.estimate(
+                    ArgusArchitectureConfig(
+                        layerCount = saved.layerCount,
+                        hiddenSize = saved.dModel,
+                        attentionHeadCount = saved.nHeads,
+                        feedForwardSize = saved.dFf,
+                        vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+                        contextLength = saved.maxSeqLen,
+                        adapterRank = saved.loraRank
+                    )
+                ).totalTrainableParameters
+            }
+            val currentDeviceParameterCapacity = deviceConfig?.let { selected ->
+                ArgusArchitectureParameterEstimator.estimate(
+                    ArgusArchitectureConfig(
+                        layerCount = selected.layerCount,
+                        hiddenSize = selected.dModel,
+                        attentionHeadCount = selected.nHeads,
+                        feedForwardSize = selected.dFf,
+                        vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+                        contextLength = selected.maxSeqLen,
+                        adapterRank = selected.loraRank
+                    )
+                ).totalTrainableParameters
+            }
+            val accumulatedTrainingIsSafe = deviceConfig != null &&
+                (savedConfig == null ||
+                    (
+                        savedParameterCount != null &&
+                            currentDeviceParameterCapacity != null &&
+                            savedParameterCount <= currentDeviceParameterCapacity &&
+                            runCatching {
+                                savedConfig.copy(gradientAccumulationEnabled = true)
+                            }.isSuccess
+                    ))
+            val selectedTier = deviceConfig?.modelTier ?: resolvedConfig.modelTier
+            val selectedBatchSize = if (accumulatedTrainingIsSafe) {
+                deviceConfig?.trainingBatchSize ?: 1
+            } else {
+                1
+            }
+            return resolvedConfig.copy(
+                modelTier = selectedTier,
+                trainingBatchSize = selectedBatchSize,
+                gradientAccumulationEnabled = accumulatedTrainingIsSafe
+            )
         }
 
         private fun readCheckpointPrefix(file: File): ByteArray {
@@ -452,7 +605,8 @@ class ArgusNeuralEngine private constructor(
                 isFullTrainingEnabled = true,
                 tokenizerConfig = TokenizerConfig(
                     algorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1
-                )
+                ),
+                gradientAccumulationEnabled = false
             )
         }
 
@@ -536,7 +690,8 @@ class ArgusNeuralEngine private constructor(
                 loraRank = savedLoraRank,
                 layerCount = layerCount,
                 isFullTrainingEnabled = true,
-                tokenizerConfig = tokenizerConfig
+                tokenizerConfig = tokenizerConfig,
+                gradientAccumulationEnabled = false
             )
         }
 
@@ -1155,19 +1310,172 @@ class ArgusNeuralEngine private constructor(
 
     fun trainStep(text: String): Float = trainStepDetailed(text).loss
 
-    fun trainStepDetailed(text: String): NeuralTrainingStepResult {
+    fun trainStepDetailed(text: String): NeuralTrainingStepResult =
+        trainBatchDetailed(listOf(text)).samples.single()
+
+    /**
+     * Performs a serial micro-batch of independent sequences with one shared AdamW update.
+     * Activations are released between samples; only the accumulated parameter gradients
+     * remain resident. The accepted batch size is strictly bounded to 1..8.
+     */
+    fun trainBatchDetailed(texts: List<String>): NeuralTrainingBatchResult {
+        require(texts.size in 1..8) {
+            "Training batch size must be between 1 and 8."
+        }
+        if (!config.gradientAccumulationEnabled) {
+            require(texts.size == 1) {
+                "This legacy checkpoint requires single-sample compatibility training."
+            }
+            return trainSingleSampleSequential(texts.single())
+        }
+
+        var shouldSaveCheckpoint = false
+        val result = synchronized(modelLock) {
+            val initialAdamStep = adamStep
+            ensureVocabCapacity(tokenizer.vocabSize)
+            val accumulator = createBatchGradientAccumulator()
+            val sampleResults = ArrayList<NeuralTrainingStepResult>(texts.size)
+
+            for (text in texts) {
+                val tokens = tokenizer.encode(text, autoRegister = false)
+                if (tokens.size < 2) {
+                    sampleResults += NeuralTrainingStepResult(
+                        loss = Float.NaN,
+                        inputTokenCount = tokens.size,
+                        predictionTargetCount = 0,
+                        contextWindowCount = 0,
+                        optimizerUpdateCount = 0,
+                        vocabularySize = tokenizer.vocabSize
+                    )
+                    continue
+                }
+
+                ensureVocabCapacity(tokenizer.vocabSize)
+                val currentVocab = tokenizer.vocabSize
+                var contextWindowCount = 0
+                var predictionTargetCount = 0
+                var weightedLoss = 0f
+                var trainedTargets = 0
+
+                if (tokens.size <= maxSeqLen) {
+                    val windowLoss = trainSingleWindow(
+                        seq = tokens,
+                        currentVocab = currentVocab,
+                        gradientAccumulator = accumulator
+                    )
+                    if (windowLoss.isFinite()) {
+                        contextWindowCount = 1
+                        predictionTargetCount = tokens.size - 1
+                        trainedTargets = tokens.size - 1
+                        weightedLoss = windowLoss * (tokens.size - 1)
+                    }
+                } else {
+                    val overlapTokens = min(24, maxSeqLen - 1)
+                    val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
+                    var start = 0
+
+                    while (start < tokens.size - 1) {
+                        val end = min(start + maxSeqLen, tokens.size)
+                        val windowSequence = tokens.subList(start, end)
+                        if (windowSequence.size >= 2) {
+                            val firstTargetIndex =
+                                if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
+                            val targetCount =
+                                (windowSequence.size - 1 - firstTargetIndex).coerceAtLeast(0)
+                            if (targetCount > 0) {
+                                val windowLoss = trainSingleWindow(
+                                    seq = windowSequence,
+                                    currentVocab = currentVocab,
+                                    firstTargetIndex = firstTargetIndex,
+                                    gradientAccumulator = accumulator
+                                )
+                                if (windowLoss.isFinite()) {
+                                    contextWindowCount++
+                                    weightedLoss += windowLoss * targetCount
+                                    trainedTargets += targetCount
+                                    predictionTargetCount += targetCount
+                                }
+                            }
+                        }
+                        if (end >= tokens.size) break
+                        start += stride
+                    }
+                }
+
+                sampleResults += NeuralTrainingStepResult(
+                    loss = if (trainedTargets > 0) {
+                        weightedLoss / trainedTargets
+                    } else {
+                        Float.NaN
+                    },
+                    inputTokenCount = tokens.size,
+                    predictionTargetCount = predictionTargetCount,
+                    contextWindowCount = contextWindowCount,
+                    optimizerUpdateCount = 0,
+                    vocabularySize = currentVocab
+                )
+            }
+
+            if (accumulator.targetCount > 0) {
+                applyAccumulatedGradients(accumulator)
+            }
+
+            val optimizerUpdates = (adamStep - initialAdamStep).coerceAtLeast(0)
+            if (adamStep / CHECKPOINT_INTERVAL > initialAdamStep / CHECKPOINT_INTERVAL) {
+                shouldSaveCheckpoint = true
+            }
+
+            val firstTrainableSample = sampleResults.indexOfFirst {
+                it.loss.isFinite() && it.predictionTargetCount > 0
+            }
+            val reportedSamples = sampleResults.mapIndexed { index, sample ->
+                sample.copy(
+                    optimizerUpdateCount = if (index == firstTrainableSample) {
+                        optimizerUpdates
+                    } else {
+                        0
+                    }
+                )
+            }
+
+            NeuralTrainingBatchResult(
+                samples = reportedSamples,
+                optimizerUpdateCount = optimizerUpdates,
+                totalPredictionTargetCount = accumulator.targetCount
+            )
+        }
+
+        if (shouldSaveCheckpoint) {
+            runCatching { saveCheckpoint() }
+                .onFailure { Log.e(TAG, "Auto-checkpoint save failed", it) }
+        }
+        return result
+    }
+
+    /**
+     * Compatibility path for older checkpoints whose existing model state fits the
+     * legacy 16-byte floor but cannot safely reserve an additional accumulation tensor.
+     * It retains the original per-window Adam update behavior and is restricted to batch 1.
+     */
+    private fun trainSingleSampleSequential(text: String): NeuralTrainingBatchResult {
         var shouldSaveCheckpoint = false
         val result = synchronized(modelLock) {
             val initialAdamStep = adamStep
             val tokens = tokenizer.encode(text, autoRegister = false)
             if (tokens.size < 2) {
-                return@synchronized NeuralTrainingStepResult(
-                    loss = Float.NaN,
-                    inputTokenCount = tokens.size,
-                    predictionTargetCount = 0,
-                    contextWindowCount = 0,
+                return@synchronized NeuralTrainingBatchResult(
+                    samples = listOf(
+                        NeuralTrainingStepResult(
+                            loss = Float.NaN,
+                            inputTokenCount = tokens.size,
+                            predictionTargetCount = 0,
+                            contextWindowCount = 0,
+                            optimizerUpdateCount = 0,
+                            vocabularySize = tokenizer.vocabSize
+                        )
+                    ),
                     optimizerUpdateCount = 0,
-                    vocabularySize = tokenizer.vocabSize
+                    totalPredictionTargetCount = 0
                 )
             }
 
@@ -1175,18 +1483,21 @@ class ArgusNeuralEngine private constructor(
             val currentVocab = tokenizer.vocabSize
             var contextWindowCount = 0
             var predictionTargetCount = 0
+            var weightedLoss = 0f
+            var trainedTargets = 0
 
-            val meanLoss = if (tokens.size <= maxSeqLen) {
-                contextWindowCount = 1
-                predictionTargetCount = tokens.size - 1
-                trainSingleWindow(tokens, currentVocab)
+            if (tokens.size <= maxSeqLen) {
+                val loss = trainSingleWindow(tokens, currentVocab)
+                if (loss.isFinite()) {
+                    contextWindowCount = 1
+                    predictionTargetCount = tokens.size - 1
+                    trainedTargets = tokens.size - 1
+                    weightedLoss = loss * (tokens.size - 1)
+                }
             } else {
                 val overlapTokens = min(24, maxSeqLen - 1)
                 val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
-                var weightedLoss = 0f
-                var trainedTargets = 0
                 var start = 0
-
                 while (start < tokens.size - 1) {
                     val end = min(start + maxSeqLen, tokens.size)
                     val windowSequence = tokens.subList(start, end)
@@ -1196,37 +1507,40 @@ class ArgusNeuralEngine private constructor(
                         val targetCount =
                             (windowSequence.size - 1 - firstTargetIndex).coerceAtLeast(0)
                         if (targetCount > 0) {
-                            val windowLoss = trainSingleWindow(
+                            val loss = trainSingleWindow(
                                 seq = windowSequence,
                                 currentVocab = currentVocab,
                                 firstTargetIndex = firstTargetIndex
                             )
-                            contextWindowCount++
-                            if (windowLoss.isFinite()) {
-                                weightedLoss += windowLoss * targetCount
-                                trainedTargets += targetCount
+                            if (loss.isFinite()) {
+                                contextWindowCount++
                                 predictionTargetCount += targetCount
+                                trainedTargets += targetCount
+                                weightedLoss += loss * targetCount
                             }
                         }
                     }
                     if (end >= tokens.size) break
                     start += stride
                 }
-
-                if (trainedTargets > 0) weightedLoss / trainedTargets else Float.NaN
             }
 
             if (adamStep / CHECKPOINT_INTERVAL > initialAdamStep / CHECKPOINT_INTERVAL) {
                 shouldSaveCheckpoint = true
             }
-
-            NeuralTrainingStepResult(
-                loss = meanLoss,
+            val optimizerUpdates = (adamStep - initialAdamStep).coerceAtLeast(0)
+            val stepResult = NeuralTrainingStepResult(
+                loss = if (trainedTargets > 0) weightedLoss / trainedTargets else Float.NaN,
                 inputTokenCount = tokens.size,
                 predictionTargetCount = predictionTargetCount,
                 contextWindowCount = contextWindowCount,
-                optimizerUpdateCount = (adamStep - initialAdamStep).coerceAtLeast(0),
+                optimizerUpdateCount = optimizerUpdates,
                 vocabularySize = currentVocab
+            )
+            NeuralTrainingBatchResult(
+                samples = listOf(stepResult),
+                optimizerUpdateCount = optimizerUpdates,
+                totalPredictionTargetCount = predictionTargetCount
             )
         }
 
@@ -1285,13 +1599,14 @@ class ArgusNeuralEngine private constructor(
         currentVocab: Int,
         updateParameters: Boolean = true,
         firstTargetIndex: Int = 0,
-        gradientProbe: GradientProbe? = null
+        gradientProbe: GradientProbe? = null,
+        gradientAccumulator: BatchGradientAccumulator? = null
     ): Float {
         val seqLen = seq.size
         if (seqLen < 2) return Float.NaN
 
-        if (updateParameters) adamStep++
-        val lr = if (updateParameters) {
+        if (updateParameters && gradientAccumulator == null) adamStep++
+        val lr = if (updateParameters && gradientAccumulator == null) {
             baseLearningRate / (1f + 0.0002f * adamStep)
         } else {
             0f
@@ -1942,6 +2257,45 @@ class ArgusNeuralEngine private constructor(
             return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
 
+        if (gradientAccumulator != null) {
+            if (validSteps > 0) {
+                val sampleGradients = ArrayList<FloatArray>(2 + layerGrads.size * 11)
+                sampleGradients += gradWHead
+                sampleGradients += gradWEmbed
+                for (layerGradient in layerGrads) {
+                    sampleGradients += layerGradient.gradWDown
+                    sampleGradients += layerGradient.gradWUp
+                    sampleGradients += layerGradient.gradWGate
+                    sampleGradients += layerGradient.gradWO
+                    sampleGradients += layerGradient.gradWQ
+                    sampleGradients += layerGradient.gradWK
+                    sampleGradients += layerGradient.gradWV
+                    sampleGradients += layerGradient.gradLoraQa
+                    sampleGradients += layerGradient.gradLoraQb
+                    sampleGradients += layerGradient.gradLoraVa
+                    sampleGradients += layerGradient.gradLoraVb
+                }
+                require(sampleGradients.size == gradientAccumulator.gradients.size) {
+                    "Gradient accumulator tensor count does not match the active architecture."
+                }
+                for (tensorIndex in sampleGradients.indices) {
+                    val source = sampleGradients[tensorIndex]
+                    val destination = gradientAccumulator.gradients[tensorIndex]
+                    require(source.size <= destination.size) {
+                        "Sample gradient exceeds the resident model tensor."
+                    }
+                    for (elementIndex in source.indices) {
+                        destination[elementIndex] += source[elementIndex] * validSteps
+                    }
+                }
+                gradientAccumulator.targetCount = Math.addExact(
+                    gradientAccumulator.targetCount,
+                    validSteps
+                )
+            }
+            return if (validSteps > 0) totalLoss / validSteps else Float.NaN
+        }
+
         var sumSquares = 0f
         sumSquares += computeSumSquares(gradWHead)
         sumSquares += computeSumSquares(gradWEmbed)
@@ -2027,6 +2381,157 @@ class ArgusNeuralEngine private constructor(
         }
 
         return if (validSteps > 0) totalLoss / validSteps else Float.NaN
+    }
+
+    private fun currentParameterArrays(): Array<FloatArray> {
+        val arrays = ArrayList<FloatArray>(2 + layerCount * 11)
+        arrays += wHead
+        arrays += wEmbed
+        for (block in blocks) {
+            arrays += block.wDown
+            arrays += block.wUp
+            arrays += block.wGate
+            arrays += block.wO
+            arrays += block.wQ
+            arrays += block.wK
+            arrays += block.wV
+            arrays += block.loraQa
+            arrays += block.loraQb
+            arrays += block.loraVa
+            arrays += block.loraVb
+        }
+        return arrays.toTypedArray()
+    }
+
+    private fun currentFirstMomentArrays(): Array<FloatArray> {
+        val arrays = ArrayList<FloatArray>(2 + layerCount * 11)
+        arrays += mHead
+        arrays += mEmbed
+        for (block in blocks) {
+            arrays += block.mWDown
+            arrays += block.mWUp
+            arrays += block.mWGate
+            arrays += block.mWO
+            arrays += block.mWQ
+            arrays += block.mWK
+            arrays += block.mWV
+            arrays += block.mLoraQa
+            arrays += block.mLoraQb
+            arrays += block.mLoraVa
+            arrays += block.mLoraVb
+        }
+        return arrays.toTypedArray()
+    }
+
+    private fun currentSecondMomentArrays(): Array<FloatArray> {
+        val arrays = ArrayList<FloatArray>(2 + layerCount * 11)
+        arrays += vHead
+        arrays += vEmbed
+        for (block in blocks) {
+            arrays += block.vWDown
+            arrays += block.vWUp
+            arrays += block.vWGate
+            arrays += block.vWO
+            arrays += block.vWQ
+            arrays += block.vWK
+            arrays += block.vWV
+            arrays += block.vLoraQa
+            arrays += block.vLoraQb
+            arrays += block.vLoraVa
+            arrays += block.vLoraVb
+        }
+        return arrays.toTypedArray()
+    }
+
+    private fun createBatchGradientAccumulator(): BatchGradientAccumulator {
+        val parameters = currentParameterArrays()
+        return BatchGradientAccumulator(
+            gradients = Array(parameters.size) { index ->
+                FloatArray(parameters[index].size)
+            }
+        )
+    }
+
+    /** Applies one target-weighted AdamW update after every micro-batch sample is processed. */
+    private fun applyAccumulatedGradients(accumulator: BatchGradientAccumulator) {
+        require(accumulator.targetCount > 0) {
+            "Cannot apply an empty gradient accumulation batch."
+        }
+
+        val parameters = currentParameterArrays()
+        val gradients = accumulator.gradients
+        val firstMoments = currentFirstMomentArrays()
+        val secondMoments = currentSecondMomentArrays()
+        require(
+            parameters.size == gradients.size &&
+                parameters.size == firstMoments.size &&
+                parameters.size == secondMoments.size
+        ) { "Optimizer tensor groups do not match the active architecture." }
+
+        var sumSquares = 0f
+        for (index in gradients.indices) {
+            require(
+                gradients[index].size <= parameters[index].size &&
+                    parameters[index].size == firstMoments[index].size &&
+                    parameters[index].size == secondMoments[index].size
+            ) { "Optimizer tensor shape mismatch at index $index." }
+            normalizeGradient(gradients[index], accumulator.targetCount.toFloat())
+            sumSquares += computeSumSquares(gradients[index])
+        }
+
+        val totalNorm = sqrt(sumSquares)
+        if (!totalNorm.isFinite()) {
+            throw IllegalStateException("Accumulated gradient norm is not finite.")
+        }
+        val clipFactor =
+            if (totalNorm > maxGradNorm) maxGradNorm / (totalNorm + 1e-6f) else 1.0f
+
+        adamStep++
+        val learningRate = baseLearningRate / (1f + 0.0002f * adamStep)
+        val biasCorrection1 = 1f -
+            Math.pow(beta1.toDouble(), adamStep.toDouble()).toFloat()
+        val biasCorrection2 = 1f -
+            Math.pow(beta2.toDouble(), adamStep.toDouble()).toFloat()
+        val weightDecayByGroup = FloatArray(parameters.size).also { values ->
+            for (layer in 0 until layerCount) {
+                val offset = 2 + layer * 11
+                for (index in 0 until 7) values[offset + index] = weightDecay
+            }
+        }
+
+        val equalTensorShapes = parameters.indices.all { index ->
+            parameters[index].size == gradients[index].size
+        }
+        val updatedByVulkan = equalTensorShapes && VulkanTrainingBackend.tryApplyAdamWUpdate(
+            parameters = parameters,
+            gradients = gradients,
+            firstMoments = firstMoments,
+            secondMoments = secondMoments,
+            weightDecayByGroup = weightDecayByGroup,
+            learningRate = learningRate,
+            beta1 = beta1,
+            beta2 = beta2,
+            biasCorrection1 = biasCorrection1,
+            biasCorrection2 = biasCorrection2,
+            epsilon = epsilon,
+            gradientClipFactor = clipFactor
+        )
+
+        if (!updatedByVulkan) {
+            for (index in parameters.indices) {
+                applyClip(gradients[index], clipFactor)
+                adamUpdate(
+                    param = parameters[index],
+                    grad = gradients[index],
+                    m = firstMoments[index],
+                    v = secondMoments[index],
+                    lr = learningRate,
+                    biasCorr1 = biasCorrection1,
+                    biasCorr2 = biasCorrection2,
+                    wd = weightDecayByGroup[index]
+                )
+            }
+        }
     }
 
     private fun normalizeGradient(grad: FloatArray, div: Float) {
@@ -2642,9 +3147,17 @@ class ArgusNeuralEngine private constructor(
         require(targetElements <= Int.MAX_VALUE.toLong()) {
             "Checkpoint vocabulary tensor dimensions exceed JVM array limits."
         }
+        val tensorBuffersPerParameter = if (config.gradientAccumulationEnabled) {
+            // Six resident model/moment arrays, one sample gradient, and one accumulator
+            // gradient for each of the embedding and output-head parameter groups.
+            10L
+        } else {
+            // Six resident model/moment arrays plus one sample gradient per group.
+            8L
+        }
         val newVocabularyArrayBytes = Math.multiplyExact(
             targetElements,
-            6L * Float.SIZE_BYTES.toLong()
+            tensorBuffersPerParameter * Float.SIZE_BYTES.toLong()
         )
         val runtime = Runtime.getRuntime()
         val availableHeap = runtime.maxMemory() -

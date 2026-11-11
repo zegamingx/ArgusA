@@ -289,8 +289,9 @@ class GenesisModelManager(
         logs += "LoRA adapters: ${String.format(Locale.US, "%.2f KB", adapterBytes / 1024.0)} " +
                 "(Rank ${neuralEngine.loraRank})."
         logs += "Total structured parameters: $totalParams (FP32)."
-        val trainingStateFloorBytes = TrainingMemoryPlanner.minimumTrainingStateBytes(totalParams)
-        logs += "Full-parameter FP32 training-state floor: " +
+        val trainingStateFloorBytes =
+            TrainingMemoryPlanner.minimumAccumulatedTrainingStateBytes(totalParams)
+        logs += "Full-parameter FP32 training-state floor including the batch-gradient buffer: " +
                 String.format(Locale.US, "%.1f MiB", trainingStateFloorBytes / (1024.0 * 1024.0)) +
                 " (weights, gradients, Adam moments; excludes activations and workspaces)."
         throttleStage()
@@ -304,7 +305,7 @@ class GenesisModelManager(
         throttleStage()
 
         publish(GenesisLifecycleStage.COMMITTING_INITIAL_GENERATION,
-            "Validating the forward pass and saving the initial ARG3 checkpoint...")
+            "Validating the forward pass and saving the initial ARG4 checkpoint...")
 
         val sanityLoss = neuralEngine.evaluateLoss("A.R.G.U.S Genesis origin test.")
         if (!sanityLoss.isFinite()) {
@@ -331,7 +332,7 @@ class GenesisModelManager(
 
         logs += "Forward validation completed without an optimizer update: initial loss = " +
                 String.format(Locale.US, "%.4f", sanityLoss)
-        logs += "Checkpoint 'argus_model_weights.bin' (ARG3 format) was verified in local storage."
+        logs += "Checkpoint 'argus_model_weights.bin' (ARG4 format) was verified in local storage."
         logs += "Model origin identity committed: $originId"
         throttleStage()
 

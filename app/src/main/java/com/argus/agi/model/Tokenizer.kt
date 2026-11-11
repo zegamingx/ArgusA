@@ -68,6 +68,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         const val THINK_START_ID = 7
         const val THINK_END_ID = 8
         private const val DEFAULT_MAX_MERGES_PER_TRAINING_PASS = 64
+        private const val SEED_CAPACITY_DIVISOR = 4
+        private const val MAX_INITIAL_SEED_WORDS = 256
+        private const val MAX_INITIAL_SEED_MERGES = 512
 
         const val MAX_TOKEN_LEN = TokenizerConfig.DEFAULT_MAX_TOKEN_LENGTH
         const val MAX_VOCAB_SIZE = TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE
@@ -116,16 +119,77 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         }
 
         val seedWords = listOf(
-            "yang", "dan", "di", "ini", "itu", "ke", "dari", "untuk", "pada", "adalah", "dengan",
-            "saya", "kamu", "bisa", "ada", "tidak", "apa", "bagaimana", "argus", "agi", "model",
-            "training", "data", "layar", "kamera", "the", "and", "is", "in", "to", "of", "for",
-            "nama", "kita", "kami", "aneh", "dimana", "kenapa", "siapa", "serius", "bener"
+    "<pad>", "<unk>", "<bos>", "<eos>", "<mask>", "yang", "dan", "di", "ini", "itu",
+    "ke", "dari", "untuk", "pada", "adalah", "dengan", "saya", "kamu", "bisa", "ada",
+    "tidak", "apa", "bagaimana", "argus", "agi", "model", "training", "data", "layar", "kamera",
+    "the", "and", "is", "in", "to", "of", "for", "nama", "kita", "kami",
+    "aneh", "dimana", "kenapa", "siapa", "serius", "bener", "aku", "gue", "gua", "gw",
+    "lo", "lu", "elu", "dia", "mereka", "beliau", "kalian", "anda", "engkau", "kau",
+    "ia", "nya", "ku", "mu", "makan", "minum", "tidur", "bangun", "jalan", "lari",
+    "duduk", "berdiri", "pergi", "pulang", "datang", "melihat", "mendengar", "bicara", "ngomong", "bilang",
+    "tanya", "jawab", "pikir", "tahu", "paham", "mengerti", "belajar", "mengajar", "baca", "tulis",
+    "dengar", "lihat", "cari", "temukan", "buat", "bikin", "coba", "mulai", "selesai", "berhenti",
+    "lanjut", "bantu", "tolong", "minta", "kasih", "beri", "ambil", "taruh", "simpan", "buka",
+    "tutup", "nyala", "mati", "hidup", "jalankan", "pasang", "copot", "ganti", "ubah", "tambah",
+    "kurang", "hapus", "edit", "kirim", "terima", "bayar", "beli", "jual", "pakai", "pake",
+    "main", "kerja", "istirahat", "nonton", "dengerin", "nyanyi", "mainkan", "rumah", "sekolah", "kampus",
+    "kantor", "mobil", "motor", "hp", "handphone", "komputer", "laptop", "internet", "wifi", "baterai",
+    "charger", "kabel", "foto", "video", "lagu", "musik", "film", "game", "bola", "buku",
+    "pena", "kertas", "meja", "kursi", "pintu", "jendela", "dapur", "kamar", "mandi", "air",
+    "nasi", "roti", "kopi", "teh", "susu", "gula", "garam", "sayur", "buah", "daging",
+    "ikan", "ayam", "telur", "mie", "bakso", "sate", "baju", "celana", "sepatu", "tas",
+    "dompet", "kunci", "uang", "toko", "pasar", "mall", "raya", "desa", "kota", "negara",
+    "dunia", "langit", "bumi", "matahari", "bulan", "bintang", "hujan", "angin", "api", "tanah",
+    "pohon", "bunga", "kucing", "anjing", "burung", "manusia", "anak", "bayi", "ibu", "bapak",
+    "kakak", "adik", "teman", "sahabat", "pacar", "keluarga", "guru", "dosen", "dokter", "polisi",
+    "tentara", "petani", "besar", "kecil", "tinggi", "rendah", "panjang", "pendek", "lebar", "sempit",
+    "cepat", "lambat", "panas", "dingin", "terang", "gelap", "baru", "lama", "bagus", "jelek",
+    "cantik", "ganteng", "pintar", "bodoh", "baik", "jahat", "senang", "sedih", "marah", "takut",
+    "capek", "lelah", "sehat", "sakit", "kaya", "miskin", "mahal", "murah", "ramai", "sepi",
+    "bersih", "kotor", "basah", "kering", "keras", "lembut", "kuat", "lemah", "berat", "ringan",
+    "jauh", "dekat", "penuh", "kosong", "benar", "salah", "jelas", "rahasia", "penting", "berbahaya",
+    "aman", "sulit", "mudah", "susah", "asyik", "seru", "lucu", "keren", "mantap", "unik",
+    "biasa", "hari", "minggu", "tahun", "pagi", "siang", "sore", "malam", "sekarang", "tadi",
+    "nanti", "besok", "kemarin", "lusa", "dulu", "sebentar", "jam", "menit", "detik", "waktu",
+    "saat", "ketika", "sebelum", "sesudah", "setelah", "selama", "sampai", "sejak", "setiap", "selalu",
+    "sering", "jarang", "pernah", "belum", "sudah", "masih", "lagi", "akan", "sedang", "telah",
+    "kapan", "berapa", "apakah", "bukan", "jangan", "boleh", "harus", "perlu", "mau", "ingin",
+    "suka", "benci", "deh", "dong", "sih", "kok", "lah", "nih", "tuh", "gitu",
+    "gini", "gak", "nggak", "ga", "tau", "udah", "aja", "yuk", "ayo", "gas",
+    "bro", "sis", "cuy", "woy", "anjir", "buset", "gila", "santai", "oke", "ok",
+    "siap", "halo", "hai", "hehe", "haha", "wkwk", "ya", "iya", "atau", "tapi",
+    "tetapi", "karena", "kalau", "jika", "bila", "agar", "supaya", "meskipun", "walaupun", "sedangkan",
+    "lalu", "kemudian", "terus", "juga", "bahkan", "hanya", "cuma", "saja", "pun", "malah",
+    "justru", "apalagi", "makanya", "soalnya", "padahal", "ternyata", "akhirnya", "sebenarnya", "memang", "satu",
+    "dua", "tiga", "empat", "lima", "enam", "tujuh", "delapan", "sembilan", "sepuluh", "sebelas",
+    "belas", "seratus", "seribu", "nol", "pertama", "kedua", "ketiga", "banyak", "sedikit", "semua",
+    "beberapa", "lain", "sendiri", "masing", "neural", "ai", "robot", "sistem", "program", "kode",
+    "aplikasi", "android", "telepon", "sensor", "mata", "telinga", "otak", "pikiran", "memori", "latih",
+    "dataset", "token", "vocab", "parameter", "neuron", "layer", "embedding", "loss", "epoch", "batch",
+    "learning", "rate", "optimizer", "checkpoint", "file", "folder", "json", "jsonl", "prompt", "reply",
+    "chat", "bot", "asisten", "user", "admin", "server", "cloud", "colab", "drive", "google",
+    "github", "studio", "jstudio", "kotlin", "java", "python", "error", "bug", "fix", "update",
+    "install", "download", "upload", "login", "logout", "password", "akun", "email", "nomor", "pesan",
+    "notifikasi", "setting"
+)
+        // Keep the bundled vocabulary bounded so small model profiles retain
+        // capacity for corpus-derived tokens and tokenizer training.
+        val seedWordLimit = minOf(
+            seedWords.size,
+            MAX_INITIAL_SEED_WORDS,
+            config.maxVocabularySize / SEED_CAPACITY_DIVISOR
         )
-        for (word in seedWords) {
+        val bundledSeedWords = seedWords
+            .asSequence()
+            .filterNot(::isMarkupSeedToken)
+            .take(seedWordLimit)
+            .toList()
+
+        for (word in bundledSeedWords) {
             runCatching { registerToken(word) }
         }
         if (config.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1) {
-            initializeSeedMerges(seedWords)
+            initializeSeedMerges(bundledSeedWords)
         }
     }
 
@@ -133,10 +197,19 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
      * Seed merges make the bundled base-word tokens usable by BPE without
      * allocating additional vocabulary entries or changing their stable IDs.
      */
+    private fun isMarkupSeedToken(token: String): Boolean =
+        token.length >= 3 && token.first() == '<' && token.last() == '>'
+
     private fun initializeSeedMerges(seedWords: List<String>) {
+        val mergeLimit = minOf(
+            MAX_INITIAL_SEED_MERGES,
+            config.maxVocabularySize / SEED_CAPACITY_DIVISOR
+        )
         for (word in seedWords) {
+            if (merges.size >= mergeLimit) break
+
             val pieces = word.map { character -> character.toString() }.toMutableList()
-            while (pieces.size > 1) {
+            while (pieces.size > 1 && merges.size < mergeLimit) {
                 val pair = pieces[0] to pieces[1]
                 if (!mergeRanks.containsKey(pair)) {
                     merges.add(pair)

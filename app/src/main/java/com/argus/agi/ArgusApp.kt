@@ -8,7 +8,6 @@ import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.argus.agi.model.ArgusNeuralEngine
-import com.argus.agi.model.EngineConfig
 import com.argus.agi.model.GenesisModelManager
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.WorldModel
@@ -41,16 +40,12 @@ class ArgusApp : Application() {
             // Stable device capacity selects a fresh model tier. Existing checkpoints
             // keep their original tensor dimensions to avoid silently discarding weights.
             val hardwareInfo = hardwareProfile.getHardwareInfo()
-            val deviceConfig = EngineConfig.forDevice(
-                totalRamGb = hardwareInfo.totalRamGb,
-                maxHeapMb = hardwareInfo.maxHeapMb,
-                availableRamGb = hardwareInfo.availRamGb
-            )
             val resolvedConfig = ArgusNeuralEngine.resolveConfig(
                 context = instance,
                 totalRamGb = hardwareInfo.totalRamGb,
                 maxHeapMb = hardwareInfo.maxHeapMb,
-                availableRamGb = hardwareInfo.availRamGb
+                availableRamGb = hardwareInfo.availRamGb,
+                cpuCores = hardwareInfo.cpuCores
             )
 
             Log.i(TAG, "Resolved neural engine architecture: ${resolvedConfig.architectureLabel}")

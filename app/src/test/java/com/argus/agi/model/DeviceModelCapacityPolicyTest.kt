@@ -147,6 +147,14 @@ class TrainingMemoryPlannerTest {
     }
 
     @Test
+    fun accountsForOneAdditionalAccumulatedGradientBuffer() {
+        assertEquals(
+            20_000_000L,
+            TrainingMemoryPlanner.minimumAccumulatedTrainingStateBytes(1_000_000L)
+        )
+    }
+
+    @Test
     fun saturatesInsteadOfOverflowing() {
         assertEquals(
             Long.MAX_VALUE,

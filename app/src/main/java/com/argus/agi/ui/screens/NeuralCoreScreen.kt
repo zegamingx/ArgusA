@@ -430,14 +430,21 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                         }
                         Spacer(modifier = Modifier.height(10.dp))
                         Text(
-                            text = "Architecture: Micro-Transformer · dModel=${modelConfig.dModel} · Heads=${modelConfig.nHeads} · FFN=${modelConfig.dFf} · Context=${modelConfig.maxSeqLen} · LoRA rank=${modelConfig.loraRank}",
+                            text = "Architecture: Argus Transformer · ${modelConfig.layerCount} layers · dModel=${modelConfig.dModel} · Heads=${modelConfig.nHeads} · FFN=${modelConfig.dFf} · Context=${modelConfig.maxSeqLen} · LoRA rank=${modelConfig.loraRank}",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted,
                             fontFamily = FontFamily.Monospace,
                             fontSize = 10.sp
                         )
                         Text(
-                            text = "Parameters: $formattedParams • LoRA adapter: $adapterSizeStr • Backend state: $backendState • Vulkan runtime: ${if (isVulkanRuntimeReady) "SELF-CHECKED" else "UNAVAILABLE"}",
+                            text = "Model profile: ${modelConfig.modelTier.displayName} • Tier ceiling: ${formatParameterScale(modelConfig.modelTier.maximumFamilyParameters)} • Active: $formattedParams • Batch: ${modelConfig.trainingBatchSize}/8 • LoRA: $adapterSizeStr",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = ArgusTextMuted,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp
+                        )
+                        Text(
+                            text = "Optimizer backend: $backendState • Vulkan: ${if (isVulkanRuntimeReady) "SELF-CHECKED" else "CPU FALLBACK"}",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted,
                             fontFamily = FontFamily.Monospace,
@@ -712,6 +719,16 @@ fun EmptyQueueCard(text: String) {
 // =====================================================================
 // ESTIMATED REMAINING TIME
 // =====================================================================
+private fun formatParameterScale(parameters: Long): String = when {
+    parameters >= 1_000_000_000L ->
+        String.format(Locale.US, "%.1fB", parameters / 1_000_000_000.0)
+    parameters >= 1_000_000L ->
+        String.format(Locale.US, "%.1fM", parameters / 1_000_000.0)
+    parameters >= 1_000L ->
+        String.format(Locale.US, "%.1fK", parameters / 1_000.0)
+    else -> parameters.toString()
+}
+
 private fun avgStepMsFrom(completed: List<TrainingData>): Long {
     val valid = completed.filter { it.status == TrainingStatus.COMPLETED && it.stepDurationMs > 0 }.take(20)
     if (valid.isEmpty()) return 0L
