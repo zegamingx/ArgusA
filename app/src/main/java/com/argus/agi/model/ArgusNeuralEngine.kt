@@ -112,16 +112,8 @@ data class EngineConfig(
     }
 
     val architectureLabel: String
-        get() = when {
-            dModel >= 128 && dFf >= 512 ->
-                "Flagship Dynamic Core"
-            dModel >= 96 && dFf >= 384 ->
-                "High Memory Neural Core"
-            dModel >= 64 && dFf >= 256 ->
-                "Balanced Neural Core"
-            else ->
-                "Compact Neural Core"
-        } + " • ${modelTier.displayName} (${layerCount}L, d_model $dModel, d_ff $dFf, context $maxSeqLen, LoRA rank $loraRank)"
+        get() = "${modelTier.displayName} (${layerCount}L, d_model $dModel, d_ff $dFf, " +
+            "context $maxSeqLen, LoRA rank $loraRank, batch $trainingBatchSize)"
 
     companion object {
         /**
