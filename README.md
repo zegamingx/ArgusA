@@ -4,7 +4,7 @@ Argus is a native Android application built with Kotlin and Jetpack Compose.
 
 ## Requirements
 
-- JDK 21
+- JDK 25
 - Android NDK r30 (30.0.16248370)
 - CMake 3.22.1
 - Android SDK Platform 37
