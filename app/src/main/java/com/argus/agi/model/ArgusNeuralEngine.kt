@@ -49,7 +49,53 @@ data class EngineConfig(
         }
         require(dFf > 0) { "dFf must be positive." }
         require(maxSeqLen >= 2) { "maxSeqLen must be at least 2." }
-        require(loraRank > 0) { "loraRank must be positive." }
+        require(loraRank in 1..dModel) {
+            "loraRank must be between one and dModel."
+        }
+
+        // This FP32 training engine still uses JVM arrays. Reject checkpoint
+        // metadata that would overflow array indexes or exceed the app heap.
+        val hidden = dModel.toLong()
+        val feedForward = dFf.toLong()
+        val vocabularyFloor = TokenizerConfig.MINIMUM_VOCAB_SIZE.toLong()
+        val estimatedArchitecture = ArgusArchitectureConfig(
+            layerCount = 1,
+            hiddenSize = dModel,
+            attentionHeadCount = nHeads,
+            feedForwardSize = dFf,
+            vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+            contextLength = maxSeqLen,
+            adapterRank = loraRank
+        )
+        val parameterCount = ArgusArchitectureParameterEstimator
+            .estimate(estimatedArchitecture)
+            .totalTrainableParameters
+        val trainingFloorBytes = TrainingMemoryPlanner.minimumTrainingStateBytes(parameterCount)
+        val positionBufferBytes = Math.multiplyExact(
+            Math.multiplyExact(maxSeqLen.toLong(), hidden),
+            Float.SIZE_BYTES.toLong()
+        )
+        val attentionScratchBytes = Math.multiplyExact(
+            Math.multiplyExact(
+                Math.multiplyExact(nHeads.toLong(), maxSeqLen.toLong()),
+                maxSeqLen.toLong()
+            ),
+            Float.SIZE_BYTES.toLong()
+        )
+        val minimumRuntimeBytes = Math.addExact(
+            Math.addExact(trainingFloorBytes, positionBufferBytes),
+            attentionScratchBytes
+        )
+        val safeHeapBudgetBytes = Runtime.getRuntime().maxMemory().toDouble() * 0.7
+        require(minimumRuntimeBytes.toDouble() <= safeHeapBudgetBytes) {
+            "The FP32 engine configuration exceeds the safe app-heap budget."
+        }
+        require(Math.multiplyExact(hidden, feedForward) <= Int.MAX_VALUE.toLong()) {
+            "Feed-forward tensor dimensions exceed JVM array limits."
+        }
+        require(Math.multiplyExact(hidden, hidden) <= Int.MAX_VALUE.toLong()) {
+            "Attention tensor dimensions exceed JVM array limits."
+        }
     }
 
     val architectureLabel: String
@@ -2210,11 +2256,28 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
-    private fun readIntLittleEndian(input: InputStream): Int =
-        ByteBuffer.wrap(input.readFully(4)).order(ByteOrder.LITTLE_ENDIAN).int
+    private fun readIntLittleEndian(input: InputStream): Int {
+        val b0 = input.read()
+        val b1 = input.read()
+        val b2 = input.read()
+        val b3 = input.read()
+        if ((b0 or b1 or b2 or b3) < 0) {
+            throw IllegalStateException("Unexpected end of little-endian integer.")
+        }
+        return b0 or (b1 shl 8) or (b2 shl 16) or (b3 shl 24)
+    }
 
-    private fun readLongLittleEndian(input: InputStream): Long =
-        ByteBuffer.wrap(input.readFully(8)).order(ByteOrder.LITTLE_ENDIAN).long
+    private fun readLongLittleEndian(input: InputStream): Long {
+        var value = 0L
+        for (shift in 0 until 8) {
+            val next = input.read()
+            if (next < 0) {
+                throw IllegalStateException("Unexpected end of little-endian long.")
+            }
+            value = value or (next.toLong() shl (shift * 8))
+        }
+        return value
+    }
 
     private fun readFloatArrayLittleEndian(
         input: InputStream,
@@ -2346,9 +2409,13 @@ class ArgusNeuralEngine private constructor(
             require(savedPayloadBytes >= 0L) {
                 "ARG4 payload byte count cannot be negative."
             }
-            require(
-                file.length() == ARG4_HEADER_SIZE.toLong() + savedPayloadBytes
-            ) { "ARG4 checkpoint length does not match its payload metadata." }
+            val expectedFileLength = Math.addExact(
+                ARG4_HEADER_SIZE.toLong(),
+                savedPayloadBytes
+            )
+            require(file.length() == expectedFileLength) {
+                "ARG4 checkpoint length does not match its payload metadata."
+            }
 
             val heapRuntime = Runtime.getRuntime()
             val availableHeap = heapRuntime.maxMemory() -
