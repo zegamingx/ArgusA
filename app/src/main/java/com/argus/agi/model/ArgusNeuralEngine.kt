@@ -2139,8 +2139,8 @@ class ArgusNeuralEngine private constructor(
                 for (tensorIndex in sampleGradients.indices) {
                     val source = sampleGradients[tensorIndex]
                     val destination = gradientAccumulator.gradients[tensorIndex]
-                    require(source.size == destination.size) {
-                        "Gradient accumulator tensor shape does not match the active architecture."
+                    require(source.size <= destination.size) {
+                        "Sample gradient exceeds the resident model tensor."
                     }
                     for (elementIndex in source.indices) {
                         destination[elementIndex] += source[elementIndex] * validSteps
@@ -2306,15 +2306,7 @@ class ArgusNeuralEngine private constructor(
         val parameters = currentParameterArrays()
         return BatchGradientAccumulator(
             gradients = Array(parameters.size) { index ->
-                val gradientSize = if (index == 0) {
-                    Math.multiplyExact(currentVocab, dModel)
-                } else {
-                    parameters[index].size
-                }
-                require(gradientSize <= parameters[index].size) {
-                    "Output-head gradient capacity exceeds the resident model tensor."
-                }
-                FloatArray(gradientSize)
+                FloatArray(parameters[index].size)
             }
         )
     }
