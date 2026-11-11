@@ -84,6 +84,24 @@ class ArgusDeviceModelPolicyTest {
     }
 
     @Test
+    fun architectureEstimatorCanDescribeTheSevenBFlagshipCeiling() {
+        val sevenBArchitecture = ArgusArchitectureConfig(
+            layerCount = 26,
+            hiddenSize = 4_096,
+            attentionHeadCount = 16,
+            feedForwardSize = 16_384,
+            vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+            contextLength = 128,
+            adapterRank = 8
+        )
+        val parameterCount = ArgusArchitectureParameterEstimator
+            .estimate(sevenBArchitecture)
+            .totalTrainableParameters
+
+        assertTrue(parameterCount in 6_900_000_000L..7_000_000_000L)
+    }
+
+    @Test
     fun rejectsDeviceMemoryBudgetsBelowTheMinimumExecutableModel() {
         val failure = runCatching {
             ArgusDeviceModelPolicy.select(
