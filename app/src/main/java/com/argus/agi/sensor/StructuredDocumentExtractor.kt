@@ -436,7 +436,7 @@ object StructuredDocumentExtractor {
             .filter(String::isNotBlank)
             .distinct()
             .joinToString("\n\n")
-            .ifBlank { document.body()?.text().orEmpty() }
+            .ifBlank { document.body().text() }
 
         if (text.length > maxTextCharacters) {
             throw DocumentTextExtractionException(

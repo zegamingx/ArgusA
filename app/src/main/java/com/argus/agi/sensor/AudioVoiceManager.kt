@@ -108,8 +108,17 @@ class AudioVoiceManager(
                 override fun onDone(utteranceId: String?) {
                     _isSpeaking.value = false
                 }
+                @Deprecated("Use onError(utteranceId, errorCode) instead.")
                 override fun onError(utteranceId: String?) {
                     _isSpeaking.value = false
+                }
+
+                override fun onError(utteranceId: String?, errorCode: Int) {
+                    _isSpeaking.value = false
+                    Log.w(
+                        TAG,
+                        "TextToSpeech utterance '$utteranceId' failed with error code $errorCode."
+                    )
                 }
             })
             _isTtsReady.value = true

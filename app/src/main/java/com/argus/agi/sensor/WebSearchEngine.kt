@@ -88,15 +88,11 @@ class WebSearchEngine(
         return client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return@use emptyList()
 
-            val html = response.body
-                ?.let { body ->
-                    readBoundedResponseBody(
-                        input = body.byteStream(),
-                        contentLength = body.contentLength(),
-                        maxBytes = MAX_DDG_RESPONSE_BYTES
-                    )
-                }
-                .orEmpty()
+            val html = readBoundedResponseBody(
+                input = response.body.byteStream(),
+                contentLength = response.body.contentLength(),
+                maxBytes = MAX_DDG_RESPONSE_BYTES
+            )
 
             parseDdgHtml(html)
         }
@@ -113,15 +109,12 @@ class WebSearchEngine(
         return client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return@use emptyList()
 
-            val body = response.body
-                ?.let { responseBody ->
-                    readBoundedResponseBody(
-                        responseBody.byteStream(),
-                        responseBody.contentLength(),
-                        MAX_WIKI_RESPONSE_BYTES
-                    )
-                }
-                ?: return@use emptyList()
+            val body = readBoundedResponseBody(
+                input = response.body.byteStream(),
+                contentLength = response.body.contentLength(),
+                maxBytes = MAX_WIKI_RESPONSE_BYTES
+            )
+            if (body.isBlank()) return@use emptyList()
 
             val json = JSONArray(body)
             if (json.length() < 4) return@use emptyList()
