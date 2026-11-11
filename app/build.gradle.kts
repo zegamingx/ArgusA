@@ -103,8 +103,7 @@ android {
     }
 
     compileOptions {
-        isCoreLibraryDesugaringEnabled = true
-        sourceCompatibility = JavaVersion.VERSION_11
+            sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
 
@@ -131,7 +130,6 @@ android {
 }
 
 dependencies {
-    coreLibraryDesugaring(libs.desugar.jdk.libs.nio)
     implementation(platform(libs.androidx.compose.bom))
 
     implementation(libs.androidx.activity.compose)
@@ -155,7 +153,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.logging.interceptor)
-    implementation(libs.moshi.kotlin)
+    implementation(libs.moshi)
     implementation(libs.okhttp)
     implementation(libs.jsoup)
     implementation(libs.pdfbox.android)
@@ -179,7 +177,6 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     ksp(libs.androidx.room.compiler)
-    ksp(libs.moshi.kotlin.codegen)
 }
 
 // =====================================================================
