@@ -347,16 +347,26 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
-    fun countTotalParameters(): Long {
-        var count = 0L
-        count += tokenizer.vocabSize.toLong() * dModel // wEmbed
-        count += maxSeqLen.toLong() * dModel           // wPos
-        count += 4L * (dModel * dModel)                // wQ, wK, wV, wO
-        count += 2L * (dModel * loraRank + loraRank * dModel) // loraQa, loraQb, loraVa, loraVb
-        count += (dModel.toLong() * dFf) * 2L + (dFf.toLong() * dModel) // wGate, wUp, wDown
-        count += tokenizer.vocabSize.toLong() * dModel // wHead
-        return count
-    }
+    /**
+     * Architecture metadata exposed by the active legacy engine.
+     * The current execution graph is a single Transformer block.
+     */
+    val architectureConfig: ArgusArchitectureConfig
+        get() = config.toArgusArchitectureConfig(tokenizer.vocabSize)
+
+    val parameterBreakdown: ArgusParameterBreakdown
+        get() = ArgusArchitectureParameterEstimator.estimate(architectureConfig)
+
+    /**
+     * Preserves the historical resident-tensor element count, including the
+     * fixed sinusoidal position table. Use countTrainableParameters() when a
+     * strict trainable-weight count is required.
+     */
+    fun countTotalParameters(): Long =
+        parameterBreakdown.totalResidentModelElements
+
+    fun countTrainableParameters(): Long =
+        parameterBreakdown.totalTrainableParameters
 
     fun calculateAdapterSizeBytes(): Long =
         ((dModel * loraRank + loraRank * dModel) * 2).toLong() * 4L
