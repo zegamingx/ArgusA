@@ -1342,7 +1342,7 @@ class ArgusNeuralEngine private constructor(
         val result = synchronized(modelLock) {
             val initialAdamStep = adamStep
             ensureVocabCapacity(tokenizer.vocabSize)
-            val accumulator = createBatchGradientAccumulator(tokenizer.vocabSize)
+            val accumulator = createBatchGradientAccumulator()
             val sampleResults = ArrayList<NeuralTrainingStepResult>(texts.size)
 
             for (text in texts) {
@@ -2452,8 +2452,7 @@ class ArgusNeuralEngine private constructor(
         return arrays.toTypedArray()
     }
 
-    private fun createBatchGradientAccumulator(currentVocab: Int): BatchGradientAccumulator {
-        require(currentVocab > 0) { "Vocabulary size must be positive." }
+    private fun createBatchGradientAccumulator(): BatchGradientAccumulator {
         val parameters = currentParameterArrays()
         return BatchGradientAccumulator(
             gradients = Array(parameters.size) { index ->
@@ -3157,9 +3156,17 @@ class ArgusNeuralEngine private constructor(
         require(targetElements <= Int.MAX_VALUE.toLong()) {
             "Checkpoint vocabulary tensor dimensions exceed JVM array limits."
         }
+        val tensorBuffersPerParameter = if (config.gradientAccumulationEnabled) {
+            // Six resident model/moment arrays, one sample gradient, and one accumulator
+            // gradient for each of the embedding and output-head parameter groups.
+            10L
+        } else {
+            // Six resident model/moment arrays plus one sample gradient per group.
+            8L
+        }
         val newVocabularyArrayBytes = Math.multiplyExact(
             targetElements,
-            6L * Float.SIZE_BYTES.toLong()
+            tensorBuffersPerParameter * Float.SIZE_BYTES.toLong()
         )
         val runtime = Runtime.getRuntime()
         val availableHeap = runtime.maxMemory() -
