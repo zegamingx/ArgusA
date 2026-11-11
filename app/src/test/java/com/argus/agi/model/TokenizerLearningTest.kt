@@ -29,6 +29,21 @@ class TokenizerLearningTest {
         assertEquals(1_024, TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE)
 
         val initialVocabulary = tokenizer.exportVocab()
+        assertTrue(
+            "The bundled seed vocabulary must leave room for BPE growth.",
+            initialVocabulary.size < 256
+        )
+        assertTrue(
+            "Initial seed merges must fit the configured checkpoint merge limit.",
+            tokenizer.mergeCount <= tokenizer.config.maxVocabularySize
+        )
+        assertTrue(
+            "Control-token markup must not be registered as seed merges.",
+            tokenizer.exportMerges().none { merge ->
+                merge.first.contains('<') || merge.first.contains('>') ||
+                    merge.second.contains('<') || merge.second.contains('>')
+            }
+        )
         val knownTokenId = initialVocabulary.single { it.first == "yang" }.second
         assertEquals(
             "Bundled seed words must use their registered vocabulary IDs under BPE.",
