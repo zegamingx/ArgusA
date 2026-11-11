@@ -172,7 +172,10 @@ data class EngineConfig(
             val minimumParameters = ArgusDeviceModelProfile.MINIMUM_MODEL_PARAMETERS
             val candidates = ArrayList<ExecutableShape>()
             val allExecutableCandidates = ArrayList<ExecutableShape>()
-            val hiddenSizes = intArrayOf(128, 160, 192, 256, 320, 384, 512, 640, 768, 1024)
+            val hiddenSizes = intArrayOf(
+                128, 160, 192, 256, 320, 384, 512, 640, 768, 1024,
+                1280, 1536, 2048, 2560, 3072, 4096
+            )
             val feedForwardMultipliers = intArrayOf(2, 3, 4)
             val adapterRanks = intArrayOf(2, 4, 8)
 
