@@ -1,5 +1,7 @@
 package com.argus.agi.model
 
+import android.content.Context
+import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -11,6 +13,32 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
 class ReasoningTrainingPipelineTest {
+
+    private val context: Context
+        get() = ApplicationProvider.getApplicationContext()
+
+    @Test
+    fun serializedReasoningSequenceProducesRealNeuralOptimizerUpdates() {
+        val config = EngineConfig(
+            dModel = 16,
+            nHeads = 4,
+            dFf = 32,
+            maxSeqLen = 64,
+            loraRank = 2,
+            layerCount = 1
+        )
+        val engine = ArgusNeuralEngine.createBlocking(context, config)
+        val sequence = TextModalityProcessor.process(
+            rawText = """{"instruction":"What is 5 plus 7?","reasoning":["Start with five units.","Add seven more units.","Five plus seven equals twelve."],"response":"12."}"""
+        ).single().content
+
+        val result = engine.trainStepDetailed(sequence)
+
+        assertTrue("Reasoning sequence must produce finite cross-entropy loss.", result.loss.isFinite())
+        assertTrue("Reasoning tokens must be scored as next-token targets.", result.predictionTargetCount > 0)
+        assertTrue("Reasoning sequence must create at least one context window.", result.contextWindowCount > 0)
+        assertTrue("Reasoning sequence must update the neural optimizer.", result.optimizerUpdateCount > 0)
+    }
 
     @Test
     fun reasoningRecordIsSerializedIntoAssistantThinkAndFinalAnswerTargets() {
