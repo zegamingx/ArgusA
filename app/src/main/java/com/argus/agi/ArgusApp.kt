@@ -41,12 +41,6 @@ class ArgusApp : Application() {
             // Stable device capacity selects a fresh model tier. Existing checkpoints
             // keep their original tensor dimensions to avoid silently discarding weights.
             val hardwareInfo = hardwareProfile.getHardwareInfo()
-            val deviceConfig = EngineConfig.forDevice(
-                totalRamGb = hardwareInfo.totalRamGb,
-                maxHeapMb = hardwareInfo.maxHeapMb,
-                availableRamGb = hardwareInfo.availRamGb,
-                cpuCores = hardwareInfo.cpuCores
-            )
             val resolvedConfig = ArgusNeuralEngine.resolveConfig(
                 context = instance,
                 totalRamGb = hardwareInfo.totalRamGb,
