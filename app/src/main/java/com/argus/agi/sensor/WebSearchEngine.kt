@@ -94,7 +94,7 @@ class WebSearchEngine(
                 maxBytes = MAX_DDG_RESPONSE_BYTES
             )
 
-            parseDdgHtml(html)
+            parseDdgHtml(html.orEmpty())
         }
     }
 
@@ -114,7 +114,7 @@ class WebSearchEngine(
                 contentLength = response.body.contentLength(),
                 maxBytes = MAX_WIKI_RESPONSE_BYTES
             )
-            if (body.isBlank()) return@use emptyList()
+            if (body.isNullOrBlank()) return@use emptyList()
 
             val json = JSONArray(body)
             if (json.length() < 4) return@use emptyList()
