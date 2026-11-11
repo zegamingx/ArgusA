@@ -175,6 +175,7 @@ data class EngineConfig(
         private fun selectExecutableShape(targetParameters: Long): ExecutableShape {
             val minimumParameters = ArgusDeviceModelProfile.MINIMUM_MODEL_PARAMETERS
             val candidates = ArrayList<ExecutableShape>()
+            val allExecutableCandidates = ArrayList<ExecutableShape>()
             val hiddenSizes = intArrayOf(128, 160, 192, 256, 320, 384, 512, 640, 768, 1024)
             val feedForwardMultipliers = intArrayOf(2, 3, 4)
             val adapterRanks = intArrayOf(2, 4, 8)
@@ -199,8 +200,8 @@ data class EngineConfig(
                             val parameterCount = ArgusArchitectureParameterEstimator
                                 .estimate(architecture)
                                 .totalTrainableParameters
-                            if (parameterCount in minimumParameters..targetParameters) {
-                                candidates += ExecutableShape(
+                            if (parameterCount >= minimumParameters) {
+                                val candidate = ExecutableShape(
                                     dModel = hidden,
                                     nHeads = heads,
                                     dFf = feedForward,
@@ -208,16 +209,29 @@ data class EngineConfig(
                                     loraRank = rank,
                                     parameterCount = parameterCount
                                 )
+                                allExecutableCandidates += candidate
+                                if (parameterCount <= targetParameters) {
+                                    candidates += candidate
+                                }
                             }
                         }
                     }
                 }
             }
 
-            return candidates.maxByOrNull(ExecutableShape::parameterCount)
-                ?: throw IllegalArgumentException(
-                    "The device budget cannot fit Argus's minimum 1M-parameter FP32 training model."
-                )
+            val bestWithinBudget = candidates.maxByOrNull(ExecutableShape::parameterCount)
+            if (bestWithinBudget != null) return bestWithinBudget
+
+            val smallestExecutable = allExecutableCandidates.minByOrNull(
+                ExecutableShape::parameterCount
+            ) ?: throw IllegalArgumentException(
+                "No executable Argus architecture reaches the minimum 1M parameters."
+            )
+            val minimumModelAllowance = (targetParameters.toDouble() * 1.1).toLong()
+            require(smallestExecutable.parameterCount <= minimumModelAllowance) {
+                "The device budget cannot fit Argus's minimum 1M-parameter FP32 training model."
+            }
+            return smallestExecutable
         }
     }
 }
