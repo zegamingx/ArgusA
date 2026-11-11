@@ -120,9 +120,13 @@ Argus selects one of four native model families from installed RAM, the current 
 
 The family band is an architecture scale, not a guarantee that the active model reaches the band's upper bound. The active FP32 shape is selected from supported hidden sizes, feed-forward multipliers, and layer counts, then capped by a conservative memory budget. The budget uses at most 45% of the app heap and 25% of currently available system RAM; only 55% of that smaller budget is assigned to the 20-byte-per-parameter accumulated-training state floor. Remaining memory is reserved for activations, attention scratch, tokenizer expansion, checkpoint buffers, and allocator overhead.
 
+The native architecture search includes hidden sizes through 4,096 and up to 32 layers, so Argus can describe architectures approaching the 7B family ceiling. The Android runtime still rejects shapes that exceed JVM array limits or the measured app-heap budget.
+
 The training queue uses a true serial micro-batch of 1–8 independent samples. Each sample's context windows are processed sequentially, their gradients are target-count weighted and accumulated, and one AdamW update is applied after the batch. Activations are not retained for all samples at once. The training worker assigns one optimizer update to the first trainable sample in the batch so session metrics do not count the same update more than once.
 
-**7B is the upper family target, not a claim that the current Android FP32/JVM engine can allocate or train a 7B model.** The current runtime is constrained by Android app-heap limits, JVM array sizes, and FP32 optimizer state. Multi-billion-parameter on-device training requires a separate memory-efficient execution design (for example, lower-precision state, optimizer sharding/offload, and streamed tensor execution) that is not currently integrated. The running model's actual parameter count is reported separately from its family label.
+Existing ARG3/ARG4 checkpoints retain their saved dimensions. When the current device cannot safely reserve the additional accumulation buffer, Argus keeps the saved model on its single-sample compatibility path and forces batch size 1; it does not resize or silently replace the user's model. A fresh installation requires enough memory for the 1M-parameter minimum before Genesis allocates its model.
+
+**7B is the upper family target, not a claim that the current Android FP32/JVM engine can allocate or train a 7B model.** Multi-billion-parameter on-device training still requires a separate memory-efficient execution design (for example, lower-precision state, optimizer sharding/offload, and streamed tensor execution) that is not currently integrated. The running model's actual parameter count is reported separately from its family label.
 
 ## Device-adaptive inference capacity
 
