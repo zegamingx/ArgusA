@@ -65,7 +65,7 @@ class InferenceMemoryEstimatorTest {
     fun estimatesQuantizedWeightsAndLeavesKvCacheUnknownWithoutShapeMetadata() {
         val estimate = InferenceMemoryEstimator.estimate(
             parameterCount = 1_000_000_000L,
-            quantization = InferenceQuantization.Q4_K_M
+            quantization = ArgusWeightPrecision.INT4
         )
 
         assertEquals(625_000_000L, estimate.weightBytes)
@@ -78,7 +78,7 @@ class InferenceMemoryEstimatorTest {
     fun estimatesKvCacheFromModelMetadata() {
         val estimate = InferenceMemoryEstimator.estimate(
             parameterCount = 1_000_000_000L,
-            quantization = InferenceQuantization.Q4_K_M,
+            quantization = ArgusWeightPrecision.INT4,
             shape = InferenceModelShape(
                 parameterCount = 1_000_000_000L,
                 layerCount = 32,
@@ -98,7 +98,7 @@ class InferenceMemoryEstimatorTest {
     fun refusesToClaimFitWhenKvCacheMetadataIsUnknown() {
         val estimate = InferenceMemoryEstimator.estimate(
             parameterCount = 1_000_000_000L,
-            quantization = InferenceQuantization.Q4_K_M
+            quantization = ArgusWeightPrecision.INT4
         )
 
         assertNull(

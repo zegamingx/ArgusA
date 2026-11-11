@@ -238,7 +238,7 @@ class GenesisModelManager(
         val inferenceCapacity = DeviceModelCapacityPolicy.recommend(
             hardwareInfo.availRamGb.toDouble()
         )
-        logs += "RAM-based Q4 inference planning range: ${inferenceCapacity.parameterRangeLabel}. " +
+        logs += "RAM-based Argus INT4 inference planning range: ${inferenceCapacity.parameterRangeLabel}. " +
                 "This is a capacity target, not a loaded model or a model-specific fit guarantee."
         logs += "Battery: ${safety.batteryPct}% | Temperature: " +
                 "${String.format(Locale.US, "%.1f", safety.temperatureCelsius)}°C"

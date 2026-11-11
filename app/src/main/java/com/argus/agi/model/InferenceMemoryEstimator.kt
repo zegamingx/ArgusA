@@ -7,10 +7,10 @@ import kotlin.math.max
  * Conservative, metadata-aware footprint estimate for a future quantized inference loader.
  * It does not allocate memory and must not be treated as proof that a device can load a model.
  */
-enum class InferenceQuantization(val estimatedBytesPerParameter: Double) {
-    Q4_K_M(0.625),
-    Q5_K_M(0.75),
-    Q8_0(1.0625),
+enum class ArgusWeightPrecision(val estimatedBytesPerParameter: Double) {
+    INT4(0.5),
+    INT5(0.625),
+    INT8(1.0),
     F16(2.0)
 }
 
@@ -56,7 +56,7 @@ object InferenceMemoryEstimator {
      */
     fun estimate(
         parameterCount: Long,
-        quantization: InferenceQuantization,
+        quantization: ArgusWeightPrecision,
         shape: InferenceModelShape? = null
     ): InferenceMemoryEstimate {
         require(parameterCount > 0L) { "parameterCount must be positive." }

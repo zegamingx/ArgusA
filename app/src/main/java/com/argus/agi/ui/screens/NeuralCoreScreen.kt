@@ -297,7 +297,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        text = "RAM-only Q4 planning range. The active model remains the separate " +
+                        text = "RAM-only Argus INT4 planning range. The active model remains the separate " +
                             "FP32 training engine. A model-specific memory and backend check is required " +
                             "before any quantized model can be loaded.",
                         style = MaterialTheme.typography.bodySmall,

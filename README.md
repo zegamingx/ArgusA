@@ -104,7 +104,7 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - Values between anchors are linearly interpolated. Above 32 GB, the estimate grows by 1.3B–1.5B parameters per additional GB.
 - These values are RAM-only planning targets, not guaranteed model-load limits. A future inference loader must inspect the actual model quantization and architecture metadata, estimate KV cache and runtime workspace, and enforce a memory safety reserve before loading.
 - The existing custom FP32 training engine remains independent from inference sizing. Its 16-byte-per-parameter state floor accounts for parameters, gradients, and two Adam moments; activation and temporary-buffer memory are additional.
-- A GGUF/llama.cpp inference loader is not yet integrated. The current custom neural engine is not a multi-billion-parameter quantized inference runtime.
+- An Argus-native multi-billion-parameter inference runtime is not yet integrated. Argus must load its own checkpoint, architecture configuration, tokenizer state, and tensor data without requiring an external model format or runtime. Internal weight quantization is a future Argus-owned storage and execution feature.
 
 ## On-device training scope
 
