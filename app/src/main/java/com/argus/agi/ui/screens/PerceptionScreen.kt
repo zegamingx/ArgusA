@@ -46,10 +46,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -59,6 +59,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -68,6 +70,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import com.argus.agi.R
 import com.argus.agi.service.ArgusAccessibilityService
 import com.argus.agi.ui.ArgusViewModel
 import com.argus.agi.ui.theme.ArgusCardBorder
@@ -82,24 +85,62 @@ import com.argus.agi.ui.theme.ArgusTextPrimary
 import com.argus.agi.ui.theme.ArgusTextSecondary
 import com.argus.agi.ui.theme.ArgusWarning
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.sqrt
 
 @Composable
 fun PerceptionScreen(viewModel: ArgusViewModel) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val hardware by viewModel.hardwareInfo.collectAsState()
     val contextSummary by viewModel.currentContextSummary.collectAsState()
     val cameraLuminance by viewModel.cameraLuminance.collectAsState()
-    val isAccessibilityActive = ArgusAccessibilityService.instance != null
+    var isAccessibilityActive by remember {
+        mutableStateOf(ArgusAccessibilityService.instance != null)
+    }
+    var isAudioPermissionDenied by remember { mutableStateOf(false) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isAccessibilityActive = ArgusAccessibilityService.instance != null
+                if (ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.RECORD_AUDIO,
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    isAudioPermissionDenied = false
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     val ambientDb by viewModel.ambientDecibel.collectAsState()
     val isAcousticActive by viewModel.isAcousticMonitoring.collectAsState()
     val isSpeaking by viewModel.isSpeaking.collectAsState()
     val isListening by viewModel.isListeningVoice.collectAsState()
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            isAudioPermissionDenied = false
+            viewModel.toggleAcousticMonitoring()
+        } else {
+            isAudioPermissionDenied = true
+        }
+    }
 
-    var isCameraActive by rememberSaveable { mutableStateOf(false) }
+    var isCameraActive by remember { mutableStateOf(false) }
+    var isCameraStreaming by remember { mutableStateOf(false) }
     var isCameraExpanded by remember { mutableStateOf(true) }
     var isScreenExpanded by remember { mutableStateOf(false) }
     var isHardwareExpanded by remember { mutableStateOf(false) }
     var isAudioExpanded by remember { mutableStateOf(false) }
+
+    val isSensing = isCameraStreaming || isAcousticActive || isAccessibilityActive
 
     LazyColumn(
         modifier = Modifier
@@ -123,16 +164,16 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                     )
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(if (isCameraActive || isAcousticActive || isAccessibilityActive) ArgusSuccess.copy(alpha = 0.15f) else ArgusSurfaceVariant).padding(horizontal = 9.dp, vertical = 4.dp)
+                        modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(if (isSensing) ArgusSuccess.copy(alpha = 0.15f) else ArgusSurfaceVariant).padding(horizontal = 9.dp, vertical = 4.dp)
                     ) {
-                        Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(if (isCameraActive || isAcousticActive || isAccessibilityActive) ArgusSuccess else ArgusTextMuted))
+                        Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(if (isSensing) ArgusSuccess else ArgusTextMuted))
                         Spacer(modifier = Modifier.width(5.dp))
-                        Text(text = if (isCameraActive || isAcousticActive || isAccessibilityActive) "SENSING" else "STANDBY", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = if (isCameraActive || isAcousticActive || isAccessibilityActive) ArgusSuccess else ArgusTextMuted, fontWeight = FontWeight.Bold)
+                        Text(text = if (isSensing) "SENSING" else "STANDBY", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = if (isSensing) ArgusSuccess else ArgusTextMuted, fontWeight = FontWeight.Bold)
                     }
                 }
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Mata, telinga, dan layar. Semua diproses di HP, sampling dibatasi biar hemat baterai.",
+                    text = "Camera, audio, and screen context. Sensor processing runs on-device with bounded sampling.",
                     style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp),
                     color = ArgusTextMuted,
                     lineHeight = 17.sp
@@ -141,14 +182,14 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                 // MINI STATUS ROW
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     MiniStatus(
-                        label = "LIGHT",
-                        value = if (isCameraActive) String.format(Locale.US, "%.0f lx", cameraLuminance) else "Off",
-                        active = isCameraActive,
+                        label = "LUMA",
+                        value = if (isCameraStreaming) String.format(Locale.US, "%.0f/255", cameraLuminance.coerceIn(0f, 255f)) else "Off",
+                        active = isCameraStreaming,
                         modifier = Modifier.weight(1f)
                     )
                     MiniStatus(
-                        label = "SOUND",
-                        value = if (isAcousticActive) String.format(Locale.US, "%.0f dB", ambientDb) else "Off",
+                        label = "AUDIO",
+                        value = if (isAcousticActive) String.format(Locale.US, "%.1f dB rel", ambientDb) else "Off",
                         active = isAcousticActive,
                         modifier = Modifier.weight(1f)
                     )
@@ -183,13 +224,20 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                             Spacer(modifier = Modifier.width(9.dp))
                             Column {
                                 Text(text = "Camera Vision", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
-                                Text(text = if (isCameraActive) "Adaptive • 1 frame / 2.5s" else "Standby • Hemat baterai", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
+                                Text(text = when {
+                                    isCameraStreaming -> "Streaming • 1 sample / 2.5s"
+                                    isCameraActive -> "Waiting for camera permission or provider"
+                                    else -> "Off • battery friendly"
+                                }, style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
                             }
                         }
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Switch(
                                 checked = isCameraActive,
-                                onCheckedChange = { isCameraActive = it },
+                                onCheckedChange = { enabled ->
+                                    isCameraActive = enabled
+                                    if (!enabled) isCameraStreaming = false
+                                },
                                 colors = SwitchDefaults.colors(checkedThumbColor = ArgusDarkBg, checkedTrackColor = ArgusCyanPrimary, uncheckedThumbColor = ArgusTextMuted, uncheckedTrackColor = ArgusSurfaceVariant),
                                 modifier = Modifier.testTag("camera_active_switch")
                             )
@@ -204,7 +252,10 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                                 Box(
                                     modifier = Modifier.fillMaxWidth().height(220.dp).clip(RoundedCornerShape(14.dp)).background(ArgusDarkBg).border(1.dp, ArgusCyanPrimary.copy(alpha = 0.4f), RoundedCornerShape(14.dp))
                                 ) {
-                                    CameraViewfinder(onLuminanceUpdate = { lum -> viewModel.updateCameraFrame(lum) })
+                                    CameraViewfinder(
+                                        onLuminanceUpdate = { luma -> viewModel.updateCameraFrame(luma) },
+                                        onStreamingChanged = { isCameraStreaming = it },
+                                    )
                                     // Scan frame overlay, lite, no particle
                                     Canvas(modifier = Modifier.fillMaxSize()) {
                                         val stroke = 2.dp.toPx()
@@ -227,11 +278,11 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                                         drawLine(Color(0xFF38BDF8).copy(alpha = 0.35f), Offset(20f, y), Offset(size.width - 20f, y), strokeWidth = 1.5f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f))
                                     }
                                     Box(modifier = Modifier.align(Alignment.TopStart).padding(10.dp).clip(RoundedCornerShape(20.dp)).background(Color.Black.copy(alpha = 0.6f)).padding(horizontal = 8.dp, vertical = 4.dp)) {
-                                        Text(text = String.format(Locale.US, "%.1f lx • LIVE", cameraLuminance), style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                                        Text(text = String.format(Locale.US, "LUMA %.0f/255 • LIVE", cameraLuminance.coerceIn(0f, 255f)), style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
                                     }
                                 }
                                 Spacer(modifier = Modifier.height(8.dp))
-                                Text(text = "Adaptive mode aktif: sampling dibatasi biar gak panas dan hemat baterai.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusCyanGlow)
+                                Text(text = "Frame analysis is throttled to one sample every 2.5 seconds to limit CPU and battery use.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusCyanGlow)
                             } else {
                                 Box(
                                     modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(ArgusSurfaceVariant.copy(alpha = 0.5f)).border(1.dp, ArgusCardBorder, RoundedCornerShape(14.dp)).padding(16.dp),
@@ -240,9 +291,9 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                         Icon(painter = painterResource(R.drawable.ic_symbol_photo_camera), contentDescription = null, tint = ArgusTextMuted, modifier = Modifier.size(28.dp))
                                         Spacer(modifier = Modifier.height(6.dp))
-                                        Text(text = "Kamera standby", style = MaterialTheme.typography.titleSmall, color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
+                                        Text(text = "Camera standby", style = MaterialTheme.typography.titleSmall, color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
                                         Spacer(modifier = Modifier.height(4.dp))
-                                        Text(text = "Kamera gak jalan terus. Nyalain cuma pas lu butuh input visual.", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp), color = ArgusTextSecondary, textAlign = TextAlign.Center)
+                                        Text(text = "The camera remains off until you explicitly enable visual input.", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp), color = ArgusTextSecondary, textAlign = TextAlign.Center)
                                         Spacer(modifier = Modifier.height(10.dp))
                                         Button(
                                             onClick = { isCameraActive = true },
@@ -307,7 +358,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Icon(painter = painterResource(R.drawable.ic_symbol_check_circle), contentDescription = null, tint = ArgusSuccess, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text(text = "Dibaca pas jendela app berubah, app yang dikecualikan di-skip.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusSuccess)
+                                    Text(text = "Screen text is observed when the active window changes; excluded apps are skipped.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusSuccess)
                                 }
                             }
                         }
@@ -367,11 +418,39 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                         Spacer(modifier = Modifier.width(9.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(text = "Voice & Acoustic", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
-                            Text(text = if (isAcousticActive) String.format(Locale.US, "Ambient: %.1f dB", ambientDb) else "Standby", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = if (isAcousticActive) ArgusCyanGlow else ArgusTextMuted)
+                            Text(
+                                text = when {
+                                    isAudioPermissionDenied -> "Microphone permission required"
+                                    isAcousticActive -> String.format(Locale.US, "Relative audio: %.1f dB", ambientDb)
+                                    else -> "Standby • microphone off"
+                                },
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                                color = when {
+                                    isAudioPermissionDenied -> ArgusWarning
+                                    isAcousticActive -> ArgusCyanGlow
+                                    else -> ArgusTextMuted
+                                },
+                            )
                         }
                         Switch(
                             checked = isAcousticActive,
-                            onCheckedChange = { viewModel.toggleAcousticMonitoring() },
+                            onCheckedChange = { enabled ->
+                                if (enabled) {
+                                    val hasPermission = ContextCompat.checkSelfPermission(
+                                        context,
+                                        Manifest.permission.RECORD_AUDIO,
+                                    ) == PackageManager.PERMISSION_GRANTED
+                                    if (hasPermission) {
+                                        isAudioPermissionDenied = false
+                                        viewModel.toggleAcousticMonitoring()
+                                    } else {
+                                        audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    }
+                                } else {
+                                    isAudioPermissionDenied = false
+                                    viewModel.toggleAcousticMonitoring()
+                                }
+                            },
                             colors = SwitchDefaults.colors(checkedThumbColor = ArgusDarkBg, checkedTrackColor = ArgusCyanPrimary, uncheckedThumbColor = ArgusTextMuted, uncheckedTrackColor = ArgusSurfaceVariant)
                         )
                         Icon(painter = if (isAudioExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down), contentDescription = "Expand", tint = ArgusTextMuted, modifier = Modifier.size(20.dp))
@@ -380,10 +459,18 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                     AnimatedVisibility(visible = isAudioExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
                             Spacer(modifier = Modifier.height(12.dp))
+                            if (isAudioPermissionDenied) {
+                                Text(
+                                    text = "Allow microphone access in Android permissions to enable acoustic monitoring.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = ArgusWarning,
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
                             HardwareSpecRow(label = "Text-to-Speech", value = if (isSpeaking) "Speaking" else "Ready • device TTS")
                             HardwareSpecRow(label = "Speech Recognition", value = if (isListening) "Listening..." else "Ready • offline preferred")
-                            HardwareSpecRow(label = "Ambient Noise", value = if (isAcousticActive) String.format(Locale.US, "%.1f dB SPL", ambientDb) else "Sensor Off")
-                            HardwareSpecRow(label = "Speech Service", value = "Device service, fallback network jika offline gak tersedia")
+                            HardwareSpecRow(label = "Relative Audio Level", value = if (isAcousticActive) String.format(Locale.US, "%.1f dB relative (uncalibrated)", ambientDb) else "Sensor Off")
+                            HardwareSpecRow(label = "Speech Service", value = "Device speech service; network fallback may be used when offline recognition is unavailable")
                         }
                     }
                 }
@@ -413,83 +500,200 @@ fun HardwareSpecRow(label: String, value: String) {
 }
 
 @Composable
-fun CameraViewfinder(onLuminanceUpdate: (Float) -> Unit) {
+fun CameraViewfinder(
+    onLuminanceUpdate: (Float) -> Unit,
+    onStreamingChanged: (Boolean) -> Unit,
+) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val currentOnLuminanceUpdate by rememberUpdatedState(onLuminanceUpdate)
+    val currentOnStreamingChanged by rememberUpdatedState(onStreamingChanged)
+    val mainExecutor = remember(context) { ContextCompat.getMainExecutor(context) }
 
-    var hasCameraPermission by remember {
-        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
+    var hasCameraPermission by remember(context) {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.CAMERA,
+            ) == PackageManager.PERMISSION_GRANTED,
+        )
+    }
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        hasCameraPermission = granted
+    }
+    DisposableEffect(context, lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasCameraPermission = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.CAMERA,
+                ) == PackageManager.PERMISSION_GRANTED
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    val launcher = rememberLauncherForActivityResult(contract = ActivityResultContracts.RequestPermission()) { granted -> hasCameraPermission = granted }
-
     if (!hasCameraPermission) {
-        Box(modifier = Modifier.fillMaxSize().padding(16.dp), contentAlignment = Alignment.Center) {
+        Box(
+            modifier = Modifier.fillMaxSize().padding(16.dp),
+            contentAlignment = Alignment.Center,
+        ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(painter = painterResource(R.drawable.ic_symbol_photo_camera), contentDescription = null, tint = ArgusCyanPrimary, modifier = Modifier.size(32.dp))
+                Icon(
+                    painter = painterResource(R.drawable.ic_symbol_photo_camera),
+                    contentDescription = null,
+                    tint = ArgusCyanPrimary,
+                    modifier = Modifier.size(32.dp),
+                )
                 Spacer(modifier = Modifier.height(8.dp))
-                Text(text = "Camera permission is required for visual input", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp), color = ArgusTextSecondary, textAlign = TextAlign.Center)
+                Text(
+                    text = "Camera permission is required for visual input.",
+                    style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp),
+                    color = ArgusTextSecondary,
+                    textAlign = TextAlign.Center,
+                )
                 Spacer(modifier = Modifier.height(10.dp))
-                Button(onClick = { launcher.launch(Manifest.permission.CAMERA) }, colors = ButtonDefaults.buttonColors(containerColor = ArgusCyanPrimary, contentColor = ArgusDarkBg), shape = RoundedCornerShape(20.dp)) {
-                    Text("Grant Camera Permission", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                Button(
+                    onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = ArgusCyanPrimary,
+                        contentColor = ArgusDarkBg,
+                    ),
+                    shape = RoundedCornerShape(20.dp),
+                ) {
+                    Text("Grant camera permission", fontWeight = FontWeight.Bold, fontSize = 11.sp)
                 }
             }
         }
         return
     }
 
-    var cameraProviderRef by remember { mutableStateOf<ProcessCameraProvider?>(null) }
+    var cameraError by remember(lifecycleOwner) { mutableStateOf<String?>(null) }
+    val analysisExecutor = remember(lifecycleOwner) { Executors.newSingleThreadExecutor() }
+    val cameraProviderRef = remember(lifecycleOwner) {
+        AtomicReference<ProcessCameraProvider?>(null)
+    }
+    val isDisposed = remember(lifecycleOwner) { AtomicBoolean(false) }
 
-    DisposableEffect(lifecycleOwner) {
+    DisposableEffect(lifecycleOwner, analysisExecutor) {
         onDispose {
-            try { cameraProviderRef?.unbindAll() } catch (_: Exception) {}
+            isDisposed.set(true)
+            currentOnStreamingChanged(false)
+            cameraProviderRef.getAndSet(null)?.unbindAll()
+            analysisExecutor.shutdownNow()
         }
     }
 
-    var lastAnalysisNs by remember { mutableStateOf(0L) }
-    val throttleIntervalNs = 2_500_000_000L
-
-    AndroidView(
-        factory = { ctx ->
-            val previewView = PreviewView(ctx)
-            val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
-            cameraProviderFuture.addListener({
-                try {
-                    val cameraProvider = cameraProviderFuture.get()
-                    cameraProviderRef = cameraProvider
-                    val preview = Preview.Builder().build().also { it.surfaceProvider = previewView.surfaceProvider }
-                    val imageAnalysis = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
-                    imageAnalysis.setAnalyzer(ContextCompat.getMainExecutor(ctx)) { imageProxy ->
-                        val now = System.nanoTime()
-                        if (now - lastAnalysisNs < throttleIntervalNs) {
-                            imageProxy.close()
-                            return@setAnalyzer
-                        }
-                        lastAnalysisNs = now
-                        try {
-                            val buffer = imageProxy.planes[0].buffer
-                            val data = ByteArray(buffer.remaining())
-                            buffer.get(data)
-                            var sum = 0L
-                            val step = (data.size / 500).coerceAtLeast(1)
-                            var count = 0
-                            for (i in 0 until data.size step step) {
-                                sum += (data[i].toInt() and 0xFF)
-                                count++
-                            }
-                            val avgLum = if (count > 0) sum.toFloat() / count else 0f
-                            onLuminanceUpdate(avgLum)
-                        } finally {
-                            imageProxy.close()
-                        }
+    Box(modifier = Modifier.fillMaxSize()) {
+        AndroidView(
+            factory = { viewContext ->
+                val previewView = PreviewView(viewContext).apply {
+                    scaleType = PreviewView.ScaleType.FILL_CENTER
+                }
+                val cameraProviderFuture = ProcessCameraProvider.getInstance(viewContext)
+                cameraProviderFuture.addListener({
+                    if (isDisposed.get()) {
+                        return@addListener
                     }
-                    val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-                    cameraProvider.unbindAll()
-                    cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalysis)
-                } catch (_: Exception) {}
-            }, ContextCompat.getMainExecutor(ctx))
-            previewView
-        },
-        modifier = Modifier.fillMaxSize()
-    )
+
+                    try {
+                        val cameraProvider = cameraProviderFuture.get()
+                        cameraProviderRef.set(cameraProvider)
+
+                        val preview = Preview.Builder().build().also {
+                            it.surfaceProvider = previewView.surfaceProvider
+                        }
+                        val imageAnalysis = ImageAnalysis.Builder()
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .build()
+
+                        var lastAnalysisNs = 0L
+                        imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
+                            try {
+                                val now = System.nanoTime()
+                                if (now - lastAnalysisNs >= 2_500_000_000L) {
+                                    lastAnalysisNs = now
+                                    val yPlane = imageProxy.planes.firstOrNull()
+                                    if (yPlane != null) {
+                                        val buffer = yPlane.buffer.duplicate()
+                                        val basePosition = buffer.position()
+                                        val width = imageProxy.width
+                                        val height = imageProxy.height
+                                        val sampleStep = sqrt(
+                                            width.toDouble() * height.toDouble() / 500.0,
+                                        ).toInt().coerceAtLeast(1)
+                                        var luminanceSum = 0L
+                                        var sampleCount = 0
+
+                                        for (row in 0 until height step sampleStep) {
+                                            val rowOffset = basePosition + row * yPlane.rowStride
+                                            for (column in 0 until width step sampleStep) {
+                                                val index = rowOffset + column * yPlane.pixelStride
+                                                if (index < buffer.limit()) {
+                                                    luminanceSum += (buffer.get(index).toInt() and 0xFF).toLong()
+                                                    sampleCount += 1
+                                                }
+                                            }
+                                        }
+
+                                        if (sampleCount > 0) {
+                                            val averageLuma = luminanceSum.toFloat() / sampleCount
+                                            mainExecutor.execute {
+                                                if (!isDisposed.get()) {
+                                                    cameraError = null
+                                                    currentOnLuminanceUpdate(averageLuma)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch (error: Exception) {
+                                mainExecutor.execute {
+                                    if (!isDisposed.get() && cameraError == null) {
+                                        cameraError = "Frame analysis failed: ${error.localizedMessage ?: "unknown error"}"
+                                    }
+                                }
+                            } finally {
+                                imageProxy.close()
+                            }
+                        }
+
+                        cameraProvider.unbindAll()
+                        cameraProvider.bindToLifecycle(
+                            lifecycleOwner,
+                            CameraSelector.DEFAULT_BACK_CAMERA,
+                            preview,
+                            imageAnalysis,
+                        )
+                        cameraError = null
+                        currentOnStreamingChanged(true)
+                    } catch (error: Exception) {
+                        currentOnStreamingChanged(false)
+                        cameraError = "Camera could not start: ${error.localizedMessage ?: "check camera availability and permissions"}"
+                    }
+                }, mainExecutor)
+                previewView
+            },
+            modifier = Modifier.fillMaxSize(),
+        )
+
+        if (cameraError != null) {
+            Box(
+                modifier = Modifier.fillMaxSize()
+                    .background(ArgusDarkBg.copy(alpha = 0.88f))
+                    .padding(20.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = cameraError.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = ArgusWarning,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
+    }
 }

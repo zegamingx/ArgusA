@@ -334,7 +334,7 @@ class AudioVoiceManager(
     }
 
     // =========================================================================
-    // Acoustic Sensor (Mengukur desibel kebisingan suara lingkungan nyata)
+    // Acoustic Sensor (uncalibrated relative PCM amplitude; not dB SPL)
     // =========================================================================
 
     fun startAcousticMonitoring(onDecibelSample: (Float) -> Unit) {

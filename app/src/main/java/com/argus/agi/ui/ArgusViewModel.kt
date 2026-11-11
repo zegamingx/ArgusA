@@ -192,10 +192,10 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             audioVoiceManager.stopAcousticMonitoring()
         } else {
             audioVoiceManager.startAcousticMonitoring { db ->
-                worldModel.storeEntities(
+                worldModel.updateTransientEntities(
                     WorldEntity(
                         "ambient_acoustic",
-                        String.format(Locale.US, "%.1f dB", db),
+                        String.format(Locale.US, "%.1f dB relative (uncalibrated)", db),
                         "Microphone Acoustic Sensor"
                     )
                 )
@@ -1265,10 +1265,11 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateCameraFrame(luminance: Float) {
-        _cameraLuminance.value = luminance
+        val safeLuma = luminance.takeIf(Float::isFinite)?.coerceIn(0f, 255f) ?: 0f
+        _cameraLuminance.value = safeLuma
         worldModel.updateCameraContext(
-            lightLevel = luminance,
-            visualSummary = "Camera active. Luminance: ${String.format("%.1f", luminance)} lx"
+            lumaLevel = safeLuma,
+            visualSummary = "Camera active. Average Y-plane luminance: ${String.format(Locale.US, "%.1f", safeLuma)}/255 (relative, not calibrated lux)."
         )
     }
 

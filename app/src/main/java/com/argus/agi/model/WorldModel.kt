@@ -115,19 +115,32 @@ class WorldModel(
         }
     }
 
-    private fun pruneIfNeeded() {
-        val now = System.currentTimeMillis()
-        // Hapus entity yang melewati TTL (atomic remove-if-equal)
-        entities.entries.removeIf { (_, v) -> now - v.timestamp > ENTITY_TTL_MS }
+    /**
+     * Publishes short-lived sensor state without writing high-frequency telemetry to Room.
+     * Sensor samples describe the current environment, not durable user knowledge.
+     */
+    fun updateTransientEntities(vararg newEntities: WorldEntity) {
+        newEntities.forEach { entities[it.key] = it }
+        pruneInMemoryEntities()
+        publishSnapshot()
+    }
 
-        // Batasi jumlah total entity
+    private fun pruneInMemoryEntities() {
+        val now = System.currentTimeMillis()
+        entities.entries.removeIf { (_, entity) ->
+            now - entity.timestamp > ENTITY_TTL_MS
+        }
+
         if (entities.size > MAX_ENTITIES) {
             entities.entries
                 .sortedBy { it.value.timestamp }
                 .take(entities.size - MAX_ENTITIES)
-                .forEach { (k, v) -> entities.remove(k, v) } // atomic
+                .forEach { (key, entity) -> entities.remove(key, entity) }
         }
+    }
 
+    private fun pruneIfNeeded() {
+        pruneInMemoryEntities()
         scope.launch {
             repo?.let { r ->
                 runCatching { r.pruneExpiredMemories(ENTITY_TTL_MS) }
@@ -163,12 +176,15 @@ class WorldModel(
             }
     }
 
-    fun updateCameraContext(lightLevel: Float, visualSummary: String) {
-        val safeLight = if (lightLevel.isFinite()) lightLevel.coerceIn(0f, 200_000f) else 0f
-        storeEntities(
+    fun updateCameraContext(lumaLevel: Float, visualSummary: String) {
+        val safeLuma = if (lumaLevel.isFinite()) lumaLevel.coerceIn(0f, 255f) else 0f
+        updateTransientEntities(
             WorldEntity("visual_environment", visualSummary.take(200), "Camera Vision Sensor"),
-            WorldEntity("ambient_luminance",
-                String.format(Locale.US, "%.1f lux", safeLight), "Camera Sensor")
+            WorldEntity(
+                "camera_luma",
+                String.format(Locale.US, "%.1f/255 relative luminance", safeLuma),
+                "Camera Y-plane Sensor",
+            ),
         )
     }
 

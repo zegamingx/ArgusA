@@ -113,9 +113,10 @@ fun ChatScreen(viewModel: ArgusViewModel) {
     val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
     val isKeyboardOpen = imeBottom > 0.dp
 
-    LaunchedEffect(messages.size, isKeyboardOpen) {
-        if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.size - 1)
+    LaunchedEffect(messages.size, isKeyboardOpen, isGenerating) {
+        val lastVisibleItemIndex = messages.lastIndex + if (isGenerating) 1 else 0
+        if (lastVisibleItemIndex >= 0) {
+            listState.animateScrollToItem(lastVisibleItemIndex)
         }
     }
 
@@ -161,13 +162,13 @@ fun ChatScreen(viewModel: ArgusViewModel) {
         AlertDialog(
             onDismissRequest = { showAttachDialog = false },
             containerColor = ArgusSurface,
-            title = { Text("Lampirkan", color = ArgusTextPrimary, fontWeight = FontWeight.Bold) },
+            title = { Text("Attach content", color = ArgusTextPrimary, fontWeight = FontWeight.Bold) },
             text = {
                 Column {
-                    Text("Pilih jenis file yang mau lu kirim ke ARGUS", color = ArgusTextSecondary, fontSize = 13.sp)
+                    Text("Choose the type of content to send to ARGUS.", color = ArgusTextSecondary, fontSize = 13.sp)
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
-                        text = "Dokumen / ZIP",
+                        text = "Document / ZIP",
                         color = ArgusCyanPrimary,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(ArgusSurfaceVariant).clickable {
@@ -177,7 +178,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Gambar / Video",
+                        text = "Image / Video",
                         color = ArgusCyanPrimary,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(ArgusSurfaceVariant).clickable {
@@ -190,7 +191,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
             confirmButton = {},
             dismissButton = {
                 TextButton(onClick = { showAttachDialog = false }) {
-                    Text("Batal", color = ArgusTextMuted)
+                    Text("Cancel", color = ArgusTextMuted)
                 }
             }
         )
@@ -307,9 +308,9 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                     modifier = Modifier.size(84.dp).clip(CircleShape).border(1.dp, ArgusCyanPrimary, CircleShape)
                 )
                 Spacer(modifier = Modifier.height(16.dp))
-                Text("Halo, gue ARGUS", color = ArgusTextPrimary, fontWeight = FontWeight.Bold, fontSize = 18.sp, textAlign = TextAlign.Center)
+                Text("Hello, I am ARGUS", color = ArgusTextPrimary, fontWeight = FontWeight.Bold, fontSize = 18.sp, textAlign = TextAlign.Center)
                 Text(
-                    "Tanya apa aja, suruh latih dokumen, atau suruh ngomong. Semua jalan di HP lu, tanpa model remote.",
+                    "Ask a question, import a document for training, or use voice input. The local model runs on this device.",
                     color = ArgusTextMuted,
                     fontSize = 13.sp,
                     textAlign = TextAlign.Center,
@@ -317,7 +318,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                 )
                 Spacer(modifier = Modifier.height(18.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    val chips = listOf("Calculate 125 * 34", "What is A.R.G.U.S architecture?", "How does 【entity-LoRA¦canonical_name=LoRA】 work?")
+                    val chips = listOf("Calculate 125 * 34", "What is the A.R.G.U.S. architecture?", "How does LoRA work?")
                     items(chips) { chip ->
                         Surface(
                             shape = RoundedCornerShape(20.dp),
@@ -349,7 +350,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         ) {
                             CircularProgressIndicator(modifier = Modifier.size(16.dp), color = ArgusCyanPrimary, strokeWidth = 2.dp)
                             Spacer(modifier = Modifier.width(10.dp))
-                            Text(text = "ARGUS lagi mikir...", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp), color = ArgusCyanGlow, fontFamily = FontFamily.Monospace)
+                            Text(text = "ARGUS is thinking...", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp), color = ArgusCyanGlow, fontFamily = FontFamily.Monospace)
                         }
                     }
                 }
@@ -447,7 +448,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                     OutlinedTextField(
                         value = inputText,
                         onValueChange = { inputText = it },
-                        placeholder = { Text("Tanya, perintah aksi, atau latih...", color = ArgusTextMuted, fontSize = 13.sp) },
+                        placeholder = { Text("Ask a question, run an action, or train...", color = ArgusTextMuted, fontSize = 13.sp) },
                         trailingIcon = {
                             if (inputText.isEmpty()) {
                                 IconButton(
