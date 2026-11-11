@@ -309,9 +309,15 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
         val wordFrequencies = LinkedHashMap<String, Int>()
         for (document in corpus) {
-            val normalized = TextModalityProcessor.normalizeTypography(document)
+            var normalized = TextModalityProcessor.normalizeTypography(document)
+            // Control tokens already have fixed IDs and are split atomically during
+            // encoding. Do not spend BPE merges learning fragments of their markup,
+            // including when a marker touches the surrounding text.
+            for (specialToken in SPECIAL_TOKENS) {
+                normalized = normalized.replace(specialToken, " ")
+            }
             for (word in normalized.split(Regex("\\s+"))) {
-                if (word.isEmpty() || word in SPECIAL_TOKENS) continue
+                if (word.isEmpty()) continue
                 val frequency = wordFrequencies[word] ?: 0
                 wordFrequencies[word] = if (frequency == Int.MAX_VALUE) frequency else frequency + 1
             }

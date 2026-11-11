@@ -70,6 +70,34 @@ class TokenizerLearningTest {
     }
 
     @Test
+    fun bpeTrainingDoesNotConsumeMergesOnControlTokenMarkup() {
+        val tokenizer = Tokenizer(
+            TokenizerConfig(
+                maxVocabularySize = 512,
+                maxTokenLength = 16
+            )
+        )
+        val corpus = List(40) {
+            "<USER><ASSISTANT><THINK>reasoningpayload</THINK><ASSISTANT>answerpayload<EOS>"
+        }
+
+        tokenizer.trainBpe(corpus, targetVocabSize = 256, maxNewMerges = 32)
+
+        val markupMerges = tokenizer.exportMerges().filter { merge ->
+            merge.first.contains('<') || merge.first.contains('>') ||
+                merge.second.contains('<') || merge.second.contains('>')
+        }
+        assertTrue("Control-token markup must not be learned as BPE fragments.", markupMerges.isEmpty())
+
+        val encoded = tokenizer.encode(corpus.first(), autoRegister = false)
+        assertTrue(encoded.contains(Tokenizer.USER_ID))
+        assertTrue(encoded.contains(Tokenizer.ASSISTANT_ID))
+        assertTrue(encoded.contains(Tokenizer.THINK_START_ID))
+        assertTrue(encoded.contains(Tokenizer.THINK_END_ID))
+        assertTrue(encoded.contains(Tokenizer.EOS_ID))
+    }
+
+    @Test
     fun vocabularyExpansionAndBpeMergesSurviveCheckpointRoundTrip() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
