@@ -288,6 +288,21 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Refreshes the volatile free-memory snapshot without adding a chat message.
+     * Model capacity is based on currently available RAM, so this is called when
+     * the Neural Core screen becomes visible.
+     */
+    fun refreshDeviceMemorySnapshot() {
+        viewModelScope.launch(Dispatchers.Default) {
+            runCatching { hardwareProfile.getHardwareInfo() }
+                .onSuccess { info -> _hardwareInfo.value = info }
+                .onFailure { error ->
+                    Log.w(TAG, "Device memory snapshot refresh failed", error)
+                }
+        }
+    }
+
     fun refreshHardwareAssessment() {
         viewModelScope.launch(Dispatchers.Default) {
             try {

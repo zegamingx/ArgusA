@@ -97,9 +97,37 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - Corpus status records whether training is ready, active, complete, or partial after a failed chunk.
 - Room schema version 2 adds corpus tables and an optional training-item document reference through an additive version 1 to 2 migration. Existing chat, memory, and training-queue rows are preserved; destructive migration fallback is not enabled. Legacy queue rows remain valid but are not retroactively grouped into corpus documents because their original document boundaries and fingerprints were not stored.
 
+## Argus-native architecture contract
+
+- `ArgusArchitectureConfig` describes the model with explicit layer count, hidden size, attention heads, feed-forward size, vocabulary size, context length, adapter rank, and Argus-owned operator metadata.
+- `ArgusArchitectureParameterEstimator` calculates parameters across every declared block. Token embeddings and the output projection are counted once; attention, SwiGLU, and optional Q/V adapter matrices scale with layer count. Parameter arithmetic is overflow-checked.
+- The estimator distinguishes trainable parameters from resident model tensors. The current fixed sinusoidal position table occupies memory but is not a trainable parameter. The legacy `countTotalParameters()` method retains its historical resident-tensor count; `countTrainableParameters()` exposes the trainable-weight count.
+- The current executable engine maps to this contract as a one-block causal multi-head attention + SwiGLU model with separate token embeddings/output projection and Q/V LoRA. The new descriptor can represent deeper models, but the current forward pass, backward pass, optimizer state, KV cache, and ARG3/ARG4 checkpoint still execute/store only one block. Multi-layer execution is not claimed until those paths are migrated together.
+- The tokenizer configuration is versioned and persisted with each ARG4 checkpoint. Its default remains 1,024 vocabulary entries and 16 UTF-16 code units per token; larger capacities and token lengths can be selected explicitly. The active algorithm is greedy longest-match with a fixed seed vocabulary and deterministic Unicode fallback, not learned BPE/Unigram. A larger configured capacity does not create a learned vocabulary by itself.
+- The architecture contract is Argus-native metadata, not a third-party model format or runtime. It does not add a pretrained model, change random initialization, or alter existing ARG3 checkpoint bytes.
+- The inference memory estimator can consume the same validated architecture descriptor, deriving trainable weight count, KV-cache shape, and the fixed sinusoidal buffer instead of accepting unrelated parameter and shape values. Its result remains a planning estimate; it does not load or quantize tensors.
+
+## Device-adaptive inference capacity
+
+- The initial RAM-to-parameter policy uses conservative currently available system memory (Android available memory minus the low-memory threshold), not installed RAM.
+- The planning anchors are 1 GB: 0.5B–1B; 2 GB: 1.5B–2.5B; 3 GB: 2.5B–3.5B; 4 GB: 3B–5B; 5 GB: 4B–6B; 6 GB: 5B–7B; 7 GB: 6B–8B; 8 GB: 7B–9B; 10 GB: 9B–12B; 12 GB: 12B–14B; 16 GB: 18B–21B; 24 GB: 28B–32B; and 32 GB: 38B–42B.
+- Values between anchors are linearly interpolated. Above 32 GB, the estimate grows by 1.3B–1.5B parameters per additional GB.
+- These values are RAM-only planning targets, not guaranteed model-load limits. A future inference loader must inspect the actual model quantization and architecture metadata, estimate KV cache and runtime workspace, and enforce a memory safety reserve before loading.
+- The existing custom FP32 training engine remains independent from inference sizing. Its 16-byte-per-parameter state floor accounts for parameters, gradients, and two Adam moments; activation and temporary-buffer memory are additional.
+- An Argus-native multi-billion-parameter inference runtime is not yet integrated. Argus must load its own checkpoint, architecture configuration, tokenizer state, and tensor data without requiring an external model format or runtime. Internal weight quantization is a future Argus-owned storage and execution feature.
+
+## Argus checkpoint format
+
+- `ARG3` remains a supported legacy read format. Its fixed tensor order is retained in the compatibility loader.
+- New checkpoints are written as `ARG4`. The fixed header records the architecture schema and dimensions, tokenizer schema/algorithm/capacity, optimizer step, payload size, and checksum.
+- The payload stores the Argus architecture ID, vocabulary entries, a named tensor directory, and FP32 tensor data. Tensor names and element counts are validated against the active engine before restore.
+- Tensor payloads are written and read in bounded chunks. The writer uses a temporary file and atomic replacement; the payload CRC32 is verified before model or tokenizer state is changed.
+- Restoring an `ARG3` checkpoint does not discard it. The next successful checkpoint save writes the current state in `ARG4`.
+- The current engine still supports one Transformer block and FP32 tensors only. The named manifest is a foundation for future block collections and Argus-owned storage; it is not a multi-layer or quantized runtime.
+
 ## On-device training scope
 
-Fresh model initialization selects tensor dimensions using total RAM, app heap, and current available RAM. Existing ARG3 checkpoints retain their saved tensor dimensions so an application update does not silently discard the user's model.
+Fresh model initialization selects tensor dimensions using total RAM, app heap, and current available RAM. Existing ARG3 checkpoints remain readable and retain their saved tensor dimensions. New saves use ARG4, an Argus-native checkpoint with architecture/tokenizer metadata, a named FP32 tensor manifest, streamed tensor I/O, and a CRC32 payload check.
 
 Genesis currently seeds three short foundation notes as retained TRAIN corpus documents. Their scheduling is idempotent: already queued, active, or trained notes are not duplicated, while a cleared or interrupted note can be replayed from Room. These notes are a small bootstrap seed, not a general-purpose language dataset; no C4 or other broad offline language corpus is bundled.
 
@@ -109,7 +137,7 @@ Within each context window, gradients are accumulated over its scored next-token
 
 Current limitations:
 
-- The tokenizer uses a fixed seed vocabulary and deterministic Unicode fallback. A learned BPE/Unigram tokenizer is not implemented.
+- The tokenizer uses the versioned greedy-longest-match algorithm, fixed seed vocabulary, and deterministic Unicode fallback. Its capacity and maximum token length are configurable and persisted, but learned BPE/Unigram training and merge-state storage are not implemented.
 - Corpus documents use a document-level TRAIN or VALIDATION split. Validation documents retain one normalized source-text payload, create no training chunks, never enter the training queue, and cannot be replayed into training.
 - Held-out evaluation uses evaluateValidationCorpus, aggregates cross-entropy by the exact number of scored next-token targets, and computes perplexity without updating model weights or optimizer state.
 - A content fingerprint cannot exist in both splits. Importing identical source text into the opposite split is rejected to prevent train/validation leakage.

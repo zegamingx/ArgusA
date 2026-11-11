@@ -234,6 +234,12 @@ class GenesisModelManager(
         logs += "RAM: ${hardwareInfo.totalRamGb} GB (Available: " +
                 "${String.format(Locale.US, "%.1f", hardwareInfo.availRamGb)} GB) | " +
                 "Free storage: $freeStorageGb GB"
+
+        val inferenceCapacity = DeviceModelCapacityPolicy.recommend(
+            hardwareInfo.availRamGb.toDouble()
+        )
+        logs += "RAM-based Argus INT4 inference planning range: ${inferenceCapacity.parameterRangeLabel}. " +
+                "This is a capacity target, not a loaded model or a model-specific fit guarantee."
         logs += "Battery: ${safety.batteryPct}% | Temperature: " +
                 "${String.format(Locale.US, "%.1f", safety.temperatureCelsius)}°C"
 
@@ -283,6 +289,10 @@ class GenesisModelManager(
         logs += "LoRA adapters: ${String.format(Locale.US, "%.2f KB", adapterBytes / 1024.0)} " +
                 "(Rank ${neuralEngine.loraRank})."
         logs += "Total structured parameters: $totalParams (FP32)."
+        val trainingStateFloorBytes = TrainingMemoryPlanner.minimumTrainingStateBytes(totalParams)
+        logs += "Full-parameter FP32 training-state floor: " +
+                String.format(Locale.US, "%.1f MiB", trainingStateFloorBytes / (1024.0 * 1024.0)) +
+                " (weights, gradients, Adam moments; excludes activations and workspaces)."
         throttleStage()
 
         publish(GenesisLifecycleStage.INITIALIZING_PARAMETERS,

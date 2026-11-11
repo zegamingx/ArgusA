@@ -10,10 +10,14 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.io.OutputStream
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.zip.CRC32
+import java.util.zip.CheckedOutputStream
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.max
@@ -35,7 +39,8 @@ data class EngineConfig(
     val dFf: Int = 512,
     val maxSeqLen: Int = 128,
     val loraRank: Int = 4,
-    val isFullTrainingEnabled: Boolean = true
+    val isFullTrainingEnabled: Boolean = true,
+    val tokenizerConfig: TokenizerConfig = TokenizerConfig()
 ) {
     init {
         require(dModel > 0) { "dModel must be positive." }
@@ -44,7 +49,56 @@ data class EngineConfig(
         }
         require(dFf > 0) { "dFf must be positive." }
         require(maxSeqLen >= 2) { "maxSeqLen must be at least 2." }
-        require(loraRank > 0) { "loraRank must be positive." }
+        require(loraRank in 1..dModel) {
+            "loraRank must be between one and dModel."
+        }
+
+        // This FP32 training engine still uses JVM arrays. Reject checkpoint
+        // metadata that would overflow array indexes or exceed the app heap.
+        val hidden = dModel.toLong()
+        val feedForward = dFf.toLong()
+        val estimatedArchitecture = ArgusArchitectureConfig(
+            layerCount = 1,
+            hiddenSize = dModel,
+            attentionHeadCount = nHeads,
+            feedForwardSize = dFf,
+            vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+            contextLength = maxSeqLen,
+            adapterRank = loraRank
+        )
+        val parameterCount = ArgusArchitectureParameterEstimator
+            .estimate(estimatedArchitecture)
+            .totalTrainableParameters
+        val trainingFloorBytes = TrainingMemoryPlanner.minimumTrainingStateBytes(parameterCount)
+        val positionElements = Math.multiplyExact(maxSeqLen.toLong(), hidden)
+        require(positionElements <= Int.MAX_VALUE.toLong()) {
+            "Position tensor dimensions exceed JVM array limits."
+        }
+        val positionBufferBytes = Math.multiplyExact(
+            positionElements,
+            Float.SIZE_BYTES.toLong()
+        )
+        val attentionScratchBytes = Math.multiplyExact(
+            Math.multiplyExact(
+                Math.multiplyExact(nHeads.toLong(), maxSeqLen.toLong()),
+                maxSeqLen.toLong()
+            ),
+            Float.SIZE_BYTES.toLong()
+        )
+        val minimumRuntimeBytes = Math.addExact(
+            Math.addExact(trainingFloorBytes, positionBufferBytes),
+            attentionScratchBytes
+        )
+        val safeHeapBudgetBytes = Runtime.getRuntime().maxMemory().toDouble() * 0.7
+        require(minimumRuntimeBytes.toDouble() <= safeHeapBudgetBytes) {
+            "The FP32 engine configuration exceeds the safe app-heap budget."
+        }
+        require(Math.multiplyExact(hidden, feedForward) <= Int.MAX_VALUE.toLong()) {
+            "Feed-forward tensor dimensions exceed JVM array limits."
+        }
+        require(Math.multiplyExact(hidden, hidden) <= Int.MAX_VALUE.toLong()) {
+            "Attention tensor dimensions exceed JVM array limits."
+        }
     }
 
     val architectureLabel: String
@@ -111,7 +165,7 @@ class ArgusNeuralEngine private constructor(
     val config: EngineConfig = EngineConfig()
 ) {
 
-    val tokenizer = Tokenizer()
+    val tokenizer = Tokenizer(config.tokenizerConfig)
 
     // =====================================================================
     // Dynamic Architecture Dimensions (Sesuai Hardware Tier Terpilih)
@@ -218,9 +272,15 @@ class ArgusNeuralEngine private constructor(
         private const val MAGIC_0 = 0x41.toByte()  // 'A'
         private const val MAGIC_1 = 0x52.toByte()  // 'R'
         private const val MAGIC_2 = 0x47.toByte()  // 'G'
-        private const val MAGIC_3 = 0x33.toByte()  // '3'
-        private const val HEADER_SIZE = 48
-        private const val CHECKPOINT_VERSION = 3
+        private const val MAGIC_3 = 0x33.toByte()  // '3' (legacy)
+        private const val MAGIC_4 = 0x34.toByte()  // '4'
+        private const val LEGACY_HEADER_SIZE = 48
+        private const val ARG4_HEADER_SIZE = 96
+        private const val LEGACY_CHECKPOINT_VERSION = 3
+        private const val ARG4_CHECKPOINT_VERSION = 4
+        private const val ARG4_CHECKSUM_OFFSET = 88
+        private const val FLOAT32_TENSOR_TYPE = 1
+        private const val TENSOR_WRITE_BUFFER_BYTES = 64 * 1024
         private const val CHECKPOINT_INTERVAL = 8
 
         /**
@@ -234,59 +294,174 @@ class ArgusNeuralEngine private constructor(
             availableRamGb: Float = totalRamGb.toFloat()
         ): EngineConfig {
             val checkpoint = File(context.filesDir, "argus_model_weights.bin")
-            if (checkpoint.isFile && checkpoint.length() >= HEADER_SIZE) {
-                val savedConfig = runCatching {
-                    FileInputStream(checkpoint).use { input ->
-                        val bytes = ByteArray(HEADER_SIZE)
-                        var offset = 0
-                        while (offset < bytes.size) {
-                            val count = input.read(bytes, offset, bytes.size - offset)
-                            if (count < 0) error("Incomplete ARG3 checkpoint header.")
-                            offset += count
-                        }
+            val savedConfig = runCatching {
+                if (!checkpoint.isFile) return@runCatching null
+                val prefix = readCheckpointPrefix(checkpoint)
+                when {
+                    prefix[0] == MAGIC_0 && prefix[1] == MAGIC_1 &&
+                        prefix[2] == MAGIC_2 && prefix[3] == MAGIC_3 ->
+                        readLegacyConfig(checkpoint)
 
-                        val header = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-                        require(
-                            header.get() == MAGIC_0 &&
-                                header.get() == MAGIC_1 &&
-                                header.get() == MAGIC_2 &&
-                                header.get() == MAGIC_3
-                        ) { "Unsupported checkpoint magic." }
-                        require(header.int == CHECKPOINT_VERSION) {
-                            "Unsupported checkpoint version."
-                        }
+                    prefix[0] == MAGIC_0 && prefix[1] == MAGIC_1 &&
+                        prefix[2] == MAGIC_2 && prefix[3] == MAGIC_4 ->
+                        readArg4Config(checkpoint)
 
-                        val savedDModel = header.int
-                        val savedNHeads = header.int
-                        val savedDFf = header.int
-                        val savedMaxSeq = header.int
-                        val savedLoraRank = header.int
-                        val savedVocabSize = header.int
-                        val savedVocabCap = header.int
-                        header.int // saved optimizer step
-                        header.int // reserved field
+                    else -> null
+                }
+            }.getOrNull()
 
-                        require(savedVocabSize > 0 && savedVocabCap >= savedVocabSize) {
-                            "Invalid checkpoint vocabulary dimensions."
-                        }
-
-                        EngineConfig(
-                            dModel = savedDModel,
-                            nHeads = savedNHeads,
-                            dFf = savedDFf,
-                            maxSeqLen = savedMaxSeq,
-                            loraRank = savedLoraRank,
-                            isFullTrainingEnabled = true
-                        )
-                    }
-                }.getOrNull()
-
-                if (savedConfig != null) return savedConfig
-            }
-
-            return EngineConfig.forDevice(totalRamGb, maxHeapMb, availableRamGb)
+            return savedConfig ?: EngineConfig.forDevice(totalRamGb, maxHeapMb, availableRamGb)
         }
 
+        private fun readCheckpointPrefix(file: File): ByteArray {
+            require(file.length() >= 4L) { "Checkpoint header is incomplete." }
+            FileInputStream(file).use { input ->
+                val prefix = ByteArray(4)
+                var offset = 0
+                while (offset < prefix.size) {
+                    val count = input.read(prefix, offset, prefix.size - offset)
+                    if (count < 0) throw IllegalStateException("Checkpoint header is incomplete.")
+                    offset += count
+                }
+                return prefix
+            }
+        }
+
+        private fun readLegacyConfig(file: File): EngineConfig {
+            require(file.length() >= LEGACY_HEADER_SIZE.toLong()) {
+                "Legacy checkpoint header is incomplete."
+            }
+            val bytes = readFilePrefix(file, LEGACY_HEADER_SIZE)
+            val header = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            require(
+                header.get() == MAGIC_0 && header.get() == MAGIC_1 &&
+                    header.get() == MAGIC_2 && header.get() == MAGIC_3
+            ) { "Invalid ARG3 checkpoint magic." }
+            require(header.int == LEGACY_CHECKPOINT_VERSION) {
+                "Unsupported ARG3 checkpoint version."
+            }
+
+            val savedDModel = header.int
+            val savedNHeads = header.int
+            val savedDFf = header.int
+            val savedMaxSeq = header.int
+            val savedLoraRank = header.int
+            val savedVocabSize = header.int
+            val savedVocabCap = header.int
+            header.int // optimizer step
+            header.int // reserved
+            require(savedVocabSize > 0) {
+                "ARG3 vocabulary size is invalid."
+            }
+            require(savedVocabCap >= savedVocabSize) {
+                "ARG3 vocabulary capacity is invalid."
+            }
+            return EngineConfig(
+                dModel = savedDModel,
+                nHeads = savedNHeads,
+                dFf = savedDFf,
+                maxSeqLen = savedMaxSeq,
+                loraRank = savedLoraRank,
+                isFullTrainingEnabled = true,
+                tokenizerConfig = TokenizerConfig()
+            )
+        }
+
+        private fun readArg4Config(file: File): EngineConfig {
+            require(file.length() >= ARG4_HEADER_SIZE.toLong()) {
+                "ARG4 checkpoint header is incomplete."
+            }
+            val bytes = readFilePrefix(file, ARG4_HEADER_SIZE)
+            val header = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            require(
+                header.get() == MAGIC_0 && header.get() == MAGIC_1 &&
+                    header.get() == MAGIC_2 && header.get() == MAGIC_4
+            ) { "Invalid ARG4 checkpoint magic." }
+            require(header.int == ARG4_CHECKPOINT_VERSION) {
+                "Unsupported ARG4 checkpoint version."
+            }
+            require(header.int == ARG4_HEADER_SIZE) {
+                "Invalid ARG4 checkpoint header size."
+            }
+
+            val architectureSchemaVersion = header.int
+            val architectureIdLength = header.int
+            val layerCount = header.int
+            val savedDModel = header.int
+            val savedNHeads = header.int
+            val savedDFf = header.int
+            val savedMaxSeq = header.int
+            val savedLoraRank = header.int
+            val savedVocabSize = header.int
+            val savedVocabCap = header.int
+            header.int // optimizer step
+            val tokenizerSchemaVersion = header.int
+            val tokenizerAlgorithmId = header.int
+            val tokenizerMaxVocab = header.int
+            val tokenizerMaxTokenLength = header.int
+            val vocabularyEntryCount = header.int
+            val tensorCount = header.int
+            val payloadBytes = header.long
+            header.int // payload checksum
+            val flags = header.int
+
+            require(architectureSchemaVersion == ArgusArchitectureConfig.CURRENT_SCHEMA_VERSION) {
+                "Unsupported Argus architecture schema."
+            }
+            require(architectureIdLength in 1..512) {
+                "ARG4 architecture ID length is invalid."
+            }
+            require(layerCount == 1) {
+                "This engine version can restore one Transformer block only."
+            }
+            require(savedVocabSize > 0) {
+                "ARG4 vocabulary size is invalid."
+            }
+            require(savedVocabCap >= savedVocabSize) {
+                "ARG4 vocabulary capacity is invalid."
+            }
+            require(vocabularyEntryCount in 1..tokenizerMaxVocab) {
+                "ARG4 vocabulary entry count is invalid."
+            }
+            require(tensorCount in 1..128) {
+                "ARG4 tensor count is invalid."
+            }
+            require(payloadBytes >= architectureIdLength.toLong()) {
+                "ARG4 payload length is invalid."
+            }
+            require(flags == 0) {
+                "ARG4 checkpoint uses unsupported architecture flags."
+            }
+
+            val tokenizerConfig = TokenizerConfig(
+                schemaVersion = tokenizerSchemaVersion,
+                algorithm = ArgusTokenizerAlgorithm.fromCheckpointId(tokenizerAlgorithmId),
+                maxVocabularySize = tokenizerMaxVocab,
+                maxTokenLength = tokenizerMaxTokenLength
+            )
+            return EngineConfig(
+                dModel = savedDModel,
+                nHeads = savedNHeads,
+                dFf = savedDFf,
+                maxSeqLen = savedMaxSeq,
+                loraRank = savedLoraRank,
+                isFullTrainingEnabled = true,
+                tokenizerConfig = tokenizerConfig
+            )
+        }
+
+        private fun readFilePrefix(file: File, size: Int): ByteArray {
+            FileInputStream(file).use { input ->
+                val bytes = ByteArray(size)
+                var offset = 0
+                while (offset < bytes.size) {
+                    val count = input.read(bytes, offset, bytes.size - offset)
+                    if (count < 0) throw IllegalStateException("Checkpoint header is incomplete.")
+                    offset += count
+                }
+                return bytes
+            }
+        }
         @JvmStatic
         fun createBlocking(context: Context, config: EngineConfig = EngineConfig()): ArgusNeuralEngine =
             ArgusNeuralEngine(context.applicationContext, config).also { engine ->
@@ -347,16 +522,26 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
-    fun countTotalParameters(): Long {
-        var count = 0L
-        count += tokenizer.vocabSize.toLong() * dModel // wEmbed
-        count += maxSeqLen.toLong() * dModel           // wPos
-        count += 4L * (dModel * dModel)                // wQ, wK, wV, wO
-        count += 2L * (dModel * loraRank + loraRank * dModel) // loraQa, loraQb, loraVa, loraVb
-        count += (dModel.toLong() * dFf) * 2L + (dFf.toLong() * dModel) // wGate, wUp, wDown
-        count += tokenizer.vocabSize.toLong() * dModel // wHead
-        return count
-    }
+    /**
+     * Architecture metadata exposed by the active legacy engine.
+     * The current execution graph is a single Transformer block.
+     */
+    val architectureConfig: ArgusArchitectureConfig
+        get() = config.toArgusArchitectureConfig(tokenizer.vocabSize)
+
+    val parameterBreakdown: ArgusParameterBreakdown
+        get() = ArgusArchitectureParameterEstimator.estimate(architectureConfig)
+
+    /**
+     * Preserves the historical resident-tensor element count, including the
+     * fixed sinusoidal position table. Use countTrainableParameters() when a
+     * strict trainable-weight count is required.
+     */
+    fun countTotalParameters(): Long =
+        parameterBreakdown.totalResidentModelElements
+
+    fun countTrainableParameters(): Long =
+        parameterBreakdown.totalTrainableParameters
 
     fun calculateAdapterSizeBytes(): Long =
         ((dModel * loraRank + loraRank * dModel) * 2).toLong() * 4L
@@ -372,12 +557,14 @@ class ArgusNeuralEngine private constructor(
 
     private fun resizeVocabCapacityTo(targetCap: Int) {
         if (targetCap <= 0 || targetCap == vocabCap) return
-        val newEmbed = FloatArray(targetCap * dModel)
-        val newHead = FloatArray(targetCap * dModel)
-        val newMEmbed = FloatArray(targetCap * dModel)
-        val newVEmbed = FloatArray(targetCap * dModel)
-        val newMHead = FloatArray(targetCap * dModel)
-        val newVHead = FloatArray(targetCap * dModel)
+        requireSafeVocabularyCapacity(targetCap)
+        val targetElements = Math.multiplyExact(targetCap, dModel)
+        val newEmbed = FloatArray(targetElements)
+        val newHead = FloatArray(targetElements)
+        val newMEmbed = FloatArray(targetElements)
+        val newVEmbed = FloatArray(targetElements)
+        val newMHead = FloatArray(targetElements)
+        val newVHead = FloatArray(targetElements)
 
         System.arraycopy(wEmbed, 0, newEmbed, 0, min(wEmbed.size, newEmbed.size))
         System.arraycopy(wHead, 0, newHead, 0, min(wHead.size, newHead.size))
@@ -388,7 +575,7 @@ class ArgusNeuralEngine private constructor(
 
         if (targetCap > vocabCap) {
             val stdEmbed = 1.0f / sqrt(dModel.toFloat())
-            for (i in (vocabCap * dModel) until (targetCap * dModel)) {
+            for (i in (vocabCap * dModel) until targetElements) {
                 newEmbed[i] = (Random.nextFloat() * 2f - 1f) * stdEmbed
                 newHead[i] = (Random.nextFloat() * 2f - 1f) * stdEmbed
             }
@@ -1865,98 +2052,550 @@ class ArgusNeuralEngine private constructor(
     }
 
     // =====================================================================
-    // Checkpoint (Format ARG3 dengan Verifikasi Transaksional)
+    // Checkpoint (ARG4 streaming writer with ARG3 compatibility reader)
     // =====================================================================
     fun saveCheckpoint(): Boolean {
-        val bytes = synchronized(modelLock) { buildCheckpointBytes() }
         return try {
-            writeBytesToDisk(bytes)
+            synchronized(modelLock) {
+                writeArg4Checkpoint()
+            }
             val file = File(context.filesDir, "argus_model_weights.bin")
-            file.exists() && file.length() >= HEADER_SIZE
+            file.isFile && file.length() >= ARG4_HEADER_SIZE.toLong()
         } catch (t: Throwable) {
             Log.e(TAG, "Checkpoint save failed", t)
             false
         }
     }
 
-    private fun buildCheckpointBytes(): ByteArray {
-        val vocabList = tokenizer.exportVocab()
+    private data class NamedCheckpointTensor(
+        val name: String,
+        val values: FloatArray
+    )
 
-        val header = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN)
-        header.put(MAGIC_0).put(MAGIC_1).put(MAGIC_2).put(MAGIC_3)
-        header.putInt(CHECKPOINT_VERSION)
-        header.putInt(dModel)
-        header.putInt(nHeads)
-        header.putInt(dFf)
-        header.putInt(maxSeqLen)
-        header.putInt(loraRank)
-        header.putInt(tokenizer.vocabSize)
+    private data class CheckpointTensorDescriptor(
+        val name: String,
+        val elementCount: Long,
+        val dataType: Int
+    )
+
+    private fun checkpointTensors(): List<NamedCheckpointTensor> = listOf(
+        NamedCheckpointTensor("token.embedding.weight", wEmbed),
+        NamedCheckpointTensor("token.embedding.adam_m", mEmbed),
+        NamedCheckpointTensor("token.embedding.adam_v", vEmbed),
+        NamedCheckpointTensor("lm_head.weight", wHead),
+        NamedCheckpointTensor("lm_head.adam_m", mHead),
+        NamedCheckpointTensor("lm_head.adam_v", vHead),
+        NamedCheckpointTensor("adapter.q.a", loraQa),
+        NamedCheckpointTensor("adapter.q.b", loraQb),
+        NamedCheckpointTensor("adapter.v.a", loraVa),
+        NamedCheckpointTensor("adapter.v.b", loraVb),
+        NamedCheckpointTensor("adapter.q.a.adam_m", mLoraQa),
+        NamedCheckpointTensor("adapter.q.b.adam_m", mLoraQb),
+        NamedCheckpointTensor("adapter.v.a.adam_m", mLoraVa),
+        NamedCheckpointTensor("adapter.v.b.adam_m", mLoraVb),
+        NamedCheckpointTensor("adapter.q.a.adam_v", vLoraQa),
+        NamedCheckpointTensor("adapter.q.b.adam_v", vLoraQb),
+        NamedCheckpointTensor("adapter.v.a.adam_v", vLoraVa),
+        NamedCheckpointTensor("adapter.v.b.adam_v", vLoraVb),
+        NamedCheckpointTensor("attention.query.weight", wQ),
+        NamedCheckpointTensor("attention.key.weight", wK),
+        NamedCheckpointTensor("attention.value.weight", wV),
+        NamedCheckpointTensor("attention.output.weight", wO),
+        NamedCheckpointTensor("attention.query.adam_m", mWQ),
+        NamedCheckpointTensor("attention.query.adam_v", vWQ),
+        NamedCheckpointTensor("attention.key.adam_m", mWK),
+        NamedCheckpointTensor("attention.key.adam_v", vWK),
+        NamedCheckpointTensor("attention.value.adam_m", mWV),
+        NamedCheckpointTensor("attention.value.adam_v", vWV),
+        NamedCheckpointTensor("attention.output.adam_m", mWO),
+        NamedCheckpointTensor("attention.output.adam_v", vWO),
+        NamedCheckpointTensor("feed_forward.gate.weight", wGate),
+        NamedCheckpointTensor("feed_forward.up.weight", wUp),
+        NamedCheckpointTensor("feed_forward.down.weight", wDown),
+        NamedCheckpointTensor("feed_forward.gate.adam_m", mWGate),
+        NamedCheckpointTensor("feed_forward.gate.adam_v", vWGate),
+        NamedCheckpointTensor("feed_forward.up.adam_m", mWUp),
+        NamedCheckpointTensor("feed_forward.up.adam_v", vWUp),
+        NamedCheckpointTensor("feed_forward.down.adam_m", mWDown),
+        NamedCheckpointTensor("feed_forward.down.adam_v", vWDown)
+    )
+
+    private fun writeArg4Checkpoint() {
+        ensureVocabCapacity(tokenizer.vocabSize)
+        require(vocabCap >= tokenizer.vocabSize) {
+            "Embedding capacity is smaller than the active tokenizer vocabulary."
+        }
+
+        val target = File(context.filesDir, "argus_model_weights.bin")
+        val temporary = File(context.filesDir, "argus_model_weights.bin.tmp")
+        val vocabEntries = tokenizer.exportVocab()
+        val tensors = checkpointTensors()
+        val architecture = architectureConfig
+        val architectureIdBytes = architecture.architectureId.toByteArray(Charsets.UTF_8)
+        require(architecture.layerCount == 1) {
+            "ARG4 writer currently supports the executable single-block engine only."
+        }
+        require(architectureIdBytes.size in 1..512) {
+            "Architecture ID length is invalid."
+        }
+        require(vocabEntries.size <= config.tokenizerConfig.maxVocabularySize) {
+            "Tokenizer vocabulary exceeds its configured checkpoint capacity."
+        }
+
+        var payloadLength = architectureIdBytes.size.toLong()
+        for ((token, _) in vocabEntries) {
+            val tokenBytes = token.toByteArray(Charsets.UTF_8)
+            require(tokenBytes.isNotEmpty() && tokenBytes.size <= config.tokenizerConfig.maxTokenLength * 4) {
+                "Checkpoint token byte length is invalid."
+            }
+            payloadLength = Math.addExact(payloadLength, 8L + tokenBytes.size.toLong())
+        }
+        for (tensor in tensors) {
+            val nameBytes = tensor.name.toByteArray(Charsets.UTF_8)
+            payloadLength = Math.addExact(payloadLength, 16L + nameBytes.size.toLong())
+            payloadLength = Math.addExact(
+                payloadLength,
+                Math.multiplyExact(tensor.values.size.toLong(), 4L)
+            )
+        }
+
+        val header = ByteBuffer.allocate(ARG4_HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+        header.put(MAGIC_0).put(MAGIC_1).put(MAGIC_2).put(MAGIC_4)
+        header.putInt(ARG4_CHECKPOINT_VERSION)
+        header.putInt(ARG4_HEADER_SIZE)
+        header.putInt(architecture.schemaVersion)
+        header.putInt(architectureIdBytes.size)
+        header.putInt(architecture.layerCount)
+        header.putInt(architecture.hiddenSize)
+        header.putInt(architecture.attentionHeadCount)
+        header.putInt(architecture.feedForwardSize)
+        header.putInt(architecture.contextLength)
+        header.putInt(architecture.adapterRank)
+        header.putInt(architecture.vocabularySize)
         header.putInt(vocabCap)
         header.putInt(adamStep)
-        header.putInt(0) // reserved
-
-        var vocabBytesLen = 4
-        vocabList.forEach { vocabBytesLen += 8 + it.first.toByteArray(Charsets.UTF_8).size }
-        val vocabBuf = ByteBuffer.allocate(vocabBytesLen).order(ByteOrder.LITTLE_ENDIAN)
-        vocabBuf.putInt(vocabList.size)
-        vocabList.forEach { (tok, id) ->
-            val b = tok.toByteArray(Charsets.UTF_8)
-            vocabBuf.putInt(id); vocabBuf.putInt(b.size); vocabBuf.put(b)
+        header.putInt(config.tokenizerConfig.schemaVersion)
+        header.putInt(config.tokenizerConfig.algorithm.checkpointId)
+        header.putInt(config.tokenizerConfig.maxVocabularySize)
+        header.putInt(config.tokenizerConfig.maxTokenLength)
+        header.putInt(vocabEntries.size)
+        header.putInt(tensors.size)
+        header.putLong(payloadLength)
+        header.putInt(0) // CRC32 of the payload is patched after streaming.
+        header.putInt(0) // Reserved architecture flags.
+        require(header.position() == ARG4_HEADER_SIZE) {
+            "ARG4 fixed header layout is inconsistent."
         }
 
-        val arrays = listOf(
-            wEmbed, mEmbed, vEmbed,
-            wHead, mHead, vHead,
-            loraQa, loraQb, loraVa, loraVb,
-            mLoraQa, mLoraQb, mLoraVa, mLoraVb,
-            vLoraQa, vLoraQb, vLoraVa, vLoraVb,
-            wQ, wK, wV, wO,
-            mWQ, vWQ, mWK, vWK, mWV, vWV, mWO, vWO,
-            wGate, wUp, wDown,
-            mWGate, vWGate, mWUp, vWUp, mWDown, vWDown
-        )
-        val totalFloats = arrays.sumOf { it.size }
-        val floatBuf = ByteBuffer.allocate(totalFloats * 4).order(ByteOrder.LITTLE_ENDIAN)
-        arrays.forEach { arr -> arr.forEach { floatBuf.putFloat(it) } }
+        val checksum = CRC32()
+        try {
+            FileOutputStream(temporary).use { fileOutput ->
+                BufferedOutputStream(fileOutput).use { buffered ->
+                    buffered.write(header.array())
+                    val checked = CheckedOutputStream(buffered, checksum)
 
-        return header.array() + vocabBuf.array() + floatBuf.array()
+                    checked.write(architectureIdBytes)
+                    for ((token, id) in vocabEntries) {
+                        val tokenBytes = token.toByteArray(Charsets.UTF_8)
+                        writeIntLittleEndian(checked, id)
+                        writeIntLittleEndian(checked, tokenBytes.size)
+                        checked.write(tokenBytes)
+                    }
+
+                    for (tensor in tensors) {
+                        val nameBytes = tensor.name.toByteArray(Charsets.UTF_8)
+                        writeIntLittleEndian(checked, nameBytes.size)
+                        writeLongLittleEndian(checked, tensor.values.size.toLong())
+                        writeIntLittleEndian(checked, FLOAT32_TENSOR_TYPE)
+                        checked.write(nameBytes)
+                    }
+
+                    for (tensor in tensors) {
+                        writeFloatArrayLittleEndian(checked, tensor.values, tensor.name)
+                    }
+
+                    checked.flush()
+                    buffered.flush()
+                    fileOutput.fd.sync()
+                }
+            }
+
+            RandomAccessFile(temporary, "rw").use { randomAccessFile ->
+                randomAccessFile.seek(ARG4_CHECKSUM_OFFSET.toLong())
+                val checksumBytes = ByteBuffer.allocate(4)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .putInt(checksum.value.toInt())
+                    .array()
+                randomAccessFile.write(checksumBytes)
+                randomAccessFile.fd.sync()
+            }
+
+            Files.move(
+                temporary.toPath(),
+                target.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE
+            )
+        } catch (t: Throwable) {
+            temporary.delete()
+            throw t
+        }
     }
 
-    private fun writeBytesToDisk(bytes: ByteArray) {
-        val target = File(context.filesDir, "argus_model_weights.bin")
-        val temp = File(context.filesDir, "argus_model_weights.bin.tmp")
-        FileOutputStream(temp).use { fos ->
-            BufferedOutputStream(fos).use { bos ->
-                bos.write(bytes)
-                bos.flush()
-                fos.fd.sync()
+    private fun writeIntLittleEndian(output: OutputStream, value: Int) {
+        output.write(value and 0xFF)
+        output.write((value ushr 8) and 0xFF)
+        output.write((value ushr 16) and 0xFF)
+        output.write((value ushr 24) and 0xFF)
+    }
+
+    private fun writeLongLittleEndian(output: OutputStream, value: Long) {
+        for (shift in 0 until 8) {
+            output.write(((value ushr (shift * 8)) and 0xFFL).toInt())
+        }
+    }
+
+    private fun writeFloatArrayLittleEndian(
+        output: OutputStream,
+        values: FloatArray,
+        tensorName: String
+    ) {
+        val buffer = ByteBuffer.allocate(TENSOR_WRITE_BUFFER_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+        for (value in values) {
+            require(value.isFinite()) {
+                "Cannot save a non-finite value in tensor $tensorName."
+            }
+            if (buffer.remaining() < Float.SIZE_BYTES) {
+                output.write(buffer.array(), 0, buffer.position())
+                buffer.clear()
+            }
+            buffer.putFloat(value)
+        }
+        if (buffer.position() > 0) {
+            output.write(buffer.array(), 0, buffer.position())
+        }
+    }
+
+    private fun readIntLittleEndian(input: InputStream): Int {
+        val b0 = input.read()
+        val b1 = input.read()
+        val b2 = input.read()
+        val b3 = input.read()
+        if ((b0 or b1 or b2 or b3) < 0) {
+            throw IllegalStateException("Unexpected end of little-endian integer.")
+        }
+        return b0 or (b1 shl 8) or (b2 shl 16) or (b3 shl 24)
+    }
+
+    private fun readLongLittleEndian(input: InputStream): Long {
+        var value = 0L
+        for (shift in 0 until 8) {
+            val next = input.read()
+            if (next < 0) {
+                throw IllegalStateException("Unexpected end of little-endian long.")
+            }
+            value = value or (next.toLong() shl (shift * 8))
+        }
+        return value
+    }
+
+    private fun readFloatArrayLittleEndian(
+        input: InputStream,
+        values: FloatArray,
+        tensorName: String
+    ) {
+        val floatsPerChunk = TENSOR_WRITE_BUFFER_BYTES / Float.SIZE_BYTES
+        var offset = 0
+        while (offset < values.size) {
+            val chunkCount = min(floatsPerChunk, values.size - offset)
+            val byteCount = chunkCount * Float.SIZE_BYTES
+            val chunk = ByteBuffer.wrap(input.readFully(byteCount))
+                .order(ByteOrder.LITTLE_ENDIAN)
+            for (index in 0 until chunkCount) {
+                val value = chunk.float
+                require(value.isFinite()) {
+                    "ARG4 contains a non-finite value in tensor $tensorName."
+                }
+                values[offset + index] = value
+            }
+            offset += chunkCount
+        }
+    }
+
+    private fun requireSafeVocabularyCapacity(targetVocabCap: Int) {
+        require(targetVocabCap > 0) {
+            "Checkpoint vocabulary capacity must be positive."
+        }
+        if (targetVocabCap == vocabCap) return
+
+        val targetElements = Math.multiplyExact(targetVocabCap.toLong(), dModel.toLong())
+        require(targetElements <= Int.MAX_VALUE.toLong()) {
+            "Checkpoint vocabulary tensor dimensions exceed JVM array limits."
+        }
+        val newVocabularyArrayBytes = Math.multiplyExact(
+            targetElements,
+            6L * Float.SIZE_BYTES.toLong()
+        )
+        val runtime = Runtime.getRuntime()
+        val availableHeap = runtime.maxMemory() -
+            (runtime.totalMemory() - runtime.freeMemory())
+        require(newVocabularyArrayBytes.toDouble() <= availableHeap.toDouble() * 0.7) {
+            "Checkpoint vocabulary tensors exceed the safe available heap budget."
+        }
+    }
+
+    private fun expectedCheckpointTensorSizes(targetVocabCap: Int): Map<String, Long> {
+        val current = checkpointTensors()
+        val dynamicVocabularyTensors = setOf(
+            "token.embedding.weight",
+            "token.embedding.adam_m",
+            "token.embedding.adam_v",
+            "lm_head.weight",
+            "lm_head.adam_m",
+            "lm_head.adam_v"
+        )
+        val vocabularyElementCount = Math.multiplyExact(targetVocabCap.toLong(), dModel.toLong())
+        return current.associate { tensor ->
+            tensor.name to if (tensor.name in dynamicVocabularyTensors) {
+                vocabularyElementCount
+            } else {
+                tensor.values.size.toLong()
             }
         }
-        Files.move(
-            temp.toPath(), target.toPath(),
-            StandardCopyOption.REPLACE_EXISTING,
-            StandardCopyOption.ATOMIC_MOVE
-        )
     }
 
-    fun loadCheckpointIfExists(): Boolean {
-        try {
-            val file = File(context.filesDir, "argus_model_weights.bin")
-            if (!file.exists() || file.length() < HEADER_SIZE) return false
+    private fun loadArg4Checkpoint(file: File): Boolean {
+        return try {
+            require(file.length() >= ARG4_HEADER_SIZE.toLong()) {
+                "ARG4 checkpoint is shorter than its fixed header."
+            }
+            val headerBytes = FileInputStream(file).use { it.readFully(ARG4_HEADER_SIZE) }
+            val header = ByteBuffer.wrap(headerBytes).order(ByteOrder.LITTLE_ENDIAN)
+            require(
+                header.get() == MAGIC_0 && header.get() == MAGIC_1 &&
+                    header.get() == MAGIC_2 && header.get() == MAGIC_4
+            ) { "Invalid ARG4 checkpoint magic." }
+            require(header.int == ARG4_CHECKPOINT_VERSION) {
+                "Unsupported ARG4 checkpoint version."
+            }
+            require(header.int == ARG4_HEADER_SIZE) {
+                "ARG4 checkpoint header size does not match."
+            }
 
-            FileInputStream(file).use { fis ->
-                BufferedInputStream(fis).use { bis ->
-                    val headerBytes = bis.readFully(HEADER_SIZE)
-                    val header = ByteBuffer.wrap(headerBytes).order(ByteOrder.LITTLE_ENDIAN)
+            val savedArchitectureSchema = header.int
+            val architectureIdLength = header.int
+            val savedLayerCount = header.int
+            val savedDModel = header.int
+            val savedNHeads = header.int
+            val savedDFf = header.int
+            val savedMaxSeq = header.int
+            val savedLoraRank = header.int
+            val savedVocabSize = header.int
+            val savedVocabCap = header.int
+            val savedAdamStep = header.int
+            val savedTokenizerSchema = header.int
+            val savedTokenizerAlgorithm = header.int
+            val savedTokenizerMaxVocab = header.int
+            val savedTokenizerMaxTokenLength = header.int
+            val savedVocabularyEntryCount = header.int
+            val savedTensorCount = header.int
+            val savedPayloadBytes = header.long
+            val savedChecksum = header.int.toLong() and 0xFFFF_FFFFL
+            val flags = header.int
 
-                    if (header.get() != MAGIC_0 || header.get() != MAGIC_1 ||
-                        header.get() != MAGIC_2 || header.get() != MAGIC_3) {
-                        Log.w(TAG, "Checkpoint bukan format ARG3; skip")
-                        return false
+            require(savedArchitectureSchema == architectureConfig.schemaVersion) {
+                "ARG4 architecture schema mismatch."
+            }
+            require(savedLayerCount == 1) {
+                "This runtime can restore a single Transformer block only."
+            }
+            require(
+                savedDModel == dModel && savedNHeads == nHeads &&
+                    savedDFf == dFf && savedMaxSeq == maxSeqLen &&
+                    savedLoraRank == loraRank
+            ) { "ARG4 architecture dimensions do not match the active engine." }
+            require(savedVocabSize > 0) {
+                "ARG4 vocabulary size is invalid."
+            }
+            require(savedVocabCap >= savedVocabSize) {
+                "ARG4 vocabulary capacity is invalid."
+            }
+            requireSafeVocabularyCapacity(savedVocabCap)
+            require(savedAdamStep >= 0) { "ARG4 optimizer step cannot be negative." }
+            require(savedTokenizerSchema == config.tokenizerConfig.schemaVersion) {
+                "ARG4 tokenizer schema mismatch."
+            }
+            require(savedTokenizerAlgorithm == config.tokenizerConfig.algorithm.checkpointId) {
+                "ARG4 tokenizer algorithm mismatch."
+            }
+            require(savedTokenizerMaxVocab == config.tokenizerConfig.maxVocabularySize) {
+                "ARG4 tokenizer vocabulary capacity mismatch."
+            }
+            require(savedTokenizerMaxTokenLength == config.tokenizerConfig.maxTokenLength) {
+                "ARG4 tokenizer token length mismatch."
+            }
+            require(
+                savedVocabularyEntryCount in 1..config.tokenizerConfig.maxVocabularySize
+            ) { "ARG4 vocabulary entry count is invalid." }
+            require(savedTensorCount in 1..128) { "ARG4 tensor count is invalid." }
+            require(architectureIdLength in 1..512) { "ARG4 architecture ID length is invalid." }
+            require(savedPayloadBytes >= architectureIdLength.toLong()) {
+                "ARG4 payload length is invalid."
+            }
+            require(flags == 0) { "ARG4 checkpoint contains unsupported flags." }
+            require(savedPayloadBytes >= 0L) {
+                "ARG4 payload byte count cannot be negative."
+            }
+            val expectedFileLength = Math.addExact(
+                ARG4_HEADER_SIZE.toLong(),
+                savedPayloadBytes
+            )
+            require(file.length() == expectedFileLength) {
+                "ARG4 checkpoint length does not match its payload metadata."
+            }
+
+            val checksum = CRC32()
+            BufferedInputStream(FileInputStream(file)).use { input ->
+                skipFully(input, ARG4_HEADER_SIZE.toLong())
+                val buffer = ByteArray(TENSOR_WRITE_BUFFER_BYTES)
+                var remaining = savedPayloadBytes
+                while (remaining > 0L) {
+                    val requested = min(remaining, buffer.size.toLong()).toInt()
+                    val count = input.read(buffer, 0, requested)
+                    if (count < 0) throw IllegalStateException("ARG4 payload ended unexpectedly.")
+                    checksum.update(buffer, 0, count)
+                    remaining -= count.toLong()
+                }
+                require(input.read() == -1) { "ARG4 checkpoint contains trailing bytes." }
+            }
+            require(checksum.value == savedChecksum) {
+                "ARG4 payload checksum mismatch."
+            }
+
+            BufferedInputStream(FileInputStream(file)).use { input ->
+                input.readFully(ARG4_HEADER_SIZE)
+                val architectureIdBytes = input.readFully(architectureIdLength)
+                val savedArchitectureId = String(architectureIdBytes, Charsets.UTF_8)
+                require(savedArchitectureId == architectureConfig.architectureId) {
+                    "ARG4 architecture ID mismatch."
+                }
+
+                var measuredPayloadBytes = architectureIdLength.toLong()
+                val vocabulary = ArrayList<Pair<String, Int>>(savedVocabularyEntryCount)
+                repeat(savedVocabularyEntryCount) {
+                    val tokenId = readIntLittleEndian(input)
+                    val tokenLength = readIntLittleEndian(input)
+                    require(
+                        tokenLength in 1..(config.tokenizerConfig.maxTokenLength * 4)
+                    ) { "ARG4 token byte length is invalid." }
+                    val tokenBytes = input.readFully(tokenLength)
+                    vocabulary.add(String(tokenBytes, Charsets.UTF_8) to tokenId)
+                    measuredPayloadBytes = Math.addExact(
+                        measuredPayloadBytes,
+                        8L + tokenLength.toLong()
+                    )
+                }
+
+                val candidateTokenizer = Tokenizer(config.tokenizerConfig)
+                candidateTokenizer.importVocab(vocabulary)
+                require(candidateTokenizer.vocabSize == savedVocabSize) {
+                    "ARG4 tokenizer vocabulary size does not match its metadata."
+                }
+
+                val expectedTensorSizes = expectedCheckpointTensorSizes(savedVocabCap)
+                require(savedTensorCount == expectedTensorSizes.size) {
+                    "ARG4 tensor count does not match the active engine."
+                }
+                val descriptors = ArrayList<CheckpointTensorDescriptor>(savedTensorCount)
+                val descriptorNames = HashSet<String>(savedTensorCount)
+                repeat(savedTensorCount) {
+                    val nameLength = readIntLittleEndian(input)
+                    val elementCount = readLongLittleEndian(input)
+                    val dataType = readIntLittleEndian(input)
+                    require(nameLength in 1..128) { "ARG4 tensor name length is invalid." }
+                    require(elementCount >= 0L) { "ARG4 tensor element count is invalid." }
+                    require(dataType == FLOAT32_TENSOR_TYPE) {
+                        "ARG4 tensor data type is not supported by the FP32 trainer."
                     }
-                    if (header.int != CHECKPOINT_VERSION) {
-                        Log.w(TAG, "Checkpoint versi tidak cocok; skip")
-                        return false
+                    val name = String(input.readFully(nameLength), Charsets.UTF_8)
+                    require(descriptorNames.add(name)) { "ARG4 tensor names must be unique." }
+                    val expectedCount = expectedTensorSizes[name]
+                        ?: throw IllegalArgumentException("ARG4 contains an unknown tensor.")
+                    require(elementCount == expectedCount) {
+                        "ARG4 tensor element count does not match the active architecture."
+                    }
+                    descriptors.add(
+                        CheckpointTensorDescriptor(name, elementCount, dataType)
+                    )
+                    measuredPayloadBytes = Math.addExact(
+                        measuredPayloadBytes,
+                        16L + nameLength.toLong()
+                    )
+                    measuredPayloadBytes = Math.addExact(
+                        measuredPayloadBytes,
+                        Math.multiplyExact(elementCount, Float.SIZE_BYTES.toLong())
+                    )
+                }
+                require(descriptorNames == expectedTensorSizes.keys) {
+                    "ARG4 tensor manifest is incomplete."
+                }
+                require(measuredPayloadBytes == savedPayloadBytes) {
+                    "ARG4 payload size does not match its tensor manifest."
+                }
+
+                synchronized(modelLock) {
+                    resizeVocabCapacityTo(savedVocabCap)
+                    tokenizer.importVocab(vocabulary)
+                    val tensorsByName = checkpointTensors().associateBy { it.name }
+                    for (descriptor in descriptors) {
+                        val targetTensor = tensorsByName[descriptor.name]
+                            ?: throw IllegalStateException("ARG4 tensor target is unavailable.")
+                        require(targetTensor.values.size.toLong() == descriptor.elementCount) {
+                            "ARG4 tensor target size changed during restoration."
+                        }
+                        readFloatArrayLittleEndian(input, targetTensor.values, descriptor.name)
+                    }
+                    adamStep = savedAdamStep
+                }
+                require(input.read() == -1) { "ARG4 tensor payload has trailing bytes." }
+            }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "ARG4 checkpoint load failed", e)
+            false
+        }
+    }
+
+    private fun skipFully(input: InputStream, count: Long) {
+        var remaining = count
+        while (remaining > 0L) {
+            val skipped = input.skip(remaining)
+            if (skipped > 0L) {
+                remaining -= skipped
+            } else {
+                if (input.read() < 0) {
+                    throw IllegalStateException("Unexpected end of checkpoint stream.")
+                }
+                remaining--
+            }
+        }
+    }
+
+    private fun loadLegacyCheckpoint(file: File): Boolean {
+        return try {
+            require(file.length() >= LEGACY_HEADER_SIZE.toLong()) {
+                "ARG3 checkpoint is shorter than its fixed header."
+            }
+            FileInputStream(file).use { fileInput ->
+                BufferedInputStream(fileInput).use { input ->
+                    val headerBytes = input.readFully(LEGACY_HEADER_SIZE)
+                    val header = ByteBuffer.wrap(headerBytes).order(ByteOrder.LITTLE_ENDIAN)
+                    require(
+                        header.get() == MAGIC_0 && header.get() == MAGIC_1 &&
+                            header.get() == MAGIC_2 && header.get() == MAGIC_3
+                    ) { "Invalid ARG3 checkpoint magic." }
+                    require(header.int == LEGACY_CHECKPOINT_VERSION) {
+                        "Unsupported ARG3 checkpoint version."
                     }
 
                     val savedDModel = header.int
@@ -1969,36 +2608,44 @@ class ArgusNeuralEngine private constructor(
                     val savedAdamStep = header.int
                     header.int // reserved
 
-                    if (savedDModel != dModel || savedLoraRank != loraRank ||
-                        savedNHeads != nHeads || savedDFf != dFf || savedMaxSeq != maxSeqLen) {
-                        Log.w(TAG, "Arsitektur mismatch: saved($savedDModel,$savedDFf) vs current($dModel,$dFf); skip")
-                        return false
+                    require(
+                        savedDModel == dModel && savedLoraRank == loraRank &&
+                            savedNHeads == nHeads && savedDFf == dFf &&
+                            savedMaxSeq == maxSeqLen
+                    ) { "ARG3 architecture dimensions do not match the active engine." }
+                    require(savedVocabSize > 0) {
+                        "ARG3 vocabulary size is invalid."
                     }
-                    if (savedVocabCap <= 0) {
-                        Log.w(TAG, "vocabCap invalid: $savedVocabCap")
-                        return false
+                    require(savedVocabCap >= savedVocabSize) {
+                        "ARG3 vocabulary capacity is invalid."
                     }
+                    require(savedAdamStep >= 0) { "ARG3 optimizer step cannot be negative." }
+                    requireSafeVocabularyCapacity(savedVocabCap)
 
-                    val countBuf = bis.readFully(4)
-                    val vocabCount = ByteBuffer.wrap(countBuf).order(ByteOrder.LITTLE_ENDIAN).int
-                    if (vocabCount < 0 || vocabCount > 1_000_000) {
-                        Log.w(TAG, "vocabCount suspicious: $vocabCount")
-                        return false
+                    val vocabCount = readIntLittleEndian(input)
+                    require(vocabCount in 1..config.tokenizerConfig.maxVocabularySize) {
+                        "ARG3 vocabulary entry count is invalid."
                     }
                     val entries = ArrayList<Pair<String, Int>>(vocabCount)
                     repeat(vocabCount) {
-                        val meta = ByteBuffer.wrap(bis.readFully(8)).order(ByteOrder.LITTLE_ENDIAN)
-                        val id = meta.int
-                        val len = meta.int
-                        if (len < 0 || len > 256) throw IllegalStateException("Token len $len invalid")
-                        val tokBytes = bis.readFully(len)
-                        entries.add(String(tokBytes, Charsets.UTF_8) to id)
+                        val id = readIntLittleEndian(input)
+                        val length = readIntLittleEndian(input)
+                        require(length in 1..(config.tokenizerConfig.maxTokenLength * 4)) {
+                            "ARG3 token byte length is invalid."
+                        }
+                        entries.add(
+                            String(input.readFully(length), Charsets.UTF_8) to id
+                        )
+                    }
+                    val candidateTokenizer = Tokenizer(config.tokenizerConfig)
+                    candidateTokenizer.importVocab(entries)
+                    require(candidateTokenizer.vocabSize == savedVocabSize) {
+                        "ARG3 tokenizer vocabulary size does not match its metadata."
                     }
 
                     synchronized(modelLock) {
                         tokenizer.importVocab(entries)
                         resizeVocabCapacityTo(savedVocabCap)
-
                         val arrays = listOf(
                             wEmbed, mEmbed, vEmbed,
                             wHead, mHead, vHead,
@@ -2010,21 +2657,46 @@ class ArgusNeuralEngine private constructor(
                             wGate, wUp, wDown,
                             mWGate, vWGate, mWUp, vWUp, mWDown, vWDown
                         )
-                        val totalFloats = arrays.sumOf { it.size }
-                        val floatBytes = bis.readFully(totalFloats * 4)
-                        val floatBuf = ByteBuffer.wrap(floatBytes).order(ByteOrder.LITTLE_ENDIAN)
-
-                        arrays.forEach { arr ->
-                            for (i in arr.indices) arr[i] = floatBuf.float
+                        arrays.forEachIndexed { index, values ->
+                            readFloatArrayLittleEndian(
+                                input = input,
+                                values = values,
+                                tensorName = "ARG3 tensor $index"
+                            )
                         }
                         adamStep = savedAdamStep
                     }
-                    return true
+                    true
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Gagal memuat checkpoint", e)
-            return false
+            Log.e(TAG, "ARG3 checkpoint load failed", e)
+            false
+        }
+    }
+
+    fun loadCheckpointIfExists(): Boolean {
+        val file = File(context.filesDir, "argus_model_weights.bin")
+        if (!file.isFile || file.length() < 4L) return false
+        return try {
+            val magic = FileInputStream(file).use { it.readFully(4) }
+            when {
+                magic[0] == MAGIC_0 && magic[1] == MAGIC_1 &&
+                    magic[2] == MAGIC_2 && magic[3] == MAGIC_3 ->
+                    loadLegacyCheckpoint(file)
+
+                magic[0] == MAGIC_0 && magic[1] == MAGIC_1 &&
+                    magic[2] == MAGIC_2 && magic[3] == MAGIC_4 ->
+                    loadArg4Checkpoint(file)
+
+                else -> {
+                    Log.w(TAG, "Checkpoint magic is not supported.")
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Checkpoint header read failed", e)
+            false
         }
     }
 
