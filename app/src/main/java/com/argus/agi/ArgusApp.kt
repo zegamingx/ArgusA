@@ -44,13 +44,15 @@ class ArgusApp : Application() {
             val deviceConfig = EngineConfig.forDevice(
                 totalRamGb = hardwareInfo.totalRamGb,
                 maxHeapMb = hardwareInfo.maxHeapMb,
-                availableRamGb = hardwareInfo.availRamGb
+                availableRamGb = hardwareInfo.availRamGb,
+                cpuCores = hardwareInfo.cpuCores
             )
             val resolvedConfig = ArgusNeuralEngine.resolveConfig(
                 context = instance,
                 totalRamGb = hardwareInfo.totalRamGb,
                 maxHeapMb = hardwareInfo.maxHeapMb,
-                availableRamGb = hardwareInfo.availRamGb
+                availableRamGb = hardwareInfo.availRamGb,
+                cpuCores = hardwareInfo.cpuCores
             )
 
             Log.i(TAG, "Resolved neural engine architecture: ${resolvedConfig.architectureLabel}")
