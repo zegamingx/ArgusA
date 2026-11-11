@@ -58,6 +58,32 @@ class ArgusDeviceModelPolicyTest {
     }
 
     @Test
+    fun selectsAnExecutableModelWithAtLeastOneMillionParameters() {
+        val config = EngineConfig.forDevice(
+            totalRamGb = 4,
+            maxHeapMb = 256L,
+            availableRamGb = 0.6f,
+            cpuCores = 4
+        )
+        val architecture = ArgusArchitectureConfig(
+            layerCount = config.layerCount,
+            hiddenSize = config.dModel,
+            attentionHeadCount = config.nHeads,
+            feedForwardSize = config.dFf,
+            vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+            contextLength = config.maxSeqLen,
+            adapterRank = config.loraRank
+        )
+        val parameterCount = ArgusArchitectureParameterEstimator
+            .estimate(architecture)
+            .totalTrainableParameters
+
+        assertTrue(parameterCount >= 1_000_000L)
+        assertEquals(ArgusDeviceModelTier.COMPACT, config.modelTier)
+        assertEquals(1, config.trainingBatchSize)
+    }
+
+    @Test
     fun neverReturnsTrainingBatchOutsideOneThroughEight() {
         val profiles = listOf(
             ArgusDeviceModelPolicy.select(2, 128L, 0.3f, 4),
