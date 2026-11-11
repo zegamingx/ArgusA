@@ -24,7 +24,7 @@ concurrency:
 jobs:
   validate:
     name: Compile Vulkan NDK, lint, test and package debug APK
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
 
     steps:
@@ -49,7 +49,7 @@ jobs:
           echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
           test -s "${sdk_root}/platforms/android-37.0/android.jar"
           test -x "${sdk_root}/build-tools/36.0.0/apksigner"
-          platform_alias="${sdk_root}/platforms/android-37"
+          platform_alias="${sdk_root}/platforms/android-37.0"
           if [[ ! -s "${platform_alias}/android.jar" ]]; then
             if [[ -e "${platform_alias}" && ! -L "${platform_alias}" ]]; then
               echo "::error::Unexpected existing SDK directory: ${platform_alias}"
