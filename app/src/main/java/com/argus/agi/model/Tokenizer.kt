@@ -2,7 +2,48 @@ package com.argus.agi.model
 
 import java.util.concurrent.ConcurrentHashMap
 
-class Tokenizer {
+enum class ArgusTokenizerAlgorithm(val checkpointId: Int) {
+    GREEDY_LONGEST_MATCH_V1(1);
+
+    companion object {
+        fun fromCheckpointId(value: Int): ArgusTokenizerAlgorithm =
+            entries.firstOrNull { it.checkpointId == value }
+                ?: throw IllegalArgumentException("Unsupported tokenizer algorithm ID: $value.")
+    }
+}
+
+data class TokenizerConfig(
+    val schemaVersion: Int = CURRENT_SCHEMA_VERSION,
+    val algorithm: ArgusTokenizerAlgorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
+    val maxVocabularySize: Int = DEFAULT_MAX_VOCAB_SIZE,
+    val maxTokenLength: Int = DEFAULT_MAX_TOKEN_LENGTH
+) {
+    init {
+        require(schemaVersion == CURRENT_SCHEMA_VERSION) {
+            "Unsupported tokenizer schema version: $schemaVersion."
+        }
+        require(maxVocabularySize >= MINIMUM_VOCAB_SIZE) {
+            "Tokenizer capacity must be at least $MINIMUM_VOCAB_SIZE."
+        }
+        require(maxVocabularySize <= MAX_SUPPORTED_VOCAB_SIZE) {
+            "Tokenizer capacity cannot exceed $MAX_SUPPORTED_VOCAB_SIZE."
+        }
+        require(maxTokenLength in 1..MAX_SUPPORTED_TOKEN_LENGTH) {
+            "Tokenizer token length must be between 1 and $MAX_SUPPORTED_TOKEN_LENGTH."
+        }
+    }
+
+    companion object {
+        const val CURRENT_SCHEMA_VERSION = 1
+        const val DEFAULT_MAX_VOCAB_SIZE = 1024
+        const val DEFAULT_MAX_TOKEN_LENGTH = 16
+        const val MINIMUM_VOCAB_SIZE = 256
+        const val MAX_SUPPORTED_VOCAB_SIZE = 1_000_000
+        const val MAX_SUPPORTED_TOKEN_LENGTH = 256
+    }
+}
+
+class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
     companion object {
         const val PAD_TOKEN = "<PAD>"
@@ -25,8 +66,8 @@ class Tokenizer {
         const val THINK_START_ID = 7
         const val THINK_END_ID = 8
 
-        const val MAX_TOKEN_LEN = 16
-        const val MAX_VOCAB_SIZE = 1024
+        const val MAX_TOKEN_LEN = TokenizerConfig.DEFAULT_MAX_TOKEN_LENGTH
+        const val MAX_VOCAB_SIZE = TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE
 
         private val SPECIAL_TOKENS = listOf(
             THINK_START, THINK_END, SYSTEM_TOKEN, USER_TOKEN,
@@ -91,8 +132,8 @@ class Tokenizer {
     @Synchronized
     fun registerToken(token: String, id: Int? = null): Int {
         require(token.isNotEmpty()) { "Token tidak boleh kosong" }
-        require(token.length <= MAX_TOKEN_LEN) {
-            "Token '$token' melebihi MAX_TOKEN_LEN=$MAX_TOKEN_LEN (len=${token.length})"
+        require(token.length <= config.maxTokenLength) {
+            "Token length ${token.length} exceeds configured maxTokenLength=${config.maxTokenLength}."
         }
 
         // Token sudah terdaftar? Kembalikan ID lama; tolak override eksplisit.
@@ -106,11 +147,14 @@ class Tokenizer {
         }
 
         // Guard kapasitas — berlaku untuk alokasi otomatis, TIDAK untuk special token / import
-        if (id == null && tokenToId.size >= MAX_VOCAB_SIZE) {
+        if (id == null && nextId >= config.maxVocabularySize) {
             return UNK_ID
         }
 
         val resolved = id ?: nextId
+        require(resolved in 0 until config.maxVocabularySize) {
+            "Token ID $resolved exceeds configured vocabulary capacity ${config.maxVocabularySize}."
+        }
         val occupant = idToToken[resolved]
         require(occupant == null) {
             "ID $resolved sudah dipakai token '$occupant', tidak bisa untuk '$token'"
@@ -141,8 +185,8 @@ class Tokenizer {
      */
     @Synchronized
     fun importVocab(entries: List<Pair<String, Int>>) {
-        require(entries.size <= MAX_VOCAB_SIZE) {
-            "Vocab import melebihi MAX_VOCAB_SIZE: ${entries.size} > $MAX_VOCAB_SIZE"
+        require(entries.size <= config.maxVocabularySize) {
+            "Vocabulary import exceeds configured capacity ${config.maxVocabularySize}."
         }
         require(entries.map { it.second }.toSet().size == entries.size) {
             "Duplicate IDs pada vocab import"
@@ -173,8 +217,11 @@ class Tokenizer {
         var newMaxLen = 1
         for ((tok, id) in entries) {
             require(tok.isNotEmpty()) { "Token kosong pada vocab import" }
-            require(tok.length <= MAX_TOKEN_LEN) {
-                "Token '$tok' melebihi MAX_TOKEN_LEN"
+            require(tok.length <= config.maxTokenLength) {
+                "Token length ${tok.length} exceeds configured maxTokenLength=${config.maxTokenLength}."
+            }
+            require(id in 0 until config.maxVocabularySize) {
+                "Token ID $id exceeds configured vocabulary capacity ${config.maxVocabularySize}."
             }
             val occupant = newIdToToken[id]
             require(occupant == null || occupant == tok) {
@@ -198,7 +245,7 @@ class Tokenizer {
         if (n == 0) return emptyList()
 
         val result = ArrayList<Int>(minOf(n, 256))
-        val localMaxLen = maxRegisteredLen.coerceIn(1, MAX_TOKEN_LEN)
+        val localMaxLen = maxRegisteredLen.coerceIn(1, config.maxTokenLength)
         var i = 0
 
         while (i < n) {

@@ -35,7 +35,8 @@ data class EngineConfig(
     val dFf: Int = 512,
     val maxSeqLen: Int = 128,
     val loraRank: Int = 4,
-    val isFullTrainingEnabled: Boolean = true
+    val isFullTrainingEnabled: Boolean = true,
+    val tokenizerConfig: TokenizerConfig = TokenizerConfig()
 ) {
     init {
         require(dModel > 0) { "dModel must be positive." }
@@ -111,7 +112,7 @@ class ArgusNeuralEngine private constructor(
     val config: EngineConfig = EngineConfig()
 ) {
 
-    val tokenizer = Tokenizer()
+    val tokenizer = Tokenizer(config.tokenizerConfig)
 
     // =====================================================================
     // Dynamic Architecture Dimensions (Sesuai Hardware Tier Terpilih)
