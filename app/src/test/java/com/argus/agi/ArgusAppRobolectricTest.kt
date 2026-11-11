@@ -3,6 +3,9 @@ package com.argus.agi
 import android.content.Context
 import android.content.pm.ServiceInfo
 import androidx.test.core.app.ApplicationProvider
+import com.argus.agi.model.ArgusArchitectureConfig
+import com.argus.agi.model.ArgusArchitectureParameterEstimator
+import com.argus.agi.model.ArgusDeviceModelTier
 import com.argus.agi.model.ArgusNeuralEngine
 import com.argus.agi.model.EngineConfig
 import com.argus.agi.model.ArgusTokenizerAlgorithm
