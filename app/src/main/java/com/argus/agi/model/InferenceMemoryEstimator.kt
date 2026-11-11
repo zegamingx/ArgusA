@@ -52,7 +52,7 @@ object InferenceMemoryEstimator {
 
     /**
      * Estimates resident weight storage, optional KV cache, and runtime workspace.
-     * Pass null shape metadata only when the GGUF metadata has not yet been inspected.
+     * Pass null shape metadata when the native model loader has not inspected its architecture yet.
      */
     fun estimate(
         parameterCount: Long,
