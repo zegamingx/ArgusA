@@ -56,37 +56,64 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun testDeviceModelConfigurationUsesStableMemoryTiers() {
-        val compact = EngineConfig.forDevice(totalRamGb = 4, maxHeapMb = 192L)
-        assertEquals(48, compact.dModel)
-        assertEquals(4, compact.nHeads)
-        assertEquals(128, compact.dFf)
-        assertEquals(64, compact.maxSeqLen)
-        assertEquals(2, compact.loraRank)
+    fun testDeviceModelConfigurationSelectsFourTiersAndSafeParameterBudgets() {
+        val compact = EngineConfig.forDevice(
+            totalRamGb = 4,
+            maxHeapMb = 192L,
+            cpuCores = 4
+        )
+        assertEquals(ArgusDeviceModelTier.COMPACT, compact.modelTier)
+        assertEquals(1, compact.trainingBatchSize)
 
-        val balanced = EngineConfig.forDevice(totalRamGb = 6, maxHeapMb = 256L)
-        assertEquals(64, balanced.dModel)
-        assertEquals(256, balanced.dFf)
-        assertEquals(96, balanced.maxSeqLen)
+        val balanced = EngineConfig.forDevice(
+            totalRamGb = 6,
+            maxHeapMb = 256L,
+            cpuCores = 6
+        )
+        assertEquals(ArgusDeviceModelTier.BALANCED, balanced.modelTier)
+        assertEquals(2, balanced.trainingBatchSize)
 
-        val highMemory = EngineConfig.forDevice(totalRamGb = 8, maxHeapMb = 384L)
-        assertEquals(96, highMemory.dModel)
-        assertEquals(384, highMemory.dFf)
-        assertEquals(128, highMemory.maxSeqLen)
+        val performance = EngineConfig.forDevice(
+            totalRamGb = 8,
+            maxHeapMb = 384L,
+            cpuCores = 8
+        )
+        assertEquals(ArgusDeviceModelTier.PERFORMANCE, performance.modelTier)
+        assertEquals(4, performance.trainingBatchSize)
 
-        val flagship = EngineConfig.forDevice(totalRamGb = 12, maxHeapMb = 512L)
-        assertEquals(128, flagship.dModel)
-        assertEquals(512, flagship.dFf)
-        assertEquals(128, flagship.maxSeqLen)
+        val flagship = EngineConfig.forDevice(
+            totalRamGb = 12,
+            maxHeapMb = 512L,
+            cpuCores = 8
+        )
+        assertEquals(ArgusDeviceModelTier.FLAGSHIP, flagship.modelTier)
+        assertEquals(8, flagship.trainingBatchSize)
 
         val memoryConstrainedFlagship = EngineConfig.forDevice(
             totalRamGb = 12,
             maxHeapMb = 512L,
-            availableRamGb = 1.5f
+            availableRamGb = 1.5f,
+            cpuCores = 8
         )
-        assertEquals(48, memoryConstrainedFlagship.dModel)
-        assertEquals(128, memoryConstrainedFlagship.dFf)
-        assertEquals(64, memoryConstrainedFlagship.maxSeqLen)
+        assertEquals(ArgusDeviceModelTier.PERFORMANCE, memoryConstrainedFlagship.modelTier)
+        assertEquals(4, memoryConstrainedFlagship.trainingBatchSize)
+
+        listOf(compact, balanced, performance, flagship, memoryConstrainedFlagship).forEach { config ->
+            val architecture = ArgusArchitectureConfig(
+                layerCount = config.layerCount,
+                hiddenSize = config.dModel,
+                attentionHeadCount = config.nHeads,
+                feedForwardSize = config.dFf,
+                vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+                contextLength = config.maxSeqLen,
+                adapterRank = config.loraRank
+            )
+            val parameters = ArgusArchitectureParameterEstimator
+                .estimate(architecture)
+                .totalTrainableParameters
+            assertTrue(parameters >= 1_000_000L)
+            assertTrue(config.trainingBatchSize in 1..8)
+        }
     }
 
     @Test
