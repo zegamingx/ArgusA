@@ -1275,6 +1275,7 @@ class ArgusNeuralEngine private constructor(
         var shouldSaveCheckpoint = false
         val result = synchronized(modelLock) {
             val initialAdamStep = adamStep
+            ensureVocabCapacity(tokenizer.vocabSize)
             val accumulator = createBatchGradientAccumulator(tokenizer.vocabSize)
             val sampleResults = ArrayList<NeuralTrainingStepResult>(texts.size)
 
