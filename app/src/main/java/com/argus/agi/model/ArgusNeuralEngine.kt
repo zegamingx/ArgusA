@@ -41,7 +41,9 @@ data class EngineConfig(
     val loraRank: Int = 4,
     val layerCount: Int = 1,
     val isFullTrainingEnabled: Boolean = true,
-    val tokenizerConfig: TokenizerConfig = TokenizerConfig()
+    val tokenizerConfig: TokenizerConfig = TokenizerConfig(),
+    val modelTier: ArgusDeviceModelTier = ArgusDeviceModelTier.COMPACT,
+    val trainingBatchSize: Int = modelTier.defaultTrainingBatchSize
 ) {
     init {
         require(dModel > 0) { "dModel must be positive." }
@@ -55,6 +57,9 @@ data class EngineConfig(
         }
         require(layerCount in 1..32) {
             "layerCount must be between 1 and 32."
+        }
+        require(trainingBatchSize in 1..8) {
+            "Training batch size must be between 1 and 8."
         }
 
         // This FP32 training engine still uses JVM arrays. Reject checkpoint
@@ -73,7 +78,8 @@ data class EngineConfig(
         val parameterCount = ArgusArchitectureParameterEstimator
             .estimate(estimatedArchitecture)
             .totalTrainableParameters
-        val trainingFloorBytes = TrainingMemoryPlanner.minimumTrainingStateBytes(parameterCount)
+        val trainingFloorBytes =
+            TrainingMemoryPlanner.minimumAccumulatedTrainingStateBytes(parameterCount)
         val positionElements = Math.multiplyExact(maxSeqLen.toLong(), hidden)
         require(positionElements <= Int.MAX_VALUE.toLong()) {
             "Position tensor dimensions exceed JVM array limits."
@@ -115,7 +121,7 @@ data class EngineConfig(
                 "Balanced Neural Core"
             else ->
                 "Compact Neural Core"
-        } + " (${layerCount}L, d_model $dModel, d_ff $dFf, context $maxSeqLen, LoRA rank $loraRank)"
+        } + " • ${modelTier.displayName} (${layerCount}L, d_model $dModel, d_ff $dFf, context $maxSeqLen, LoRA rank $loraRank)"
 
     companion object {
         /**
@@ -125,19 +131,93 @@ data class EngineConfig(
         fun forDevice(
             totalRamGb: Int,
             maxHeapMb: Long,
-            availableRamGb: Float = totalRamGb.toFloat()
-        ): EngineConfig = when {
-            totalRamGb >= 12 && maxHeapMb >= 512L && availableRamGb >= 3.0f ->
-                EngineConfig(dModel = 128, nHeads = 4, dFf = 512, maxSeqLen = 128, loraRank = 4)
+            availableRamGb: Float = totalRamGb.toFloat(),
+            cpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+        ): EngineConfig {
+            val profile = ArgusDeviceModelPolicy.select(
+                totalRamGb = totalRamGb,
+                maxHeapMb = maxHeapMb,
+                availableRamGb = availableRamGb,
+                cpuCores = cpuCores
+            )
+            val shape = selectExecutableShape(profile.targetParameterCount)
+            return EngineConfig(
+                dModel = shape.dModel,
+                nHeads = shape.nHeads,
+                dFf = shape.dFf,
+                maxSeqLen = when (profile.tier) {
+                    ArgusDeviceModelTier.COMPACT -> 64
+                    ArgusDeviceModelTier.BALANCED -> 96
+                    ArgusDeviceModelTier.PERFORMANCE,
+                    ArgusDeviceModelTier.FLAGSHIP -> 128
+                },
+                loraRank = shape.loraRank,
+                layerCount = shape.layerCount,
+                modelTier = profile.tier,
+                trainingBatchSize = profile.trainingBatchSize
+            )
+        }
 
-            totalRamGb >= 8 && maxHeapMb >= 384L && availableRamGb >= 2.0f ->
-                EngineConfig(dModel = 96, nHeads = 4, dFf = 384, maxSeqLen = 128, loraRank = 4)
+        private data class ExecutableShape(
+            val dModel: Int,
+            val nHeads: Int,
+            val dFf: Int,
+            val layerCount: Int,
+            val loraRank: Int,
+            val parameterCount: Long
+        )
 
-            totalRamGb >= 6 && maxHeapMb >= 256L && availableRamGb >= 2.0f ->
-                EngineConfig(dModel = 64, nHeads = 4, dFf = 256, maxSeqLen = 96, loraRank = 2)
+        /**
+         * Chooses the largest executable Transformer shape below the device's safe
+         * parameter target. The full 1M–7B family range is a design envelope; the
+         * active FP32 engine is deliberately constrained by its JVM heap budget.
+         */
+        private fun selectExecutableShape(targetParameters: Long): ExecutableShape {
+            val minimumParameters = ArgusDeviceModelProfile.MINIMUM_MODEL_PARAMETERS
+            val candidates = ArrayList<ExecutableShape>()
+            val hiddenSizes = intArrayOf(128, 160, 192, 256, 320, 384, 512, 640, 768, 1024)
+            val feedForwardMultipliers = intArrayOf(2, 3, 4)
+            val adapterRanks = intArrayOf(2, 4, 8)
 
-            else ->
-                EngineConfig(dModel = 48, nHeads = 4, dFf = 128, maxSeqLen = 64, loraRank = 2)
+            for (hidden in hiddenSizes) {
+                val heads = (hidden / 64).coerceIn(2, 16)
+                if (hidden % heads != 0) continue
+                for (multiplier in feedForwardMultipliers) {
+                    val feedForward = Math.multiplyExact(hidden, multiplier)
+                    for (rank in adapterRanks) {
+                        if (rank > hidden) continue
+                        for (layers in 1..32) {
+                            val architecture = ArgusArchitectureConfig(
+                                layerCount = layers,
+                                hiddenSize = hidden,
+                                attentionHeadCount = heads,
+                                feedForwardSize = feedForward,
+                                vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+                                contextLength = 64,
+                                adapterRank = rank
+                            )
+                            val parameterCount = ArgusArchitectureParameterEstimator
+                                .estimate(architecture)
+                                .totalTrainableParameters
+                            if (parameterCount in minimumParameters..targetParameters) {
+                                candidates += ExecutableShape(
+                                    dModel = hidden,
+                                    nHeads = heads,
+                                    dFf = feedForward,
+                                    layerCount = layers,
+                                    loraRank = rank,
+                                    parameterCount = parameterCount
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            return candidates.maxByOrNull(ExecutableShape::parameterCount)
+                ?: throw IllegalArgumentException(
+                    "The device budget cannot fit Argus's minimum 1M-parameter FP32 training model."
+                )
         }
     }
 }
@@ -378,7 +458,8 @@ class ArgusNeuralEngine private constructor(
             context: Context,
             totalRamGb: Int,
             maxHeapMb: Long,
-            availableRamGb: Float = totalRamGb.toFloat()
+            availableRamGb: Float = totalRamGb.toFloat(),
+            cpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
         ): EngineConfig {
             val checkpoint = File(context.filesDir, "argus_model_weights.bin")
             val savedConfig = runCatching {
@@ -397,7 +478,17 @@ class ArgusNeuralEngine private constructor(
                 }
             }.getOrNull()
 
-            return savedConfig ?: EngineConfig.forDevice(totalRamGb, maxHeapMb, availableRamGb)
+            val deviceConfig = EngineConfig.forDevice(
+                totalRamGb = totalRamGb,
+                maxHeapMb = maxHeapMb,
+                availableRamGb = availableRamGb,
+                cpuCores = cpuCores
+            )
+            val resolved = savedConfig ?: deviceConfig
+            return resolved.copy(
+                modelTier = deviceConfig.modelTier,
+                trainingBatchSize = deviceConfig.trainingBatchSize
+            )
         }
 
         private fun readCheckpointPrefix(file: File): ByteArray {
