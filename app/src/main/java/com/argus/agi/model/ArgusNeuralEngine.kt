@@ -267,9 +267,9 @@ internal data class GradientCheckResult(
 )
 
 /**
- * On-Device Neural Engine A.R.G.U.S:
- * Micro-Transformer SwiGLU with full-parameter backpropagation and LoRA adapters.
- * Uses sequential gradient accumulation and Adam without premature in-place mutation.
+ * Argus-native on-device causal Transformer with configurable SwiGLU blocks and Q/V LoRA.
+ * Supports full-parameter backpropagation, serial micro-batch gradient accumulation,
+ * AdamW updates, and Argus-owned checkpoint serialization.
  */
 class ArgusNeuralEngine private constructor(
     private val context: Context,
