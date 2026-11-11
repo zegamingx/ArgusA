@@ -146,11 +146,6 @@ object TextModalityProcessor {
     }
 
     /**
-     * Parses JSONL records, a pretty-printed object, or a JSON array of training
-     * records. Returns null unless every non-empty record is an instruction/answer
-     * example, so general JSON documents continue through the regular text path.
-     */
-    /**
      * Parses one JSON object, a top-level array of training objects, or a JSONL
      * stream. Every non-whitespace character must belong to a complete JSON value;
      * a valid prefix followed by unrelated text is rejected.
