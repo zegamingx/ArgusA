@@ -513,18 +513,47 @@ class ArgusNeuralEngine private constructor(
             val resolvedConfig = savedConfig ?: requireNotNull(deviceConfig) {
                 "This device cannot currently allocate the minimum 1M-parameter Argus model safely."
             }
-            val accumulatedTrainingIsSafe = if (savedConfig == null) {
-                true
-            } else {
-                runCatching {
-                    savedConfig.copy(gradientAccumulationEnabled = true)
-                }.isSuccess
+            val savedParameterCount = savedConfig?.let { saved ->
+                ArgusArchitectureParameterEstimator.estimate(
+                    ArgusArchitectureConfig(
+                        layerCount = saved.layerCount,
+                        hiddenSize = saved.dModel,
+                        attentionHeadCount = saved.nHeads,
+                        feedForwardSize = saved.dFf,
+                        vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+                        contextLength = saved.maxSeqLen,
+                        adapterRank = saved.loraRank
+                    )
+                ).totalTrainableParameters
             }
+            val currentDeviceParameterCapacity = deviceConfig?.let { selected ->
+                ArgusArchitectureParameterEstimator.estimate(
+                    ArgusArchitectureConfig(
+                        layerCount = selected.layerCount,
+                        hiddenSize = selected.dModel,
+                        attentionHeadCount = selected.nHeads,
+                        feedForwardSize = selected.dFf,
+                        vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+                        contextLength = selected.maxSeqLen,
+                        adapterRank = selected.loraRank
+                    )
+                ).totalTrainableParameters
+            }
+            val accumulatedTrainingIsSafe = deviceConfig != null &&
+                (savedConfig == null ||
+                    (
+                        savedParameterCount != null &&
+                            currentDeviceParameterCapacity != null &&
+                            savedParameterCount <= currentDeviceParameterCapacity &&
+                            runCatching {
+                                savedConfig.copy(gradientAccumulationEnabled = true)
+                            }.isSuccess
+                    ))
             val selectedTier = deviceConfig?.modelTier ?: resolvedConfig.modelTier
-            val selectedBatchSize = when {
-                !accumulatedTrainingIsSafe -> 1
-                deviceConfig != null -> deviceConfig.trainingBatchSize
-                else -> 1
+            val selectedBatchSize = if (accumulatedTrainingIsSafe) {
+                deviceConfig?.trainingBatchSize ?: 1
+            } else {
+                1
             }
             return resolvedConfig.copy(
                 modelTier = selectedTier,
