@@ -65,7 +65,7 @@ object ArgusDeviceModelPolicy {
         require(cpuCores > 0) { "CPU core count must be positive." }
 
         val safeAvailableRamGb = availableRamGb
-            .takeIf(Float::isFinite)
+            .takeIf { value -> value.isFinite() }
             ?.coerceAtLeast(0.0f)
             ?: 0.0f
         val availableBytes = (safeAvailableRamGb.toDouble() * GIB)
