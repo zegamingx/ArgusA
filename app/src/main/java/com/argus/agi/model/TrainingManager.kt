@@ -1206,6 +1206,7 @@ class TrainingManager(
 
                 val activeItems = batchItems.map { it.copy(status = TrainingStatus.TRAINING) }
                 _currentTrainingItem.value = activeItems.first()
+                updateActiveDocumentEntering(activeItems.first())
 
                 try {
                     processBatch(activeItems)
