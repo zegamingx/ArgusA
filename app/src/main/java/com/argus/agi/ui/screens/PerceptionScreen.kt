@@ -16,6 +16,7 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -53,10 +54,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -77,8 +82,6 @@ import com.argus.agi.ui.theme.ArgusTextPrimary
 import com.argus.agi.ui.theme.ArgusTextSecondary
 import com.argus.agi.ui.theme.ArgusWarning
 import java.util.Locale
-import androidx.compose.ui.res.painterResource
-import com.argus.agi.R
 
 @Composable
 fun PerceptionScreen(viewModel: ArgusViewModel) {
@@ -94,167 +97,157 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
 
     var isCameraActive by rememberSaveable { mutableStateOf(false) }
     var isCameraExpanded by remember { mutableStateOf(true) }
-    var isScreenExpanded by remember { mutableStateOf(true) }
-    var isHardwareExpanded by remember { mutableStateOf(true) }
-    var isAudioExpanded by remember { mutableStateOf(true) }
+    var isScreenExpanded by remember { mutableStateOf(false) }
+    var isHardwareExpanded by remember { mutableStateOf(false) }
+    var isAudioExpanded by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
             .background(ArgusDarkBg)
-            .padding(horizontal = 16.dp),
-        contentPadding = PaddingValues(vertical = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+            .padding(horizontal = 12.dp),
+        contentPadding = PaddingValues(vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Title Header
+        // HEADER COMPACT + LIVE STATUS
         item {
             Column {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "PERCEPTION",
+                        style = MaterialTheme.typography.titleLarge.copy(fontSize = 20.sp),
+                        color = ArgusTextPrimary,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(if (isCameraActive || isAcousticActive || isAccessibilityActive) ArgusSuccess.copy(alpha = 0.15f) else ArgusSurfaceVariant).padding(horizontal = 9.dp, vertical = 4.dp)
+                    ) {
+                        Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(if (isCameraActive || isAcousticActive || isAccessibilityActive) ArgusSuccess else ArgusTextMuted))
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text(text = if (isCameraActive || isAcousticActive || isAccessibilityActive) "SENSING" else "STANDBY", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = if (isCameraActive || isAcousticActive || isAccessibilityActive) ArgusSuccess else ArgusTextMuted, fontWeight = FontWeight.Bold)
+                    }
+                }
+                Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "ENVIRONMENT & SENSOR PERCEPTION",
-                    style = MaterialTheme.typography.titleLarge,
-                    color = ArgusCyanPrimary,
-                    fontWeight = FontWeight.Bold
+                    text = "Mata, telinga, dan layar. Semua diproses di HP, sampling dibatasi biar hemat baterai.",
+                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp),
+                    color = ArgusTextMuted,
+                    lineHeight = 17.sp
                 )
-                Text(
-                    text = "Adaptive camera vision, accessibility-based screen reading, and hardware capabilities",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = ArgusTextSecondary
-                )
+                Spacer(modifier = Modifier.height(10.dp))
+                // MINI STATUS ROW
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MiniStatus(
+                        label = "LIGHT",
+                        value = if (isCameraActive) String.format(Locale.US, "%.0f lx", cameraLuminance) else "Off",
+                        active = isCameraActive,
+                        modifier = Modifier.weight(1f)
+                    )
+                    MiniStatus(
+                        label = "SOUND",
+                        value = if (isAcousticActive) String.format(Locale.US, "%.0f dB", ambientDb) else "Off",
+                        active = isAcousticActive,
+                        modifier = Modifier.weight(1f)
+                    )
+                    MiniStatus(
+                        label = "SCREEN",
+                        value = if (isAccessibilityActive) "Active" else "Off",
+                        active = isAccessibilityActive,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
             }
         }
 
-        // 1. Camera Vision Card (Collapsible & Adaptive)
+        // 1. CAMERA HERO
         item {
             Surface(
-                shape = RoundedCornerShape(16.dp),
+                shape = RoundedCornerShape(18.dp),
                 color = ArgusSurface,
                 border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Column(modifier = Modifier.padding(14.dp)) {
+                Column(modifier = Modifier.padding(12.dp)) {
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { isCameraExpanded = !isCameraExpanded }
-                            .padding(vertical = 2.dp),
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { isCameraExpanded = !isCameraExpanded }.padding(vertical = 2.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_symbol_photo_camera),
-                                contentDescription = "Camera",
-                                tint = if (isCameraActive) ArgusCyanPrimary else ArgusTextMuted,
-                                modifier = Modifier.size(22.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "Camera Vision (Adaptive)",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = ArgusTextPrimary,
-                                fontWeight = FontWeight.Bold
-                            )
+                            Box(modifier = Modifier.size(34.dp).clip(CircleShape).background(ArgusCyanPrimary.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
+                                Icon(painter = painterResource(R.drawable.ic_symbol_photo_camera), contentDescription = "Camera", tint = if (isCameraActive) ArgusCyanPrimary else ArgusTextMuted, modifier = Modifier.size(18.dp))
+                            }
+                            Spacer(modifier = Modifier.width(9.dp))
+                            Column {
+                                Text(text = "Camera Vision", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
+                                Text(text = if (isCameraActive) "Adaptive • 1 frame / 2.5s" else "Standby • Hemat baterai", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
+                            }
                         }
-
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = if (isCameraActive) String.format(Locale.US, "%.1f lx", cameraLuminance) else "Standby",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (isCameraActive) ArgusCyanGlow else ArgusTextMuted,
-                                fontFamily = FontFamily.Monospace
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
                             Switch(
                                 checked = isCameraActive,
                                 onCheckedChange = { isCameraActive = it },
-                                colors = SwitchDefaults.colors(
-                                    checkedThumbColor = ArgusCyanPrimary,
-                                    checkedTrackColor = ArgusCyanPrimary.copy(alpha = 0.3f),
-                                    uncheckedThumbColor = ArgusTextMuted,
-                                    uncheckedTrackColor = ArgusSurfaceVariant
-                                ),
+                                colors = SwitchDefaults.colors(checkedThumbColor = ArgusDarkBg, checkedTrackColor = ArgusCyanPrimary, uncheckedThumbColor = ArgusTextMuted, uncheckedTrackColor = ArgusSurfaceVariant),
                                 modifier = Modifier.testTag("camera_active_switch")
                             )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Icon(
-                                painter = if (isCameraExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
-                                contentDescription = "Toggle",
-                                tint = ArgusCyanPrimary,
-                                modifier = Modifier.size(20.dp)
-                            )
+                            Icon(painter = if (isCameraExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down), contentDescription = "Toggle", tint = ArgusCyanPrimary, modifier = Modifier.size(20.dp))
                         }
                     }
 
-                    AnimatedVisibility(
-                        visible = isCameraExpanded,
-                        enter = expandVertically() + fadeIn(),
-                        exit = shrinkVertically() + fadeOut()
-                    ) {
+                    AnimatedVisibility(visible = isCameraExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
-                            Spacer(modifier = Modifier.height(12.dp))
-
+                            Spacer(modifier = Modifier.height(10.dp))
                             if (isCameraActive) {
-                                // Real Camera Preview Viewport with Adaptive Throttled Analyzer
                                 Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(200.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(ArgusDarkBg)
-                                        .border(1.dp, ArgusCyanPrimary.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                                    modifier = Modifier.fillMaxWidth().height(220.dp).clip(RoundedCornerShape(14.dp)).background(ArgusDarkBg).border(1.dp, ArgusCyanPrimary.copy(alpha = 0.4f), RoundedCornerShape(14.dp))
                                 ) {
-                                    CameraViewfinder(onLuminanceUpdate = { lum ->
-                                        viewModel.updateCameraFrame(lum)
-                                    })
+                                    CameraViewfinder(onLuminanceUpdate = { lum -> viewModel.updateCameraFrame(lum) })
+                                    // Scan frame overlay, lite, no particle
+                                    Canvas(modifier = Modifier.fillMaxSize()) {
+                                        val stroke = 2.dp.toPx()
+                                        val corner = 22.dp.toPx()
+                                        val c = ArgusCyanPrimary.copy(alpha = 0.9f)
+                                        // top left
+                                        drawLine(c, Offset(12f, 12f + corner), Offset(12f, 12f), strokeWidth = stroke)
+                                        drawLine(c, Offset(12f, 12f), Offset(12f + corner, 12f), strokeWidth = stroke)
+                                        // top right
+                                        drawLine(c, Offset(size.width - 12f - corner, 12f), Offset(size.width - 12f, 12f), strokeWidth = stroke)
+                                        drawLine(c, Offset(size.width - 12f, 12f), Offset(size.width - 12f, 12f + corner), strokeWidth = stroke)
+                                        // bottom left
+                                        drawLine(c, Offset(12f, size.height - 12f - corner), Offset(12f, size.height - 12f), strokeWidth = stroke)
+                                        drawLine(c, Offset(12f, size.height - 12f), Offset(12f + corner, size.height - 12f), strokeWidth = stroke)
+                                        // bottom right
+                                        drawLine(c, Offset(size.width - 12f - corner, size.height - 12f), Offset(size.width - 12f, size.height - 12f), strokeWidth = stroke)
+                                        drawLine(c, Offset(size.width - 12f, size.height - 12f), Offset(size.width - 12f, size.height - 12f - corner), strokeWidth = stroke)
+                                        // scan line
+                                        val y = size.height * 0.5f
+                                        drawLine(Color(0xFF38BDF8).copy(alpha = 0.35f), Offset(20f, y), Offset(size.width - 20f, y), strokeWidth = 1.5f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f))
+                                    }
+                                    Box(modifier = Modifier.align(Alignment.TopStart).padding(10.dp).clip(RoundedCornerShape(20.dp)).background(Color.Black.copy(alpha = 0.6f)).padding(horizontal = 8.dp, vertical = 4.dp)) {
+                                        Text(text = String.format(Locale.US, "%.1f lx • LIVE", cameraLuminance), style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                                    }
                                 }
-
                                 Spacer(modifier = Modifier.height(8.dp))
-                                Text(
-                                    text = "Adaptive mode is active: the camera samples a frame every 2.5 seconds to reduce battery use and heat.",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = ArgusCyanGlow
-                                )
+                                Text(text = "Adaptive mode aktif: sampling dibatasi biar gak panas dan hemat baterai.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusCyanGlow)
                             } else {
-                                // Power-saving Standby Placeholder
                                 Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(ArgusSurfaceVariant.copy(alpha = 0.5f))
-                                        .border(1.dp, ArgusCardBorder, RoundedCornerShape(12.dp))
-                                        .padding(16.dp),
+                                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(ArgusSurfaceVariant.copy(alpha = 0.5f)).border(1.dp, ArgusCardBorder, RoundedCornerShape(14.dp)).padding(16.dp),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                        Icon(
-                                            painter = painterResource(R.drawable.ic_symbol_photo_camera),
-                                            contentDescription = null,
-                                            tint = ArgusTextMuted,
-                                            modifier = Modifier.size(28.dp)
-                                        )
+                                        Icon(painter = painterResource(R.drawable.ic_symbol_photo_camera), contentDescription = null, tint = ArgusTextMuted, modifier = Modifier.size(28.dp))
                                         Spacer(modifier = Modifier.height(6.dp))
-                                        Text(
-                                            text = "Camera sensor is on standby",
-                                            style = MaterialTheme.typography.titleSmall,
-                                            color = ArgusTextPrimary,
-                                            fontWeight = FontWeight.Bold
-                                        )
+                                        Text(text = "Kamera standby", style = MaterialTheme.typography.titleSmall, color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
                                         Spacer(modifier = Modifier.height(4.dp))
-                                        Text(
-                                            text = "The camera does not run continuously. Enable it when you need visual input; sampling is limited to reduce battery use and heat.",
-                                            style = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp),
-                                            color = ArgusTextSecondary,
-                                            textAlign = TextAlign.Center
-                                        )
+                                        Text(text = "Kamera gak jalan terus. Nyalain cuma pas lu butuh input visual.", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp), color = ArgusTextSecondary, textAlign = TextAlign.Center)
                                         Spacer(modifier = Modifier.height(10.dp))
                                         Button(
                                             onClick = { isCameraActive = true },
-                                            colors = ButtonDefaults.buttonColors(
-                                                containerColor = ArgusCyanPrimary.copy(alpha = 0.2f),
-                                                contentColor = ArgusCyanPrimary
-                                            ),
-                                            shape = RoundedCornerShape(8.dp),
+                                            colors = ButtonDefaults.buttonColors(containerColor = ArgusCyanPrimary, contentColor = ArgusDarkBg),
+                                            shape = RoundedCornerShape(20.dp),
                                             modifier = Modifier.testTag("activate_camera_button")
                                         ) {
                                             Text("Enable Camera", fontWeight = FontWeight.Bold, fontSize = 11.sp)
@@ -268,122 +261,53 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
             }
         }
 
-        // 2. Screen Perception & Accessibility Service Card (Collapsible)
+        // 2. SCREEN PERCEPTION - Collapsed by default
         item {
-            Surface(
-                shape = RoundedCornerShape(16.dp),
-                color = ArgusSurface,
-                border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
+            Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp)) {
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { isScreenExpanded = !isScreenExpanded }
-                            .padding(vertical = 2.dp),
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { isScreenExpanded = !isScreenExpanded }.padding(vertical = 2.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_symbol_screen_share),
-                                contentDescription = "Screen",
-                                tint = ArgusCyanPrimary,
-                                modifier = Modifier.size(22.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "Screen Text Perception",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = ArgusTextPrimary,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(if (isAccessibilityActive) ArgusSuccess.copy(alpha = 0.15f) else ArgusWarning.copy(alpha = 0.15f))
-                                    .padding(horizontal = 8.dp, vertical = 4.dp)
-                            ) {
-                                Text(
-                                    text = if (isAccessibilityActive) "ACTIVE" else "NOT ENABLED",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (isAccessibilityActive) ArgusSuccess else ArgusWarning,
-                                    fontWeight = FontWeight.Bold
-                                )
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                            Box(modifier = Modifier.size(34.dp).clip(CircleShape).background(ArgusCyanPrimary.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
+                                Icon(painter = painterResource(R.drawable.ic_symbol_screen_share), contentDescription = "Screen", tint = ArgusCyanPrimary, modifier = Modifier.size(18.dp))
                             }
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Icon(
-                                painter = if (isScreenExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
-                                contentDescription = "Toggle",
-                                tint = ArgusCyanPrimary,
-                                modifier = Modifier.size(20.dp)
-                            )
+                            Spacer(modifier = Modifier.width(9.dp))
+                            Column {
+                                Text(text = "Screen Text", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
+                                Text(text = contextSummary.take(42) + if (contextSummary.length > 42) "..." else "", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
+                            }
                         }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Box(modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(if (isAccessibilityActive) ArgusSuccess.copy(alpha = 0.15f) else ArgusWarning.copy(alpha = 0.15f)).padding(horizontal = 8.dp, vertical = 4.dp)) {
+                            Text(text = if (isAccessibilityActive) "ACTIVE" else "OFF", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = if (isAccessibilityActive) ArgusSuccess else ArgusWarning, fontWeight = FontWeight.Bold)
+                        }
+                        Icon(painter = if (isScreenExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down), contentDescription = "Toggle", tint = ArgusCyanPrimary, modifier = Modifier.size(20.dp))
                     }
 
-                    AnimatedVisibility(
-                        visible = isScreenExpanded,
-                        enter = expandVertically() + fadeIn(),
-                        exit = shrinkVertically() + fadeOut()
-                    ) {
+                    AnimatedVisibility(visible = isScreenExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
                             Spacer(modifier = Modifier.height(10.dp))
-
-                            Text(
-                                text = "Status: $contextSummary",
-                                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp),
-                                color = ArgusTextPrimary,
-                                fontFamily = FontFamily.Monospace
-                            )
-
+                            Text(text = "Status: $contextSummary", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary, fontFamily = FontFamily.Monospace)
                             Spacer(modifier = Modifier.height(12.dp))
-
                             if (!isAccessibilityActive) {
                                 Button(
-                                    onClick = {
-                                        val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                                        context.startActivity(intent)
-                                    },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = ArgusCyanPrimary,
-                                        contentColor = ArgusDarkBg
-                                    ),
-                                    shape = RoundedCornerShape(10.dp),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .testTag("enable_accessibility_button")
+                                    onClick = { val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS); context.startActivity(intent) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = ArgusCyanPrimary, contentColor = ArgusDarkBg),
+                                    shape = RoundedCornerShape(20.dp),
+                                    modifier = Modifier.fillMaxWidth().testTag("enable_accessibility_button")
                                 ) {
-                                    Icon(
-                                        painter = painterResource(R.drawable.ic_symbol_open_in_new),
-                                        contentDescription = null,
-                                        modifier = Modifier.size(16.dp)
-                                    )
+                                    Icon(painter = painterResource(R.drawable.ic_symbol_open_in_new), contentDescription = null, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = "Enable Accessibility Access",
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 12.sp
-                                    )
+                                    Text(text = "Enable Accessibility Access", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                 }
                             } else {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        painter = painterResource(R.drawable.ic_symbol_check_circle),
-                                        contentDescription = null,
-                                        tint = ArgusSuccess,
-                                        modifier = Modifier.size(16.dp)
-                                    )
+                                    Icon(painter = painterResource(R.drawable.ic_symbol_check_circle), contentDescription = null, tint = ArgusSuccess, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = "Accessible text is read when the active app window changes; excluded apps are skipped.",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = ArgusSuccess
-                                    )
+                                    Text(text = "Dibaca pas jendela app berubah, app yang dikecualikan di-skip.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusSuccess)
                                 }
                             }
                         }
@@ -392,60 +316,35 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
             }
         }
 
-        // 3. Hardware & SoC Acceleration Card (Collapsible)
+        // 3. HARDWARE - Collapsed by default, fixed row layout
         item {
-            Surface(
-                shape = RoundedCornerShape(16.dp),
-                color = ArgusSurface,
-                border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
+            Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp)) {
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { isHardwareExpanded = !isHardwareExpanded }
-                            .padding(vertical = 2.dp),
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { isHardwareExpanded = !isHardwareExpanded }.padding(vertical = 2.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_symbol_developer_board),
-                                contentDescription = "SoC",
-                                tint = ArgusCyanPrimary,
-                                modifier = Modifier.size(22.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "Hardware & Compute Capabilities",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = ArgusTextPrimary,
-                                fontWeight = FontWeight.Bold
-                            )
+                            Box(modifier = Modifier.size(34.dp).clip(CircleShape).background(ArgusCyanPrimary.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
+                                Icon(painter = painterResource(R.drawable.ic_symbol_developer_board), contentDescription = "SoC", tint = ArgusCyanPrimary, modifier = Modifier.size(18.dp))
+                            }
+                            Spacer(modifier = Modifier.width(9.dp))
+                            Column {
+                                Text(text = "Hardware & Compute", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
+                                Text(text = "${hardware.socManufacturer} • ${hardware.cpuCores} cores • ${hardware.maxHeapMb} MB heap", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
+                            }
                         }
-
-                        Icon(
-                            painter = if (isHardwareExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
-                            contentDescription = "Toggle",
-                            tint = ArgusCyanPrimary,
-                            modifier = Modifier.size(20.dp)
-                        )
+                        Icon(painter = if (isHardwareExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down), contentDescription = "Toggle", tint = ArgusCyanPrimary, modifier = Modifier.size(20.dp))
                     }
 
-                    AnimatedVisibility(
-                        visible = isHardwareExpanded,
-                        enter = expandVertically() + fadeIn(),
-                        exit = shrinkVertically() + fadeOut()
-                    ) {
+                    AnimatedVisibility(visible = isHardwareExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
-                            Spacer(modifier = Modifier.height(14.dp))
-
+                            Spacer(modifier = Modifier.height(12.dp))
                             HardwareSpecRow(label = "Chipset / SoC", value = "${hardware.socManufacturer} (${hardware.socModel})")
-                            HardwareSpecRow(label = "Vulkan GPU Capability", value = hardware.primaryAccelerator)
-                            HardwareSpecRow(label = "NPU/APU Family (Detection Only)", value = if (hardware.npuApuDetected == "Not detected") "Not detected" else "${hardware.npuApuDetected} • no vendor runtime integrated")
-                            HardwareSpecRow(label = "Vulkan Support", value = if (hardware.vulkanSupported) "Advertised (version code ${hardware.vulkanVersionCode})" else "Not advertised")
+                            HardwareSpecRow(label = "Vulkan GPU", value = hardware.primaryAccelerator)
+                            HardwareSpecRow(label = "NPU / APU", value = if (hardware.npuApuDetected == "Not detected") "Not detected" else "${hardware.npuApuDetected} • no vendor runtime")
+                            HardwareSpecRow(label = "Vulkan Support", value = if (hardware.vulkanSupported) "Yes • v${hardware.vulkanVersionCode}" else "Not advertised")
                             HardwareSpecRow(label = "CPU Cores", value = "${hardware.cpuCores} logical cores")
                             HardwareSpecRow(label = "App Heap Limit", value = "${hardware.maxHeapMb} MB")
                         }
@@ -454,86 +353,37 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
             }
         }
 
-        // 4. Audio & Voice Perception Card
+        // 4. AUDIO
         item {
-            Surface(
-                shape = RoundedCornerShape(16.dp),
-                color = ArgusSurface,
-                border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
+            Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp)) {
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { isAudioExpanded = !isAudioExpanded }
-                            .padding(vertical = 4.dp),
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { isAudioExpanded = !isAudioExpanded }.padding(vertical = 2.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(36.dp)
-                                .clip(CircleShape)
-                                .background(ArgusCyanPrimary.copy(alpha = 0.15f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_symbol_mic),
-                                contentDescription = "Audio Voice",
-                                tint = if (isAcousticActive || isListening) ArgusCyanPrimary else ArgusTextMuted,
-                                modifier = Modifier.size(20.dp)
-                            )
+                        Box(modifier = Modifier.size(34.dp).clip(CircleShape).background(ArgusCyanPrimary.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
+                            Icon(painter = painterResource(R.drawable.ic_symbol_mic), contentDescription = "Audio", tint = if (isAcousticActive || isListening) ArgusCyanPrimary else ArgusTextMuted, modifier = Modifier.size(18.dp))
                         }
-
-                        Spacer(modifier = Modifier.width(12.dp))
-
+                        Spacer(modifier = Modifier.width(9.dp))
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Voice & Acoustic Input",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = ArgusTextPrimary,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = if (isAcousticActive) String.format(Locale.US, "Ambient level: %.1f dB", ambientDb) else "Acoustic sensor: Standby",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (isAcousticActive) ArgusCyanGlow else ArgusTextMuted
-                            )
+                            Text(text = "Voice & Acoustic", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
+                            Text(text = if (isAcousticActive) String.format(Locale.US, "Ambient: %.1f dB", ambientDb) else "Standby", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = if (isAcousticActive) ArgusCyanGlow else ArgusTextMuted)
                         }
-
                         Switch(
                             checked = isAcousticActive,
                             onCheckedChange = { viewModel.toggleAcousticMonitoring() },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = ArgusDarkBg,
-                                checkedTrackColor = ArgusCyanPrimary,
-                                uncheckedThumbColor = ArgusTextMuted,
-                                uncheckedTrackColor = ArgusSurfaceVariant
-                            )
+                            colors = SwitchDefaults.colors(checkedThumbColor = ArgusDarkBg, checkedTrackColor = ArgusCyanPrimary, uncheckedThumbColor = ArgusTextMuted, uncheckedTrackColor = ArgusSurfaceVariant)
                         )
-
-                        Spacer(modifier = Modifier.width(6.dp))
-
-                        Icon(
-                            painter = if (isAudioExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down),
-                            contentDescription = "Expand",
-                            tint = ArgusTextMuted
-                        )
+                        Icon(painter = if (isAudioExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down), contentDescription = "Expand", tint = ArgusTextMuted, modifier = Modifier.size(20.dp))
                     }
 
-                    AnimatedVisibility(
-                        visible = isAudioExpanded,
-                        enter = expandVertically() + fadeIn(),
-                        exit = shrinkVertically() + fadeOut()
-                    ) {
+                    AnimatedVisibility(visible = isAudioExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
-                            Spacer(modifier = Modifier.height(14.dp))
-
-                            HardwareSpecRow(label = "Text-to-Speech", value = if (isSpeaking) "Speaking" else "Ready (device TTS engine)")
-                            HardwareSpecRow(label = "Speech Recognition", value = if (isListening) "Listening..." else "Ready (offline preferred; system fallback)")
-                            HardwareSpecRow(label = "Ambient Noise Level", value = if (isAcousticActive) String.format(Locale.US, "%.1f dB SPL", ambientDb) else "Sensor Off")
-                            HardwareSpecRow(label = "Speech Service", value = "Device speech service; network fallback may be used when offline recognition is unavailable")
+                            Spacer(modifier = Modifier.height(12.dp))
+                            HardwareSpecRow(label = "Text-to-Speech", value = if (isSpeaking) "Speaking" else "Ready • device TTS")
+                            HardwareSpecRow(label = "Speech Recognition", value = if (isListening) "Listening..." else "Ready • offline preferred")
+                            HardwareSpecRow(label = "Ambient Noise", value = if (isAcousticActive) String.format(Locale.US, "%.1f dB SPL", ambientDb) else "Sensor Off")
+                            HardwareSpecRow(label = "Speech Service", value = "Device service, fallback network jika offline gak tersedia")
                         }
                     }
                 }
@@ -543,26 +393,22 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
 }
 
 @Composable
-fun HardwareSpecRow(label: String, value: String) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 5.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
+fun MiniStatus(label: String, value: String, active: Boolean, modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier.clip(RoundedCornerShape(12.dp)).background(if (active) ArgusCyanPrimary.copy(alpha = 0.12f) else ArgusSurfaceVariant).border(1.dp, if (active) ArgusCyanPrimary.copy(alpha = 0.4f) else ArgusCardBorder, RoundedCornerShape(12.dp)).padding(horizontal = 10.dp, vertical = 8.dp)
     ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall,
-            color = ArgusTextMuted
-        )
-        Text(
-            text = value,
-            style = MaterialTheme.typography.labelSmall,
-            color = ArgusTextPrimary,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Medium
-        )
+        Text(text = label, style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp), color = ArgusTextMuted, fontWeight = FontWeight.Bold)
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(text = value, style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp), color = if (active) ArgusCyanPrimary else ArgusTextPrimary, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+    }
+}
+
+@Composable
+fun HardwareSpecRow(label: String, value: String) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+        Text(text = label, style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(text = value, style = MaterialTheme.typography.bodySmall.copy(fontSize = 13.sp), color = ArgusTextPrimary, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium)
     }
 }
 
@@ -572,46 +418,19 @@ fun CameraViewfinder(onLuminanceUpdate: (Float) -> Unit) {
     val lifecycleOwner = LocalLifecycleOwner.current
 
     var hasCameraPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-        )
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
     }
 
-    val launcher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        hasCameraPermission = granted
-    }
+    val launcher = rememberLauncherForActivityResult(contract = ActivityResultContracts.RequestPermission()) { granted -> hasCameraPermission = granted }
 
     if (!hasCameraPermission) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp),
-            contentAlignment = Alignment.Center
-        ) {
+        Box(modifier = Modifier.fillMaxSize().padding(16.dp), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_symbol_photo_camera),
-                    contentDescription = null,
-                    tint = ArgusCyanPrimary,
-                    modifier = Modifier.size(32.dp)
-                )
+                Icon(painter = painterResource(R.drawable.ic_symbol_photo_camera), contentDescription = null, tint = ArgusCyanPrimary, modifier = Modifier.size(32.dp))
                 Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "Camera permission is required for visual input",
-                    style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp),
-                    color = ArgusTextSecondary
-                )
+                Text(text = "Camera permission is required for visual input", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp), color = ArgusTextSecondary, textAlign = TextAlign.Center)
                 Spacer(modifier = Modifier.height(10.dp))
-                Button(
-                    onClick = { launcher.launch(Manifest.permission.CAMERA) },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = ArgusCyanPrimary,
-                        contentColor = ArgusDarkBg
-                    ),
-                    shape = RoundedCornerShape(10.dp)
-                ) {
+                Button(onClick = { launcher.launch(Manifest.permission.CAMERA) }, colors = ButtonDefaults.buttonColors(containerColor = ArgusCyanPrimary, contentColor = ArgusDarkBg), shape = RoundedCornerShape(20.dp)) {
                     Text("Grant Camera Permission", fontWeight = FontWeight.Bold, fontSize = 11.sp)
                 }
             }
@@ -623,48 +442,34 @@ fun CameraViewfinder(onLuminanceUpdate: (Float) -> Unit) {
 
     DisposableEffect(lifecycleOwner) {
         onDispose {
-            try {
-                cameraProviderRef?.unbindAll()
-            } catch (_: Exception) {}
+            try { cameraProviderRef?.unbindAll() } catch (_: Exception) {}
         }
     }
 
     var lastAnalysisNs by remember { mutableStateOf(0L) }
-    val throttleIntervalNs = 2_500_000_000L // 2.5 seconds adaptive sampling rate
+    val throttleIntervalNs = 2_500_000_000L
 
     AndroidView(
         factory = { ctx ->
             val previewView = PreviewView(ctx)
             val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
-
             cameraProviderFuture.addListener({
                 try {
                     val cameraProvider = cameraProviderFuture.get()
                     cameraProviderRef = cameraProvider
-
-                    val preview = Preview.Builder().build().also {
-                        it.surfaceProvider = previewView.surfaceProvider
-                    }
-
-                    val imageAnalysis = ImageAnalysis.Builder()
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .build()
-
+                    val preview = Preview.Builder().build().also { it.surfaceProvider = previewView.surfaceProvider }
+                    val imageAnalysis = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
                     imageAnalysis.setAnalyzer(ContextCompat.getMainExecutor(ctx)) { imageProxy ->
                         val now = System.nanoTime()
-                        // Adaptive sampling: only analyze 1 frame every 2.5 seconds to protect battery & thermals
                         if (now - lastAnalysisNs < throttleIntervalNs) {
                             imageProxy.close()
                             return@setAnalyzer
                         }
                         lastAnalysisNs = now
-
                         try {
                             val buffer = imageProxy.planes[0].buffer
                             val data = ByteArray(buffer.remaining())
                             buffer.get(data)
-
-                            // Compute average luminance across sampled pixels
                             var sum = 0L
                             val step = (data.size / 500).coerceAtLeast(1)
                             var count = 0
@@ -678,13 +483,11 @@ fun CameraViewfinder(onLuminanceUpdate: (Float) -> Unit) {
                             imageProxy.close()
                         }
                     }
-
                     val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
                     cameraProvider.unbindAll()
                     cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalysis)
                 } catch (_: Exception) {}
             }, ContextCompat.getMainExecutor(ctx))
-
             previewView
         },
         modifier = Modifier.fillMaxSize()
