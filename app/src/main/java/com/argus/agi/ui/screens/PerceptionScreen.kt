@@ -70,6 +70,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import com.argus.agi.R
 import com.argus.agi.service.ArgusAccessibilityService
 import com.argus.agi.ui.ArgusViewModel
 import com.argus.agi.ui.theme.ArgusCardBorder
