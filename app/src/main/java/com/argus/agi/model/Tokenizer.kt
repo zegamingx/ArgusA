@@ -68,6 +68,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         const val THINK_START_ID = 7
         const val THINK_END_ID = 8
         private const val DEFAULT_MAX_MERGES_PER_TRAINING_PASS = 64
+        private const val SEED_CAPACITY_DIVISOR = 4
+        private const val MAX_INITIAL_SEED_WORDS = 256
+        private const val MAX_INITIAL_SEED_MERGES = 512
 
         const val MAX_TOKEN_LEN = TokenizerConfig.DEFAULT_MAX_TOKEN_LENGTH
         const val MAX_VOCAB_SIZE = TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE
@@ -169,11 +172,24 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
     "install", "download", "upload", "login", "logout", "password", "akun", "email", "nomor", "pesan",
     "notifikasi", "setting"
 )
-        for (word in seedWords) {
+        // Keep the bundled vocabulary bounded so small model profiles retain
+        // capacity for corpus-derived tokens and tokenizer training.
+        val seedWordLimit = minOf(
+            seedWords.size,
+            MAX_INITIAL_SEED_WORDS,
+            config.maxVocabularySize / SEED_CAPACITY_DIVISOR
+        )
+        val bundledSeedWords = seedWords
+            .asSequence()
+            .filterNot(::isMarkupSeedToken)
+            .take(seedWordLimit)
+            .toList()
+
+        for (word in bundledSeedWords) {
             runCatching { registerToken(word) }
         }
         if (config.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1) {
-            initializeSeedMerges(seedWords)
+            initializeSeedMerges(bundledSeedWords)
         }
     }
 
@@ -181,10 +197,19 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
      * Seed merges make the bundled base-word tokens usable by BPE without
      * allocating additional vocabulary entries or changing their stable IDs.
      */
+    private fun isMarkupSeedToken(token: String): Boolean =
+        token.length >= 3 && token.first() == '<' && token.last() == '>'
+
     private fun initializeSeedMerges(seedWords: List<String>) {
+        val mergeLimit = minOf(
+            MAX_INITIAL_SEED_MERGES,
+            config.maxVocabularySize / SEED_CAPACITY_DIVISOR
+        )
         for (word in seedWords) {
+            if (merges.size >= mergeLimit) break
+
             val pieces = word.map { character -> character.toString() }.toMutableList()
-            while (pieces.size > 1) {
+            while (pieces.size > 1 && merges.size < mergeLimit) {
                 val pair = pieces[0] to pieces[1]
                 if (!mergeRanks.containsKey(pair)) {
                     merges.add(pair)
