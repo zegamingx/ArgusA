@@ -1275,7 +1275,7 @@ class ArgusNeuralEngine private constructor(
         var shouldSaveCheckpoint = false
         val result = synchronized(modelLock) {
             val initialAdamStep = adamStep
-            val accumulator = createBatchGradientAccumulator()
+            val accumulator = createBatchGradientAccumulator(tokenizer.vocabSize)
             val sampleResults = ArrayList<NeuralTrainingStepResult>(texts.size)
 
             for (text in texts) {
@@ -2286,11 +2286,20 @@ class ArgusNeuralEngine private constructor(
         return arrays.toTypedArray()
     }
 
-    private fun createBatchGradientAccumulator(): BatchGradientAccumulator {
+    private fun createBatchGradientAccumulator(currentVocab: Int): BatchGradientAccumulator {
+        require(currentVocab > 0) { "Vocabulary size must be positive." }
         val parameters = currentParameterArrays()
         return BatchGradientAccumulator(
             gradients = Array(parameters.size) { index ->
-                FloatArray(parameters[index].size)
+                val gradientSize = if (index == 0) {
+                    Math.multiplyExact(currentVocab, dModel)
+                } else {
+                    parameters[index].size
+                }
+                require(gradientSize <= parameters[index].size) {
+                    "Output-head gradient capacity exceeds the resident model tensor."
+                }
+                FloatArray(gradientSize)
             }
         )
     }
@@ -2314,7 +2323,7 @@ class ArgusNeuralEngine private constructor(
         var sumSquares = 0f
         for (index in gradients.indices) {
             require(
-                parameters[index].size == gradients[index].size &&
+                gradients[index].size <= parameters[index].size &&
                     parameters[index].size == firstMoments[index].size &&
                     parameters[index].size == secondMoments[index].size
             ) { "Optimizer tensor shape mismatch at index $index." }
@@ -2342,7 +2351,10 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
-        val updatedByVulkan = VulkanTrainingBackend.tryApplyAdamWUpdate(
+        val equalTensorShapes = parameters.indices.all { index ->
+            parameters[index].size == gradients[index].size
+        }
+        val updatedByVulkan = equalTensorShapes && VulkanTrainingBackend.tryApplyAdamWUpdate(
             parameters = parameters,
             gradients = gradients,
             firstMoments = firstMoments,
