@@ -69,6 +69,7 @@ class InferenceMemoryEstimatorTest {
         )
 
         assertEquals(625_000_000L, estimate.weightBytes)
+        assertEquals(0L, estimate.fixedModelBufferBytes)
         assertNull(estimate.keyValueCacheBytes)
         assertNull(estimate.totalRequiredBytes)
         assertFalse(estimate.hasCompleteModelMetadata)
@@ -90,6 +91,31 @@ class InferenceMemoryEstimatorTest {
         )
 
         assertEquals(268_435_456L, estimate.keyValueCacheBytes)
+        assertTrue(requireNotNull(estimate.totalRequiredBytes) > estimate.weightBytes)
+        assertTrue(estimate.hasCompleteModelMetadata)
+    }
+
+    @Test
+    fun derivesWeightKvAndFixedPositionMemoryFromArgusArchitecture() {
+        val architecture = ArgusArchitectureConfig(
+            layerCount = 2,
+            hiddenSize = 32,
+            attentionHeadCount = 4,
+            feedForwardSize = 64,
+            vocabularySize = 128,
+            contextLength = 32,
+            adapterRank = 2
+        )
+        val estimate = InferenceMemoryEstimator.estimate(
+            architecture = architecture,
+            quantization = ArgusWeightPrecision.INT4
+        )
+
+        val parameterBreakdown = ArgusArchitectureParameterEstimator.estimate(architecture)
+        assertEquals(29_184L, parameterBreakdown.totalTrainableParameters)
+        assertEquals(14_592L, estimate.weightBytes)
+        assertEquals(4_096L, estimate.fixedModelBufferBytes)
+        assertEquals(8_192L, estimate.keyValueCacheBytes)
         assertTrue(requireNotNull(estimate.totalRequiredBytes) > estimate.weightBytes)
         assertTrue(estimate.hasCompleteModelMetadata)
     }

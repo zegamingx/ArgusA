@@ -20,7 +20,9 @@ data class InferenceModelShape(
     val contextTokens: Int,
     val keyValueHeadCount: Int,
     val headDimension: Int,
-    val keyValueBytesPerElement: Int = 2
+    val keyValueBytesPerElement: Int = 2,
+    val fixedPositionBufferElements: Long = 0L,
+    val fixedPositionBytesPerElement: Int = 4
 ) {
     init {
         require(parameterCount > 0L) { "parameterCount must be positive." }
@@ -31,11 +33,18 @@ data class InferenceModelShape(
         require(keyValueBytesPerElement > 0) {
             "keyValueBytesPerElement must be positive."
         }
+        require(fixedPositionBufferElements >= 0L) {
+            "fixedPositionBufferElements cannot be negative."
+        }
+        require(fixedPositionBytesPerElement > 0) {
+            "fixedPositionBytesPerElement must be positive."
+        }
     }
 }
 
 data class InferenceMemoryEstimate(
     val weightBytes: Long,
+    val fixedModelBufferBytes: Long,
     val keyValueCacheBytes: Long?,
     val runtimeWorkspaceBytes: Long,
     val totalRequiredBytes: Long?
@@ -54,6 +63,42 @@ object InferenceMemoryEstimator {
      * Estimates resident weight storage, optional KV cache, and runtime workspace.
      * Pass null shape metadata when the native model loader has not inspected its architecture yet.
      */
+    /**
+     * Estimates an Argus architecture directly from its validated native configuration.
+     * The current attention layout uses equal query and key/value head counts.
+     */
+    fun estimate(
+        architecture: ArgusArchitectureConfig,
+        quantization: ArgusWeightPrecision,
+        keyValueBytesPerElement: Int = 2,
+        fixedPositionBytesPerElement: Int = 4
+    ): InferenceMemoryEstimate {
+        require(keyValueBytesPerElement > 0) {
+            "keyValueBytesPerElement must be positive."
+        }
+        require(fixedPositionBytesPerElement > 0) {
+            "fixedPositionBytesPerElement must be positive."
+        }
+
+        val parameterBreakdown = ArgusArchitectureParameterEstimator.estimate(architecture)
+        val parameterCount = parameterBreakdown.totalTrainableParameters
+        val shape = InferenceModelShape(
+            parameterCount = parameterCount,
+            layerCount = architecture.layerCount,
+            contextTokens = architecture.contextLength,
+            keyValueHeadCount = architecture.attentionHeadCount,
+            headDimension = architecture.headDimension,
+            keyValueBytesPerElement = keyValueBytesPerElement,
+            fixedPositionBufferElements = parameterBreakdown.fixedPositionBufferElements,
+            fixedPositionBytesPerElement = fixedPositionBytesPerElement
+        )
+        return estimate(
+            parameterCount = parameterCount,
+            quantization = quantization,
+            shape = shape
+        )
+    }
+
     fun estimate(
         parameterCount: Long,
         quantization: ArgusWeightPrecision,
@@ -74,13 +119,21 @@ object InferenceMemoryEstimator {
             safeCeilToLong(weightBytes.toDouble() * WORKSPACE_WEIGHT_FRACTION)
         )
 
+        val fixedBufferBytes = shape?.let {
+            safeMultiply(
+                it.fixedPositionBufferElements,
+                it.fixedPositionBytesPerElement.toLong()
+            )
+        } ?: 0L
         val cacheBytes = shape?.let(::estimateKeyValueCacheBytes)
         val totalBytes = cacheBytes?.let {
-            safeAdd(safeAdd(weightBytes, it), workspaceBytes)
+            val modelBytes = safeAdd(weightBytes, fixedBufferBytes)
+            safeAdd(safeAdd(modelBytes, it), workspaceBytes)
         }
 
         return InferenceMemoryEstimate(
             weightBytes = weightBytes,
+            fixedModelBufferBytes = fixedBufferBytes,
             keyValueCacheBytes = cacheBytes,
             runtimeWorkspaceBytes = workspaceBytes,
             totalRequiredBytes = totalBytes

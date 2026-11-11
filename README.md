@@ -104,6 +104,7 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - The estimator distinguishes trainable parameters from resident model tensors. The current fixed sinusoidal position table occupies memory but is not a trainable parameter. The legacy `countTotalParameters()` method retains its historical resident-tensor count; `countTrainableParameters()` exposes the trainable-weight count.
 - The current executable engine maps to this contract as a one-block causal multi-head attention + SwiGLU model with separate token embeddings/output projection and Q/V LoRA. The new descriptor can represent deeper models, but the current forward pass, backward pass, optimizer state, KV cache, and ARG3 checkpoint still execute/store only one block. Multi-layer execution is not claimed until those paths are migrated together.
 - The architecture contract is Argus-native metadata, not a third-party model format or runtime. It does not add a pretrained model, change random initialization, or alter existing ARG3 checkpoint bytes.
+- The inference memory estimator can consume the same validated architecture descriptor, deriving trainable weight count, KV-cache shape, and the fixed sinusoidal buffer instead of accepting unrelated parameter and shape values. Its result remains a planning estimate; it does not load or quantize tensors.
 
 ## Device-adaptive inference capacity
 
