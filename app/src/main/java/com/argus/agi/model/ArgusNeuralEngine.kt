@@ -353,14 +353,14 @@ class ArgusNeuralEngine private constructor(
          * the same serialized sequence used by reasoning training examples.
          */
         internal fun formatGenerationPrompt(prompt: String, reasoningMode: Boolean): String {
-            val assistantPrompt = if (prompt.contains(Tokenizer.USER_TOKEN)) {
-                if (prompt.endsWith(Tokenizer.ASSISTANT_TOKEN)) {
-                    prompt
-                } else {
+            val assistantPrompt = when {
+                prompt.endsWith(Tokenizer.THINK_START) -> prompt
+                prompt.contains(Tokenizer.USER_TOKEN) &&
+                    prompt.endsWith(Tokenizer.ASSISTANT_TOKEN) -> prompt
+                prompt.contains(Tokenizer.USER_TOKEN) ->
                     "$prompt ${Tokenizer.ASSISTANT_TOKEN}"
-                }
-            } else {
-                "${Tokenizer.USER_TOKEN}$prompt${Tokenizer.ASSISTANT_TOKEN}"
+                else ->
+                    "${Tokenizer.USER_TOKEN}$prompt${Tokenizer.ASSISTANT_TOKEN}"
             }
 
             return if (reasoningMode && !assistantPrompt.endsWith(Tokenizer.THINK_START)) {
