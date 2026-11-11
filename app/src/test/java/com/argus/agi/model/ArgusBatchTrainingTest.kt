@@ -60,7 +60,7 @@ class ArgusBatchTrainingTest {
     }
 
     @Test
-    fun legacyCheckpointFallbackKeepsBatchSizeAtOne() {
+    fun legacyCompatibilityPathKeepsBatchSizeAtOne() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
@@ -91,11 +91,16 @@ class ArgusBatchTrainingTest {
             }.exceptionOrNull()
             assertTrue(failure is IllegalArgumentException)
 
-            val result = engine.trainBatchDetailed(
-                listOf("The saved legacy checkpoint continues with one training sample.")
-            )
+            // Legacy mode updates once per context window; keep this fixture to one window.
+            val legacySample = "argus learns"
+            val legacyTokenCount = engine.tokenizer.encode(legacySample).size
+            assertTrue(legacyTokenCount in 2..engine.maxSeqLen)
+
+            val result = engine.trainBatchDetailed(listOf(legacySample))
             assertEquals(1, result.samples.size)
+            assertEquals(1, result.samples.single().contextWindowCount)
             assertEquals(1, result.optimizerUpdateCount)
+            assertEquals(1, result.samples.single().optimizerUpdateCount)
             assertTrue(result.samples.single().loss.isFinite())
         } finally {
             restoreCheckpoint(checkpoint, previousCheckpoint)
