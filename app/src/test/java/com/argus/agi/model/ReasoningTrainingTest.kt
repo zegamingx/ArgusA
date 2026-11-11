@@ -158,6 +158,47 @@ class ReasoningTrainingTest {
     }
 
     @Test
+    fun streamFormatterRejectsValidJsonlPrefixFollowedByUnrelatedText() {
+        val validRecord = """{"instruction":"Add two numbers.","reasoning":["Add the operands."],"response":"5."}"""
+        val malformedDataset = "$validRecord\nnot-a-json-record"
+
+        assertEquals(
+            null,
+            TextModalityProcessor.formatTrainingDatasetRecords(malformedDataset)
+        )
+    }
+
+    @Test
+    fun streamFormatterAcceptsPrettyPrintedArrayAsIndependentRecords() {
+        val prettyArray = """
+            [
+              {
+                "instruction": "Add two numbers.",
+                "reasoning": ["Add both operands."],
+                "response": "5."
+              },
+              {
+                "instruction": "Multiply two numbers.",
+                "steps": ["Multiply both factors."],
+                "response": "12."
+              }
+            ]
+        """.trimIndent()
+
+        val records = TextModalityProcessor.formatTrainingDatasetRecords(prettyArray)
+
+        assertEquals(2, records?.size)
+        assertTrue(records.orEmpty().all { it.contains(Tokenizer.THINK_START) })
+        assertTrue(records.orEmpty().all { it.contains(Tokenizer.THINK_END) })
+
+        val validationDocument = TextModalityProcessor.formatTrainingDocument(prettyArray)
+        assertEquals(
+            2,
+            Regex(Regex.escape(Tokenizer.THINK_START)).findAll(validationDocument).count()
+        )
+    }
+
+    @Test
     fun legacyInstructionResponseFormatRemainsUnchangedWithoutReasoning() {
         val raw = """{"instruction":"Explain gravity.","input":"For a falling object.","response":"Gravity attracts masses."}"""
         val formatted = TextModalityProcessor.formatStructuredLineIfJson(raw)

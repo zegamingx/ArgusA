@@ -35,6 +35,7 @@ import com.argus.agi.skill.WebArticleExtractionSkillOutput
 import com.argus.agi.skill.WebSearchIntentRouter
 import com.argus.agi.skill.WebSearchSkill
 import com.argus.agi.skill.WebSearchSkillOutput
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -421,7 +422,10 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         generationJob = viewModelScope.launch {
             try {
                 val worldSummary = worldModel.currentContextSummary.value
-                val priorMessages = _messages.value.takeLast(6).filter { it.text.isNotBlank() }
+                // The current user message was appended before generation starts.
+                // Exclude it here because it is appended explicitly below.
+                val priorMessages = _messages.value.dropLast(1).takeLast(6)
+                    .filter { it.text.isNotBlank() }
                 val multiTurnPrompt = buildString {
                     if (worldSummary.isNotBlank()) {
                         append("<SYSTEM> ").append(worldSummary.take(120)).append(" ")
@@ -451,6 +455,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             reasoningMode = true
                         )
                     }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (e: Exception) {
                     Log.e(TAG, "Generation failed", e)
                     "The local model is busy or encountered an error (${e.javaClass.simpleName}). " +
@@ -485,9 +491,14 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     )
 
-                    val webItems = runCatching { executeWebSearchSkill(searchQuery) }
-                        .onFailure { Log.w(TAG, "Web search failed", it) }
-                        .getOrDefault(emptyList())
+                    val webItems = try {
+                        executeWebSearchSkill(searchQuery)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        Log.w(TAG, "Web search failed", error)
+                        emptyList()
+                    }
 
                     _searchResults.value = webItems
                     if (webItems.isNotEmpty()) {

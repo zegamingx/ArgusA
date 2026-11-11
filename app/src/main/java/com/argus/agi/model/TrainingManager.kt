@@ -5,6 +5,7 @@ import android.util.Log
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.sensor.DeviceGuard
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -209,7 +210,7 @@ class TrainingManager(
         val restoreGeneration = synchronized(queueLock) { queueGeneration }
         scope.launch {
             repo?.let { repository ->
-                runCatching {
+                runSuspendCatching {
                     repository.recoverInterruptedTrainingItems()
                     repository.getPendingQueueSnapshot()
                 }
@@ -753,9 +754,7 @@ class TrainingManager(
         val clean = fullText.trim()
         if (clean.isBlank() || closed) return false
 
-        val normalizedText = TextModalityProcessor.normalizeTypography(clean)
-            .lines()
-            .joinToString("\n") { TextModalityProcessor.formatStructuredLineIfJson(it) }
+        val normalizedText = TextModalityProcessor.formatTrainingDocument(clean)
         if (normalizedText.isBlank()) return false
 
         val documentId = sha256Utf16Be(fullText)
@@ -795,20 +794,13 @@ class TrainingManager(
             "Local corpus storage is unavailable; validation cannot be evaluated."
         }
         val documents = activeRepository.getValidationCorpusDocuments(limit)
+        // Keep one complete validation sequence per source document. The neural
+        // engine owns context-windowing so overlapping ingestion chunks cannot
+        // duplicate prediction targets or distort corpus-level loss weighting.
         val processedDocuments = documents.map { document ->
-            val validationText = document.validationText.orEmpty()
-            if (validationText.isBlank()) {
-                emptyList()
-            } else {
-                TextModalityProcessor.process(
-                    rawText = validationText,
-                    documentTitle = document.title,
-                    chunkSize = 380,
-                    overlap = 50
-                ).map { it.content }
-            }
+            TextModalityProcessor.formatTrainingDocument(document.validationText.orEmpty())
         }
-        val texts = processedDocuments.flatten()
+        val texts = processedDocuments.filter { it.isNotBlank() }
         val evaluation = neuralEngine.evaluateCorpusLoss(texts)
         val perplexity = if (evaluation.meanLoss.isFinite()) {
             exp(evaluation.meanLoss)
@@ -827,8 +819,8 @@ class TrainingManager(
         } else {
             Float.NaN
         }
-        val reasoningDocumentCount = processedDocuments.count { chunks ->
-            chunks.any { it.contains(Tokenizer.THINK_START) && it.contains(Tokenizer.THINK_END) }
+        val reasoningDocumentCount = texts.count { text ->
+            text.contains(Tokenizer.THINK_START) && text.contains(Tokenizer.THINK_END)
         }
 
         return ValidationCorpusEvaluation(
@@ -1100,7 +1092,7 @@ class TrainingManager(
 
         if (trimmed.length > 380) {
             scope.launch {
-                runCatching { enqueueDocument(source, title, trimmed) }
+                runSuspendCatching { enqueueDocument(source, title, trimmed) }
                     .onFailure { error ->
                         Log.e(TAG, "Failed to persist long-form training input", error)
                     }
@@ -1218,18 +1210,20 @@ class TrainingManager(
 
                 try {
                     processItem(activeItem)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (t: Throwable) {
                     Log.e(TAG, "processItem gagal untuk '${item.title}'", t)
                     val failed = activeItem.copy(status = TrainingStatus.FAILED)
                     pushCompleted(failed)
                     scope.launch {
                         repo?.let { repository ->
-                            runCatching { repository.markTrainingFailed(failed.id) }
+                            runSuspendCatching { repository.markTrainingFailed(failed.id) }
                                 .onFailure { error ->
                                     Log.w(TAG, "Failed to persist exception-failed training item", error)
                                 }
                             failed.documentId?.let { documentId ->
-                                runCatching { repository.markCorpusDocumentPartial(documentId) }
+                                runSuspendCatching { repository.markCorpusDocumentPartial(documentId) }
                                     .onFailure { error ->
                                         Log.w(TAG, "Failed to mark exception-failed corpus document partial", error)
                                     }
@@ -1286,7 +1280,7 @@ class TrainingManager(
         when (operation) {
             is QueuePersistenceOperation.Clear -> {
                 repo?.let { repository ->
-                    runCatching {
+                    runSuspendCatching {
                         repository.clearPendingQueueAndMarkInterruptedCorpusDocumentsPartial()
                     }
                         .onFailure { error ->
@@ -1298,7 +1292,7 @@ class TrainingManager(
             is QueuePersistenceOperation.Start -> {
                 try {
                     repo?.let { repository ->
-                        runCatching {
+                        runSuspendCatching {
                             repository.markTrainingStarted(operation.itemId)
                         }.onFailure { error ->
                             Log.e(
@@ -1324,7 +1318,7 @@ class TrainingManager(
                 if (!isCurrentGeneration) return
 
                 val persistenceFailure = repo?.let { repository ->
-                    runCatching {
+                    runSuspendCatching {
                         repository.saveTrainingItems(operation.items)
                     }.exceptionOrNull()
                 }
@@ -1454,6 +1448,9 @@ class TrainingManager(
                     "${update.previousVocabularySize} -> ${update.vocabularySize} tokens, " +
                     "${update.mergeCount - update.previousMergeCount} new merges."
             )
+        } catch (cancelled: CancellationException) {
+            preparedTokenizerDocuments.remove(documentId)
+            throw cancelled
         } catch (error: Exception) {
             preparedTokenizerDocuments.remove(documentId)
             Log.w(TAG, "Tokenizer preparation failed for document $documentId; existing vocabulary will be used.", error)
@@ -1464,7 +1461,7 @@ class TrainingManager(
         item.documentId?.let { documentId ->
             if (item.chunkIndex == 1) {
                 repo?.let { repository ->
-                    runCatching { repository.markCorpusDocumentTraining(documentId) }
+                    runSuspendCatching { repository.markCorpusDocumentTraining(documentId) }
                         .onFailure { error ->
                             Log.w(TAG, "Failed to mark corpus document as training", error)
                         }
@@ -1485,12 +1482,12 @@ class TrainingManager(
             pushCompleted(failed)
             scope.launch {
                 repo?.let { repository ->
-                    runCatching { repository.markTrainingFailed(failed.id) }
+                    runSuspendCatching { repository.markTrainingFailed(failed.id) }
                         .onFailure { error ->
                             Log.w(TAG, "Failed to persist failed training item", error)
                         }
                     failed.documentId?.let { documentId ->
-                        runCatching { repository.markCorpusDocumentPartial(documentId) }
+                        runSuspendCatching { repository.markCorpusDocumentPartial(documentId) }
                             .onFailure { error ->
                                 Log.w(TAG, "Failed to mark corpus document as partial", error)
                             }
@@ -1581,7 +1578,7 @@ class TrainingManager(
         pushCompleted(finished)
         scope.launch {
             repo?.let { repository ->
-                runCatching {
+                runSuspendCatching {
                     repository.markTrainingCompleted(finished.id, stepLoss, durationMs)
                 }.onFailure { error ->
                     Log.w(TAG, "Failed to persist completed training item", error)
@@ -1591,7 +1588,7 @@ class TrainingManager(
                     finished.documentId != null &&
                     finished.chunkIndex >= finished.totalChunks
                 ) {
-                    runCatching {
+                    runSuspendCatching {
                         val document = repository.getCorpusDocument(finished.documentId)
                         if (document != null && document.chunkCount > 0) {
                             val completedPasses = finished.totalChunks / document.chunkCount
@@ -1605,6 +1602,22 @@ class TrainingManager(
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Preserve coroutine cancellation while converting ordinary persistence failures
+     * into Result values for logging and queue recovery.
+     */
+    private suspend fun <T> runSuspendCatching(
+        block: suspend () -> T
+    ): Result<T> {
+        return try {
+            Result.success(block())
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            Result.failure(error)
         }
     }
 

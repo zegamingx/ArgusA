@@ -102,28 +102,8 @@ object TextModalityProcessor {
      * records. Other JSON documents are left untouched.
      */
     private fun normalizeReasoningDatasetInput(text: String): String {
-        val trimmed = text.trim()
-        if (trimmed.isEmpty()) return text
-
-        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-            val array = runCatching { JSONArray(trimmed) }.getOrNull()
-            if (array != null && array.length() > 0) {
-                val records = (0 until array.length()).mapNotNull { array.optJSONObject(it) }
-                if (
-                    records.size == array.length() &&
-                    records.isNotEmpty() &&
-                    records.all(::isTrainingRecord)
-                ) {
-                    return records.joinToString("\n") { it.toString() }
-                }
-            }
-        }
-
-        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-            val record = runCatching { JSONObject(trimmed) }.getOrNull()
-            if (record != null && isTrainingRecord(record)) return record.toString()
-        }
-        return text
+        val records = parseTrainingDatasetObjects(text) ?: return text
+        return records.joinToString("\n") { it.toString() }
     }
 
         /**
@@ -170,25 +150,84 @@ object TextModalityProcessor {
      * records. Returns null unless every non-empty record is an instruction/answer
      * example, so general JSON documents continue through the regular text path.
      */
-    internal fun formatTrainingDatasetRecords(rawText: String): List<String>? {
-        val normalized = normalizeReasoningDatasetInput(normalizeTypography(rawText))
-        val serializedRecords = normalized.lineSequence()
-            .map { it.trim() }
-            .filter { it.isNotBlank() }
-            .toList()
-        if (serializedRecords.isEmpty()) return null
+    /**
+     * Parses one JSON object, a top-level array of training objects, or a JSONL
+     * stream. Every non-whitespace character must belong to a complete JSON value;
+     * a valid prefix followed by unrelated text is rejected.
+     */
+    private fun parseTrainingDatasetObjects(rawText: String): List<JSONObject>? {
+        val normalized = normalizeTypography(rawText)
+        if (normalized.isBlank()) return null
 
-        val parsedRecords = serializedRecords.map { serialized ->
-            runCatching { JSONObject(serialized) }.getOrNull()
+        fun skipWhitespace(startIndex: Int): Int {
+            var index = startIndex
+            while (index < normalized.length && normalized[index].isWhitespace()) {
+                index++
+            }
+            return index
         }
-        if (parsedRecords.any { it == null }) return null
 
-        val objects = parsedRecords.filterNotNull()
-        if (objects.isEmpty() || !objects.all(::isTrainingRecord)) return null
+        var cursor = skipWhitespace(0)
+        if (cursor >= normalized.length) return null
 
-        return objects.map { record ->
+        if (normalized[cursor] == '[') {
+            val endExclusive = findCompleteJsonValueEnd(normalized, cursor) ?: return null
+            if (skipWhitespace(endExclusive) != normalized.length) return null
+
+            val array = runCatching {
+                JSONArray(normalized.substring(cursor, endExclusive))
+            }.getOrNull() ?: return null
+            if (array.length() == 0) return null
+
+            val records = ArrayList<JSONObject>(array.length())
+            for (index in 0 until array.length()) {
+                val record = array.optJSONObject(index) ?: return null
+                records.add(record)
+            }
+            return records.takeIf { it.all(::isTrainingRecord) }
+        }
+
+        if (normalized[cursor] != '{') return null
+
+        val records = ArrayList<JSONObject>()
+        while (cursor < normalized.length) {
+            cursor = skipWhitespace(cursor)
+            if (cursor >= normalized.length) break
+            if (normalized[cursor] != '{') return null
+
+            val endExclusive = findCompleteJsonValueEnd(normalized, cursor) ?: return null
+            val record = runCatching {
+                JSONObject(normalized.substring(cursor, endExclusive))
+            }.getOrNull() ?: return null
+            records.add(record)
+            cursor = endExclusive
+        }
+
+        if (records.isEmpty() || !records.all(::isTrainingRecord)) return null
+        return records
+    }
+
+    internal fun formatTrainingDatasetRecords(rawText: String): List<String>? {
+        val records = parseTrainingDatasetObjects(rawText) ?: return null
+        return records.map { record ->
             formatStructuredLineIfJson(record.toString())
         }
+    }
+
+    /**
+     * Canonicalizes one complete corpus document without splitting it into model
+     * context windows. Structured training records are formatted independently and
+     * kept in source order; other structured lines retain the existing formatter.
+     */
+    internal fun formatTrainingDocument(rawText: String): String {
+        val normalized = normalizeTypography(rawText)
+        if (normalized.isBlank()) return ""
+
+        val records = formatTrainingDatasetRecords(normalized)
+        if (records != null) return records.joinToString("\n")
+
+        return normalized.lineSequence()
+            .joinToString("\n") { line -> formatStructuredLineIfJson(line) }
     }
 
     private fun firstNonBlankText(obj: JSONObject, keys: List<String>): String {
