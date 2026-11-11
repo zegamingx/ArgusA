@@ -447,7 +447,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                 96,
                                 (neuralEngine.maxSeqLen - 1).coerceAtLeast(1)
                             ),
-                            includeReasoningMarkers = true
+                            includeReasoningMarkers = true,
+                            reasoningMode = true
                         )
                     }
                 } catch (e: Exception) {
