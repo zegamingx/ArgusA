@@ -70,8 +70,12 @@ data class EngineConfig(
             .estimate(estimatedArchitecture)
             .totalTrainableParameters
         val trainingFloorBytes = TrainingMemoryPlanner.minimumTrainingStateBytes(parameterCount)
+        val positionElements = Math.multiplyExact(maxSeqLen.toLong(), hidden)
+        require(positionElements <= Int.MAX_VALUE.toLong()) {
+            "Position tensor dimensions exceed JVM array limits."
+        }
         val positionBufferBytes = Math.multiplyExact(
-            Math.multiplyExact(maxSeqLen.toLong(), hidden),
+            positionElements,
             Float.SIZE_BYTES.toLong()
         )
         val attentionScratchBytes = Math.multiplyExact(
@@ -2200,7 +2204,7 @@ class ArgusNeuralEngine private constructor(
                     }
 
                     for (tensor in tensors) {
-                        writeFloatArrayLittleEndian(checked, tensor.values)
+                        writeFloatArrayLittleEndian(checked, tensor.values, tensor.name)
                     }
 
                     checked.flush()
@@ -2244,9 +2248,16 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
-    private fun writeFloatArrayLittleEndian(output: OutputStream, values: FloatArray) {
+    private fun writeFloatArrayLittleEndian(
+        output: OutputStream,
+        values: FloatArray,
+        tensorName: String
+    ) {
         val buffer = ByteBuffer.allocate(TENSOR_WRITE_BUFFER_BYTES).order(ByteOrder.LITTLE_ENDIAN)
         for (value in values) {
+            require(value.isFinite()) {
+                "Cannot save a non-finite value in tensor $tensorName."
+            }
             if (buffer.remaining() < Float.SIZE_BYTES) {
                 output.write(buffer.array(), 0, buffer.position())
                 buffer.clear()
@@ -2646,7 +2657,11 @@ class ArgusNeuralEngine private constructor(
                         val floatBuffer = ByteBuffer.wrap(floatBytes).order(ByteOrder.LITTLE_ENDIAN)
                         arrays.forEach { values ->
                             for (index in values.indices) {
-                                values[index] = floatBuffer.float
+                                val value = floatBuffer.float
+                                require(value.isFinite()) {
+                                    "ARG3 contains a non-finite tensor value."
+                                }
+                                values[index] = value
                             }
                         }
                         adamStep = savedAdamStep

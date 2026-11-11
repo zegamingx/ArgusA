@@ -233,6 +233,10 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             if (tok.length > newMaxLen) newMaxLen = tok.length
         }
 
+        require(newTokenToId.size <= config.maxVocabularySize) {
+            "Imported vocabulary plus canonical tokens exceeds configured capacity."
+        }
+
         // Commit
         tokenToId.clear(); tokenToId.putAll(newTokenToId)
         idToToken.clear(); idToToken.putAll(newIdToToken)

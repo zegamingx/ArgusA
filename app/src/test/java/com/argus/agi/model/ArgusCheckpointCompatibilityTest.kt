@@ -70,6 +70,37 @@ class ArgusCheckpointCompatibilityTest {
     }
 
     @Test
+    fun arg4LoaderRejectsPayloadChecksumMismatch() {
+        val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
+        val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
+
+        try {
+            checkpoint.delete()
+            val config = smallEngineConfig(TokenizerConfig())
+            val original = ArgusNeuralEngine.createBlocking(context, config)
+            assertTrue(original.saveCheckpoint())
+
+            val corruptedBytes = checkpoint.readBytes()
+            val payloadStart = 96
+            assertTrue(corruptedBytes.size > payloadStart)
+            corruptedBytes[corruptedBytes.lastIndex] =
+                (corruptedBytes[corruptedBytes.lastIndex].toInt() xor 0x01).toByte()
+            checkpoint.writeBytes(corruptedBytes)
+
+            val restoredConfig = ArgusNeuralEngine.resolveConfig(
+                context = context,
+                totalRamGb = 2,
+                maxHeapMb = 128L,
+                availableRamGb = 1.0f
+            )
+            val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
+            assertTrue(!restored.loadCheckpointIfExists())
+        } finally {
+            restoreCheckpoint(checkpoint, previousCheckpoint)
+        }
+    }
+
+    @Test
     fun arg3HeaderStillResolvesItsOriginalEngineDimensions() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
