@@ -71,6 +71,8 @@ data class TrainingSessionMetrics(
     val predictionTargets: Long = 0L,
     val contextWindows: Long = 0L,
     val optimizerUpdates: Long = 0L,
+    val reasoningExamples: Long = 0L,
+    val reasoningTokens: Long = 0L,
     val vocabularySize: Int = 0,
     val vocabularyCapacity: Int = 0,
     val vocabularyTokensAdded: Int = 0,
@@ -82,7 +84,12 @@ data class ValidationCorpusEvaluation(
     val evaluatedDocumentCount: Int,
     val targetTokenCount: Int,
     val meanLoss: Float,
-    val perplexity: Float
+    val perplexity: Float,
+    val reasoningDocumentCount: Int = 0,
+    val reasoningSequenceCount: Int = 0,
+    val reasoningTargetTokenCount: Int = 0,
+    val reasoningMeanLoss: Float = Float.NaN,
+    val reasoningPerplexity: Float = Float.NaN
 )
 
 class TrainingManager(
@@ -128,6 +135,14 @@ class TrainingManager(
         private const val MAX_TOKENIZER_SAMPLE_CHUNKS = 256
         private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
         private const val IDLE_POLL_MS = 500L
+        private val REASONING_BLOCK_PATTERN = Regex(
+            "<THINK>(.*?)</THINK>",
+            RegexOption.DOT_MATCHES_ALL
+        )
+        private val REASONING_SEQUENCE_PATTERN = Regex(
+            "<USER>.*?<THINK>.*?</THINK>",
+            RegexOption.DOT_MATCHES_ALL
+        )
     }
 
     // StateFlow<List<TrainingData>> sebagai satu-satunya sumber kebenaran untuk queue.
@@ -687,19 +702,53 @@ class TrainingManager(
             "Local corpus storage is unavailable; validation cannot be evaluated."
         }
         val documents = activeRepository.getValidationCorpusDocuments(limit)
-        val texts = documents.mapNotNull { it.validationText }
+        val processedDocuments = documents.map { document ->
+            val validationText = document.validationText.orEmpty()
+            if (validationText.isBlank()) {
+                emptyList()
+            } else {
+                TextModalityProcessor.process(
+                    rawText = validationText,
+                    documentTitle = document.title,
+                    chunkSize = 380,
+                    overlap = 50
+                ).map { it.content }
+            }
+        }
+        val texts = processedDocuments.flatten()
         val evaluation = neuralEngine.evaluateCorpusLoss(texts)
         val perplexity = if (evaluation.meanLoss.isFinite()) {
             exp(evaluation.meanLoss)
         } else {
             Float.NaN
         }
+
+        // Evaluate prompt + reasoning prefixes without scoring their final answers.
+        // This is a language-model fit diagnostic, not a reasoning correctness score.
+        val reasoningSequences = texts.flatMap { text ->
+            REASONING_SEQUENCE_PATTERN.findAll(text).map { it.value }.toList()
+        }
+        val reasoningEvaluation = neuralEngine.evaluateCorpusLoss(reasoningSequences)
+        val reasoningPerplexity = if (reasoningEvaluation.meanLoss.isFinite()) {
+            exp(reasoningEvaluation.meanLoss)
+        } else {
+            Float.NaN
+        }
+        val reasoningDocumentCount = processedDocuments.count { chunks ->
+            chunks.any { it.contains(Tokenizer.THINK_START) && it.contains(Tokenizer.THINK_END) }
+        }
+
         return ValidationCorpusEvaluation(
             corpusDocumentCount = documents.size,
             evaluatedDocumentCount = evaluation.evaluatedDocumentCount,
             targetTokenCount = evaluation.targetCount,
             meanLoss = evaluation.meanLoss,
-            perplexity = perplexity
+            perplexity = perplexity,
+            reasoningDocumentCount = reasoningDocumentCount,
+            reasoningSequenceCount = reasoningSequences.size,
+            reasoningTargetTokenCount = reasoningEvaluation.targetCount,
+            reasoningMeanLoss = reasoningEvaluation.meanLoss,
+            reasoningPerplexity = reasoningPerplexity
         )
     }
 
@@ -1328,6 +1377,13 @@ class TrainingManager(
             return
         }
 
+        val reasoningSpans = REASONING_BLOCK_PATTERN.findAll(item.content)
+            .map { it.groupValues[1] }
+            .toList()
+        val reasoningTokenCount = reasoningSpans.sumOf { reasoningText ->
+            neuralEngine.tokenizer.encode(reasoningText, autoRegister = false).size.toLong()
+        }
+
         val finished = item.copy(
             status = TrainingStatus.COMPLETED,
             finalLoss = stepLoss,
@@ -1348,6 +1404,8 @@ class TrainingManager(
                 predictionTargets = current.predictionTargets + stepResult.predictionTargetCount,
                 contextWindows = current.contextWindows + stepResult.contextWindowCount,
                 optimizerUpdates = current.optimizerUpdates + stepResult.optimizerUpdateCount,
+                reasoningExamples = current.reasoningExamples + reasoningSpans.size.toLong(),
+                reasoningTokens = current.reasoningTokens + reasoningTokenCount,
                 vocabularySize = stepResult.vocabularySize
             )
         }

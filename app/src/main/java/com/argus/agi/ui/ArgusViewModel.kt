@@ -12,6 +12,7 @@ import com.argus.agi.model.BenchmarkResult
 import com.argus.agi.model.GenesisLifecycleStage
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingManager
+import com.argus.agi.model.ReasoningOutputParser
 import com.argus.agi.model.TrainingSessionMetrics
 import com.argus.agi.model.WorldEntity
 import android.media.MediaMetadataRetriever
@@ -448,10 +449,16 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             "Please try again shortly."
                 }
 
-                val reflection = worldModel.reflectOnResponse(text, rawOutput)
+                val parsedOutput = ReasoningOutputParser.parse(rawOutput)
+                val reflection = worldModel.reflectOnResponse(text, parsedOutput.answer)
 
-                var finalAnswer = rawOutput
+                var finalAnswer = parsedOutput.answer
                 val thinking = StringBuilder()
+                parsedOutput.reasoning?.takeIf { it.isNotBlank() }?.let { modelReasoning ->
+                    thinking.append("Model reasoning:\n")
+                        .append(modelReasoning)
+                        .append("\n\n")
+                }
                 thinking.append("Self-Reflection: ").append(reflection.reasoningNote)
                 thinking.append(" | Confidence: ")
                     .append(String.format("%.0f%%", reflection.confidenceScore * 100))

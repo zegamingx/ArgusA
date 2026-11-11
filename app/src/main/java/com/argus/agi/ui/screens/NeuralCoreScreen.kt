@@ -132,6 +132,8 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
     val predictionTargetsLabel = NumberFormat.getNumberInstance(Locale.US).format(trainingMetrics.predictionTargets)
     val contextWindowsLabel = NumberFormat.getNumberInstance(Locale.US).format(trainingMetrics.contextWindows)
     val optimizerUpdatesLabel = NumberFormat.getNumberInstance(Locale.US).format(trainingMetrics.optimizerUpdates)
+    val reasoningExamplesLabel = NumberFormat.getNumberInstance(Locale.US).format(trainingMetrics.reasoningExamples)
+    val reasoningTokensLabel = NumberFormat.getNumberInstance(Locale.US).format(trainingMetrics.reasoningTokens)
     val memoryRecordsLabel = NumberFormat.getNumberInstance(Locale.US).format(worldEntities.size)
 
     // Only completed chunks contribute to document progress.
@@ -310,6 +312,23 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             value = memoryRecordsLabel,
                             unit = "World Model entries",
                             valueColor = ArgusSuccess,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        StatMetricBox(
+                            label = "REASONING EXAMPLES",
+                            value = reasoningExamplesLabel,
+                            unit = "structured training samples",
+                            valueColor = ArgusCyanPrimary,
+                            modifier = Modifier.weight(1f)
+                        )
+                        StatMetricBox(
+                            label = "REASONING TOKENS",
+                            value = reasoningTokensLabel,
+                            unit = "tokens inside reasoning spans",
+                            valueColor = ArgusCyanGlow,
                             modifier = Modifier.weight(1f)
                         )
                     }

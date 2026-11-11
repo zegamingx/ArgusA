@@ -1,11 +1,13 @@
 package com.argus.agi.model
 
 import java.util.regex.Pattern
+import org.json.JSONArray
 import org.json.JSONObject
 
 enum class TextModality(val displayName: String, val description: String) {
     CONVERSATION("Percakapan", "Dialog multi-turn dengan token <USER> dan <ASSISTANT>"),
     QA_PAIR("Tanya Jawab", "Pasangan Pertanyaan & Jawaban terstruktur"),
+    REASONING("Reasoning Training", "Instruksi, jejak penalaran terstruktur, dan jawaban akhir"),
     ARTICLE_NEWS("Artikel & Berita", "Teks ekspositori, tajuk berita, dan paragraf analitis"),
     STORY_NARRATIVE("Cerita & Narasi", "Prosa naratif, kutipan dialog sastra, dan alur cerita"),
     STRUCTURED_DATA("Data Terstruktur", "Daftar butir, key-value, dan ringkasan teknis"),
@@ -98,12 +100,130 @@ object TextModalityProcessor {
     /**
      * Mendeteksi modalitas konten teks.
      */
+    /**
+     * Canonicalizes a pretty-printed training object or an array of JSONL-style
+     * records. Other JSON documents are left untouched.
+     */
+    private fun normalizeReasoningDatasetInput(text: String): String {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return text
+
+        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+            val array = runCatching { JSONArray(trimmed) }.getOrNull()
+            if (array != null && array.length() > 0) {
+                val records = (0 until array.length()).mapNotNull { array.optJSONObject(it) }
+                if (
+                    records.size == array.length() &&
+                    records.isNotEmpty() &&
+                    records.all(::isTrainingRecord)
+                ) {
+                    return records.joinToString("\n") { it.toString() }
+                }
+            }
+        }
+
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            val record = runCatching { JSONObject(trimmed) }.getOrNull()
+            if (record != null && isTrainingRecord(record)) return record.toString()
+        }
+        return text
+    }
+
+    private fun firstNonBlankText(obj: JSONObject, keys: List<String>): String {
+        for (key in keys) {
+            val value = obj.opt(key)
+            if (value is String && value.isNotBlank()) return value.trim()
+        }
+        return ""
+    }
+
+    private fun isTrainingRecord(obj: JSONObject): Boolean {
+        val hasPrompt = firstNonBlankText(obj, listOf("instruction", "prompt", "question")).isNotBlank()
+        val hasAnswer = firstNonBlankText(obj, listOf("response", "completion", "answer")).isNotBlank()
+        return hasPrompt && hasAnswer
+    }
+
+    private fun readReasoningStep(value: Any?): String {
+        return when (value) {
+            is String -> value.trim()
+            is JSONObject -> firstNonBlankText(
+                value,
+                listOf("step", "text", "content", "reasoning", "explanation")
+            )
+            else -> ""
+        }
+    }
+
+    /**
+     * Accepts a plain reasoning string, an array of strings, or an array of
+     * objects containing step/text/content/reasoning/explanation.
+     */
+    private fun extractReasoningText(obj: JSONObject): String? {
+        val raw = when {
+            obj.has("reasoning") && !obj.isNull("reasoning") -> obj.opt("reasoning")
+            obj.has("steps") && !obj.isNull("steps") -> obj.opt("steps")
+            else -> null
+        }
+
+        val reasoning = when (raw) {
+            is String -> raw.trim()
+            is JSONArray -> {
+                val steps = mutableListOf<String>()
+                for (index in 0 until raw.length()) {
+                    val step = readReasoningStep(raw.opt(index))
+                    if (step.isNotBlank()) steps += "Step ${steps.size + 1}: $step"
+                }
+                steps.joinToString("\n")
+            }
+            is JSONObject -> readReasoningStep(raw)
+            else -> ""
+        }
+        return reasoning.takeIf { it.isNotBlank() }
+    }
+
+    private fun formatInstructionResponse(
+        instruction: String,
+        input: String,
+        reasoning: String?,
+        response: String
+    ): String {
+        val prompt = listOf(
+            instruction.trim(),
+            input.trim().takeIf { it.isNotBlank() }?.let { "Input: $it" }
+        ).filterNotNull().filter { it.isNotBlank() }.joinToString("\n")
+
+        val reasoningBlock = reasoning?.trim()?.takeIf { it.isNotBlank() }
+        return if (reasoningBlock == null) {
+            "${Tokenizer.USER_TOKEN} $prompt\n${Tokenizer.ASSISTANT_TOKEN} $response ${Tokenizer.EOS_TOKEN}"
+        } else {
+            "${Tokenizer.USER_TOKEN} $prompt\n" +
+                "${Tokenizer.ASSISTANT_TOKEN}${Tokenizer.THINK_START}\n" +
+                "$reasoningBlock\n" +
+                "${Tokenizer.THINK_END}\n" +
+                "${Tokenizer.ASSISTANT_TOKEN} $response ${Tokenizer.EOS_TOKEN}"
+        }
+    }
+
     fun detectModality(text: String): TextModality {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return TextModality.GENERAL_PROSE
 
         val lines = trimmed.lines().map { it.trim() }.filter { it.isNotEmpty() }
         if (lines.isEmpty()) return TextModality.GENERAL_PROSE
+
+        val containsReasoningMarkers =
+            trimmed.contains(Tokenizer.THINK_START) &&
+                trimmed.contains(Tokenizer.THINK_END)
+        val containsReasoningRecords = lines.any { line ->
+            runCatching { JSONObject(line) }
+                .getOrNull()
+                ?.let { record ->
+                    isTrainingRecord(record) && !extractReasoningText(record).isNullOrBlank()
+                } == true
+        }
+        if (containsReasoningMarkers || containsReasoningRecords) {
+            return TextModality.REASONING
+        }
 
         // 1. Percakapan
         var userTurnCount = 0
@@ -170,7 +290,7 @@ object TextModalityProcessor {
         require(overlap >= 0) { "overlap tidak boleh negatif, diterima: $overlap" }
         require(overlap < chunkSize) { "overlap ($overlap) harus < chunkSize ($chunkSize)" }
 
-        val normalized = normalizeTypography(rawText)
+        val normalized = normalizeReasoningDatasetInput(normalizeTypography(rawText))
         if (normalized.isBlank()) return emptyList()
 
         val modality = detectModality(normalized)
@@ -178,6 +298,7 @@ object TextModalityProcessor {
         return when (modality) {
             TextModality.CONVERSATION -> processConversation(normalized, documentTitle, chunkSize)
             TextModality.QA_PAIR -> processQAPairs(normalized, documentTitle, chunkSize)
+            TextModality.REASONING -> processReasoningDataset(normalized, documentTitle, chunkSize)
             TextModality.ARTICLE_NEWS -> processArticleNews(normalized, documentTitle, chunkSize, overlap)
             TextModality.STORY_NARRATIVE -> processStoryNarrative(normalized, documentTitle, chunkSize, overlap)
             TextModality.STRUCTURED_DATA -> processStructuredData(normalized, documentTitle, chunkSize)
@@ -435,16 +556,16 @@ object TextModalityProcessor {
     }
 
     /**
-     * Memformat baris data terstruktur:
-     * Jika berupa JSON object leksikon (kamus kata, QA pair, instruction-tuning, dsb.),
-     * diubah menjadi relasi semantik berdensitas tinggi tanpa noise sintaksis berulang.
-     * Field null/missing dilewati.
+     * Formats JSONL instruction-tuning examples. Reasoning examples are serialized as
+     * USER -> ASSISTANT/THINK -> THINK_END -> ASSISTANT/final answer -> EOS.
+     * Existing no-reasoning records retain their previous serialization.
      */
     fun formatStructuredLineIfJson(line: String): String {
         val trimmed = line.trim()
         if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
             val parsed = runCatching {
                 val obj = JSONObject(trimmed)
+                val reasoning = extractReasoningText(obj)
                 when {
                     obj.has("kata") && obj.has("kata_dasar") -> {
                         val kata = obj.optString("kata")
@@ -454,15 +575,26 @@ object TextModalityProcessor {
                         "Kata: $kata -> Kata dasar: $dasar$extra"
                     }
                     obj.has("prompt") && obj.has("completion") ->
-                        "${Tokenizer.USER_TOKEN} ${obj.optString("prompt")}\n${Tokenizer.ASSISTANT_TOKEN} ${obj.optString("completion")} ${Tokenizer.EOS_TOKEN}"
-                    obj.has("instruction") && obj.has("response") -> {
-                        val input = obj.optString("input")
-                        val instruction = obj.optString("instruction")
-                        val prompt = if (input.isNotBlank()) "$instruction\nInput: $input" else instruction
-                        "${Tokenizer.USER_TOKEN} $prompt\n${Tokenizer.ASSISTANT_TOKEN} ${obj.optString("response")} ${Tokenizer.EOS_TOKEN}"
-                    }
+                        formatInstructionResponse(
+                            instruction = obj.optString("prompt"),
+                            input = obj.optString("input"),
+                            reasoning = reasoning,
+                            response = obj.optString("completion")
+                        )
+                    obj.has("instruction") && obj.has("response") ->
+                        formatInstructionResponse(
+                            instruction = obj.optString("instruction"),
+                            input = obj.optString("input"),
+                            reasoning = reasoning,
+                            response = obj.optString("response")
+                        )
                     obj.has("question") && obj.has("answer") ->
-                        "${Tokenizer.USER_TOKEN} Tanya: ${obj.optString("question")}\n${Tokenizer.ASSISTANT_TOKEN} Jawab: ${obj.optString("answer")} ${Tokenizer.EOS_TOKEN}"
+                        formatInstructionResponse(
+                            instruction = "Tanya: ${obj.optString("question")}",
+                            input = "",
+                            reasoning = reasoning,
+                            response = "Jawab: ${obj.optString("answer")}"
+                        )
                     else -> {
                         val pairs = mutableListOf<String>()
                         val keys = obj.keys()
@@ -478,6 +610,46 @@ object TextModalityProcessor {
             if (parsed != null) return parsed
         }
         return line
+    }
+
+    /**
+     * Keeps each reasoning record intact while batching records into bounded chunks.
+     * A single long record may exceed chunkSize because the neural engine trains it
+     * through overlapping context windows.
+     */
+    private fun processReasoningDataset(
+        text: String,
+        documentTitle: String,
+        chunkSize: Int
+    ): List<ProcessedChunk> {
+        val records = text.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .map(::formatStructuredLineIfJson)
+            .toList()
+        if (records.isEmpty()) return emptyList()
+
+        val chunks = mutableListOf<String>()
+        val buffer = StringBuilder()
+        for (record in records) {
+            if (buffer.isNotEmpty() && buffer.length + record.length + 1 > chunkSize) {
+                chunks += buffer.toString().trim()
+                buffer.setLength(0)
+            }
+            if (buffer.isNotEmpty()) buffer.append('\n')
+            buffer.append(record)
+        }
+        if (buffer.isNotEmpty()) chunks += buffer.toString().trim()
+
+        val total = chunks.size
+        return chunks.mapIndexed { index, chunk ->
+            ProcessedChunk(
+                content = chunk,
+                modality = TextModality.REASONING,
+                segmentTitle = "$documentTitle [Reasoning ${index + 1}/$total]",
+                tokenHint = "Instruction, reasoning steps, and final answer"
+            )
+        }
     }
 
     /**
