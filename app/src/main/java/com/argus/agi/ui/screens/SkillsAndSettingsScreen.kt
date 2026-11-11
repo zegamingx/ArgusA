@@ -46,6 +46,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -59,6 +62,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.argus.agi.sensor.PrivacyAppHeuristics
 import com.argus.agi.ui.ArgusViewModel
 import com.argus.agi.ui.theme.ArgusBlueAccent
 import com.argus.agi.ui.theme.ArgusCardBorder
@@ -78,6 +82,7 @@ import com.argus.agi.R
 @Composable
 fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val installedApps by viewModel.installedApps.collectAsState()
     val worldEntities by viewModel.worldEntities.collectAsState()
     val searchResults by viewModel.searchResults.collectAsState()
@@ -101,21 +106,41 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
     var appFilterText by remember { mutableStateOf("") }
     var appFilterTab by remember { mutableStateOf(0) }
 
-    val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
-    val isIgnoringOpt = pm?.isIgnoringBatteryOptimizations(context.packageName) ?: false
-    val excludedCount = installedApps.count { it.isExcluded }
-
-    val sensitiveKeywords = remember {
-        listOf("bank", "bca", "bri", "【entity-mandiri¦canonical_name=mandiri】", "bni", "【entity-cimb¦canonical_name=cimb】", "dana", "ovo", "gopay", "shopeepay", "wallet", "crypto", "【entity-binance¦canonical_name=binance】", "【entity-indodax¦canonical_name=indodax】", "auth", "authenticator", "password", "bitwarden", "1password", "keepass", "whatsapp", "telegram", "signal")
+    val pm = remember(context) {
+        context.getSystemService(Context.POWER_SERVICE) as? PowerManager
     }
-    val filteredApps = installedApps.filter { app ->
-        val matchesText = appFilterText.isBlank() || app.appName.contains(appFilterText, ignoreCase = true) || app.packageName.contains(appFilterText, ignoreCase = true)
-        val matchesTab = when (appFilterTab) {
-            1 -> app.isExcluded
-            2 -> sensitiveKeywords.any { app.packageName.lowercase().contains(it) }
-            else -> true
+    var isIgnoringOpt by remember(pm) {
+        mutableStateOf(pm?.isIgnoringBatteryOptimizations(context.packageName) ?: false)
+    }
+    DisposableEffect(lifecycleOwner, pm) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isIgnoringOpt = pm?.isIgnoringBatteryOptimizations(context.packageName) ?: false
+            }
         }
-        matchesText && matchesTab
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val excludedCount = installedApps.count { it.isExcluded }
+    val privacySuggestedCount = remember(installedApps) {
+        installedApps.count { app ->
+            PrivacyAppHeuristics.isPrivacySensitiveApp(app.appName, app.packageName)
+        }
+    }
+    val filteredApps = remember(installedApps, appFilterText, appFilterTab) {
+        installedApps.filter { app ->
+            val query = appFilterText.trim()
+            val matchesText = query.isBlank() ||
+                app.appName.contains(query, ignoreCase = true) ||
+                app.packageName.contains(query, ignoreCase = true)
+            val matchesTab = when (appFilterTab) {
+                1 -> app.isExcluded
+                2 -> PrivacyAppHeuristics.isPrivacySensitiveApp(app.appName, app.packageName)
+                else -> true
+            }
+            matchesText && matchesTab
+        }
     }
 
     LazyColumn(
@@ -133,10 +158,10 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                     }
                 }
                 Spacer(modifier = Modifier.height(4.dp))
-                Text(text = "Atur apa yang boleh ARGUS baca, klik, dan latih. Semua diproses lokal, kecuali web search.", style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp), color = ArgusTextMuted, lineHeight = 17.sp)
+                Text(text = "Configure what ARGUS can read, act on, and learn. Model execution and stored memory stay on-device; web retrieval and some speech services may use network providers.", style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp), color = ArgusTextMuted, lineHeight = 17.sp)
                 Spacer(modifier = Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    MiniStat(label = "SKILLS", value = "7 aktif", modifier = Modifier.weight(1f))
+                    MiniStat(label = "CAPABILITIES", value = "7 built-in", modifier = Modifier.weight(1f))
                     MiniStat(label = "EXCLUDED", value = "$excludedCount app", modifier = Modifier.weight(1f))
                     MiniStat(label = "MEMORY", value = "${worldEntities.size} fakta", modifier = Modifier.weight(1f))
                 }
@@ -155,7 +180,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                             Spacer(modifier = Modifier.width(9.dp))
                             Column {
                                 Text(text = "Battery & Background", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
-                                Text(text = if (isIgnoringOpt) "Background diizinkan" else "Background dibatasi sistem", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
+                                Text(text = if (isIgnoringOpt) "Background activity allowed" else "Background activity restricted", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
                             }
                         }
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -168,7 +193,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                     AnimatedVisibility(visible = isBatteryExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
                             Spacer(modifier = Modifier.height(10.dp))
-                            Text(text = "Exempt ARGUS dari optimasi baterai biar training dan persepsi background tetap jalan. Android tetap bisa ngebatesin di kondisi tertentu.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextSecondary, lineHeight = 16.sp)
+                            Text(text = "Allow ARGUS to ignore battery optimization for more reliable background work. Android may still apply other background execution limits.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextSecondary, lineHeight = 16.sp)
                             if (!isIgnoringOpt) {
                                 Spacer(modifier = Modifier.height(12.dp))
                                 Button(onClick = {
@@ -179,7 +204,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                         context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
                                     }
                                 }, colors = ButtonDefaults.buttonColors(containerColor = ArgusCyanPrimary, contentColor = ArgusDarkBg), shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
-                                    Text(text = "Buka Pengaturan Baterai", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                    Text(text = "Open battery settings", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                 }
                             }
                         }
@@ -200,7 +225,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                             Spacer(modifier = Modifier.width(9.dp))
                             Column {
                                 Text(text = "Core Capabilities", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
-                                Text(text = "7 skill • semua lokal kecuali web", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
+                                Text(text = "7 built-in capabilities • network use is disclosed per service", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
                             }
                         }
                         Icon(painter = if (isSkillsExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down), contentDescription = "Toggle", tint = ArgusCyanPrimary, modifier = Modifier.size(20.dp))
@@ -209,13 +234,13 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                     AnimatedVisibility(visible = isSkillsExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
                             Spacer(modifier = Modifier.height(8.dp))
-                            SkillRow(number = "01", title = "General Web Search", desc = "DuckDuckGo, 【entity-Wikipedia¦canonical_name=Wikipedia】 buat nambal hasil pendek.")
-                            SkillRow(number = "02", title = "Article Extraction", desc = "Ambil teks artikel yang lu pilih, buat direview dulu.")
-                            SkillRow(number = "03", title = "Screen Text Perception", desc = "Baca teks app aktif, app yang di-exclude di-skip.")
-                            SkillRow(number = "04", title = "Accessibility Actions", desc = "Coba klik node teks yang keliatan di layar.")
-                            SkillRow(number = "05", title = "Deterministic Arithmetic", desc = "Hitung ekspresi matematika secara deterministik.")
-                            SkillRow(number = "06", title = "World Model Memory", desc = "Simpan fakta key-value + sumber + konteks app.")
-                            SkillRow(number = "07", title = "Local Model Training", desc = "Update weights dan LoRA langsung di HP.")
+                            SkillRow(number = "01", title = "General Web Search", desc = "Searches web sources and returns source links for review.")
+                            SkillRow(number = "02", title = "Article Extraction", desc = "Extracts a selected article and presents a preview for review.")
+                            SkillRow(number = "03", title = "Screen Text Perception", desc = "Reads visible text from the active app; excluded apps are skipped.")
+                            SkillRow(number = "04", title = "Accessibility Actions", desc = "Attempts supported actions on visible accessibility nodes.")
+                            SkillRow(number = "05", title = "Deterministic Arithmetic", desc = "Evaluates supported arithmetic expressions deterministically.")
+                            SkillRow(number = "06", title = "World Model Memory", desc = "Stores local key-value facts with source and app context.")
+                            SkillRow(number = "07", title = "Local Model Training", desc = "Trains the on-device model using the local document queue.")
 
                             Spacer(modifier = Modifier.height(10.dp))
                             // TESTER - pisah, default ketutup biar gak berat
@@ -271,7 +296,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                                 Text(text = "Review konten, tanggal, publisher, dan URL sebelum masuk training.", style = MaterialTheme.typography.bodySmall, color = ArgusTextPrimary)
                                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                                     Checkbox(checked = allowArticleTraining, onCheckedChange = { allowArticleTraining = it }, colors = CheckboxDefaults.colors(checkedColor = ArgusCyanPrimary, uncheckedColor = ArgusTextMuted, checkmarkColor = ArgusDarkBg))
-                                                    Text(text = "Gue confirm punya hak / izin buat pake artikel ini sebagai data training.", style = MaterialTheme.typography.bodySmall, color = ArgusTextSecondary)
+                                                    Text(text = "I confirm that I have the rights or permission to use this article for model training.", style = MaterialTheme.typography.bodySmall, color = ArgusTextSecondary)
                                                 }
                                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                                     Button(onClick = { viewModel.enqueueReviewedWebArticle() }, enabled = allowArticleTraining && !isQueueingArticle, colors = ButtonDefaults.buttonColors(containerColor = ArgusSuccess, contentColor = ArgusDarkBg, disabledContainerColor = ArgusSurface, disabledContentColor = ArgusTextMuted), shape = RoundedCornerShape(10.dp)) {
@@ -294,7 +319,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                         Button(onClick = {
                                             if (actionClickQuery.isNotBlank()) {
                                                 val success = viewModel.executeActionClick(actionClickQuery)
-                                                actionClickResult = if (success) "Success: click sent to '$actionClickQuery'." else "Failed: '$actionClickQuery' gak ketemu di jendela aktif."
+                                                actionClickResult = if (success) "Success: click action sent to '$actionClickQuery'." else "Failed: '$actionClickQuery' was not found in the active window."
                                             }
                                         }, colors = ButtonDefaults.buttonColors(containerColor = ArgusBlueAccent, contentColor = ArgusDarkBg), shape = RoundedCornerShape(12.dp)) {
                                             Text("Tap", fontWeight = FontWeight.Bold, fontSize = 12.sp)
@@ -324,7 +349,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                             Spacer(modifier = Modifier.width(9.dp))
                             Column {
                                 Text(text = "Excluded Apps", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
-                                Text(text = "$excludedCount app di-skip dari screen reading", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
+                                Text(text = "$excludedCount apps excluded from screen reading", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
                             }
                         }
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -337,13 +362,13 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                     AnimatedVisibility(visible = isExcludeAppsExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
                             Spacer(modifier = Modifier.height(8.dp))
-                            Text(text = "Teks dari app yang lu pilih gak bakal dibaca sama Accessibility. Ini ngurangin exposure, tapi bukan pengganti permission Android.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextSecondary, lineHeight = 16.sp)
+                            Text(text = "ARGUS skips screen text from excluded apps. This reduces exposure but does not replace Android permissions or the app's own privacy controls.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextSecondary, lineHeight = 16.sp)
                             Spacer(modifier = Modifier.height(10.dp))
                             OutlinedTextField(value = appFilterText, onValueChange = { appFilterText = it }, placeholder = { Text("Cari app...", color = ArgusTextMuted, fontSize = 12.sp) }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = ArgusCyanPrimary, unfocusedBorderColor = ArgusCardBorder, focusedTextColor = ArgusTextPrimary, unfocusedTextColor = ArgusTextPrimary, focusedContainerColor = ArgusSurfaceVariant, unfocusedContainerColor = ArgusSurfaceVariant), singleLine = true)
                             Spacer(modifier = Modifier.height(8.dp))
                             // FIX: LazyRow biar tab gak kepotong
                             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                val tabs = listOf("All (${installedApps.size})", "Excluded ($excludedCount)", "Privacy suggestions (${installedApps.count { item -> sensitiveKeywords.any { item.packageName.lowercase().contains(it) } }})")
+                                val tabs = listOf("All (${installedApps.size})", "Excluded ($excludedCount)", "Privacy suggestions ($privacySuggestedCount)")
                                 items(tabs.indices.toList()) { idx ->
                                     val label = tabs[idx]
                                     val isSelected = appFilterTab == idx
@@ -358,7 +383,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                             Column(modifier = Modifier.fillMaxWidth().heightIn(max = 340.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                 if (filteredApps.isEmpty()) {
                                     Box(modifier = Modifier.fillMaxWidth().padding(20.dp), contentAlignment = Alignment.Center) {
-                                        Text(text = "Gak ada app yang cocok.", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp), color = ArgusTextMuted)
+                                        Text(text = "No matching apps.", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp), color = ArgusTextMuted)
                                     }
                                 } else {
                                     filteredApps.forEach { app ->
@@ -390,7 +415,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                             Spacer(modifier = Modifier.width(9.dp))
                             Column {
                                 Text(text = "World Model Memory", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
-                                Text(text = "${worldEntities.size} fakta tersimpan lokal", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
+                                Text(text = "${worldEntities.size} facts stored locally", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
                             }
                         }
                         Icon(painter = if (isWorldModelExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down), contentDescription = "Toggle", tint = ArgusCyanPrimary, modifier = Modifier.size(20.dp))
@@ -398,11 +423,11 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                     AnimatedVisibility(visible = isWorldModelExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
                             Spacer(modifier = Modifier.height(6.dp))
-                            Text(text = "Fakta key-value, label sumber, dan konteks app, semua lokal.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextSecondary)
+                            Text(text = "Local key-value facts with source labels and app context.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextSecondary)
                             Spacer(modifier = Modifier.height(10.dp))
                             if (worldEntities.isEmpty()) {
                                 Box(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(ArgusSurfaceVariant).padding(14.dp), contentAlignment = Alignment.Center) {
-                                    Text(text = "Belum ada fakta tersimpan.", style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
+                                    Text(text = "No facts stored yet.", style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
                                 }
                             } else {
                                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
