@@ -63,6 +63,20 @@ data class ActiveDocumentTraining(
     val runningAverageLoss: Float? = null
 )
 
+/** Runtime counters for this app session; they are not presented as lifetime corpus totals. */
+data class TrainingSessionMetrics(
+    val completedChunks: Long = 0L,
+    val completedDocuments: Long = 0L,
+    val inputTokens: Long = 0L,
+    val predictionTargets: Long = 0L,
+    val contextWindows: Long = 0L,
+    val optimizerUpdates: Long = 0L,
+    val vocabularySize: Int = 0,
+    val vocabularyCapacity: Int = 0,
+    val vocabularyTokensAdded: Int = 0,
+    val tokenizerMerges: Int = 0
+)
+
 data class ValidationCorpusEvaluation(
     val corpusDocumentCount: Int,
     val evaluatedDocumentCount: Int,
@@ -111,6 +125,8 @@ class TrainingManager(
         const val MAX_CORPUS_REPLAY_DOCUMENTS = 500
         const val MAX_DEFAULT_CORPUS_REPLAY_CHUNKS = 4_096
         const val MAX_CORPUS_REPLAY_CHUNKS = 50_000
+        private const val MAX_TOKENIZER_SAMPLE_CHUNKS = 256
+        private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
         private const val IDLE_POLL_MS = 500L
     }
 
@@ -146,6 +162,17 @@ class TrainingManager(
 
     private val _totalStepsExecuted = MutableStateFlow(0)
     val totalStepsExecuted: StateFlow<Int> = _totalStepsExecuted.asStateFlow()
+
+    private val preparedTokenizerDocuments = HashSet<String>()
+
+    private val _trainingMetrics = MutableStateFlow(
+        TrainingSessionMetrics(
+            vocabularySize = neuralEngine.tokenizer.vocabSize,
+            vocabularyCapacity = neuralEngine.config.tokenizerConfig.maxVocabularySize,
+            tokenizerMerges = neuralEngine.tokenizer.mergeCount
+        )
+    )
+    val trainingMetrics: StateFlow<TrainingSessionMetrics> = _trainingMetrics.asStateFlow()
 
     @Volatile private var closed = false
 
@@ -1202,7 +1229,7 @@ class TrainingManager(
     }
 
     private fun updateActiveDocumentEntering(item: TrainingData) {
-        if (item.documentTitle == null || item.totalChunks <= 1) return
+        if (item.documentTitle == null) return
         _activeDocument.update { current ->
             if (current != null && current.docTitle == item.documentTitle) {
                 current.copy(currentChunkIndex = item.chunkIndex)
@@ -1219,9 +1246,51 @@ class TrainingManager(
         }
     }
 
+    private suspend fun prepareTokenizerForDocument(item: TrainingData) {
+        val documentId = item.documentId ?: return
+        if (!preparedTokenizerDocuments.add(documentId)) return
+
+        try {
+            val storedSamples = repo?.getTokenizerCorpusSample(
+                documentId = documentId,
+                limit = MAX_TOKENIZER_SAMPLE_CHUNKS
+            ).orEmpty()
+
+            var remainingCharacters = MAX_TOKENIZER_SAMPLE_CHARACTERS
+            val corpusSample = ArrayList<String>(storedSamples.size)
+            for (chunk in storedSamples) {
+                if (remainingCharacters <= 0) break
+                val sample = chunk.take(remainingCharacters)
+                if (sample.isNotBlank()) corpusSample.add(sample)
+                remainingCharacters -= sample.length
+            }
+            if (corpusSample.isEmpty() && item.content.isNotBlank()) {
+                corpusSample.add(item.content.take(MAX_TOKENIZER_SAMPLE_CHARACTERS))
+            }
+
+            val update = neuralEngine.trainTokenizerFromCorpus(corpusSample)
+            _trainingMetrics.update { current ->
+                current.copy(
+                    vocabularySize = update.vocabularySize,
+                    vocabularyTokensAdded = current.vocabularyTokensAdded + update.tokensAdded,
+                    tokenizerMerges = update.mergeCount
+                )
+            }
+            Log.i(
+                TAG,
+                "Tokenizer corpus prepared for '${item.documentTitle ?: item.title}': " +
+                    "${update.previousVocabularySize} -> ${update.vocabularySize} tokens, " +
+                    "${update.mergeCount - update.previousMergeCount} new merges."
+            )
+        } catch (error: Exception) {
+            preparedTokenizerDocuments.remove(documentId)
+            Log.w(TAG, "Tokenizer preparation failed for document $documentId; existing vocabulary will be used.", error)
+        }
+    }
+
     private suspend fun processItem(item: TrainingData) {
-        if (item.chunkIndex == 1) {
-            item.documentId?.let { documentId ->
+        item.documentId?.let { documentId ->
+            if (item.chunkIndex == 1) {
                 repo?.let { repository ->
                     runCatching { repository.markCorpusDocumentTraining(documentId) }
                         .onFailure { error ->
@@ -1229,15 +1298,17 @@ class TrainingManager(
                         }
                 }
             }
+            prepareTokenizerForDocument(item)
         }
 
         val startNs = System.nanoTime()
-        val stepLoss = neuralEngine.trainStep(item.content)
+        val stepResult = neuralEngine.trainStepDetailed(item.content)
+        val stepLoss = stepResult.loss
         val durationMs = (System.nanoTime() - startNs) / 1_000_000L
 
-        // Loss tidak valid → FAILED, bukan COMPLETED.
+        // Invalid loss is a failed step, never a completed training item.
         if (!stepLoss.isFinite()) {
-            Log.w(TAG, "trainStep return non-finite loss=$stepLoss untuk '${item.title}'")
+            Log.w(TAG, "trainStep returned non-finite loss=$stepLoss for '${item.title}'")
             val failed = item.copy(status = TrainingStatus.FAILED, stepDurationMs = durationMs)
             pushCompleted(failed)
             scope.launch {
@@ -1266,6 +1337,21 @@ class TrainingManager(
         _lossHistory.update { (it + stepLoss).takeLast(MAX_LOSS_HISTORY) }
         _totalStepsExecuted.update { it + 1 }
 
+        val documentCompleted = item.documentId != null &&
+            item.chunkIndex >= item.totalChunks
+        _trainingMetrics.update { current ->
+            current.copy(
+                completedChunks = current.completedChunks + 1L,
+                completedDocuments = current.completedDocuments +
+                    if (documentCompleted) 1L else 0L,
+                inputTokens = current.inputTokens + stepResult.inputTokenCount,
+                predictionTargets = current.predictionTargets + stepResult.predictionTargetCount,
+                contextWindows = current.contextWindows + stepResult.contextWindowCount,
+                optimizerUpdates = current.optimizerUpdates + stepResult.optimizerUpdateCount,
+                vocabularySize = stepResult.vocabularySize
+            )
+        }
+
         runCatching {
             worldModel.storeEntity(
                 "last_training_loss",
@@ -1277,31 +1363,36 @@ class TrainingManager(
                 _totalStepsExecuted.value.toString(),
                 "On-Device Neural Core"
             )
-        }.onFailure { Log.w(TAG, "Gagal mencatat telemetri loss/steps", it) }
+        }.onFailure { Log.w(TAG, "Failed to record training telemetry.", it) }
 
-        if (item.documentTitle != null && item.totalChunks > 1) {
-            var docCompleted = false
+        if (item.documentTitle != null) {
+            var documentCompletedInUi = false
             _activeDocument.update { current ->
-                if (current == null || current.docTitle != item.documentTitle) current
-                else {
-                    val avg = current.runningAverageLoss
-                    val newAvg = if (avg != null) (avg * 0.7f + stepLoss * 0.3f) else stepLoss
-                    if (item.chunkIndex >= item.totalChunks) docCompleted = true
+                if (current == null || current.docTitle != item.documentTitle) {
+                    current
+                } else {
+                    val previousAverage = current.runningAverageLoss
+                    val updatedAverage = if (previousAverage != null) {
+                        previousAverage * 0.7f + stepLoss * 0.3f
+                    } else {
+                        stepLoss
+                    }
+                    if (documentCompleted) documentCompletedInUi = true
                     current.copy(
                         completedChunks = item.chunkIndex,
                         latestLoss = stepLoss,
-                        runningAverageLoss = newAvg
+                        runningAverageLoss = updatedAverage
                     )
                 }
             }
-            if (docCompleted) {
+            if (documentCompletedInUi) {
                 runCatching {
                     worldModel.storeEntity(
                         "doc_trained_${System.currentTimeMillis()}",
-                        "Dokumen '${item.documentTitle}' selesai diasimilasi (${item.totalChunks} blok).",
+                        "Document '${item.documentTitle}' completed assimilation (${item.totalChunks} training items).",
                         "Document Trainer"
                     )
-                }.onFailure { Log.w(TAG, "Gagal mencatat telemetri docCompleted", it) }
+                }.onFailure { Log.w(TAG, "Failed to record document completion telemetry.", it) }
                 _activeDocument.value = null
             }
         }

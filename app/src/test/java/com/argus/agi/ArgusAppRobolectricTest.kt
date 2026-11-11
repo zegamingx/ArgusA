@@ -166,7 +166,9 @@ class ArgusAppRobolectricTest {
 
     @Test
     fun testTokenizerImportVocabValidation() {
-        val tokenizer = Tokenizer()
+        val tokenizer = Tokenizer(
+            TokenizerConfig(algorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1)
+        )
         val validEntries = listOf(
             Pair("test1", 10),
             Pair("test2", 11)

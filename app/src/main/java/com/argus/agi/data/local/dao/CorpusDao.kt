@@ -75,6 +75,12 @@ interface CorpusDao {
     suspend fun getChunks(documentId: String): List<CorpusChunkEntity>
 
     @Query(
+        "SELECT content FROM corpus_chunks WHERE documentId = :documentId " +
+            "ORDER BY chunkIndex ASC LIMIT :limit"
+    )
+    suspend fun getTokenizerCorpusSample(documentId: String, limit: Int): List<String>
+
+    @Query(
         "UPDATE corpus_documents SET status = :status, " +
             "lastTrainedAtEpochMs = :trainedAtEpochMs, " +
             "completedPassCount = :completedPassCount " +

@@ -12,6 +12,7 @@ import com.argus.agi.model.BenchmarkResult
 import com.argus.agi.model.GenesisLifecycleStage
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingManager
+import com.argus.agi.model.TrainingSessionMetrics
 import com.argus.agi.model.WorldEntity
 import android.media.MediaMetadataRetriever
 import com.argus.agi.sensor.ArticleExtractor
@@ -116,6 +117,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     val lossHistory: StateFlow<List<Float>> = trainingManager.lossHistory
     val isTrainingPaused: StateFlow<Boolean> = trainingManager.isTrainingPaused
     val totalStepsExecuted: StateFlow<Int> = trainingManager.totalStepsExecuted
+    val trainingMetrics: StateFlow<TrainingSessionMetrics> = trainingManager.trainingMetrics
     val engineConfig get() = neuralEngine.config
     val activeComputeBackend get() = neuralEngine.optimizerBackend
     val isVulkanRuntimeReady get() = neuralEngine.isVulkanRuntimeReady

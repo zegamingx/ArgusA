@@ -307,6 +307,12 @@ class ArgusRepository(
             corpusDao.getChunks(documentId)
         }
 
+    suspend fun getTokenizerCorpusSample(documentId: String, limit: Int): List<String> =
+        withContext(Dispatchers.IO) {
+            require(limit in 1..512) { "Tokenizer corpus sample limit must be in 1..512." }
+            corpusDao.getTokenizerCorpusSample(documentId, limit)
+        }
+
     suspend fun getCorpusSources(documentId: String): List<CorpusSourceEntity> =
         withContext(Dispatchers.IO) {
             corpusDao.getSources(documentId)
