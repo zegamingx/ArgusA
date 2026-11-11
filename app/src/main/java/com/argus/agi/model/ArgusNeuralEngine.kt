@@ -43,7 +43,8 @@ data class EngineConfig(
     val isFullTrainingEnabled: Boolean = true,
     val tokenizerConfig: TokenizerConfig = TokenizerConfig(),
     val modelTier: ArgusDeviceModelTier = ArgusDeviceModelTier.COMPACT,
-    val trainingBatchSize: Int = modelTier.defaultTrainingBatchSize
+    val trainingBatchSize: Int = modelTier.defaultTrainingBatchSize,
+    val gradientAccumulationEnabled: Boolean = true
 ) {
     init {
         require(dModel > 0) { "dModel must be positive." }
@@ -78,8 +79,11 @@ data class EngineConfig(
         val parameterCount = ArgusArchitectureParameterEstimator
             .estimate(estimatedArchitecture)
             .totalTrainableParameters
-        val trainingFloorBytes =
+        val trainingFloorBytes = if (gradientAccumulationEnabled) {
             TrainingMemoryPlanner.minimumAccumulatedTrainingStateBytes(parameterCount)
+        } else {
+            TrainingMemoryPlanner.minimumTrainingStateBytes(parameterCount)
+        }
         val positionElements = Math.multiplyExact(maxSeqLen.toLong(), hidden)
         require(positionElements <= Int.MAX_VALUE.toLong()) {
             "Position tensor dimensions exceed JVM array limits."
@@ -503,10 +507,27 @@ class ArgusNeuralEngine private constructor(
                 availableRamGb = availableRamGb,
                 cpuCores = cpuCores
             )
-            val resolved = savedConfig ?: deviceConfig
+            val accumulatedTrainingIsSafe = if (savedConfig == null) {
+                true
+            } else {
+                runCatching {
+                    savedConfig.copy(gradientAccumulationEnabled = true)
+                }.isSuccess
+            }
+            val resolved = when {
+                savedConfig == null -> deviceConfig
+                accumulatedTrainingIsSafe ->
+                    savedConfig.copy(gradientAccumulationEnabled = true)
+                else ->
+                    savedConfig.copy(gradientAccumulationEnabled = false)
+            }
             return resolved.copy(
                 modelTier = deviceConfig.modelTier,
-                trainingBatchSize = deviceConfig.trainingBatchSize
+                trainingBatchSize = if (accumulatedTrainingIsSafe) {
+                    deviceConfig.trainingBatchSize
+                } else {
+                    1
+                }
             )
         }
 
@@ -562,7 +583,8 @@ class ArgusNeuralEngine private constructor(
                 isFullTrainingEnabled = true,
                 tokenizerConfig = TokenizerConfig(
                     algorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1
-                )
+                ),
+                gradientAccumulationEnabled = false
             )
         }
 
@@ -646,7 +668,8 @@ class ArgusNeuralEngine private constructor(
                 loraRank = savedLoraRank,
                 layerCount = layerCount,
                 isFullTrainingEnabled = true,
-                tokenizerConfig = tokenizerConfig
+                tokenizerConfig = tokenizerConfig,
+                gradientAccumulationEnabled = false
             )
         }
 
@@ -1277,6 +1300,12 @@ class ArgusNeuralEngine private constructor(
         require(texts.size in 1..8) {
             "Training batch size must be between 1 and 8."
         }
+        if (!config.gradientAccumulationEnabled) {
+            require(texts.size == 1) {
+                "This legacy checkpoint requires single-sample compatibility training."
+            }
+            return trainSingleSampleSequential(texts.single())
+        }
 
         var shouldSaveCheckpoint = false
         val result = synchronized(modelLock) {
@@ -1391,6 +1420,105 @@ class ArgusNeuralEngine private constructor(
                 samples = reportedSamples,
                 optimizerUpdateCount = optimizerUpdates,
                 totalPredictionTargetCount = accumulator.targetCount
+            )
+        }
+
+        if (shouldSaveCheckpoint) {
+            runCatching { saveCheckpoint() }
+                .onFailure { Log.e(TAG, "Auto-checkpoint save failed", it) }
+        }
+        return result
+    }
+
+    /**
+     * Compatibility path for older checkpoints whose existing model state fits the
+     * legacy 16-byte floor but cannot safely reserve an additional accumulation tensor.
+     * It retains the original per-window Adam update behavior and is restricted to batch 1.
+     */
+    private fun trainSingleSampleSequential(text: String): NeuralTrainingBatchResult {
+        var shouldSaveCheckpoint = false
+        val result = synchronized(modelLock) {
+            val initialAdamStep = adamStep
+            val tokens = tokenizer.encode(text, autoRegister = false)
+            if (tokens.size < 2) {
+                return@synchronized NeuralTrainingBatchResult(
+                    samples = listOf(
+                        NeuralTrainingStepResult(
+                            loss = Float.NaN,
+                            inputTokenCount = tokens.size,
+                            predictionTargetCount = 0,
+                            contextWindowCount = 0,
+                            optimizerUpdateCount = 0,
+                            vocabularySize = tokenizer.vocabSize
+                        )
+                    ),
+                    optimizerUpdateCount = 0,
+                    totalPredictionTargetCount = 0
+                )
+            }
+
+            ensureVocabCapacity(tokenizer.vocabSize)
+            val currentVocab = tokenizer.vocabSize
+            var contextWindowCount = 0
+            var predictionTargetCount = 0
+            var weightedLoss = 0f
+            var trainedTargets = 0
+
+            if (tokens.size <= maxSeqLen) {
+                val loss = trainSingleWindow(tokens, currentVocab)
+                if (loss.isFinite()) {
+                    contextWindowCount = 1
+                    predictionTargetCount = tokens.size - 1
+                    trainedTargets = tokens.size - 1
+                    weightedLoss = loss * (tokens.size - 1)
+                }
+            } else {
+                val overlapTokens = min(24, maxSeqLen - 1)
+                val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
+                var start = 0
+                while (start < tokens.size - 1) {
+                    val end = min(start + maxSeqLen, tokens.size)
+                    val windowSequence = tokens.subList(start, end)
+                    if (windowSequence.size >= 2) {
+                        val firstTargetIndex =
+                            if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
+                        val targetCount =
+                            (windowSequence.size - 1 - firstTargetIndex).coerceAtLeast(0)
+                        if (targetCount > 0) {
+                            val loss = trainSingleWindow(
+                                seq = windowSequence,
+                                currentVocab = currentVocab,
+                                firstTargetIndex = firstTargetIndex
+                            )
+                            if (loss.isFinite()) {
+                                contextWindowCount++
+                                predictionTargetCount += targetCount
+                                trainedTargets += targetCount
+                                weightedLoss += loss * targetCount
+                            }
+                        }
+                    }
+                    if (end >= tokens.size) break
+                    start += stride
+                }
+            }
+
+            if (adamStep / CHECKPOINT_INTERVAL > initialAdamStep / CHECKPOINT_INTERVAL) {
+                shouldSaveCheckpoint = true
+            }
+            val optimizerUpdates = (adamStep - initialAdamStep).coerceAtLeast(0)
+            val stepResult = NeuralTrainingStepResult(
+                loss = if (trainedTargets > 0) weightedLoss / trainedTargets else Float.NaN,
+                inputTokenCount = tokens.size,
+                predictionTargetCount = predictionTargetCount,
+                contextWindowCount = contextWindowCount,
+                optimizerUpdateCount = optimizerUpdates,
+                vocabularySize = currentVocab
+            )
+            NeuralTrainingBatchResult(
+                samples = listOf(stepResult),
+                optimizerUpdateCount = optimizerUpdates,
+                totalPredictionTargetCount = predictionTargetCount
             )
         }
 
