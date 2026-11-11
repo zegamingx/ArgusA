@@ -437,7 +437,14 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             fontSize = 10.sp
                         )
                         Text(
-                            text = "Model profile: ${modelConfig.modelTier.displayName} • Parameters: $formattedParams • Training batch: ${modelConfig.trainingBatchSize}/8 • LoRA adapter: $adapterSizeStr",
+                            text = "Model profile: ${modelConfig.modelTier.displayName} • Family: ${formatParameterScale(modelConfig.modelTier.minimumFamilyParameters)}–${formatParameterScale(modelConfig.modelTier.maximumFamilyParameters)} • Active: $formattedParams • Batch: ${modelConfig.trainingBatchSize}/8 • LoRA: $adapterSizeStr",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = ArgusTextMuted,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp
+                        )
+                        Text(
+                            text = "Optimizer backend: $backendState • Vulkan: ${if (isVulkanRuntimeReady) "SELF-CHECKED" else "CPU FALLBACK"}",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted,
                             fontFamily = FontFamily.Monospace,
@@ -712,6 +719,16 @@ fun EmptyQueueCard(text: String) {
 // =====================================================================
 // ESTIMATED REMAINING TIME
 // =====================================================================
+private fun formatParameterScale(parameters: Long): String = when {
+    parameters >= 1_000_000_000L ->
+        String.format(Locale.US, "%.1fB", parameters / 1_000_000_000.0)
+    parameters >= 1_000_000L ->
+        String.format(Locale.US, "%.1fM", parameters / 1_000_000.0)
+    parameters >= 1_000L ->
+        String.format(Locale.US, "%.1fK", parameters / 1_000.0)
+    else -> parameters.toString()
+}
+
 private fun avgStepMsFrom(completed: List<TrainingData>): Long {
     val valid = completed.filter { it.status == TrainingStatus.COMPLETED && it.stepDurationMs > 0 }.take(20)
     if (valid.isEmpty()) return 0L
