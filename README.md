@@ -102,10 +102,27 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - `ArgusArchitectureConfig` describes the model with explicit layer count, hidden size, attention heads, feed-forward size, vocabulary size, context length, adapter rank, and Argus-owned operator metadata.
 - `ArgusArchitectureParameterEstimator` calculates parameters across every declared block. Token embeddings and the output projection are counted once; attention, SwiGLU, and optional Q/V adapter matrices scale with layer count. Parameter arithmetic is overflow-checked.
 - The estimator distinguishes trainable parameters from resident model tensors. The current fixed sinusoidal position table occupies memory but is not a trainable parameter. The legacy `countTotalParameters()` method retains its historical resident-tensor count; `countTrainableParameters()` exposes the trainable-weight count.
-- The current executable engine maps to this contract as a one-block causal multi-head attention + SwiGLU model with separate token embeddings/output projection and Q/V LoRA. The new descriptor can represent deeper models, but the current forward pass, backward pass, optimizer state, KV cache, and ARG3/ARG4 checkpoint still execute/store only one block. Multi-layer execution is not claimed until those paths are migrated together.
-- The tokenizer configuration is versioned and persisted with each ARG4 checkpoint. Its default remains 1,024 vocabulary entries and 16 UTF-16 code units per token; larger capacities and token lengths can be selected explicitly. The active algorithm is greedy longest-match with a fixed seed vocabulary and deterministic Unicode fallback, not learned BPE/Unigram. A larger configured capacity does not create a learned vocabulary by itself.
+- The executable engine runs a configurable stack of causal multi-head attention + SwiGLU blocks with separate token embeddings/output projection and Q/V LoRA. Forward execution, reverse backpropagation, optimizer state, KV cache, and ARG4 checkpoint tensors use the configured layer count. ARG3 remains a legacy one-block compatibility format.
+- The tokenizer configuration is versioned and persisted with each ARG4 checkpoint. Its default is learned BPE with 1,024 vocabulary entries and a 16 UTF-16-code-unit token limit; larger capacities and token lengths can be selected explicitly. ARG3 checkpoints retain the legacy greedy-longest-match algorithm and deterministic Unicode fallback.
 - The architecture contract is Argus-native metadata, not a third-party model format or runtime. It does not add a pretrained model, change random initialization, or alter existing ARG3 checkpoint bytes.
 - The inference memory estimator can consume the same validated architecture descriptor, deriving trainable weight count, KV-cache shape, and the fixed sinusoidal buffer instead of accepting unrelated parameter and shape values. Its result remains a planning estimate; it does not load or quantize tensors.
+
+## Device-adaptive training model profiles
+
+Argus selects one of four native model families from installed RAM, the current available-system-memory snapshot, the app heap limit, and CPU core count:
+
+| Model family | Family parameter band | Default training batch |
+| --- | ---: | ---: |
+| Argus Compact | 1M–10M | 1 |
+| Argus Balanced | 10M–100M | 2 |
+| Argus Performance | 100M–1B | 4 |
+| Argus Flagship | 1B–7B | 8 |
+
+The family band is an architecture scale, not a guarantee that the active model reaches the band's upper bound. The active FP32 shape is selected from supported hidden sizes, feed-forward multipliers, and layer counts, then capped by a conservative memory budget. The budget uses at most 45% of the app heap and 25% of currently available system RAM; only 55% of that smaller budget is assigned to the 20-byte-per-parameter accumulated-training state floor. Remaining memory is reserved for activations, attention scratch, tokenizer expansion, checkpoint buffers, and allocator overhead.
+
+The training queue uses a true serial micro-batch of 1–8 independent samples. Each sample's context windows are processed sequentially, their gradients are target-count weighted and accumulated, and one AdamW update is applied after the batch. Activations are not retained for all samples at once. The training worker assigns one optimizer update to the first trainable sample in the batch so session metrics do not count the same update more than once.
+
+**7B is the upper family target, not a claim that the current Android FP32/JVM engine can allocate or train a 7B model.** The current runtime is constrained by Android app-heap limits, JVM array sizes, and FP32 optimizer state. Multi-billion-parameter on-device training requires a separate memory-efficient execution design (for example, lower-precision state, optimizer sharding/offload, and streamed tensor execution) that is not currently integrated. The running model's actual parameter count is reported separately from its family label.
 
 ## Device-adaptive inference capacity
 
@@ -113,7 +130,7 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - The planning anchors are 1 GB: 0.5B–1B; 2 GB: 1.5B–2.5B; 3 GB: 2.5B–3.5B; 4 GB: 3B–5B; 5 GB: 4B–6B; 6 GB: 5B–7B; 7 GB: 6B–8B; 8 GB: 7B–9B; 10 GB: 9B–12B; 12 GB: 12B–14B; 16 GB: 18B–21B; 24 GB: 28B–32B; and 32 GB: 38B–42B.
 - Values between anchors are linearly interpolated. Above 32 GB, the estimate grows by 1.3B–1.5B parameters per additional GB.
 - These values are RAM-only planning targets, not guaranteed model-load limits. A future inference loader must inspect the actual model quantization and architecture metadata, estimate KV cache and runtime workspace, and enforce a memory safety reserve before loading.
-- The existing custom FP32 training engine remains independent from inference sizing. Its 16-byte-per-parameter state floor accounts for parameters, gradients, and two Adam moments; activation and temporary-buffer memory are additional.
+- The custom FP32 training engine remains independent from inference sizing. Its 16-byte-per-parameter base floor accounts for parameters, gradients, and two Adam moments. The new serial gradient-accumulation path uses an additional FP32 gradient buffer, bringing its state floor to 20 bytes per parameter before activations and temporary buffers.
 - An Argus-native multi-billion-parameter inference runtime is not yet integrated. Argus must load its own checkpoint, architecture configuration, tokenizer state, and tensor data without requiring an external model format or runtime. Internal weight quantization is a future Argus-owned storage and execution feature.
 
 ## Argus checkpoint format
@@ -123,7 +140,7 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - The payload stores the Argus architecture ID, vocabulary entries, a named tensor directory, and FP32 tensor data. Tensor names and element counts are validated against the active engine before restore.
 - Tensor payloads are written and read in bounded chunks. The writer uses a temporary file and atomic replacement; the payload CRC32 is verified before model or tokenizer state is changed.
 - Restoring an `ARG3` checkpoint does not discard it. The next successful checkpoint save writes the current state in `ARG4`.
-- The current engine still supports one Transformer block and FP32 tensors only. The named manifest is a foundation for future block collections and Argus-owned storage; it is not a multi-layer or quantized runtime.
+- The current engine supports configurable multi-layer execution and FP32 tensors only. The named manifest stores each layer's tensors; it is not a quantized runtime.
 
 ## On-device training scope
 
@@ -133,7 +150,7 @@ Genesis currently seeds three short foundation notes as retained TRAIN corpus do
 
 Training currently uses causal next-token cross-entropy, full-parameter backpropagation, gradient clipping, and Adam. Imported documents can be scheduled for up to three passes on devices that meet the memory thresholds; smaller or larger documents use fewer passes. Loss-only validation skips backpropagation gradient-buffer allocation and does not update model weights or optimizer state. An internal central finite-difference diagnostic and test cover representative output-head, embedding, MLP, attention, and LoRA parameter groups; execution remains part of final verification.
 
-Within each context window, gradients are accumulated over its scored next-token positions and one Adam update is applied. Longer inputs are split into sliding windows with up to 24 tokens of overlap; each window performs its own optimizer update. The `trainStep` loss is a target-count-weighted aggregate of the window losses measured before each window update. It is a training-progress statistic, not a single post-update evaluation of the full document.
+For each training micro-batch, gradients are accumulated across all scored next-token positions in every sample and context window, then one AdamW update is applied. Longer inputs are split into sliding windows with up to 24 tokens of overlap; all windows belonging to the micro-batch contribute to the same update. Each sample's loss is reported as a target-count-weighted aggregate measured before that shared update. It is a training-progress statistic, not a single post-update evaluation of the full document.
 
 Current limitations:
 
