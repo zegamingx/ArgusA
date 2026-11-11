@@ -207,7 +207,8 @@ object TextModalityProcessor {
      * Mendeteksi modalitas konten teks.
      */
     fun detectModality(text: String): TextModality {
-        val trimmed = text.trim()
+        val normalizedInput = normalizeReasoningDatasetInput(text)
+        val trimmed = normalizedInput.trim()
         if (trimmed.isEmpty()) return TextModality.GENERAL_PROSE
 
         val lines = trimmed.lines().map { it.trim() }.filter { it.isNotEmpty() }

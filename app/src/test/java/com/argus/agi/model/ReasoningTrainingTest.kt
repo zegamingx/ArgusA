@@ -93,6 +93,32 @@ class ReasoningTrainingTest {
     }
 
     @Test
+    fun prettyPrintedReasoningArrayIsDetectedBeforeChunking() {
+        val raw = """
+            [
+              {
+                "instruction": "Find the sum.",
+                "reasoning": ["Identify the operands.", "Add the values."],
+                "response": "9."
+              }
+            ]
+        """.trimIndent()
+
+        assertEquals(TextModality.REASONING, TextModalityProcessor.detectModality(raw))
+    }
+
+    @Test
+    fun emptyReasoningFieldFallsBackToStepsAlias() {
+        val raw = """{"instruction":"Find the difference.","reasoning":"","steps":[{"step":"Subtract the smaller value from the larger value."}],"response":"4."}"""
+        val formatted = TextModalityProcessor.formatStructuredLineIfJson(raw)
+
+        assertTrue(formatted.contains(Tokenizer.THINK_START))
+        assertTrue(formatted.contains("Subtract the smaller value"))
+        assertTrue(formatted.contains(Tokenizer.THINK_END))
+        assertTrue(formatted.contains("4."))
+    }
+
+    @Test
     fun legacyInstructionResponseFormatRemainsUnchangedWithoutReasoning() {
         val raw = """{"instruction":"Explain gravity.","input":"For a falling object.","response":"Gravity attracts masses."}"""
         val formatted = TextModalityProcessor.formatStructuredLineIfJson(raw)

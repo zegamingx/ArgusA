@@ -443,7 +443,10 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         mathResult != null -> mathResult
                         else -> neuralEngine.generate(
                             multiTurnPrompt,
-                            maxNewTokens = 60,
+                            maxNewTokens = minOf(
+                                96,
+                                (neuralEngine.maxSeqLen - 1).coerceAtLeast(1)
+                            ),
                             includeReasoningMarkers = true
                         )
                     }

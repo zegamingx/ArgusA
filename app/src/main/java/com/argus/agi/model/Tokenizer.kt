@@ -579,9 +579,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
      * Decode token ID → teks.
      *
      * @param keepControlTokens jika false (default), semua special token
-     *        (<PAD>, <BOS>, <EOS>, <UNK>, <SYSTEM>, <USER>, <ASSISTANT>,
-     *        <THINK>, </THINK>) dihapus dari output user-facing.
-     *        Set true jika ingin merekonstruksi prompt terstruktur.
+     *        selain penanda reasoning yang diminta secara eksplisit dihapus.
+     * @param keepReasoningTokens jika true, hanya <THINK> dan </THINK> yang
+     *        dipertahankan sementara token kontrol lain tetap disembunyikan.
      */
     fun decode(
         tokenIds: List<Int>,
