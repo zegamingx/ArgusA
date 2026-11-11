@@ -138,7 +138,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             val pieces = word.map { character -> character.toString() }.toMutableList()
             while (pieces.size > 1) {
                 val pair = pieces[0] to pieces[1]
-                if (pair !in mergeRanks) {
+                if (!mergeRanks.containsKey(pair)) {
                     merges.add(pair)
                     mergeRanks[pair] = merges.lastIndex
                 }
@@ -346,7 +346,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 val symbols = wordSymbols[word] ?: continue
                 for (index in 0 until symbols.size - 1) {
                     val pair = symbols[index] to symbols[index + 1]
-                    if (pair in mergeRanks) continue
+                    if (mergeRanks.containsKey(pair)) continue
                     if (pair.first.length + pair.second.length > config.maxTokenLength) continue
                     val previous = pairCounts[pair] ?: 0
                     pairCounts[pair] = if (previous > Int.MAX_VALUE - frequency) {
