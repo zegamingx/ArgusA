@@ -1175,24 +1175,18 @@ class TrainingManager(
     private fun startTrainingWorker() {
         workerJob = scope.launch {
             while (isActive && !closed) {
-                // 1. Tunggu pause lift
                 if (_isTrainingPaused.value) {
                     _isTrainingPaused.first { !it || closed }
                     if (closed) break
                 }
 
-                // 2. Tunggu safety (respect force override)
                 deviceGuard.safetyState.first { it.isSafeToTrain || closed }
                 if (closed) break
 
-                // Konsumsi force override segera setelah lolos guard termal/baterai
-                // agar tidak membocorkan hak istimewa ini ke antrean berikutnya atau saat idle
                 resetForceOverrideIfSet()
 
-                // 3. Pop item dari queue secara atomik
-                val item = popNext()
-                if (item == null) {
-                    // Keep document progress while the head item is still being persisted.
+                val firstItem = popNext()
+                if (firstItem == null) {
                     if (_nextQueue.value.isEmpty()) {
                         _currentTrainingItem.value = null
                         _activeDocument.value = null
@@ -1203,45 +1197,37 @@ class TrainingManager(
                     continue
                 }
 
-                // 4. Proses
-                val activeItem = item.copy(status = TrainingStatus.TRAINING)
-                _currentTrainingItem.value = activeItem
-                updateActiveDocumentEntering(activeItem)
+                val batchItems = ArrayList<TrainingData>(neuralEngine.config.trainingBatchSize)
+                batchItems += firstItem
+                while (batchItems.size < neuralEngine.config.trainingBatchSize) {
+                    val nextItem = popNext() ?: break
+                    batchItems += nextItem
+                }
+
+                val activeItems = batchItems.map { it.copy(status = TrainingStatus.TRAINING) }
+                _currentTrainingItem.value = activeItems.first()
 
                 try {
-                    processItem(activeItem)
+                    processBatch(activeItems)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
-                } catch (t: Throwable) {
-                    Log.e(TAG, "processItem gagal untuk '${item.title}'", t)
-                    val failed = activeItem.copy(status = TrainingStatus.FAILED)
-                    pushCompleted(failed)
-                    scope.launch {
-                        repo?.let { repository ->
-                            runSuspendCatching { repository.markTrainingFailed(failed.id) }
-                                .onFailure { error ->
-                                    Log.w(TAG, "Failed to persist exception-failed training item", error)
-                                }
-                            failed.documentId?.let { documentId ->
-                                runSuspendCatching { repository.markCorpusDocumentPartial(documentId) }
-                                    .onFailure { error ->
-                                        Log.w(TAG, "Failed to mark exception-failed corpus document partial", error)
-                                    }
-                            }
-                        }
+                } catch (error: Throwable) {
+                    Log.e(
+                        TAG,
+                        "Training micro-batch failed (${activeItems.size} samples).",
+                        error
+                    )
+                    activeItems.forEach { item ->
+                        markTrainingItemFailed(item, error.message)
                     }
                 } finally {
-                    // PENTING: Jangan set _currentTrainingItem.value = null di sini!
-                    // Pertahankan activeItem agar UI tidak berkedip (muncul hilang muncul hilang).
-                    // Item hanya di-null-kan saat antrean benar-benar habis (item == null di atas).
                     resetForceOverrideIfSet()
                 }
 
-                // 5. Thermal throttle
-                val temp = deviceGuard.safetyState.value.temperatureCelsius
+                val temperature = deviceGuard.safetyState.value.temperatureCelsius
                 val throttleMs = when {
-                    temp >= 45f -> 600L
-                    temp >= 40f -> 300L
+                    temperature >= 45f -> 600L
+                    temperature >= 40f -> 300L
                     else -> 100L
                 }
                 delay(throttleMs)
@@ -1457,43 +1443,79 @@ class TrainingManager(
         }
     }
 
-    private suspend fun processItem(item: TrainingData) {
-        item.documentId?.let { documentId ->
-            if (item.chunkIndex == 1) {
-                repo?.let { repository ->
-                    runSuspendCatching { repository.markCorpusDocumentTraining(documentId) }
-                        .onFailure { error ->
+    private suspend fun processBatch(items: List<TrainingData>) {
+        require(items.isNotEmpty()) { "A training micro-batch cannot be empty." }
+
+        for (item in items) {
+            item.documentId?.let { documentId ->
+                if (item.chunkIndex == 1) {
+                    repo?.let { activeRepository ->
+                        runSuspendCatching {
+                            activeRepository.markCorpusDocumentTraining(documentId)
+                        }.onFailure { error ->
                             Log.w(TAG, "Failed to mark corpus document as training", error)
                         }
+                    }
                 }
+                prepareTokenizerForDocument(item)
             }
-            prepareTokenizerForDocument(item)
         }
 
         val startNs = System.nanoTime()
-        val stepResult = neuralEngine.trainStepDetailed(item.content)
-        val stepLoss = stepResult.loss
-        val durationMs = (System.nanoTime() - startNs) / 1_000_000L
+        val batchResult = neuralEngine.trainBatchDetailed(items.map(TrainingData::content))
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+        require(batchResult.samples.size == items.size) {
+            "Neural engine returned ${batchResult.samples.size} results for ${items.size} samples."
+        }
+        val perItemDurationMs = (elapsedMs / items.size).coerceAtLeast(1L)
 
-        // Invalid loss is a failed step, never a completed training item.
-        if (!stepLoss.isFinite()) {
-            Log.w(TAG, "trainStep returned non-finite loss=$stepLoss for '${item.title}'")
-            val failed = item.copy(status = TrainingStatus.FAILED, stepDurationMs = durationMs)
-            pushCompleted(failed)
-            scope.launch {
-                repo?.let { repository ->
-                    runSuspendCatching { repository.markTrainingFailed(failed.id) }
-                        .onFailure { error ->
-                            Log.w(TAG, "Failed to persist failed training item", error)
-                        }
-                    failed.documentId?.let { documentId ->
-                        runSuspendCatching { repository.markCorpusDocumentPartial(documentId) }
-                            .onFailure { error ->
-                                Log.w(TAG, "Failed to mark corpus document as partial", error)
-                            }
+        items.zip(batchResult.samples).forEach { (item, stepResult) ->
+            try {
+                processItem(item, stepResult, perItemDurationMs)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                Log.e(TAG, "Failed to finalize training item '${item.title}'.", error)
+                markTrainingItemFailed(item, error.message)
+            }
+        }
+    }
+
+    private fun markTrainingItemFailed(item: TrainingData, reason: String?) {
+        val failed = item.copy(status = TrainingStatus.FAILED)
+        pushCompleted(failed)
+        if (!reason.isNullOrBlank()) {
+            Log.w(TAG, "Training item '${item.title}' failed: $reason")
+        }
+        scope.launch {
+            repo?.let { activeRepository ->
+                runSuspendCatching {
+                    activeRepository.markTrainingFailed(failed.id)
+                }.onFailure { error ->
+                    Log.w(TAG, "Failed to persist failed training item", error)
+                }
+                failed.documentId?.let { documentId ->
+                    runSuspendCatching {
+                        activeRepository.markCorpusDocumentPartial(documentId)
+                    }.onFailure { error ->
+                        Log.w(TAG, "Failed to mark failed corpus document partial", error)
                     }
                 }
             }
+        }
+    }
+
+    private suspend fun processItem(
+        item: TrainingData,
+        stepResult: NeuralTrainingStepResult,
+        durationMs: Long
+    ) {
+        updateActiveDocumentEntering(item)
+        val stepLoss = stepResult.loss
+        // Invalid loss is a failed step, never a completed training item.
+        if (!stepLoss.isFinite()) {
+            Log.w(TAG, "trainBatchDetailed returned non-finite loss=$stepLoss for '${item.title}'")
+            markTrainingItemFailed(item, "The model produced a non-finite loss.")
             return
         }
 
