@@ -163,8 +163,8 @@ class WorldModel(
             }
     }
 
-    fun updateCameraContext(lightLevel: Float, visualSummary: String) {
-        val safeLuma = if (lightLevel.isFinite()) lightLevel.coerceIn(0f, 255f) else 0f
+    fun updateCameraContext(lumaLevel: Float, visualSummary: String) {
+        val safeLuma = if (lumaLevel.isFinite()) lumaLevel.coerceIn(0f, 255f) else 0f
         storeEntities(
             WorldEntity("visual_environment", visualSummary.take(200), "Camera Vision Sensor"),
             WorldEntity(

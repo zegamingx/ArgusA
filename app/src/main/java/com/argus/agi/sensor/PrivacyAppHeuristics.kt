@@ -38,6 +38,6 @@ object PrivacyAppHeuristics {
 
     fun isPrivacySensitiveApp(appName: String, packageName: String): Boolean {
         val identity = "$appName $packageName".lowercase(Locale.ROOT)
-        return sensitiveTerms.any(identity::contains)
+        return sensitiveTerms.any { term -> identity.contains(term) }
     }
 }

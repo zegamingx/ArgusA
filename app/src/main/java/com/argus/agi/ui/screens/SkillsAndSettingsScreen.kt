@@ -162,8 +162,8 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                 Spacer(modifier = Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     MiniStat(label = "CAPABILITIES", value = "7 built-in", modifier = Modifier.weight(1f))
-                    MiniStat(label = "EXCLUDED", value = "$excludedCount app", modifier = Modifier.weight(1f))
-                    MiniStat(label = "MEMORY", value = "${worldEntities.size} fakta", modifier = Modifier.weight(1f))
+                    MiniStat(label = "EXCLUDED", value = "$excludedCount apps", modifier = Modifier.weight(1f))
+                    MiniStat(label = "MEMORY", value = "${worldEntities.size} facts", modifier = Modifier.weight(1f))
                 }
             }
         }

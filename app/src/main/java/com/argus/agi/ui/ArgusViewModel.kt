@@ -1268,7 +1268,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         val safeLuma = luminance.takeIf(Float::isFinite)?.coerceIn(0f, 255f) ?: 0f
         _cameraLuminance.value = safeLuma
         worldModel.updateCameraContext(
-            lightLevel = safeLuma,
+            lumaLevel = safeLuma,
             visualSummary = "Camera active. Average Y-plane luminance: ${String.format(Locale.US, "%.1f", safeLuma)}/255 (relative, not calibrated lux)."
         )
     }
