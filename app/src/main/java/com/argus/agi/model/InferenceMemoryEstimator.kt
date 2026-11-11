@@ -60,10 +60,6 @@ object InferenceMemoryEstimator {
     private const val WORKSPACE_WEIGHT_FRACTION = 0.05
 
     /**
-     * Estimates resident weight storage, optional KV cache, and runtime workspace.
-     * Pass null shape metadata when the native model loader has not inspected its architecture yet.
-     */
-    /**
      * Estimates an Argus architecture directly from its validated native configuration.
      * The current attention layout uses equal query and key/value head counts.
      */
@@ -99,6 +95,11 @@ object InferenceMemoryEstimator {
         )
     }
 
+    /**
+     * Estimates resident weight storage, optional KV cache, fixed model buffers,
+     * and runtime workspace. Pass null shape metadata when the model architecture
+     * has not been inspected yet; a complete memory-fit decision is then unavailable.
+     */
     fun estimate(
         parameterCount: Long,
         quantization: ArgusWeightPrecision,
