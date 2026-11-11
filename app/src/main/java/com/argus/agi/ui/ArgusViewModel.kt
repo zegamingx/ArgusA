@@ -192,7 +192,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             audioVoiceManager.stopAcousticMonitoring()
         } else {
             audioVoiceManager.startAcousticMonitoring { db ->
-                worldModel.storeEntities(
+                worldModel.updateTransientEntities(
                     WorldEntity(
                         "ambient_acoustic",
                         String.format(Locale.US, "%.1f dB relative (uncalibrated)", db),

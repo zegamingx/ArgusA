@@ -99,10 +99,18 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
     var isAccessibilityActive by remember {
         mutableStateOf(ArgusAccessibilityService.instance != null)
     }
+    var isAudioPermissionDenied by remember { mutableStateOf(false) }
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 isAccessibilityActive = ArgusAccessibilityService.instance != null
+                if (ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.RECORD_AUDIO,
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    isAudioPermissionDenied = false
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -113,6 +121,16 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
     val isAcousticActive by viewModel.isAcousticMonitoring.collectAsState()
     val isSpeaking by viewModel.isSpeaking.collectAsState()
     val isListening by viewModel.isListeningVoice.collectAsState()
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            isAudioPermissionDenied = false
+            viewModel.toggleAcousticMonitoring()
+        } else {
+            isAudioPermissionDenied = true
+        }
+    }
 
     var isCameraActive by remember { mutableStateOf(false) }
     var isCameraStreaming by remember { mutableStateOf(false) }
@@ -399,11 +417,39 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                         Spacer(modifier = Modifier.width(9.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(text = "Voice & Acoustic", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
-                            Text(text = if (isAcousticActive) String.format(Locale.US, "Ambient: %.1f dB", ambientDb) else "Standby", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = if (isAcousticActive) ArgusCyanGlow else ArgusTextMuted)
+                            Text(
+                                text = when {
+                                    isAudioPermissionDenied -> "Microphone permission required"
+                                    isAcousticActive -> String.format(Locale.US, "Relative audio: %.1f dB", ambientDb)
+                                    else -> "Standby • microphone off"
+                                },
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                                color = when {
+                                    isAudioPermissionDenied -> ArgusWarning
+                                    isAcousticActive -> ArgusCyanGlow
+                                    else -> ArgusTextMuted
+                                },
+                            )
                         }
                         Switch(
                             checked = isAcousticActive,
-                            onCheckedChange = { viewModel.toggleAcousticMonitoring() },
+                            onCheckedChange = { enabled ->
+                                if (enabled) {
+                                    val hasPermission = ContextCompat.checkSelfPermission(
+                                        context,
+                                        Manifest.permission.RECORD_AUDIO,
+                                    ) == PackageManager.PERMISSION_GRANTED
+                                    if (hasPermission) {
+                                        isAudioPermissionDenied = false
+                                        viewModel.toggleAcousticMonitoring()
+                                    } else {
+                                        audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    }
+                                } else {
+                                    isAudioPermissionDenied = false
+                                    viewModel.toggleAcousticMonitoring()
+                                }
+                            },
                             colors = SwitchDefaults.colors(checkedThumbColor = ArgusDarkBg, checkedTrackColor = ArgusCyanPrimary, uncheckedThumbColor = ArgusTextMuted, uncheckedTrackColor = ArgusSurfaceVariant)
                         )
                         Icon(painter = if (isAudioExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down), contentDescription = "Expand", tint = ArgusTextMuted, modifier = Modifier.size(20.dp))
@@ -412,6 +458,14 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                     AnimatedVisibility(visible = isAudioExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
                             Spacer(modifier = Modifier.height(12.dp))
+                            if (isAudioPermissionDenied) {
+                                Text(
+                                    text = "Allow microphone access in Android permissions to enable acoustic monitoring.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = ArgusWarning,
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
                             HardwareSpecRow(label = "Text-to-Speech", value = if (isSpeaking) "Speaking" else "Ready • device TTS")
                             HardwareSpecRow(label = "Speech Recognition", value = if (isListening) "Listening..." else "Ready • offline preferred")
                             HardwareSpecRow(label = "Relative Audio Level", value = if (isAcousticActive) String.format(Locale.US, "%.1f dB relative (uncalibrated)", ambientDb) else "Sensor Off")
@@ -467,6 +521,18 @@ fun CameraViewfinder(
         contract = ActivityResultContracts.RequestPermission(),
     ) { granted ->
         hasCameraPermission = granted
+    }
+    DisposableEffect(context, lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasCameraPermission = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.CAMERA,
+                ) == PackageManager.PERMISSION_GRANTED
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     if (!hasCameraPermission) {
