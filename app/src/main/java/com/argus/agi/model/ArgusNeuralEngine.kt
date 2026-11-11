@@ -57,7 +57,6 @@ data class EngineConfig(
         // metadata that would overflow array indexes or exceed the app heap.
         val hidden = dModel.toLong()
         val feedForward = dFf.toLong()
-        val vocabularyFloor = TokenizerConfig.MINIMUM_VOCAB_SIZE.toLong()
         val estimatedArchitecture = ArgusArchitectureConfig(
             layerCount = 1,
             hiddenSize = dModel,
@@ -2173,6 +2172,9 @@ class ArgusNeuralEngine private constructor(
         header.putLong(payloadLength)
         header.putInt(0) // CRC32 of the payload is patched after streaming.
         header.putInt(0) // Reserved architecture flags.
+        require(header.position() == ARG4_HEADER_SIZE) {
+            "ARG4 fixed header layout is inconsistent."
+        }
 
         val checksum = CRC32()
         try {

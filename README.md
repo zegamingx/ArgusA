@@ -102,8 +102,8 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - `ArgusArchitectureConfig` describes the model with explicit layer count, hidden size, attention heads, feed-forward size, vocabulary size, context length, adapter rank, and Argus-owned operator metadata.
 - `ArgusArchitectureParameterEstimator` calculates parameters across every declared block. Token embeddings and the output projection are counted once; attention, SwiGLU, and optional Q/V adapter matrices scale with layer count. Parameter arithmetic is overflow-checked.
 - The estimator distinguishes trainable parameters from resident model tensors. The current fixed sinusoidal position table occupies memory but is not a trainable parameter. The legacy `countTotalParameters()` method retains its historical resident-tensor count; `countTrainableParameters()` exposes the trainable-weight count.
-- The current executable engine maps to this contract as a one-block causal multi-head attention + SwiGLU model with separate token embeddings/output projection and Q/V LoRA. The new descriptor can represent deeper models, but the current forward pass, backward pass, optimizer state, KV cache, and ARG3 checkpoint still execute/store only one block. Multi-layer execution is not claimed until those paths are migrated together.
-- The active tokenizer remains capped at 1,024 vocabulary entries and uses a fixed seed vocabulary with deterministic Unicode fallback. Larger vocabulary sizes can be described by the architecture contract, but cannot be activated until tokenizer training, embedding-resize semantics, and checkpoint migration are implemented together.
+- The current executable engine maps to this contract as a one-block causal multi-head attention + SwiGLU model with separate token embeddings/output projection and Q/V LoRA. The new descriptor can represent deeper models, but the current forward pass, backward pass, optimizer state, KV cache, and ARG3/ARG4 checkpoint still execute/store only one block. Multi-layer execution is not claimed until those paths are migrated together.
+- The tokenizer configuration is versioned and persisted with each ARG4 checkpoint. Its default remains 1,024 vocabulary entries and 16 UTF-16 code units per token; larger capacities and token lengths can be selected explicitly. The active algorithm is greedy longest-match with a fixed seed vocabulary and deterministic Unicode fallback, not learned BPE/Unigram. A larger configured capacity does not create a learned vocabulary by itself.
 - The architecture contract is Argus-native metadata, not a third-party model format or runtime. It does not add a pretrained model, change random initialization, or alter existing ARG3 checkpoint bytes.
 - The inference memory estimator can consume the same validated architecture descriptor, deriving trainable weight count, KV-cache shape, and the fixed sinusoidal buffer instead of accepting unrelated parameter and shape values. Its result remains a planning estimate; it does not load or quantize tensors.
 
@@ -116,9 +116,18 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - The existing custom FP32 training engine remains independent from inference sizing. Its 16-byte-per-parameter state floor accounts for parameters, gradients, and two Adam moments; activation and temporary-buffer memory are additional.
 - An Argus-native multi-billion-parameter inference runtime is not yet integrated. Argus must load its own checkpoint, architecture configuration, tokenizer state, and tensor data without requiring an external model format or runtime. Internal weight quantization is a future Argus-owned storage and execution feature.
 
+## Argus checkpoint format
+
+- `ARG3` remains a supported legacy read format. Its fixed tensor order is retained in the compatibility loader.
+- New checkpoints are written as `ARG4`. The fixed header records the architecture schema and dimensions, tokenizer schema/algorithm/capacity, optimizer step, payload size, and checksum.
+- The payload stores the Argus architecture ID, vocabulary entries, a named tensor directory, and FP32 tensor data. Tensor names and element counts are validated against the active engine before restore.
+- Tensor payloads are written and read in bounded chunks. The writer uses a temporary file and atomic replacement; the payload CRC32 is verified before model or tokenizer state is changed.
+- Restoring an `ARG3` checkpoint does not discard it. The next successful checkpoint save writes the current state in `ARG4`.
+- The current engine still supports one Transformer block and FP32 tensors only. The named manifest is a foundation for future block collections and Argus-owned storage; it is not a multi-layer or quantized runtime.
+
 ## On-device training scope
 
-Fresh model initialization selects tensor dimensions using total RAM, app heap, and current available RAM. Existing ARG3 checkpoints retain their saved tensor dimensions so an application update does not silently discard the user's model.
+Fresh model initialization selects tensor dimensions using total RAM, app heap, and current available RAM. Existing ARG3 checkpoints remain readable and retain their saved tensor dimensions. New saves use ARG4, an Argus-native checkpoint with architecture/tokenizer metadata, a named FP32 tensor manifest, streamed tensor I/O, and a CRC32 payload check.
 
 Genesis currently seeds three short foundation notes as retained TRAIN corpus documents. Their scheduling is idempotent: already queued, active, or trained notes are not duplicated, while a cleared or interrupted note can be replayed from Room. These notes are a small bootstrap seed, not a general-purpose language dataset; no C4 or other broad offline language corpus is bundled.
 
