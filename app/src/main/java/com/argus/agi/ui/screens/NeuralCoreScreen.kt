@@ -437,7 +437,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             fontSize = 10.sp
                         )
                         Text(
-                            text = "Model profile: ${modelConfig.modelTier.displayName} • Family: ${formatParameterScale(modelConfig.modelTier.minimumFamilyParameters)}–${formatParameterScale(modelConfig.modelTier.maximumFamilyParameters)} • Active: $formattedParams • Batch: ${modelConfig.trainingBatchSize}/8 • LoRA: $adapterSizeStr",
+                            text = "Model profile: ${modelConfig.modelTier.displayName} • Tier ceiling: ${formatParameterScale(modelConfig.modelTier.maximumFamilyParameters)} • Active: $formattedParams • Batch: ${modelConfig.trainingBatchSize}/8 • LoRA: $adapterSizeStr",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted,
                             fontFamily = FontFamily.Monospace,
