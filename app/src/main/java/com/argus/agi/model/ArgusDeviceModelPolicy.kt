@@ -81,7 +81,12 @@ object ArgusDeviceModelPolicy {
             trainingStateBudget.toDouble() *
                 TRAINING_STATE_HEADROOM /
                 TrainingMemoryPlanner.ACCUMULATED_BYTES_PER_PARAMETER
-            ).toLong().coerceAtLeast(ArgusDeviceModelProfile.MINIMUM_MODEL_PARAMETERS)
+            ).toLong()
+        require(
+            conservativeParameterBudget >= ArgusDeviceModelProfile.MINIMUM_MODEL_PARAMETERS
+        ) {
+            "This device does not currently have enough safe memory to train Argus's minimum 1M-parameter model."
+        }
 
         val tier = when {
             totalRamGb >= 12 && maxHeapMb >= 512L &&
@@ -102,7 +107,7 @@ object ArgusDeviceModelPolicy {
         val targetParameterCount = minOf(
             tier.maximumFamilyParameters,
             conservativeParameterBudget
-        ).coerceAtLeast(ArgusDeviceModelProfile.MINIMUM_MODEL_PARAMETERS)
+        )
 
         val batchSize = tier.defaultTrainingBatchSize.coerceIn(
             ArgusDeviceModelProfile.MINIMUM_TRAINING_BATCH_SIZE,
