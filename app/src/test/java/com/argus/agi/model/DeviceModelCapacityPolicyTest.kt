@@ -68,7 +68,7 @@ class InferenceMemoryEstimatorTest {
             quantization = ArgusWeightPrecision.INT4
         )
 
-        assertEquals(625_000_000L, estimate.weightBytes)
+        assertEquals(500_000_000L, estimate.weightBytes)
         assertEquals(0L, estimate.fixedModelBufferBytes)
         assertNull(estimate.keyValueCacheBytes)
         assertNull(estimate.totalRequiredBytes)

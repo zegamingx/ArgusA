@@ -3,7 +3,8 @@ package com.argus.agi.model
 import java.util.concurrent.ConcurrentHashMap
 
 enum class ArgusTokenizerAlgorithm(val checkpointId: Int) {
-    GREEDY_LONGEST_MATCH_V1(1);
+    GREEDY_LONGEST_MATCH_V1(1),
+    LEARNED_BPE_V1(2);
 
     companion object {
         fun fromCheckpointId(value: Int): ArgusTokenizerAlgorithm =
@@ -244,10 +245,210 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         maxRegisteredLen = newMaxLen
     }
 
+    private val merges = mutableListOf<Pair<String, String>>()
+    private val mergeRanks = ConcurrentHashMap<Pair<String, String>, Int>()
+
+    @Synchronized
+    fun exportMerges(): List<Pair<String, String>> = ArrayList(merges)
+
+    @Synchronized
+    fun importMerges(importedMerges: List<Pair<String, String>>) {
+        merges.clear()
+        mergeRanks.clear()
+        for ((idx, pair) in importedMerges.withIndex()) {
+            require(pair.first.isNotEmpty() && pair.second.isNotEmpty()) {
+                "Merge pair components must not be empty."
+            }
+            merges.add(pair)
+            mergeRanks[pair] = idx
+        }
+    }
+
+    /**
+     * Trains learned BPE merge rules from corpus text until targetVocabSize is reached.
+     */
+    @Synchronized
+    fun trainBpe(corpus: List<String>, targetVocabSize: Int = config.maxVocabularySize): Int {
+        val target = minOf(targetVocabSize, config.maxVocabularySize)
+        if (vocabSize >= target) return vocabSize
+
+        val wordFreqs = LinkedHashMap<String, Int>()
+        for (doc in corpus) {
+            val normalized = TextModalityProcessor.normalizeTypography(doc)
+            val tokens = normalized.split(Regex("\\s+"))
+            for (token in tokens) {
+                if (token.isEmpty() || token in SPECIAL_TOKENS) continue
+                wordFreqs[token] = (wordFreqs[token] ?: 0) + 1
+            }
+        }
+
+        val wordSymbols = LinkedHashMap<String, MutableList<String>>()
+        for (w in wordFreqs.keys) {
+            val symbols = mutableListOf<String>()
+            var idx = 0
+            while (idx < w.length) {
+                val cp = Character.codePointAt(w, idx)
+                val len = Character.charCount(cp)
+                symbols.add(w.substring(idx, idx + len))
+                idx += len
+            }
+            wordSymbols[w] = symbols
+        }
+
+        while (vocabSize < target) {
+            val pairCounts = HashMap<Pair<String, String>, Int>()
+            for ((word, freq) in wordFreqs) {
+                val symbols = wordSymbols[word] ?: continue
+                for (i in 0 until symbols.size - 1) {
+                    val pair = symbols[i] to symbols[i + 1]
+                    val combinedLen = pair.first.length + pair.second.length
+                    if (combinedLen <= config.maxTokenLength) {
+                        pairCounts[pair] = (pairCounts[pair] ?: 0) + freq
+                    }
+                }
+            }
+
+            if (pairCounts.isEmpty()) break
+            val bestEntry = pairCounts.entries.maxByOrNull { it.value } ?: break
+            if (bestEntry.value <= 1 && vocabSize >= 256) break
+            val bestPair = bestEntry.key
+            val combined = bestPair.first + bestPair.second
+            if (combined.length > config.maxTokenLength) break
+
+            val registeredId = registerToken(combined)
+            if (registeredId == UNK_ID && vocabSize >= target) break
+
+            merges.add(bestPair)
+            mergeRanks[bestPair] = merges.lastIndex
+
+            for ((_, symbols) in wordSymbols) {
+                var i = 0
+                while (i < symbols.size - 1) {
+                    if (symbols[i] == bestPair.first && symbols[i + 1] == bestPair.second) {
+                        symbols[i] = combined
+                        symbols.removeAt(i + 1)
+                    } else {
+                        i++
+                    }
+                }
+            }
+        }
+
+        return vocabSize
+    }
+
+    private fun encodeLearnedBpe(cleanText: String, autoRegister: Boolean): List<Int> {
+        val n = cleanText.length
+        val result = ArrayList<Int>(minOf(n, 256))
+        var i = 0
+
+        while (i < n) {
+            val c = cleanText[i]
+
+            // 1. Special tokens
+            if (c == '<') {
+                var matched = false
+                for (sp in SPECIAL_TOKENS) {
+                    if (cleanText.startsWith(sp, i)) {
+                        result.add(tokenToId[sp] ?: UNK_ID)
+                        i += sp.length
+                        matched = true
+                        break
+                    }
+                }
+                if (matched) continue
+            }
+
+            // Find next special token or end of text
+            var segmentEnd = n
+            for (sp in SPECIAL_TOKENS) {
+                val spIdx = cleanText.indexOf(sp, i)
+                if (spIdx in i until segmentEnd) {
+                    segmentEnd = spIdx
+                }
+            }
+            val segment = cleanText.substring(i, segmentEnd)
+            i = segmentEnd
+
+            // Split segment into initial code point pieces
+            val pieces = mutableListOf<String>()
+            var segIdx = 0
+            while (segIdx < segment.length) {
+                val cp = Character.codePointAt(segment, segIdx)
+                val len = Character.charCount(cp)
+                pieces.add(segment.substring(segIdx, segIdx + len))
+                segIdx += len
+            }
+
+            // Apply BPE merges greedily by priority rank
+            if (merges.isNotEmpty()) {
+                while (pieces.size >= 2) {
+                    var minRank = Int.MAX_VALUE
+                    var bestIdx = -1
+
+                    for (pIdx in 0 until pieces.size - 1) {
+                        val pair = pieces[pIdx] to pieces[pIdx + 1]
+                        val rank = mergeRanks[pair]
+                        if (rank != null && rank < minRank) {
+                            minRank = rank
+                            bestIdx = pIdx
+                        }
+                    }
+
+                    if (bestIdx == -1) break
+
+                    val mergedPiece = pieces[bestIdx] + pieces[bestIdx + 1]
+                    pieces[bestIdx] = mergedPiece
+                    pieces.removeAt(bestIdx + 1)
+                }
+            }
+
+            // Convert pieces to token IDs
+            for (piece in pieces) {
+                if (piece == "~") {
+                    val tildeId = tokenToId["~"] ?: UNK_ID
+                    result.add(tildeId)
+                    result.add(tildeId)
+                    continue
+                }
+
+                val id = tokenToId[piece]
+                if (id != null) {
+                    result.add(id)
+                } else if (autoRegister) {
+                    result.add(runCatching { registerToken(piece) }.getOrDefault(UNK_ID))
+                } else {
+                    var pieceIdx = 0
+                    while (pieceIdx < piece.length) {
+                        val cp = Character.codePointAt(piece, pieceIdx)
+                        val len = Character.charCount(cp)
+                        val charStr = piece.substring(pieceIdx, pieceIdx + len)
+                        val charId = tokenToId[charStr]
+                        if (charId != null) {
+                            result.add(charId)
+                        } else {
+                            val codePointMarker = "~u{${cp.toString(16).uppercase(java.util.Locale.ROOT)}}~"
+                            for (markerChar in codePointMarker) {
+                                result.add(tokenToId[markerChar.toString()] ?: UNK_ID)
+                            }
+                        }
+                        pieceIdx += len
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+
     fun encode(text: String, autoRegister: Boolean = false): List<Int> {
         val cleanText = TextModalityProcessor.normalizeTypography(text)
         val n = cleanText.length
         if (n == 0) return emptyList()
+
+        if (config.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1) {
+            return encodeLearnedBpe(cleanText, autoRegister)
+        }
 
         val result = ArrayList<Int>(minOf(n, 256))
         val localMaxLen = maxRegisteredLen.coerceIn(1, config.maxTokenLength)

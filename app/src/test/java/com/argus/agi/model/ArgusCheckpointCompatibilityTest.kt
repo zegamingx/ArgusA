@@ -148,6 +148,136 @@ class ArgusCheckpointCompatibilityTest {
         }
     }
 
+    @Test
+    fun arg4MultiLayerRoundTripRestoresAllTransformerBlocks() {
+        val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
+        val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
+
+        try {
+            checkpoint.delete()
+            val engineConfig = EngineConfig(
+                layerCount = 2,
+                dModel = 16,
+                nHeads = 4,
+                dFf = 32,
+                maxSeqLen = 16,
+                loraRank = 2,
+                tokenizerConfig = TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32)
+            )
+            val original = ArgusNeuralEngine.createBlocking(context, engineConfig)
+            assertEquals(2, original.layerCount)
+            assertEquals(2, original.architectureConfig.layerCount)
+
+            original.blocks[1].wDown[0] = 3.14159f
+            assertTrue(original.saveCheckpoint())
+
+            val restoredConfig = ArgusNeuralEngine.resolveConfig(
+                context = context,
+                totalRamGb = 2,
+                maxHeapMb = 128L,
+                availableRamGb = 1.0f
+            )
+            assertEquals(2, restoredConfig.layerCount)
+
+            val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
+            assertTrue(restored.loadCheckpointIfExists())
+            assertEquals(2, restored.layerCount)
+            assertEquals(3.14159f, restored.blocks[1].wDown[0], 1e-6f)
+            assertEquals(original.countTotalParameters(), restored.countTotalParameters())
+        } finally {
+            restoreCheckpoint(checkpoint, previousCheckpoint)
+        }
+    }
+
+    @Test
+    fun learnedBpeTokenizerTrainsMergesAndPersistsInArg4Checkpoint() {
+        val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
+        val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
+
+        try {
+            checkpoint.delete()
+            val tokenizerConfig = TokenizerConfig(
+                algorithm = ArgusTokenizerAlgorithm.LEARNED_BPE_V1,
+                maxVocabularySize = 512,
+                maxTokenLength = 32
+            )
+            val engineConfig = EngineConfig(
+                layerCount = 2,
+                dModel = 16,
+                nHeads = 4,
+                dFf = 32,
+                maxSeqLen = 16,
+                loraRank = 2,
+                tokenizerConfig = tokenizerConfig
+            )
+            val original = ArgusNeuralEngine.createBlocking(context, engineConfig)
+            val corpus = listOf(
+                "argus neural engine learned bpe tokenizer merge test",
+                "learned bpe tokenizer creates merge pairs from frequency",
+                "argus neural engine learned bpe training"
+            )
+            val trainedMerges = original.tokenizer.trainBpe(corpus, targetVocabSize = original.tokenizer.vocabSize + 10)
+            assertTrue(trainedMerges > 0)
+            val originalMerges = original.tokenizer.exportMerges()
+            assertTrue(originalMerges.isNotEmpty())
+
+            assertTrue(original.saveCheckpoint())
+
+            val restoredConfig = ArgusNeuralEngine.resolveConfig(
+                context = context,
+                totalRamGb = 2,
+                maxHeapMb = 128L,
+                availableRamGb = 1.0f
+            )
+            assertEquals(ArgusTokenizerAlgorithm.LEARNED_BPE_V1, restoredConfig.tokenizerConfig.algorithm)
+
+            val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
+            assertTrue(restored.loadCheckpointIfExists())
+            val restoredMerges = restored.tokenizer.exportMerges()
+            assertEquals(originalMerges, restoredMerges)
+
+            val sampleText = "argus neural engine"
+            assertEquals(original.tokenizer.encode(sampleText), restored.tokenizer.encode(sampleText))
+        } finally {
+            restoreCheckpoint(checkpoint, previousCheckpoint)
+        }
+    }
+
+    @Test
+    fun multiLayerEngineGeneratesAndTrainsWithoutError() {
+        val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
+        val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
+
+        try {
+            checkpoint.delete()
+            val engineConfig = EngineConfig(
+                layerCount = 3,
+                dModel = 16,
+                nHeads = 4,
+                dFf = 32,
+                maxSeqLen = 16,
+                loraRank = 2,
+                isFullTrainingEnabled = true,
+                tokenizerConfig = TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32)
+            )
+            val engine = ArgusNeuralEngine.createBlocking(context, engineConfig)
+            assertEquals(3, engine.layerCount)
+
+            val generated = kotlinx.coroutines.runBlocking {
+                engine.generate("test prompt", maxNewTokens = 4, temperature = 0.5f)
+            }
+            assertTrue(generated.isNotEmpty())
+
+            val initialLoss = engine.trainStep(
+                text = "argus multi layer transformer training validation"
+            )
+            assertTrue(initialLoss > 0f)
+            assertTrue(initialLoss.isFinite())
+        } finally {
+            restoreCheckpoint(checkpoint, previousCheckpoint)
+        }
+    }
+
     private fun smallEngineConfig(tokenizerConfig: TokenizerConfig): EngineConfig =
         EngineConfig(
             dModel = 16,

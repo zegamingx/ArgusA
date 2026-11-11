@@ -39,6 +39,7 @@ data class EngineConfig(
     val dFf: Int = 512,
     val maxSeqLen: Int = 128,
     val loraRank: Int = 4,
+    val layerCount: Int = 1,
     val isFullTrainingEnabled: Boolean = true,
     val tokenizerConfig: TokenizerConfig = TokenizerConfig()
 ) {
@@ -52,13 +53,16 @@ data class EngineConfig(
         require(loraRank in 1..dModel) {
             "loraRank must be between one and dModel."
         }
+        require(layerCount in 1..32) {
+            "layerCount must be between 1 and 32."
+        }
 
         // This FP32 training engine still uses JVM arrays. Reject checkpoint
         // metadata that would overflow array indexes or exceed the app heap.
         val hidden = dModel.toLong()
         val feedForward = dFf.toLong()
         val estimatedArchitecture = ArgusArchitectureConfig(
-            layerCount = 1,
+            layerCount = layerCount,
             hiddenSize = dModel,
             attentionHeadCount = nHeads,
             feedForwardSize = dFf,
@@ -111,7 +115,7 @@ data class EngineConfig(
                 "Balanced Neural Core"
             else ->
                 "Compact Neural Core"
-        } + " (d_model $dModel, d_ff $dFf, context $maxSeqLen, LoRA rank $loraRank)"
+        } + " (${layerCount}L, d_model $dModel, d_ff $dFf, context $maxSeqLen, LoRA rank $loraRank)"
 
     companion object {
         /**
@@ -176,6 +180,7 @@ class ArgusNeuralEngine private constructor(
     val dFf = config.dFf
     val maxSeqLen = config.maxSeqLen
     val loraRank = config.loraRank
+    val layerCount = config.layerCount
     val isFullTrainingEnabled = config.isFullTrainingEnabled
 
     val optimizerBackend: String
@@ -192,60 +197,100 @@ class ArgusNeuralEngine private constructor(
     private var wEmbed = FloatArray(vocabCap * dModel)
     private val wPos = FloatArray(maxSeqLen * dModel)
 
-    // Attention Projection Weights
-    private val wQ = FloatArray(dModel * dModel)
-    private val wK = FloatArray(dModel * dModel)
-    private val wV = FloatArray(dModel * dModel)
-    private val wO = FloatArray(dModel * dModel)
-
-    // LoRA Adapter Matrices
-    private val loraQa = FloatArray(dModel * loraRank)
-    private val loraQb = FloatArray(loraRank * dModel)
-    private val loraVa = FloatArray(dModel * loraRank)
-    private val loraVb = FloatArray(loraRank * dModel)
-
-    // SwiGLU MLP Weights
-    private val wGate = FloatArray(dModel * dFf)
-    private val wUp = FloatArray(dModel * dFf)
-    private val wDown = FloatArray(dFf * dModel)
-
     // LM Output Head
     private var wHead = FloatArray(vocabCap * dModel)
 
-    // =====================================================================
-    // Adam Optimizer State (1st and 2nd Moments for Full Backprop)
-    // =====================================================================
+    // LM and Embedding Optimizer Moments
     private var mHead = FloatArray(vocabCap * dModel)
     private var vHead = FloatArray(vocabCap * dModel)
     private var mEmbed = FloatArray(vocabCap * dModel)
     private var vEmbed = FloatArray(vocabCap * dModel)
 
-    // LoRA Moments
-    private val mLoraQa = FloatArray(dModel * loraRank)
-    private val vLoraQa = FloatArray(dModel * loraRank)
-    private val mLoraQb = FloatArray(loraRank * dModel)
-    private val vLoraQb = FloatArray(loraRank * dModel)
-    private val mLoraVa = FloatArray(dModel * loraRank)
-    private val vLoraVa = FloatArray(dModel * loraRank)
-    private val mLoraVb = FloatArray(loraRank * dModel)
-    private val vLoraVb = FloatArray(loraRank * dModel)
+    internal class TransformerBlock(
+        val layerIndex: Int,
+        dModel: Int,
+        dFf: Int,
+        loraRank: Int
+    ) {
+        val wQ = FloatArray(dModel * dModel)
+        val wK = FloatArray(dModel * dModel)
+        val wV = FloatArray(dModel * dModel)
+        val wO = FloatArray(dModel * dModel)
 
-    // Full Transformer Layer Moments
-    private val mWQ = FloatArray(dModel * dModel)
-    private val vWQ = FloatArray(dModel * dModel)
-    private val mWK = FloatArray(dModel * dModel)
-    private val vWK = FloatArray(dModel * dModel)
-    private val mWV = FloatArray(dModel * dModel)
-    private val vWV = FloatArray(dModel * dModel)
-    private val mWO = FloatArray(dModel * dModel)
-    private val vWO = FloatArray(dModel * dModel)
+        val loraQa = FloatArray(dModel * loraRank)
+        val loraQb = FloatArray(loraRank * dModel)
+        val loraVa = FloatArray(dModel * loraRank)
+        val loraVb = FloatArray(loraRank * dModel)
 
-    private val mWGate = FloatArray(dModel * dFf)
-    private val vWGate = FloatArray(dModel * dFf)
-    private val mWUp = FloatArray(dModel * dFf)
-    private val vWUp = FloatArray(dModel * dFf)
-    private val mWDown = FloatArray(dFf * dModel)
-    private val vWDown = FloatArray(dFf * dModel)
+        val wGate = FloatArray(dModel * dFf)
+        val wUp = FloatArray(dModel * dFf)
+        val wDown = FloatArray(dFf * dModel)
+
+        val mWQ = FloatArray(dModel * dModel)
+        val vWQ = FloatArray(dModel * dModel)
+        val mWK = FloatArray(dModel * dModel)
+        val vWK = FloatArray(dModel * dModel)
+        val mWV = FloatArray(dModel * dModel)
+        val vWV = FloatArray(dModel * dModel)
+        val mWO = FloatArray(dModel * dModel)
+        val vWO = FloatArray(dModel * dModel)
+
+        val mLoraQa = FloatArray(dModel * loraRank)
+        val vLoraQa = FloatArray(dModel * loraRank)
+        val mLoraQb = FloatArray(loraRank * dModel)
+        val vLoraQb = FloatArray(loraRank * dModel)
+        val mLoraVa = FloatArray(dModel * loraRank)
+        val vLoraVa = FloatArray(dModel * loraRank)
+        val mLoraVb = FloatArray(loraRank * dModel)
+        val vLoraVb = FloatArray(loraRank * dModel)
+
+        val mWGate = FloatArray(dModel * dFf)
+        val vWGate = FloatArray(dModel * dFf)
+        val mWUp = FloatArray(dModel * dFf)
+        val vWUp = FloatArray(dModel * dFf)
+        val mWDown = FloatArray(dFf * dModel)
+        val vWDown = FloatArray(dFf * dModel)
+    }
+
+    internal val blocks: Array<TransformerBlock> = Array(layerCount) { layerIndex ->
+        TransformerBlock(layerIndex, dModel, dFf, loraRank)
+    }
+
+    // Layer 0 delegates for compatibility & single-layer callers
+    val wQ get() = blocks[0].wQ
+    val wK get() = blocks[0].wK
+    val wV get() = blocks[0].wV
+    val wO get() = blocks[0].wO
+    val loraQa get() = blocks[0].loraQa
+    val loraQb get() = blocks[0].loraQb
+    val loraVa get() = blocks[0].loraVa
+    val loraVb get() = blocks[0].loraVb
+    val wGate get() = blocks[0].wGate
+    val wUp get() = blocks[0].wUp
+    val wDown get() = blocks[0].wDown
+
+    val mWQ get() = blocks[0].mWQ
+    val vWQ get() = blocks[0].vWQ
+    val mWK get() = blocks[0].mWK
+    val vWK get() = blocks[0].vWK
+    val mWV get() = blocks[0].mWV
+    val vWV get() = blocks[0].vWV
+    val mWO get() = blocks[0].mWO
+    val vWO get() = blocks[0].vWO
+    val mLoraQa get() = blocks[0].mLoraQa
+    val vLoraQa get() = blocks[0].vLoraQa
+    val mLoraQb get() = blocks[0].mLoraQb
+    val vLoraQb get() = blocks[0].vLoraQb
+    val mLoraVa get() = blocks[0].mLoraVa
+    val vLoraVa get() = blocks[0].vLoraVa
+    val mLoraVb get() = blocks[0].mLoraVb
+    val vLoraVb get() = blocks[0].vLoraVb
+    val mWGate get() = blocks[0].mWGate
+    val vWGate get() = blocks[0].vWGate
+    val mWUp get() = blocks[0].mWUp
+    val vWUp get() = blocks[0].vWUp
+    val mWDown get() = blocks[0].mWDown
+    val vWDown get() = blocks[0].vWDown
 
     private var adamStep = 0
     private val weightDecay = 0.01f
@@ -411,8 +456,8 @@ class ArgusNeuralEngine private constructor(
             require(architectureIdLength in 1..512) {
                 "ARG4 architecture ID length is invalid."
             }
-            require(layerCount == 1) {
-                "This engine version can restore one Transformer block only."
+            require(layerCount in 1..32) {
+                "ARG4 layer count is invalid: $layerCount."
             }
             require(savedVocabSize > 0) {
                 "ARG4 vocabulary size is invalid."
@@ -423,8 +468,8 @@ class ArgusNeuralEngine private constructor(
             require(vocabularyEntryCount in 1..tokenizerMaxVocab) {
                 "ARG4 vocabulary entry count is invalid."
             }
-            require(tensorCount in 1..128) {
-                "ARG4 tensor count is invalid."
+            require(tensorCount in 1..2048) {
+                "ARG4 tensor count is invalid: $tensorCount."
             }
             require(payloadBytes >= architectureIdLength.toLong()) {
                 "ARG4 payload length is invalid."
@@ -445,6 +490,7 @@ class ArgusNeuralEngine private constructor(
                 dFf = savedDFf,
                 maxSeqLen = savedMaxSeq,
                 loraRank = savedLoraRank,
+                layerCount = layerCount,
                 isFullTrainingEnabled = true,
                 tokenizerConfig = tokenizerConfig
             )
@@ -495,21 +541,24 @@ class ArgusNeuralEngine private constructor(
         }
 
         val stdAttn = 1.0f / sqrt(dModel.toFloat())
-        initFlatMatrix(wQ, dModel, dModel, stdAttn)
-        initFlatMatrix(wK, dModel, dModel, stdAttn)
-        initFlatMatrix(wV, dModel, dModel, stdAttn)
-        initFlatMatrix(wO, dModel, dModel, stdAttn)
-
         val stdLora = 1.0f / sqrt(loraRank.toFloat())
-        initFlatMatrix(loraQa, dModel, loraRank, stdLora)
-        loraQb.fill(0f)
-        initFlatMatrix(loraVa, dModel, loraRank, stdLora)
-        loraVb.fill(0f)
-
         val stdMlp = 1.0f / sqrt(dModel.toFloat())
-        initFlatMatrix(wGate, dModel, dFf, stdMlp)
-        initFlatMatrix(wUp, dModel, dFf, stdMlp)
-        initFlatMatrix(wDown, dFf, dModel, 1.0f / sqrt(dFf.toFloat()))
+
+        for (b in blocks) {
+            initFlatMatrix(b.wQ, dModel, dModel, stdAttn)
+            initFlatMatrix(b.wK, dModel, dModel, stdAttn)
+            initFlatMatrix(b.wV, dModel, dModel, stdAttn)
+            initFlatMatrix(b.wO, dModel, dModel, stdAttn)
+
+            initFlatMatrix(b.loraQa, dModel, loraRank, stdLora)
+            b.loraQb.fill(0f)
+            initFlatMatrix(b.loraVa, dModel, loraRank, stdLora)
+            b.loraVb.fill(0f)
+
+            initFlatMatrix(b.wGate, dModel, dFf, stdMlp)
+            initFlatMatrix(b.wUp, dModel, dFf, stdMlp)
+            initFlatMatrix(b.wDown, dFf, dModel, 1.0f / sqrt(dFf.toFloat()))
+        }
 
         val stdHead = 1.0f / sqrt(dModel.toFloat())
         for (i in wHead.indices) wHead[i] = (Random.nextFloat() * 2f - 1f) * stdHead
@@ -523,11 +572,13 @@ class ArgusNeuralEngine private constructor(
     }
 
     /**
-     * Architecture metadata exposed by the active legacy engine.
-     * The current execution graph is a single Transformer block.
+     * Architecture metadata exposed by the active engine.
      */
     val architectureConfig: ArgusArchitectureConfig
-        get() = config.toArgusArchitectureConfig(tokenizer.vocabSize)
+        get() = config.toArgusArchitectureConfig(
+            vocabularySize = tokenizer.vocabSize,
+            layerCount = layerCount
+        )
 
     val parameterBreakdown: ArgusParameterBreakdown
         get() = ArgusArchitectureParameterEstimator.estimate(architectureConfig)
@@ -544,7 +595,7 @@ class ArgusNeuralEngine private constructor(
         parameterBreakdown.totalTrainableParameters
 
     fun calculateAdapterSizeBytes(): Long =
-        ((dModel * loraRank + loraRank * dModel) * 2).toLong() * 4L
+        ((dModel * loraRank + loraRank * dModel) * 2).toLong() * 4L * layerCount.toLong()
 
     // =====================================================================
     // Vocab Capacity Management
@@ -617,16 +668,17 @@ class ArgusNeuralEngine private constructor(
             val currentTokens = effective.toMutableList()
             val generatedTokens = mutableListOf<Int>()
 
-            val kCache = FloatArray(maxSeqLen * dModel)
-            val vCache = FloatArray(maxSeqLen * dModel)
+            val kCache = Array(layerCount) { FloatArray(maxSeqLen * dModel) }
+            val vCache = Array(layerCount) { FloatArray(maxSeqLen * dModel) }
 
             val initialLen = currentTokens.size
-            val x = FloatArray(dModel)
+            val hidden = FloatArray(dModel)
             val q = FloatArray(dModel)
             val k = FloatArray(dModel)
             val v = FloatArray(dModel)
             val loraMid = FloatArray(loraRank)
             val attnOut = FloatArray(dModel)
+            val projBuf = FloatArray(dModel)
             val h1 = FloatArray(dModel)
             val gate = FloatArray(dFf)
             val up = FloatArray(dFf)
@@ -637,13 +689,66 @@ class ArgusNeuralEngine private constructor(
 
             val embedScale = sqrt(dModel.toFloat())
 
-            // Prefill: K,V untuk semua posisi prompt
+            // Prefill: K,V untuk semua posisi prompt dan aktivasi multi-layer
             for (pos in 0 until initialLen) {
-                computeTokenEmbedAndPos(currentTokens[pos], pos, embedScale, x)
-                computeLinear(x, wK, dModel, dModel, k)
-                System.arraycopy(k, 0, kCache, pos * dModel, dModel)
-                computeLinearWithLora(x, wV, loraVa, loraVb, dModel, dModel, loraRank, loraMid, v)
-                System.arraycopy(v, 0, vCache, pos * dModel, dModel)
+                computeTokenEmbedAndPos(currentTokens[pos], pos, embedScale, hidden)
+                for (layer in 0 until layerCount) {
+                    val b = blocks[layer]
+                    computeLinear(hidden, b.wK, dModel, dModel, k)
+                    System.arraycopy(k, 0, kCache[layer], pos * dModel, dModel)
+                    computeLinearWithLora(hidden, b.wV, b.loraVa, b.loraVb, dModel, dModel, loraRank, loraMid, v)
+                    System.arraycopy(v, 0, vCache[layer], pos * dModel, dModel)
+
+                    computeLinearWithLora(hidden, b.wQ, b.loraQa, b.loraQb, dModel, dModel, loraRank, loraMid, q)
+
+                    attnOut.fill(0f)
+                    val seqSoFar = pos + 1
+                    val scores = FloatArray(seqSoFar)
+
+                    for (h in 0 until nHeads) {
+                        val hOffset = h * headDim
+                        var maxScore = -Float.MAX_VALUE
+                        for (j in 0 until seqSoFar) {
+                            var dot = 0f
+                            val kOffset = j * dModel + hOffset
+                            for (d in 0 until headDim) dot += q[hOffset + d] * kCache[layer][kOffset + d]
+                            val sc = dot * scale
+                            scores[j] = sc
+                            if (sc > maxScore) maxScore = sc
+                        }
+                        var sumExp = 0f
+                        for (j in 0 until seqSoFar) {
+                            val e = exp(scores[j] - maxScore)
+                            scores[j] = e; sumExp += e
+                        }
+                        val invSum = 1.0f / max(sumExp, 1e-9f)
+                        for (j in 0 until seqSoFar) scores[j] *= invSum
+
+                        for (d in 0 until headDim) {
+                            var weightedV = 0f
+                            for (j in 0 until seqSoFar) {
+                                val vOffset = j * dModel + hOffset
+                                weightedV += scores[j] * vCache[layer][vOffset + d]
+                            }
+                            attnOut[hOffset + d] = weightedV
+                        }
+                    }
+
+                    computeLinear(attnOut, b.wO, dModel, dModel, projBuf)
+                    for (d in 0 until dModel) h1[d] = hidden[d] + projBuf[d]
+                    layerNormInPlace(h1, dModel)
+
+                    computeLinear(h1, b.wGate, dModel, dFf, gate)
+                    computeLinear(h1, b.wUp, dModel, dFf, up)
+                    for (d in 0 until dFf) {
+                        val sig = 1.0f / (1.0f + exp(-gate[d]))
+                        act[d] = (gate[d] * sig) * up[d]
+                    }
+                    computeLinear(act, b.wDown, dFf, dModel, down)
+                    for (d in 0 until dModel) h2[d] = h1[d] + down[d]
+                    layerNormInPlace(h2, dModel)
+                    System.arraycopy(h2, 0, hidden, 0, dModel)
+                }
             }
 
             // Decode loop
@@ -652,69 +757,72 @@ class ArgusNeuralEngine private constructor(
                 if (currentPos >= maxSeqLen - 1) break
 
                 val lastTok = currentTokens[currentPos]
-                computeTokenEmbedAndPos(lastTok, currentPos, embedScale, x)
+                computeTokenEmbedAndPos(lastTok, currentPos, embedScale, hidden)
 
-                computeLinearWithLora(x, wQ, loraQa, loraQb, dModel, dModel, loraRank, loraMid, q)
-
-                if (step > 0) {
-                    computeLinear(x, wK, dModel, dModel, k)
-                    System.arraycopy(k, 0, kCache, currentPos * dModel, dModel)
-                    computeLinearWithLora(x, wV, loraVa, loraVb, dModel, dModel, loraRank, loraMid, v)
-                    System.arraycopy(v, 0, vCache, currentPos * dModel, dModel)
-                }
-
-                attnOut.fill(0f)
-                val seqSoFar = currentPos + 1
-                val scores = FloatArray(seqSoFar)
-
-                for (h in 0 until nHeads) {
-                    val hOffset = h * headDim
-                    var maxScore = -Float.MAX_VALUE
-                    for (j in 0 until seqSoFar) {
-                        var dot = 0f
-                        val kOffset = j * dModel + hOffset
-                        for (d in 0 until headDim) dot += q[hOffset + d] * kCache[kOffset + d]
-                        val sc = dot * scale
-                        scores[j] = sc
-                        if (sc > maxScore) maxScore = sc
+                for (layer in 0 until layerCount) {
+                    val b = blocks[layer]
+                    if (step > 0) {
+                        computeLinear(hidden, b.wK, dModel, dModel, k)
+                        System.arraycopy(k, 0, kCache[layer], currentPos * dModel, dModel)
+                        computeLinearWithLora(hidden, b.wV, b.loraVa, b.loraVb, dModel, dModel, loraRank, loraMid, v)
+                        System.arraycopy(v, 0, vCache[layer], currentPos * dModel, dModel)
                     }
-                    var sumExp = 0f
-                    for (j in 0 until seqSoFar) {
-                        val e = exp(scores[j] - maxScore)
-                        scores[j] = e; sumExp += e
-                    }
-                    val invSum = 1.0f / max(sumExp, 1e-9f)
-                    for (j in 0 until seqSoFar) scores[j] *= invSum
 
-                    for (d in 0 until headDim) {
-                        var weightedV = 0f
+                    computeLinearWithLora(hidden, b.wQ, b.loraQa, b.loraQb, dModel, dModel, loraRank, loraMid, q)
+
+                    attnOut.fill(0f)
+                    val seqSoFar = currentPos + 1
+                    val scores = FloatArray(seqSoFar)
+
+                    for (h in 0 until nHeads) {
+                        val hOffset = h * headDim
+                        var maxScore = -Float.MAX_VALUE
                         for (j in 0 until seqSoFar) {
-                            val vOffset = j * dModel + hOffset
-                            weightedV += scores[j] * vCache[vOffset + d]
+                            var dot = 0f
+                            val kOffset = j * dModel + hOffset
+                            for (d in 0 until headDim) dot += q[hOffset + d] * kCache[layer][kOffset + d]
+                            val sc = dot * scale
+                            scores[j] = sc
+                            if (sc > maxScore) maxScore = sc
                         }
-                        attnOut[hOffset + d] = weightedV
+                        var sumExp = 0f
+                        for (j in 0 until seqSoFar) {
+                            val e = exp(scores[j] - maxScore)
+                            scores[j] = e; sumExp += e
+                        }
+                        val invSum = 1.0f / max(sumExp, 1e-9f)
+                        for (j in 0 until seqSoFar) scores[j] *= invSum
+
+                        for (d in 0 until headDim) {
+                            var weightedV = 0f
+                            for (j in 0 until seqSoFar) {
+                                val vOffset = j * dModel + hOffset
+                                weightedV += scores[j] * vCache[layer][vOffset + d]
+                            }
+                            attnOut[hOffset + d] = weightedV
+                        }
                     }
-                }
 
-                val projBuf = FloatArray(dModel)
-                computeLinear(attnOut, wO, dModel, dModel, projBuf)
-                for (d in 0 until dModel) h1[d] = x[d] + projBuf[d]
-                layerNormInPlace(h1, dModel)
+                    computeLinear(attnOut, b.wO, dModel, dModel, projBuf)
+                    for (d in 0 until dModel) h1[d] = hidden[d] + projBuf[d]
+                    layerNormInPlace(h1, dModel)
 
-                computeLinear(h1, wGate, dModel, dFf, gate)
-                computeLinear(h1, wUp, dModel, dFf, up)
-                for (d in 0 until dFf) {
-                    val sig = 1.0f / (1.0f + exp(-gate[d]))
-                    act[d] = (gate[d] * sig) * up[d]
+                    computeLinear(h1, b.wGate, dModel, dFf, gate)
+                    computeLinear(h1, b.wUp, dModel, dFf, up)
+                    for (d in 0 until dFf) {
+                        val sig = 1.0f / (1.0f + exp(-gate[d]))
+                        act[d] = (gate[d] * sig) * up[d]
+                    }
+                    computeLinear(act, b.wDown, dFf, dModel, down)
+                    for (d in 0 until dModel) h2[d] = h1[d] + down[d]
+                    layerNormInPlace(h2, dModel)
+                    System.arraycopy(h2, 0, hidden, 0, dModel)
                 }
-                computeLinear(act, wDown, dFf, dModel, down)
-                for (d in 0 until dModel) h2[d] = h1[d] + down[d]
-                layerNormInPlace(h2, dModel)
 
                 for (vIdx in 0 until currentVocab) {
                     var sum = 0f
                     val wOff = vIdx * dModel
-                    for (d in 0 until dModel) sum += h2[d] * wHead[wOff + d]
+                    for (d in 0 until dModel) sum += hidden[d] * wHead[wOff + d]
                     logits[vIdx] = sum
                 }
 
@@ -914,25 +1022,41 @@ class ArgusNeuralEngine private constructor(
         )
     }
 
-    private fun gradientParameterArray(parameterName: String): FloatArray = when (parameterName) {
-        "wHead" -> wHead
-        "wEmbed" -> wEmbed
-        "wDown" -> wDown
-        "wUp" -> wUp
-        "wGate" -> wGate
-        "wO" -> wO
-        "wQ" -> wQ
-        "wK" -> wK
-        "wV" -> wV
-        "loraQa" -> loraQa
-        "loraQb" -> loraQb
-        "loraVa" -> loraVa
-        "loraVb" -> loraVb
-        else -> throw IllegalArgumentException("Unsupported gradient-check parameter: $parameterName")
+    private fun gradientParameterArray(parameterName: String): FloatArray {
+        if (parameterName == "wHead") return wHead
+        if (parameterName == "wEmbed") return wEmbed
+
+        val (targetLayer, simpleName) = if (parameterName.startsWith("layers.")) {
+            val parts = parameterName.split(".", limit = 3)
+            val layerIdx = parts[1].toIntOrNull()
+                ?: throw IllegalArgumentException("Invalid layer index in parameter: $parameterName")
+            require(layerIdx in 0 until layerCount) {
+                "Layer index $layerIdx out of range for $layerCount layers."
+            }
+            layerIdx to parts[2]
+        } else {
+            0 to parameterName
+        }
+
+        val b = blocks[targetLayer]
+        return when (simpleName) {
+            "wDown", "feed_forward.down.weight" -> b.wDown
+            "wUp", "feed_forward.up.weight" -> b.wUp
+            "wGate", "feed_forward.gate.weight" -> b.wGate
+            "wO", "attention.output.weight" -> b.wO
+            "wQ", "attention.query.weight" -> b.wQ
+            "wK", "attention.key.weight" -> b.wK
+            "wV", "attention.value.weight" -> b.wV
+            "loraQa", "adapter.q.a" -> b.loraQa
+            "loraQb", "adapter.q.b" -> b.loraQb
+            "loraVa", "adapter.v.a" -> b.loraVa
+            "loraVb", "adapter.v.b" -> b.loraVb
+            else -> throw IllegalArgumentException("Unsupported gradient-check parameter: $parameterName")
+        }
     }
 
     fun trainStep(text: String): Float {
-        var pendingSnapshot: ByteArray? = null
+        var shouldSaveCheckpoint = false
         val loss = synchronized(modelLock) {
             // Keep token IDs stable while training; unknown Unicode uses the tokenizer's deterministic Unicode escape.
             val tokens = tokenizer.encode(text, autoRegister = false)
@@ -975,12 +1099,12 @@ class ArgusNeuralEngine private constructor(
                 if (trainedTargets > 0) weightedLoss / trainedTargets else Float.NaN
             }
 
-            if (adamStep % CHECKPOINT_INTERVAL == 0) pendingSnapshot = buildCheckpointBytes()
+            if (adamStep % CHECKPOINT_INTERVAL == 0) shouldSaveCheckpoint = true
             result
         }
 
-        pendingSnapshot?.let { bytes ->
-            runCatching { writeBytesToDisk(bytes) }
+        if (shouldSaveCheckpoint) {
+            runCatching { saveCheckpoint() }
                 .onFailure { Log.e(TAG, "Auto-checkpoint save failed", it) }
         }
         return loss
@@ -1049,90 +1173,104 @@ class ArgusNeuralEngine private constructor(
 
         // ============================= FORWARD =============================
         val x = Array(seqLen) { FloatArray(dModel) }
-        val q = Array(seqLen) { FloatArray(dModel) }
-        val k = Array(seqLen) { FloatArray(dModel) }
-        val v = Array(seqLen) { FloatArray(dModel) }
-        val mQ = Array(seqLen) { FloatArray(loraRank) }
-        val mV = Array(seqLen) { FloatArray(loraRank) }
-        val attnOut = Array(seqLen) { FloatArray(dModel) }
-        val h1PreLN = Array(seqLen) { FloatArray(dModel) }
-        val h1 = Array(seqLen) { FloatArray(dModel) }
-        val gate = Array(seqLen) { FloatArray(dFf) }
-        val up = Array(seqLen) { FloatArray(dFf) }
-        val act = Array(seqLen) { FloatArray(dFf) }
-        val h2PreLN = Array(seqLen) { FloatArray(dModel) }
-        val h2 = Array(seqLen) { FloatArray(dModel) }
         val logits = Array(seqLen) { FloatArray(currentVocab) }
 
         for (t in 0 until seqLen) {
             computeTokenEmbedAndPos(seq[t], t, embedScale, x[t])
         }
 
-        computeBatchedLinear(
-            inputs = arrayOf(x, x, x),
-            weights = arrayOf(wQ, wK, wV),
-            outputs = arrayOf(q, k, v),
-            inputColumns = dModel,
-            outputColumns = dModel
-        )
-
-        for (t in 0 until seqLen) {
-            addLoraProjection(x[t], loraQa, loraQb, dModel, dModel, loraRank, mQ[t], q[t])
-            addLoraProjection(x[t], loraVa, loraVb, dModel, dModel, loraRank, mV[t], v[t])
+        class LayerForward(seqLen: Int, dModel: Int, dFf: Int, loraRank: Int, nHeads: Int) {
+            val q = Array(seqLen) { FloatArray(dModel) }
+            val k = Array(seqLen) { FloatArray(dModel) }
+            val v = Array(seqLen) { FloatArray(dModel) }
+            val mQ = Array(seqLen) { FloatArray(loraRank) }
+            val mV = Array(seqLen) { FloatArray(loraRank) }
+            val attnWeights = Array(nHeads) { Array(seqLen) { FloatArray(seqLen) } }
+            val attnOut = Array(seqLen) { FloatArray(dModel) }
+            val h1PreLN = Array(seqLen) { FloatArray(dModel) }
+            val h1 = Array(seqLen) { FloatArray(dModel) }
+            val gate = Array(seqLen) { FloatArray(dFf) }
+            val up = Array(seqLen) { FloatArray(dFf) }
+            val act = Array(seqLen) { FloatArray(dFf) }
+            val h2PreLN = Array(seqLen) { FloatArray(dModel) }
+            val h2 = Array(seqLen) { FloatArray(dModel) }
         }
 
-        val attnWeights = attnWeightsCache
-        for (h in 0 until nHeads) {
-            val hOffset = h * headDim
-            for (i in 0 until seqLen) {
-                var maxScore = -Float.MAX_VALUE
-                for (j in 0..i) {
-                    var dot = 0f
-                    for (d in 0 until headDim) dot += q[i][hOffset + d] * k[j][hOffset + d]
-                    val sc = dot * scale
-                    attnWeights[h][i][j] = sc
-                    if (sc > maxScore) maxScore = sc
+        val layerForwards = Array(layerCount) {
+            LayerForward(seqLen, dModel, dFf, loraRank, nHeads)
+        }
+
+        for (layer in 0 until layerCount) {
+            val b = blocks[layer]
+            val lf = layerForwards[layer]
+            val layerInput = if (layer == 0) x else layerForwards[layer - 1].h2
+
+            computeBatchedLinear(
+                inputs = arrayOf(layerInput, layerInput, layerInput),
+                weights = arrayOf(b.wQ, b.wK, b.wV),
+                outputs = arrayOf(lf.q, lf.k, lf.v),
+                inputColumns = dModel,
+                outputColumns = dModel
+            )
+
+            for (t in 0 until seqLen) {
+                addLoraProjection(layerInput[t], b.loraQa, b.loraQb, dModel, dModel, loraRank, lf.mQ[t], lf.q[t])
+                addLoraProjection(layerInput[t], b.loraVa, b.loraVb, dModel, dModel, loraRank, lf.mV[t], lf.v[t])
+            }
+
+            for (h in 0 until nHeads) {
+                val hOffset = h * headDim
+                for (i in 0 until seqLen) {
+                    var maxScore = -Float.MAX_VALUE
+                    for (j in 0..i) {
+                        var dot = 0f
+                        for (d in 0 until headDim) dot += lf.q[i][hOffset + d] * lf.k[j][hOffset + d]
+                        val sc = dot * scale
+                        lf.attnWeights[h][i][j] = sc
+                        if (sc > maxScore) maxScore = sc
+                    }
+                    var sumExp = 0f
+                    for (j in 0..i) {
+                        val e = exp(lf.attnWeights[h][i][j] - maxScore)
+                        lf.attnWeights[h][i][j] = e; sumExp += e
+                    }
+                    val invSum = 1.0f / max(sumExp, 1e-9f)
+                    for (j in 0..i) lf.attnWeights[h][i][j] *= invSum
+                    for (d in 0 until headDim) {
+                        var weightedV = 0f
+                        for (j in 0..i) weightedV += lf.attnWeights[h][i][j] * lf.v[j][hOffset + d]
+                        lf.attnOut[i][hOffset + d] = weightedV
+                    }
                 }
-                var sumExp = 0f
-                for (j in 0..i) {
-                    val e = exp(attnWeights[h][i][j] - maxScore)
-                    attnWeights[h][i][j] = e; sumExp += e
+            }
+
+            computeLinearBatch(lf.attnOut, b.wO, dModel, dModel, lf.h1PreLN)
+            for (t in 0 until seqLen) {
+                for (d in 0 until dModel) lf.h1PreLN[t][d] += layerInput[t][d]
+                System.arraycopy(lf.h1PreLN[t], 0, lf.h1[t], 0, dModel)
+                layerNormInPlace(lf.h1[t], dModel)
+            }
+
+            computeLinearBatch(lf.h1, b.wGate, dModel, dFf, lf.gate)
+            computeLinearBatch(lf.h1, b.wUp, dModel, dFf, lf.up)
+            for (t in 0 until seqLen) {
+                for (d in 0 until dFf) {
+                    val sig = 1.0f / (1.0f + exp(-lf.gate[t][d]))
+                    lf.act[t][d] = (lf.gate[t][d] * sig) * lf.up[t][d]
                 }
-                val invSum = 1.0f / max(sumExp, 1e-9f)
-                for (j in 0..i) attnWeights[h][i][j] *= invSum
-                for (d in 0 until headDim) {
-                    var weightedV = 0f
-                    for (j in 0..i) weightedV += attnWeights[h][i][j] * v[j][hOffset + d]
-                    attnOut[i][hOffset + d] = weightedV
-                }
+            }
+
+            computeLinearBatch(lf.act, b.wDown, dFf, dModel, lf.h2PreLN)
+            for (t in 0 until seqLen) {
+                for (d in 0 until dModel) lf.h2PreLN[t][d] += lf.h1[t][d]
+                System.arraycopy(lf.h2PreLN[t], 0, lf.h2[t], 0, dModel)
+                layerNormInPlace(lf.h2[t], dModel)
             }
         }
 
-        computeLinearBatch(attnOut, wO, dModel, dModel, h1PreLN)
-        for (t in 0 until seqLen) {
-            for (d in 0 until dModel) h1PreLN[t][d] += x[t][d]
-            System.arraycopy(h1PreLN[t], 0, h1[t], 0, dModel)
-            layerNormInPlace(h1[t], dModel)
-        }
-
-        computeLinearBatch(h1, wGate, dModel, dFf, gate)
-        computeLinearBatch(h1, wUp, dModel, dFf, up)
-        for (t in 0 until seqLen) {
-            for (d in 0 until dFf) {
-                val sig = 1.0f / (1.0f + exp(-gate[t][d]))
-                act[t][d] = (gate[t][d] * sig) * up[t][d]
-            }
-        }
-
-        computeLinearBatch(act, wDown, dFf, dModel, h2PreLN)
-        for (t in 0 until seqLen) {
-            for (d in 0 until dModel) h2PreLN[t][d] += h1[t][d]
-            System.arraycopy(h2PreLN[t], 0, h2[t], 0, dModel)
-            layerNormInPlace(h2[t], dModel)
-        }
-
+        val lastHidden = layerForwards[layerCount - 1].h2
         computeLinearBatch(
-            inputs = h2,
+            inputs = lastHidden,
             weights = wHead,
             inputColumns = dModel,
             outputColumns = currentVocab,
@@ -1141,7 +1279,6 @@ class ArgusNeuralEngine private constructor(
         )
 
         // ============================ BACKWARD ============================
-        // Loss-only evaluation exits before allocating gradient or backpropagation buffers.
         if (!updateParameters && gradientProbe == null) {
             return computeCrossEntropyLoss(
                 logits = logits,
@@ -1157,33 +1294,27 @@ class ArgusNeuralEngine private constructor(
             "firstTargetIndex must identify at least one next-token target."
         }
 
-        // Backpropagation buffers are allocated only for optimizer updates or explicit diagnostics.
         val gradWHead = FloatArray(currentVocab * dModel)
         val gradWEmbed = FloatArray(vocabCap * dModel)
-        val gradWDown = FloatArray(dFf * dModel)
-        val gradWUp = FloatArray(dModel * dFf)
-        val gradWGate = FloatArray(dModel * dFf)
-        val gradWO = FloatArray(dModel * dModel)
-        val gradWQ = FloatArray(dModel * dModel)
-        val gradWK = FloatArray(dModel * dModel)
-        val gradWV = FloatArray(dModel * dModel)
 
-        val gradLoraQa = FloatArray(dModel * loraRank)
-        val gradLoraQb = FloatArray(loraRank * dModel)
-        val gradLoraVa = FloatArray(dModel * loraRank)
-        val gradLoraVb = FloatArray(loraRank * dModel)
+        class LayerGradients(dModel: Int, dFf: Int, loraRank: Int) {
+            val gradWDown = FloatArray(dFf * dModel)
+            val gradWUp = FloatArray(dModel * dFf)
+            val gradWGate = FloatArray(dModel * dFf)
+            val gradWO = FloatArray(dModel * dModel)
+            val gradWQ = FloatArray(dModel * dModel)
+            val gradWK = FloatArray(dModel * dModel)
+            val gradWV = FloatArray(dModel * dModel)
+            val gradLoraQa = FloatArray(dModel * loraRank)
+            val gradLoraQb = FloatArray(loraRank * dModel)
+            val gradLoraVa = FloatArray(dModel * loraRank)
+            val gradLoraVb = FloatArray(loraRank * dModel)
+        }
+        val layerGrads = Array(layerCount) { LayerGradients(dModel, dFf, loraRank) }
 
         val dLogits = Array(seqLen) { FloatArray(currentVocab) }
-        val dL_dh2PostLN = Array(seqLen) { FloatArray(dModel) }
-        val dL_dh2PreLN = Array(seqLen) { FloatArray(dModel) }
-        val dL_dh1PostLN = Array(seqLen) { FloatArray(dModel) }
-        val dL_dh1PreLN = Array(seqLen) { FloatArray(dModel) }
-        val dL_dattnOut = Array(seqLen) { FloatArray(dModel) }
-        val dQ = Array(seqLen) { FloatArray(dModel) }
-        val dK = Array(seqLen) { FloatArray(dModel) }
-        val dV = Array(seqLen) { FloatArray(dModel) }
 
-        // (1) Cross-Entropy & Gradient Accumulation for the Output Head.
+        // (1) Cross-Entropy & Gradient Accumulation for Output Head
         for (t in firstTargetIndex until seqLen - 1) {
             val target = seq[t + 1]
             if (target !in 0 until currentVocab) continue
@@ -1215,8 +1346,7 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
-        // Output-head backward is two matrix products:
-        // dHidden = dLogits × WHead and dWHead = transpose(dLogits) × hidden.
+        val dL_dh2PostLN = Array(seqLen) { FloatArray(dModel) }
         computeLinearBatch(
             inputs = dLogits,
             weights = wHead,
@@ -1228,7 +1358,7 @@ class ArgusNeuralEngine private constructor(
         val dLogitsByVocab = Array(currentVocab) { vocabIndex ->
             FloatArray(seqLen) { timeIndex -> dLogits[timeIndex][vocabIndex] }
         }
-        val hiddenRows = flattenRows(h2)
+        val hiddenRows = flattenRows(lastHidden)
         val gradWHeadRows = Array(currentVocab) { FloatArray(dModel) }
         computeLinearBatch(
             inputs = dLogitsByVocab,
@@ -1247,354 +1377,363 @@ class ArgusNeuralEngine private constructor(
             )
         }
 
-        // (2) SwiGLU MLP & Residual Backward
-        // The final sequence row has no next-token target, so its backward buffers
-        // remain zero. Keeping it in the batch preserves the original t < seqLen - 1
-        // gradient-accumulation boundary.
-        for (t in 0 until seqLen - 1) {
-            layerNormBackward(dL_dh2PostLN[t], h2PreLN[t], dL_dh2PreLN[t], dModel)
-        }
+        var incomingGrad = dL_dh2PostLN
 
-        // dAct = dL_dh2PreLN × transpose(wDown).
-        val dActRows = Array(seqLen) { FloatArray(dFf) }
-        computeLinearBatch(
-            inputs = dL_dh2PreLN,
-            weights = wDown,
-            inputColumns = dModel,
-            outputColumns = dFf,
-            outputs = dActRows,
-            transposeWeights = true
-        )
+        // (2) Reverse Backpropagation through Transformer Blocks
+        for (layer in layerCount - 1 downTo 0) {
+            val b = blocks[layer]
+            val lf = layerForwards[layer]
+            val lg = layerGrads[layer]
+            val layerInput = if (layer == 0) x else layerForwards[layer - 1].h2
 
-        val dUpRows = Array(seqLen) { FloatArray(dFf) }
-        val dGateRows = Array(seqLen) { FloatArray(dFf) }
-        for (t in 0 until seqLen - 1) {
-            for (dimension in 0 until dFf) {
-                val sigmoid = 1.0f / (1.0f + exp(-gate[t][dimension]))
-                val swish = gate[t][dimension] * sigmoid
-                val dActValue = dActRows[t][dimension]
-                dUpRows[t][dimension] = dActValue * swish
-                val dSwish = dActValue * up[t][dimension]
-                dGateRows[t][dimension] =
-                    dSwish * (sigmoid * (1f + gate[t][dimension] * (1f - sigmoid)))
+            val dL_dh2PreLN = Array(seqLen) { FloatArray(dModel) }
+            val dL_dh1PostLN = Array(seqLen) { FloatArray(dModel) }
+            val dL_dh1PreLN = Array(seqLen) { FloatArray(dModel) }
+            val dL_dattnOut = Array(seqLen) { FloatArray(dModel) }
+            val dQ = Array(seqLen) { FloatArray(dModel) }
+            val dK = Array(seqLen) { FloatArray(dModel) }
+            val dV = Array(seqLen) { FloatArray(dModel) }
+
+            for (t in 0 until seqLen - 1) {
+                layerNormBackward(incomingGrad[t], lf.h2PreLN[t], dL_dh2PreLN[t], dModel)
             }
-        }
 
-        // Accumulate all three FFN weight gradients as batched matrix products.
-        // gradWDown = transpose(act) × dL_dh2PreLN.
-        val actTransposed = transposeRows(act)
-        val gradWDownRows = Array(dFf) { FloatArray(dModel) }
-        computeLinearBatch(
-            inputs = actTransposed,
-            weights = flattenRows(dL_dh2PreLN),
-            inputColumns = seqLen,
-            outputColumns = dModel,
-            outputs = gradWDownRows
-        )
-        for (row in gradWDownRows.indices) {
-            System.arraycopy(gradWDownRows[row], 0, gradWDown, row * dModel, dModel)
-        }
-
-        // gradWUp = transpose(h1) × dUp; gradWGate = transpose(h1) × dGate.
-        val h1Transposed = transposeRows(h1)
-        val gradWUpRows = Array(dModel) { FloatArray(dFf) }
-        computeLinearBatch(
-            inputs = h1Transposed,
-            weights = flattenRows(dUpRows),
-            inputColumns = seqLen,
-            outputColumns = dFf,
-            outputs = gradWUpRows
-        )
-        for (row in gradWUpRows.indices) {
-            System.arraycopy(gradWUpRows[row], 0, gradWUp, row * dFf, dFf)
-        }
-
-        val gradWGateRows = Array(dModel) { FloatArray(dFf) }
-        computeLinearBatch(
-            inputs = h1Transposed,
-            weights = flattenRows(dGateRows),
-            inputColumns = seqLen,
-            outputColumns = dFf,
-            outputs = gradWGateRows
-        )
-        for (row in gradWGateRows.indices) {
-            System.arraycopy(gradWGateRows[row], 0, gradWGate, row * dFf, dFf)
-        }
-
-        // Propagate dGate and dUp through their corresponding FFN projections.
-        val dHiddenFromGate = Array(seqLen) { FloatArray(dModel) }
-        computeLinearBatch(
-            inputs = dGateRows,
-            weights = wGate,
-            inputColumns = dFf,
-            outputColumns = dModel,
-            outputs = dHiddenFromGate,
-            transposeWeights = true
-        )
-
-        val dHiddenFromUp = Array(seqLen) { FloatArray(dModel) }
-        computeLinearBatch(
-            inputs = dUpRows,
-            weights = wUp,
-            inputColumns = dFf,
-            outputColumns = dModel,
-            outputs = dHiddenFromUp,
-            transposeWeights = true
-        )
-
-        for (t in 0 until seqLen - 1) {
-            for (dimension in 0 until dModel) {
-                dL_dh1PostLN[t][dimension] =
-                    dHiddenFromGate[t][dimension] +
-                    dHiddenFromUp[t][dimension] +
-                    dL_dh2PreLN[t][dimension]
-            }
-            layerNormBackward(dL_dh1PostLN[t], h1PreLN[t], dL_dh1PreLN[t], dModel)
-        }
-
-        val attentionBackwardRows = seqLen - 1
-        val attentionOutputRows = Array(attentionBackwardRows) { row -> attnOut[row] }
-        val outputProjectionGradientRows =
-            Array(attentionBackwardRows) { row -> dL_dh1PreLN[row] }
-
-        val gradWORows = Array(dModel) { FloatArray(dModel) }
-        computeLinearBatch(
-            inputs = transposeRows(attentionOutputRows),
-            weights = flattenRows(outputProjectionGradientRows),
-            inputColumns = attentionBackwardRows,
-            outputColumns = dModel,
-            outputs = gradWORows
-        )
-        System.arraycopy(flattenRows(gradWORows), 0, gradWO, 0, gradWO.size)
-
-        val attentionInputGradientRows =
-            Array(attentionBackwardRows) { FloatArray(dModel) }
-        computeLinearBatch(
-            inputs = outputProjectionGradientRows,
-            weights = wO,
-            inputColumns = dModel,
-            outputColumns = dModel,
-            outputs = attentionInputGradientRows,
-            transposeWeights = true
-        )
-        for (time in 0 until attentionBackwardRows) {
-            System.arraycopy(
-                attentionInputGradientRows[time],
-                0,
-                dL_dattnOut[time],
-                0,
-                dModel
+            val dActRows = Array(seqLen) { FloatArray(dFf) }
+            computeLinearBatch(
+                inputs = dL_dh2PreLN,
+                weights = b.wDown,
+                inputColumns = dModel,
+                outputColumns = dFf,
+                outputs = dActRows,
+                transposeWeights = true
             )
-        }
 
-        // (3) Causal attention backward. Independent heads are processed as a batch,
-        // avoiding one queue submission and synchronization for every individual head.
-        val attentionGradientByHead = Array(nHeads) { head ->
-            val headOffset = head * headDim
-            Array(seqLen) { time ->
-                FloatArray(headDim) { dimension ->
-                    dL_dattnOut[time][headOffset + dimension]
+            val dUpRows = Array(seqLen) { FloatArray(dFf) }
+            val dGateRows = Array(seqLen) { FloatArray(dFf) }
+            for (t in 0 until seqLen - 1) {
+                for (dimension in 0 until dFf) {
+                    val sigmoid = 1.0f / (1.0f + exp(-lf.gate[t][dimension]))
+                    val swish = lf.gate[t][dimension] * sigmoid
+                    val dActValue = dActRows[t][dimension]
+                    dUpRows[t][dimension] = dActValue * swish
+                    val dSwish = dActValue * lf.up[t][dimension]
+                    dGateRows[t][dimension] =
+                        dSwish * (sigmoid * (1f + lf.gate[t][dimension] * (1f - sigmoid)))
                 }
             }
-        }
-        val queryRowsByHead = Array(nHeads) { head ->
-            val headOffset = head * headDim
-            Array(seqLen) { time ->
-                FloatArray(headDim) { dimension -> q[time][headOffset + dimension] }
-            }
-        }
-        val keyRowsByHead = Array(nHeads) { head ->
-            val headOffset = head * headDim
-            Array(seqLen) { time ->
-                FloatArray(headDim) { dimension -> k[time][headOffset + dimension] }
-            }
-        }
-        val valueRowsByHead = Array(nHeads) { head ->
-            val headOffset = head * headDim
-            Array(seqLen) { time ->
-                FloatArray(headDim) { dimension -> v[time][headOffset + dimension] }
-            }
-        }
 
-        // dV = transpose(P) × dAttention. P is lower triangular.
-        val transposedAttentionByHead = Array(nHeads) { head ->
-            Array(seqLen) { keyIndex ->
-                FloatArray(seqLen) { queryIndex ->
-                    if (queryIndex >= keyIndex) {
-                        attnWeights[head][queryIndex][keyIndex]
-                    } else {
-                        0f
+            val actTransposed = transposeRows(lf.act)
+            val gradWDownRows = Array(dFf) { FloatArray(dModel) }
+            computeLinearBatch(
+                inputs = actTransposed,
+                weights = flattenRows(dL_dh2PreLN),
+                inputColumns = seqLen,
+                outputColumns = dModel,
+                outputs = gradWDownRows
+            )
+            for (row in gradWDownRows.indices) {
+                System.arraycopy(gradWDownRows[row], 0, lg.gradWDown, row * dModel, dModel)
+            }
+
+            val h1Transposed = transposeRows(lf.h1)
+            val gradWUpRows = Array(dModel) { FloatArray(dFf) }
+            computeLinearBatch(
+                inputs = h1Transposed,
+                weights = flattenRows(dUpRows),
+                inputColumns = seqLen,
+                outputColumns = dFf,
+                outputs = gradWUpRows
+            )
+            for (row in gradWUpRows.indices) {
+                System.arraycopy(gradWUpRows[row], 0, lg.gradWUp, row * dFf, dFf)
+            }
+
+            val gradWGateRows = Array(dModel) { FloatArray(dFf) }
+            computeLinearBatch(
+                inputs = h1Transposed,
+                weights = flattenRows(dGateRows),
+                inputColumns = seqLen,
+                outputColumns = dFf,
+                outputs = gradWGateRows
+            )
+            for (row in gradWGateRows.indices) {
+                System.arraycopy(gradWGateRows[row], 0, lg.gradWGate, row * dFf, dFf)
+            }
+
+            val dHiddenFromGate = Array(seqLen) { FloatArray(dModel) }
+            computeLinearBatch(
+                inputs = dGateRows,
+                weights = b.wGate,
+                inputColumns = dFf,
+                outputColumns = dModel,
+                outputs = dHiddenFromGate,
+                transposeWeights = true
+            )
+
+            val dHiddenFromUp = Array(seqLen) { FloatArray(dModel) }
+            computeLinearBatch(
+                inputs = dUpRows,
+                weights = b.wUp,
+                inputColumns = dFf,
+                outputColumns = dModel,
+                outputs = dHiddenFromUp,
+                transposeWeights = true
+            )
+
+            for (t in 0 until seqLen - 1) {
+                for (dimension in 0 until dModel) {
+                    dL_dh1PostLN[t][dimension] =
+                        dHiddenFromGate[t][dimension] +
+                        dHiddenFromUp[t][dimension] +
+                        dL_dh2PreLN[t][dimension]
+                }
+                layerNormBackward(dL_dh1PostLN[t], lf.h1PreLN[t], dL_dh1PreLN[t], dModel)
+            }
+
+            val attentionBackwardRows = seqLen - 1
+            val attentionOutputRows = Array(attentionBackwardRows) { row -> lf.attnOut[row] }
+            val outputProjectionGradientRows =
+                Array(attentionBackwardRows) { row -> dL_dh1PreLN[row] }
+
+            val gradWORows = Array(dModel) { FloatArray(dModel) }
+            computeLinearBatch(
+                inputs = transposeRows(attentionOutputRows),
+                weights = flattenRows(outputProjectionGradientRows),
+                inputColumns = attentionBackwardRows,
+                outputColumns = dModel,
+                outputs = gradWORows
+            )
+            System.arraycopy(flattenRows(gradWORows), 0, lg.gradWO, 0, lg.gradWO.size)
+
+            val attentionInputGradientRows =
+                Array(attentionBackwardRows) { FloatArray(dModel) }
+            computeLinearBatch(
+                inputs = outputProjectionGradientRows,
+                weights = b.wO,
+                inputColumns = dModel,
+                outputColumns = dModel,
+                outputs = attentionInputGradientRows,
+                transposeWeights = true
+            )
+            for (time in 0 until attentionBackwardRows) {
+                System.arraycopy(
+                    attentionInputGradientRows[time],
+                    0,
+                    dL_dattnOut[time],
+                    0,
+                    dModel
+                )
+            }
+
+            val attentionGradientByHead = Array(nHeads) { head ->
+                val headOffset = head * headDim
+                Array(seqLen) { time ->
+                    FloatArray(headDim) { dimension ->
+                        dL_dattnOut[time][headOffset + dimension]
                     }
                 }
             }
-        }
-        val dValueByHead = Array(nHeads) { Array(seqLen) { FloatArray(headDim) } }
-        computeBatchedLinear(
-            inputs = transposedAttentionByHead,
-            weights = Array(nHeads) { head -> flattenRows(attentionGradientByHead[head]) },
-            outputs = dValueByHead,
-            inputColumns = seqLen,
-            outputColumns = headDim
-        )
-
-        // dW = dAttention × transpose(V); the causal mask is applied below.
-        val dWeightsByHead = Array(nHeads) { Array(seqLen) { FloatArray(seqLen) } }
-        computeBatchedLinear(
-            inputs = attentionGradientByHead,
-            weights = Array(nHeads) { head -> flattenRows(valueRowsByHead[head]) },
-            outputs = dWeightsByHead,
-            inputColumns = headDim,
-            outputColumns = seqLen,
-            transposeWeights = true
-        )
-
-        val dScoreByHead = Array(nHeads) { Array(seqLen) { FloatArray(seqLen) } }
-        for (head in 0 until nHeads) {
-            for (queryIndex in 0 until seqLen) {
-                var weightedGradient = 0f
-                for (keyIndex in 0..queryIndex) {
-                    weightedGradient +=
-                        attnWeights[head][queryIndex][keyIndex] *
-                        dWeightsByHead[head][queryIndex][keyIndex]
-                }
-                for (keyIndex in 0..queryIndex) {
-                    dScoreByHead[head][queryIndex][keyIndex] =
-                        attnWeights[head][queryIndex][keyIndex] *
-                        (dWeightsByHead[head][queryIndex][keyIndex] - weightedGradient) *
-                        scale
+            val queryRowsByHead = Array(nHeads) { head ->
+                val headOffset = head * headDim
+                Array(seqLen) { time ->
+                    FloatArray(headDim) { dimension -> lf.q[time][headOffset + dimension] }
                 }
             }
-        }
-
-        // dQ = dScore × K; dK = transpose(dScore) × Q.
-        val dQueryByHead = Array(nHeads) { Array(seqLen) { FloatArray(headDim) } }
-        computeBatchedLinear(
-            inputs = dScoreByHead,
-            weights = Array(nHeads) { head -> flattenRows(keyRowsByHead[head]) },
-            outputs = dQueryByHead,
-            inputColumns = seqLen,
-            outputColumns = headDim
-        )
-
-        val transposedDScoreByHead = Array(nHeads) { head ->
-            transposeRows(dScoreByHead[head])
-        }
-        val dKeyByHead = Array(nHeads) { Array(seqLen) { FloatArray(headDim) } }
-        computeBatchedLinear(
-            inputs = transposedDScoreByHead,
-            weights = Array(nHeads) { head -> flattenRows(queryRowsByHead[head]) },
-            outputs = dKeyByHead,
-            inputColumns = seqLen,
-            outputColumns = headDim
-        )
-
-        for (head in 0 until nHeads) {
-            val headOffset = head * headDim
-            for (time in 0 until seqLen) {
-                System.arraycopy(dQueryByHead[head][time], 0, dQ[time], headOffset, headDim)
-                System.arraycopy(dKeyByHead[head][time], 0, dK[time], headOffset, headDim)
-                System.arraycopy(dValueByHead[head][time], 0, dV[time], headOffset, headDim)
+            val keyRowsByHead = Array(nHeads) { head ->
+                val headOffset = head * headDim
+                Array(seqLen) { time ->
+                    FloatArray(headDim) { dimension -> lf.k[time][headOffset + dimension] }
+                }
             }
-        }
+            val valueRowsByHead = Array(nHeads) { head ->
+                val headOffset = head * headDim
+                Array(seqLen) { time ->
+                    FloatArray(headDim) { dimension -> lf.v[time][headOffset + dimension] }
+                }
+            }
 
-        // (4) Q/K/V parameter gradients. The small rank-by-model LoRA updates
-        // remain on CPU to avoid extra synchronization for low-rank workloads.
-        val inputRowsForGradient = Array(attentionBackwardRows) { row -> x[row] }
-        val transposedInputRows = transposeRows(inputRowsForGradient)
-        val queryGradientRows = Array(attentionBackwardRows) { row -> dQ[row] }
-        val keyGradientRows = Array(attentionBackwardRows) { row -> dK[row] }
-        val valueGradientRows = Array(attentionBackwardRows) { row -> dV[row] }
+            val transposedAttentionByHead = Array(nHeads) { head ->
+                Array(seqLen) { keyIndex ->
+                    FloatArray(seqLen) { queryIndex ->
+                        if (queryIndex >= keyIndex) {
+                            lf.attnWeights[head][queryIndex][keyIndex]
+                        } else {
+                            0f
+                        }
+                    }
+                }
+            }
+            val dValueByHead = Array(nHeads) { Array(seqLen) { FloatArray(headDim) } }
+            computeBatchedLinear(
+                inputs = transposedAttentionByHead,
+                weights = Array(nHeads) { head -> flattenRows(attentionGradientByHead[head]) },
+                outputs = dValueByHead,
+                inputColumns = seqLen,
+                outputColumns = headDim
+            )
 
-        val qkvGradientOutputs = Array(3) { Array(dModel) { FloatArray(dModel) } }
-        computeBatchedLinear(
-            inputs = arrayOf(transposedInputRows, transposedInputRows, transposedInputRows),
-            weights = arrayOf(
-                flattenRows(queryGradientRows),
-                flattenRows(keyGradientRows),
-                flattenRows(valueGradientRows)
-            ),
-            outputs = qkvGradientOutputs,
-            inputColumns = attentionBackwardRows,
-            outputColumns = dModel
-        )
-        System.arraycopy(flattenRows(qkvGradientOutputs[0]), 0, gradWQ, 0, gradWQ.size)
-        System.arraycopy(flattenRows(qkvGradientOutputs[1]), 0, gradWK, 0, gradWK.size)
-        System.arraycopy(flattenRows(qkvGradientOutputs[2]), 0, gradWV, 0, gradWV.size)
+            val dWeightsByHead = Array(nHeads) { Array(seqLen) { FloatArray(seqLen) } }
+            computeBatchedLinear(
+                inputs = attentionGradientByHead,
+                weights = Array(nHeads) { head -> flattenRows(valueRowsByHead[head]) },
+                outputs = dWeightsByHead,
+                inputColumns = headDim,
+                outputColumns = seqLen,
+                transposeWeights = true
+            )
 
-        // LoRA Q/V gradients remain local and use the original rank-sized equations.
-        for (time in 0 until attentionBackwardRows) {
-            for (rankIndex in 0 until loraRank) {
-                val queryMidValue = mQ[time][rankIndex]
-                val valueMidValue = mV[time][rankIndex]
-                val queryGradientOffset = rankIndex * dModel
+            val dScoreByHead = Array(nHeads) { Array(seqLen) { FloatArray(seqLen) } }
+            for (head in 0 until nHeads) {
+                for (queryIndex in 0 until seqLen) {
+                    var weightedGradient = 0f
+                    for (keyIndex in 0..queryIndex) {
+                        weightedGradient +=
+                            lf.attnWeights[head][queryIndex][keyIndex] *
+                            dWeightsByHead[head][queryIndex][keyIndex]
+                    }
+                    for (keyIndex in 0..queryIndex) {
+                        dScoreByHead[head][queryIndex][keyIndex] =
+                            lf.attnWeights[head][queryIndex][keyIndex] *
+                            (dWeightsByHead[head][queryIndex][keyIndex] - weightedGradient) *
+                            scale
+                    }
+                }
+            }
+
+            val dQueryByHead = Array(nHeads) { Array(seqLen) { FloatArray(headDim) } }
+            computeBatchedLinear(
+                inputs = dScoreByHead,
+                weights = Array(nHeads) { head -> flattenRows(keyRowsByHead[head]) },
+                outputs = dQueryByHead,
+                inputColumns = seqLen,
+                outputColumns = headDim
+            )
+
+            val transposedDScoreByHead = Array(nHeads) { head ->
+                transposeRows(dScoreByHead[head])
+            }
+            val dKeyByHead = Array(nHeads) { Array(seqLen) { FloatArray(headDim) } }
+            computeBatchedLinear(
+                inputs = transposedDScoreByHead,
+                weights = Array(nHeads) { head -> flattenRows(queryRowsByHead[head]) },
+                outputs = dKeyByHead,
+                inputColumns = seqLen,
+                outputColumns = headDim
+            )
+
+            for (head in 0 until nHeads) {
+                val headOffset = head * headDim
+                for (time in 0 until seqLen) {
+                    System.arraycopy(dQueryByHead[head][time], 0, dQ[time], headOffset, headDim)
+                    System.arraycopy(dKeyByHead[head][time], 0, dK[time], headOffset, headDim)
+                    System.arraycopy(dValueByHead[head][time], 0, dV[time], headOffset, headDim)
+                }
+            }
+
+            val inputRowsForGradient = Array(attentionBackwardRows) { row -> layerInput[row] }
+            val transposedInputRows = transposeRows(inputRowsForGradient)
+            val queryGradientRows = Array(attentionBackwardRows) { row -> dQ[row] }
+            val keyGradientRows = Array(attentionBackwardRows) { row -> dK[row] }
+            val valueGradientRows = Array(attentionBackwardRows) { row -> dV[row] }
+
+            val qkvGradientOutputs = Array(3) { Array(dModel) { FloatArray(dModel) } }
+            computeBatchedLinear(
+                inputs = arrayOf(transposedInputRows, transposedInputRows, transposedInputRows),
+                weights = arrayOf(
+                    flattenRows(queryGradientRows),
+                    flattenRows(keyGradientRows),
+                    flattenRows(valueGradientRows)
+                ),
+                outputs = qkvGradientOutputs,
+                inputColumns = attentionBackwardRows,
+                outputColumns = dModel
+            )
+            System.arraycopy(flattenRows(qkvGradientOutputs[0]), 0, lg.gradWQ, 0, lg.gradWQ.size)
+            System.arraycopy(flattenRows(qkvGradientOutputs[1]), 0, lg.gradWK, 0, lg.gradWK.size)
+            System.arraycopy(flattenRows(qkvGradientOutputs[2]), 0, lg.gradWV, 0, lg.gradWV.size)
+
+            for (time in 0 until attentionBackwardRows) {
+                for (rankIndex in 0 until loraRank) {
+                    val queryMidValue = lf.mQ[time][rankIndex]
+                    val valueMidValue = lf.mV[time][rankIndex]
+                    val queryGradientOffset = rankIndex * dModel
+                    for (dimension in 0 until dModel) {
+                        lg.gradLoraQb[queryGradientOffset + dimension] +=
+                            queryMidValue * dQ[time][dimension]
+                        lg.gradLoraVb[queryGradientOffset + dimension] +=
+                            valueMidValue * dV[time][dimension]
+                    }
+                }
+                for (rankIndex in 0 until loraRank) {
+                    var queryBackProjection = 0f
+                    var valueBackProjection = 0f
+                    val queryWeightOffset = rankIndex * dModel
+                    for (dimension in 0 until dModel) {
+                        queryBackProjection +=
+                            dQ[time][dimension] * b.loraQb[queryWeightOffset + dimension]
+                        valueBackProjection +=
+                            dV[time][dimension] * b.loraVb[queryWeightOffset + dimension]
+                    }
+                    for (dimension in 0 until dModel) {
+                        lg.gradLoraQa[dimension * loraRank + rankIndex] +=
+                            layerInput[time][dimension] * queryBackProjection
+                        lg.gradLoraVa[dimension * loraRank + rankIndex] +=
+                            layerInput[time][dimension] * valueBackProjection
+                    }
+                }
+            }
+
+            val wQEff = FloatArray(dModel * dModel)
+            val wVEff = FloatArray(dModel * dModel)
+            for (i in 0 until dModel) {
+                for (j in 0 until dModel) {
+                    var qSum = b.wQ[i * dModel + j]
+                    var vSum = b.wV[i * dModel + j]
+                    for (r in 0 until loraRank) {
+                        qSum += b.loraQa[i * loraRank + r] * b.loraQb[r * dModel + j]
+                        vSum += b.loraVa[i * loraRank + r] * b.loraVb[r * dModel + j]
+                    }
+                    wQEff[i * dModel + j] = qSum
+                    wVEff[i * dModel + j] = vSum
+                }
+            }
+
+            val inputGradientByProjection =
+                Array(3) { Array(attentionBackwardRows) { FloatArray(dModel) } }
+            computeBatchedLinear(
+                inputs = arrayOf(queryGradientRows, keyGradientRows, valueGradientRows),
+                weights = arrayOf(wQEff, b.wK, wVEff),
+                outputs = inputGradientByProjection,
+                inputColumns = dModel,
+                outputColumns = dModel,
+                transposeWeights = true
+            )
+
+            val dLayerInput = Array(seqLen) { FloatArray(dModel) }
+            for (time in 0 until attentionBackwardRows) {
+                val queryInputGradient = inputGradientByProjection[0][time]
+                val keyInputGradient = inputGradientByProjection[1][time]
+                val valueInputGradient = inputGradientByProjection[2][time]
                 for (dimension in 0 until dModel) {
-                    gradLoraQb[queryGradientOffset + dimension] +=
-                        queryMidValue * dQ[time][dimension]
-                    gradLoraVb[queryGradientOffset + dimension] +=
-                        valueMidValue * dV[time][dimension]
+                    dLayerInput[time][dimension] =
+                        dL_dh1PreLN[time][dimension] +
+                        queryInputGradient[dimension] +
+                        keyInputGradient[dimension] +
+                        valueInputGradient[dimension]
                 }
             }
-            for (rankIndex in 0 until loraRank) {
-                var queryBackProjection = 0f
-                var valueBackProjection = 0f
-                val queryWeightOffset = rankIndex * dModel
-                for (dimension in 0 until dModel) {
-                    queryBackProjection +=
-                        dQ[time][dimension] * loraQb[queryWeightOffset + dimension]
-                    valueBackProjection +=
-                        dV[time][dimension] * loraVb[queryWeightOffset + dimension]
+
+            if (layer > 0) {
+                incomingGrad = dLayerInput
+            } else {
+                for (time in 0 until attentionBackwardRows) {
+                    val token = seq[time]
+                    if (token !in 0 until vocabCap) continue
+                    val embeddingOffset = token * dModel
+                    for (dimension in 0 until dModel) {
+                        gradWEmbed[embeddingOffset + dimension] += dLayerInput[time][dimension] * embedScale
+                    }
                 }
-                for (dimension in 0 until dModel) {
-                    gradLoraQa[dimension * loraRank + rankIndex] +=
-                        x[time][dimension] * queryBackProjection
-                    gradLoraVa[dimension * loraRank + rankIndex] +=
-                        x[time][dimension] * valueBackProjection
-                }
-            }
-        }
-
-        // (5) Embedding Backward Accumulation
-        val wQEff = FloatArray(dModel * dModel)
-        val wVEff = FloatArray(dModel * dModel)
-        for (i in 0 until dModel) {
-            for (j in 0 until dModel) {
-                var qSum = wQ[i * dModel + j]
-                var vSum = wV[i * dModel + j]
-                for (r in 0 until loraRank) {
-                    qSum += loraQa[i * loraRank + r] * loraQb[r * dModel + j]
-                    vSum += loraVa[i * loraRank + r] * loraVb[r * dModel + j]
-                }
-                wQEff[i * dModel + j] = qSum
-                wVEff[i * dModel + j] = vSum
-            }
-        }
-
-        val inputGradientByProjection =
-            Array(3) { Array(attentionBackwardRows) { FloatArray(dModel) } }
-        computeBatchedLinear(
-            inputs = arrayOf(queryGradientRows, keyGradientRows, valueGradientRows),
-            weights = arrayOf(wQEff, wK, wVEff),
-            outputs = inputGradientByProjection,
-            inputColumns = dModel,
-            outputColumns = dModel,
-            transposeWeights = true
-        )
-
-        for (time in 0 until attentionBackwardRows) {
-            val token = seq[time]
-            if (token !in 0 until vocabCap) continue
-
-            val embeddingOffset = token * dModel
-            val queryInputGradient = inputGradientByProjection[0][time]
-            val keyInputGradient = inputGradientByProjection[1][time]
-            val valueInputGradient = inputGradientByProjection[2][time]
-            for (dimension in 0 until dModel) {
-                val inputGradient =
-                    dL_dh1PreLN[time][dimension] +
-                    queryInputGradient[dimension] +
-                    keyInputGradient[dimension] +
-                    valueInputGradient[dimension]
-                gradWEmbed[embeddingOffset + dimension] += inputGradient * embedScale
             }
         }
 
@@ -1602,36 +1741,61 @@ class ArgusNeuralEngine private constructor(
         val stepDiv = max(validSteps, 1).toFloat()
         normalizeGradient(gradWHead, stepDiv)
         normalizeGradient(gradWEmbed, stepDiv)
-        normalizeGradient(gradWDown, stepDiv)
-        normalizeGradient(gradWUp, stepDiv)
-        normalizeGradient(gradWGate, stepDiv)
-        normalizeGradient(gradWO, stepDiv)
-        normalizeGradient(gradWQ, stepDiv)
-        normalizeGradient(gradWK, stepDiv)
-        normalizeGradient(gradWV, stepDiv)
-        normalizeGradient(gradLoraQa, stepDiv)
-        normalizeGradient(gradLoraQb, stepDiv)
-        normalizeGradient(gradLoraVa, stepDiv)
-        normalizeGradient(gradLoraVb, stepDiv)
+        for (lg in layerGrads) {
+            normalizeGradient(lg.gradWDown, stepDiv)
+            normalizeGradient(lg.gradWUp, stepDiv)
+            normalizeGradient(lg.gradWGate, stepDiv)
+            normalizeGradient(lg.gradWO, stepDiv)
+            normalizeGradient(lg.gradWQ, stepDiv)
+            normalizeGradient(lg.gradWK, stepDiv)
+            normalizeGradient(lg.gradWV, stepDiv)
+            normalizeGradient(lg.gradLoraQa, stepDiv)
+            normalizeGradient(lg.gradLoraQb, stepDiv)
+            normalizeGradient(lg.gradLoraVa, stepDiv)
+            normalizeGradient(lg.gradLoraVb, stepDiv)
+        }
 
         if (gradientProbe != null) {
-            val selectedGradient = when (gradientProbe.parameterName) {
-                "wHead" -> gradWHead
-                "wEmbed" -> gradWEmbed
-                "wDown" -> gradWDown
-                "wUp" -> gradWUp
-                "wGate" -> gradWGate
-                "wO" -> gradWO
-                "wQ" -> gradWQ
-                "wK" -> gradWK
-                "wV" -> gradWV
-                "loraQa" -> gradLoraQa
-                "loraQb" -> gradLoraQb
-                "loraVa" -> gradLoraVa
-                "loraVb" -> gradLoraVb
-                else -> throw IllegalArgumentException(
-                    "Unsupported gradient-check parameter: ${gradientProbe.parameterName}"
-                )
+            val selectedGradient = when {
+                gradientProbe.parameterName == "wHead" -> gradWHead
+                gradientProbe.parameterName == "wEmbed" -> gradWEmbed
+                gradientProbe.parameterName.startsWith("layers.") -> {
+                    val parts = gradientProbe.parameterName.split(".", limit = 3)
+                    val lIdx = parts[1].toIntOrNull() ?: 0
+                    val subName = parts[2]
+                    val lg = layerGrads[lIdx]
+                    when (subName) {
+                        "wDown", "feed_forward.down.weight" -> lg.gradWDown
+                        "wUp", "feed_forward.up.weight" -> lg.gradWUp
+                        "wGate", "feed_forward.gate.weight" -> lg.gradWGate
+                        "wO", "attention.output.weight" -> lg.gradWO
+                        "wQ", "attention.query.weight" -> lg.gradWQ
+                        "wK", "attention.key.weight" -> lg.gradWK
+                        "wV", "attention.value.weight" -> lg.gradWV
+                        "loraQa", "adapter.q.a" -> lg.gradLoraQa
+                        "loraQb", "adapter.q.b" -> lg.gradLoraQb
+                        "loraVa", "adapter.v.a" -> lg.gradLoraVa
+                        "loraVb", "adapter.v.b" -> lg.gradLoraVb
+                        else -> throw IllegalArgumentException("Unsupported gradient-check parameter: ${gradientProbe.parameterName}")
+                    }
+                }
+                else -> {
+                    val lg = layerGrads[0]
+                    when (gradientProbe.parameterName) {
+                        "wDown" -> lg.gradWDown
+                        "wUp" -> lg.gradWUp
+                        "wGate" -> lg.gradWGate
+                        "wO" -> lg.gradWO
+                        "wQ" -> lg.gradWQ
+                        "wK" -> lg.gradWK
+                        "wV" -> lg.gradWV
+                        "loraQa" -> lg.gradLoraQa
+                        "loraQb" -> lg.gradLoraQb
+                        "loraVa" -> lg.gradLoraVa
+                        "loraVb" -> lg.gradLoraVb
+                        else -> throw IllegalArgumentException("Unsupported gradient-check parameter: ${gradientProbe.parameterName}")
+                    }
+                }
             }
             val resolvedIndex = if (gradientProbe.parameterIndex == -1) {
                 selectedGradient.indices.maxByOrNull {
@@ -1651,60 +1815,65 @@ class ArgusNeuralEngine private constructor(
             return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
 
-        // Hitung total L2 Norm untuk Gradient Clipping
         var sumSquares = 0f
         sumSquares += computeSumSquares(gradWHead)
         sumSquares += computeSumSquares(gradWEmbed)
-        sumSquares += computeSumSquares(gradWDown)
-        sumSquares += computeSumSquares(gradWUp)
-        sumSquares += computeSumSquares(gradWGate)
-        sumSquares += computeSumSquares(gradWO)
-        sumSquares += computeSumSquares(gradWQ)
-        sumSquares += computeSumSquares(gradWK)
-        sumSquares += computeSumSquares(gradWV)
-        sumSquares += computeSumSquares(gradLoraQa)
-        sumSquares += computeSumSquares(gradLoraQb)
-        sumSquares += computeSumSquares(gradLoraVa)
-        sumSquares += computeSumSquares(gradLoraVb)
+        for (lg in layerGrads) {
+            sumSquares += computeSumSquares(lg.gradWDown)
+            sumSquares += computeSumSquares(lg.gradWUp)
+            sumSquares += computeSumSquares(lg.gradWGate)
+            sumSquares += computeSumSquares(lg.gradWO)
+            sumSquares += computeSumSquares(lg.gradWQ)
+            sumSquares += computeSumSquares(lg.gradWK)
+            sumSquares += computeSumSquares(lg.gradWV)
+            sumSquares += computeSumSquares(lg.gradLoraQa)
+            sumSquares += computeSumSquares(lg.gradLoraQb)
+            sumSquares += computeSumSquares(lg.gradLoraVa)
+            sumSquares += computeSumSquares(lg.gradLoraVb)
+        }
 
         val totalNorm = sqrt(sumSquares)
         if (!totalNorm.isFinite()) { adamStep--; return Float.NaN }
         val clipFactor = if (totalNorm > maxGradNorm) maxGradNorm / (totalNorm + 1e-6f) else 1.0f
 
-        // Keep the existing clipped-gradient AdamW math available as the exact CPU fallback.
         val beta1Pow = Math.pow(beta1.toDouble(), adamStep.toDouble()).toFloat()
         val beta2Pow = Math.pow(beta2.toDouble(), adamStep.toDouble()).toFloat()
         val biasCorr1 = 1f - beta1Pow
         val biasCorr2 = 1f - beta2Pow
 
-        val parameterGroups = arrayOf(
-            wHead, wEmbed, wDown, wUp, wGate, wO, wQ, wK, wV,
-            loraQa, loraQb, loraVa, loraVb
-        )
-        val gradientGroups = arrayOf(
-            gradWHead, gradWEmbed, gradWDown, gradWUp, gradWGate, gradWO,
-            gradWQ, gradWK, gradWV, gradLoraQa, gradLoraQb, gradLoraVa, gradLoraVb
-        )
-        val firstMomentGroups = arrayOf(
-            mHead, mEmbed, mWDown, mWUp, mWGate, mWO, mWQ, mWK, mWV,
-            mLoraQa, mLoraQb, mLoraVa, mLoraVb
-        )
-        val secondMomentGroups = arrayOf(
-            vHead, vEmbed, vWDown, vWUp, vWGate, vWO, vWQ, vWK, vWV,
-            vLoraQa, vLoraQb, vLoraVa, vLoraVb
-        )
-        val weightDecayByGroup = floatArrayOf(
-            0f, 0f,
-            weightDecay, weightDecay, weightDecay, weightDecay, weightDecay, weightDecay, weightDecay,
-            0f, 0f, 0f, 0f
-        )
+        val parameterList = mutableListOf<FloatArray>()
+        val gradientList = mutableListOf<FloatArray>()
+        val firstMomentList = mutableListOf<FloatArray>()
+        val secondMomentList = mutableListOf<FloatArray>()
+        val weightDecayList = mutableListOf<Float>()
+
+        parameterList.add(wHead); gradientList.add(gradWHead); firstMomentList.add(mHead); secondMomentList.add(vHead); weightDecayList.add(0f)
+        parameterList.add(wEmbed); gradientList.add(gradWEmbed); firstMomentList.add(mEmbed); secondMomentList.add(vEmbed); weightDecayList.add(0f)
+
+        for (l in 0 until layerCount) {
+            val b = blocks[l]
+            val lg = layerGrads[l]
+
+            parameterList.add(b.wDown); gradientList.add(lg.gradWDown); firstMomentList.add(b.mWDown); secondMomentList.add(b.vWDown); weightDecayList.add(weightDecay)
+            parameterList.add(b.wUp); gradientList.add(lg.gradWUp); firstMomentList.add(b.mWUp); secondMomentList.add(b.vWUp); weightDecayList.add(weightDecay)
+            parameterList.add(b.wGate); gradientList.add(lg.gradWGate); firstMomentList.add(b.mWGate); secondMomentList.add(b.vWGate); weightDecayList.add(weightDecay)
+            parameterList.add(b.wO); gradientList.add(lg.gradWO); firstMomentList.add(b.mWO); secondMomentList.add(b.vWO); weightDecayList.add(weightDecay)
+            parameterList.add(b.wQ); gradientList.add(lg.gradWQ); firstMomentList.add(b.mWQ); secondMomentList.add(b.vWQ); weightDecayList.add(weightDecay)
+            parameterList.add(b.wK); gradientList.add(lg.gradWK); firstMomentList.add(b.mWK); secondMomentList.add(b.vWK); weightDecayList.add(weightDecay)
+            parameterList.add(b.wV); gradientList.add(lg.gradWV); firstMomentList.add(b.mWV); secondMomentList.add(b.vWV); weightDecayList.add(weightDecay)
+
+            parameterList.add(b.loraQa); gradientList.add(lg.gradLoraQa); firstMomentList.add(b.mLoraQa); secondMomentList.add(b.vLoraQa); weightDecayList.add(0f)
+            parameterList.add(b.loraQb); gradientList.add(lg.gradLoraQb); firstMomentList.add(b.mLoraQb); secondMomentList.add(b.vLoraQb); weightDecayList.add(0f)
+            parameterList.add(b.loraVa); gradientList.add(lg.gradLoraVa); firstMomentList.add(b.mLoraVa); secondMomentList.add(b.vLoraVa); weightDecayList.add(0f)
+            parameterList.add(b.loraVb); gradientList.add(lg.gradLoraVb); firstMomentList.add(b.mLoraVb); secondMomentList.add(b.vLoraVb); weightDecayList.add(0f)
+        }
 
         val updatedByVulkan = VulkanTrainingBackend.tryApplyAdamWUpdate(
-            parameters = parameterGroups,
-            gradients = gradientGroups,
-            firstMoments = firstMomentGroups,
-            secondMoments = secondMomentGroups,
-            weightDecayByGroup = weightDecayByGroup,
+            parameters = parameterList.toTypedArray(),
+            gradients = gradientList.toTypedArray(),
+            firstMoments = firstMomentList.toTypedArray(),
+            secondMoments = secondMomentList.toTypedArray(),
+            weightDecayByGroup = weightDecayList.toFloatArray(),
             learningRate = lr,
             beta1 = beta1,
             beta2 = beta2,
@@ -1715,33 +1884,19 @@ class ArgusNeuralEngine private constructor(
         )
 
         if (!updatedByVulkan) {
-            applyClip(gradWHead, clipFactor)
-            applyClip(gradWEmbed, clipFactor)
-            applyClip(gradWDown, clipFactor)
-            applyClip(gradWUp, clipFactor)
-            applyClip(gradWGate, clipFactor)
-            applyClip(gradWO, clipFactor)
-            applyClip(gradWQ, clipFactor)
-            applyClip(gradWK, clipFactor)
-            applyClip(gradWV, clipFactor)
-            applyClip(gradLoraQa, clipFactor)
-            applyClip(gradLoraQb, clipFactor)
-            applyClip(gradLoraVa, clipFactor)
-            applyClip(gradLoraVb, clipFactor)
-
-            adamUpdate(wHead, gradWHead, mHead, vHead, lr, biasCorr1, biasCorr2)
-            adamUpdate(wEmbed, gradWEmbed, mEmbed, vEmbed, lr, biasCorr1, biasCorr2)
-            adamUpdate(wDown, gradWDown, mWDown, vWDown, lr, biasCorr1, biasCorr2, weightDecay)
-            adamUpdate(wUp, gradWUp, mWUp, vWUp, lr, biasCorr1, biasCorr2, weightDecay)
-            adamUpdate(wGate, gradWGate, mWGate, vWGate, lr, biasCorr1, biasCorr2, weightDecay)
-            adamUpdate(wO, gradWO, mWO, vWO, lr, biasCorr1, biasCorr2, weightDecay)
-            adamUpdate(wQ, gradWQ, mWQ, vWQ, lr, biasCorr1, biasCorr2, weightDecay)
-            adamUpdate(wK, gradWK, mWK, vWK, lr, biasCorr1, biasCorr2, weightDecay)
-            adamUpdate(wV, gradWV, mWV, vWV, lr, biasCorr1, biasCorr2, weightDecay)
-            adamUpdate(loraQa, gradLoraQa, mLoraQa, vLoraQa, lr, biasCorr1, biasCorr2)
-            adamUpdate(loraQb, gradLoraQb, mLoraQb, vLoraQb, lr, biasCorr1, biasCorr2)
-            adamUpdate(loraVa, gradLoraVa, mLoraVa, vLoraVa, lr, biasCorr1, biasCorr2)
-            adamUpdate(loraVb, gradLoraVb, mLoraVb, vLoraVb, lr, biasCorr1, biasCorr2)
+            for (i in parameterList.indices) {
+                applyClip(gradientList[i], clipFactor)
+                adamUpdate(
+                    parameterList[i],
+                    gradientList[i],
+                    firstMomentList[i],
+                    secondMomentList[i],
+                    lr,
+                    biasCorr1,
+                    biasCorr2,
+                    weightDecayList[i]
+                )
+            }
         }
 
         return if (validSteps > 0) totalLoss / validSteps else Float.NaN
@@ -2078,47 +2233,53 @@ class ArgusNeuralEngine private constructor(
         val dataType: Int
     )
 
-    private fun checkpointTensors(): List<NamedCheckpointTensor> = listOf(
-        NamedCheckpointTensor("token.embedding.weight", wEmbed),
-        NamedCheckpointTensor("token.embedding.adam_m", mEmbed),
-        NamedCheckpointTensor("token.embedding.adam_v", vEmbed),
-        NamedCheckpointTensor("lm_head.weight", wHead),
-        NamedCheckpointTensor("lm_head.adam_m", mHead),
-        NamedCheckpointTensor("lm_head.adam_v", vHead),
-        NamedCheckpointTensor("adapter.q.a", loraQa),
-        NamedCheckpointTensor("adapter.q.b", loraQb),
-        NamedCheckpointTensor("adapter.v.a", loraVa),
-        NamedCheckpointTensor("adapter.v.b", loraVb),
-        NamedCheckpointTensor("adapter.q.a.adam_m", mLoraQa),
-        NamedCheckpointTensor("adapter.q.b.adam_m", mLoraQb),
-        NamedCheckpointTensor("adapter.v.a.adam_m", mLoraVa),
-        NamedCheckpointTensor("adapter.v.b.adam_m", mLoraVb),
-        NamedCheckpointTensor("adapter.q.a.adam_v", vLoraQa),
-        NamedCheckpointTensor("adapter.q.b.adam_v", vLoraQb),
-        NamedCheckpointTensor("adapter.v.a.adam_v", vLoraVa),
-        NamedCheckpointTensor("adapter.v.b.adam_v", vLoraVb),
-        NamedCheckpointTensor("attention.query.weight", wQ),
-        NamedCheckpointTensor("attention.key.weight", wK),
-        NamedCheckpointTensor("attention.value.weight", wV),
-        NamedCheckpointTensor("attention.output.weight", wO),
-        NamedCheckpointTensor("attention.query.adam_m", mWQ),
-        NamedCheckpointTensor("attention.query.adam_v", vWQ),
-        NamedCheckpointTensor("attention.key.adam_m", mWK),
-        NamedCheckpointTensor("attention.key.adam_v", vWK),
-        NamedCheckpointTensor("attention.value.adam_m", mWV),
-        NamedCheckpointTensor("attention.value.adam_v", vWV),
-        NamedCheckpointTensor("attention.output.adam_m", mWO),
-        NamedCheckpointTensor("attention.output.adam_v", vWO),
-        NamedCheckpointTensor("feed_forward.gate.weight", wGate),
-        NamedCheckpointTensor("feed_forward.up.weight", wUp),
-        NamedCheckpointTensor("feed_forward.down.weight", wDown),
-        NamedCheckpointTensor("feed_forward.gate.adam_m", mWGate),
-        NamedCheckpointTensor("feed_forward.gate.adam_v", vWGate),
-        NamedCheckpointTensor("feed_forward.up.adam_m", mWUp),
-        NamedCheckpointTensor("feed_forward.up.adam_v", vWUp),
-        NamedCheckpointTensor("feed_forward.down.adam_m", mWDown),
-        NamedCheckpointTensor("feed_forward.down.adam_v", vWDown)
-    )
+    private fun checkpointTensors(): List<NamedCheckpointTensor> {
+        val list = ArrayList<NamedCheckpointTensor>(6 + layerCount * 32)
+        list.add(NamedCheckpointTensor("token.embedding.weight", wEmbed))
+        list.add(NamedCheckpointTensor("token.embedding.adam_m", mEmbed))
+        list.add(NamedCheckpointTensor("token.embedding.adam_v", vEmbed))
+        list.add(NamedCheckpointTensor("lm_head.weight", wHead))
+        list.add(NamedCheckpointTensor("lm_head.adam_m", mHead))
+        list.add(NamedCheckpointTensor("lm_head.adam_v", vHead))
+        for (l in 0 until layerCount) {
+            val b = blocks[l]
+            val prefix = "layers.$l."
+            list.add(NamedCheckpointTensor("${prefix}adapter.q.a", b.loraQa))
+            list.add(NamedCheckpointTensor("${prefix}adapter.q.b", b.loraQb))
+            list.add(NamedCheckpointTensor("${prefix}adapter.v.a", b.loraVa))
+            list.add(NamedCheckpointTensor("${prefix}adapter.v.b", b.loraVb))
+            list.add(NamedCheckpointTensor("${prefix}adapter.q.a.adam_m", b.mLoraQa))
+            list.add(NamedCheckpointTensor("${prefix}adapter.q.b.adam_m", b.mLoraQb))
+            list.add(NamedCheckpointTensor("${prefix}adapter.v.a.adam_m", b.mLoraVa))
+            list.add(NamedCheckpointTensor("${prefix}adapter.v.b.adam_m", b.mLoraVb))
+            list.add(NamedCheckpointTensor("${prefix}adapter.q.a.adam_v", b.vLoraQa))
+            list.add(NamedCheckpointTensor("${prefix}adapter.q.b.adam_v", b.vLoraQb))
+            list.add(NamedCheckpointTensor("${prefix}adapter.v.a.adam_v", b.vLoraVa))
+            list.add(NamedCheckpointTensor("${prefix}adapter.v.b.adam_v", b.vLoraVb))
+            list.add(NamedCheckpointTensor("${prefix}attention.query.weight", b.wQ))
+            list.add(NamedCheckpointTensor("${prefix}attention.key.weight", b.wK))
+            list.add(NamedCheckpointTensor("${prefix}attention.value.weight", b.wV))
+            list.add(NamedCheckpointTensor("${prefix}attention.output.weight", b.wO))
+            list.add(NamedCheckpointTensor("${prefix}attention.query.adam_m", b.mWQ))
+            list.add(NamedCheckpointTensor("${prefix}attention.query.adam_v", b.vWQ))
+            list.add(NamedCheckpointTensor("${prefix}attention.key.adam_m", b.mWK))
+            list.add(NamedCheckpointTensor("${prefix}attention.key.adam_v", b.vWK))
+            list.add(NamedCheckpointTensor("${prefix}attention.value.adam_m", b.mWV))
+            list.add(NamedCheckpointTensor("${prefix}attention.value.adam_v", b.vWV))
+            list.add(NamedCheckpointTensor("${prefix}attention.output.adam_m", b.mWO))
+            list.add(NamedCheckpointTensor("${prefix}attention.output.adam_v", b.vWO))
+            list.add(NamedCheckpointTensor("${prefix}feed_forward.gate.weight", b.wGate))
+            list.add(NamedCheckpointTensor("${prefix}feed_forward.up.weight", b.wUp))
+            list.add(NamedCheckpointTensor("${prefix}feed_forward.down.weight", b.wDown))
+            list.add(NamedCheckpointTensor("${prefix}feed_forward.gate.adam_m", b.mWGate))
+            list.add(NamedCheckpointTensor("${prefix}feed_forward.gate.adam_v", b.vWGate))
+            list.add(NamedCheckpointTensor("${prefix}feed_forward.up.adam_m", b.mWUp))
+            list.add(NamedCheckpointTensor("${prefix}feed_forward.up.adam_v", b.vWUp))
+            list.add(NamedCheckpointTensor("${prefix}feed_forward.down.adam_m", b.mWDown))
+            list.add(NamedCheckpointTensor("${prefix}feed_forward.down.adam_v", b.vWDown))
+        }
+        return list
+    }
 
     private fun writeArg4Checkpoint() {
         ensureVocabCapacity(tokenizer.vocabSize)
@@ -2129,11 +2290,13 @@ class ArgusNeuralEngine private constructor(
         val target = File(context.filesDir, "argus_model_weights.bin")
         val temporary = File(context.filesDir, "argus_model_weights.bin.tmp")
         val vocabEntries = tokenizer.exportVocab()
+        val isLearnedBpe = config.tokenizerConfig.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1
+        val merges = if (isLearnedBpe) tokenizer.exportMerges() else emptyList()
         val tensors = checkpointTensors()
         val architecture = architectureConfig
         val architectureIdBytes = architecture.architectureId.toByteArray(Charsets.UTF_8)
-        require(architecture.layerCount == 1) {
-            "ARG4 writer currently supports the executable single-block engine only."
+        require(architecture.layerCount in 1..32) {
+            "ARG4 writer supports 1..32 Transformer blocks."
         }
         require(architectureIdBytes.size in 1..512) {
             "Architecture ID length is invalid."
@@ -2149,6 +2312,14 @@ class ArgusNeuralEngine private constructor(
                 "Checkpoint token byte length is invalid."
             }
             payloadLength = Math.addExact(payloadLength, 8L + tokenBytes.size.toLong())
+        }
+        if (isLearnedBpe) {
+            payloadLength = Math.addExact(payloadLength, 4L)
+            for ((left, right) in merges) {
+                val leftBytes = left.toByteArray(Charsets.UTF_8)
+                val rightBytes = right.toByteArray(Charsets.UTF_8)
+                payloadLength = Math.addExact(payloadLength, 8L + leftBytes.size.toLong() + rightBytes.size.toLong())
+            }
         }
         for (tensor in tensors) {
             val nameBytes = tensor.name.toByteArray(Charsets.UTF_8)
@@ -2200,6 +2371,18 @@ class ArgusNeuralEngine private constructor(
                         writeIntLittleEndian(checked, id)
                         writeIntLittleEndian(checked, tokenBytes.size)
                         checked.write(tokenBytes)
+                    }
+
+                    if (isLearnedBpe) {
+                        writeIntLittleEndian(checked, merges.size)
+                        for ((left, right) in merges) {
+                            val leftBytes = left.toByteArray(Charsets.UTF_8)
+                            val rightBytes = right.toByteArray(Charsets.UTF_8)
+                            writeIntLittleEndian(checked, leftBytes.size)
+                            checked.write(leftBytes)
+                            writeIntLittleEndian(checked, rightBytes.size)
+                            checked.write(rightBytes)
+                        }
                     }
 
                     for (tensor in tensors) {
@@ -2406,8 +2589,11 @@ class ArgusNeuralEngine private constructor(
             require(savedArchitectureSchema == architectureConfig.schemaVersion) {
                 "ARG4 architecture schema mismatch."
             }
-            require(savedLayerCount == 1) {
-                "This runtime can restore a single Transformer block only."
+            require(savedLayerCount in 1..32) {
+                "ARG4 layer count must be between 1 and 32: $savedLayerCount."
+            }
+            require(savedLayerCount == layerCount) {
+                "ARG4 layer count ($savedLayerCount) does not match the active engine ($layerCount)."
             }
             require(
                 savedDModel == dModel && savedNHeads == nHeads &&
@@ -2437,7 +2623,7 @@ class ArgusNeuralEngine private constructor(
             require(
                 savedVocabularyEntryCount in 1..config.tokenizerConfig.maxVocabularySize
             ) { "ARG4 vocabulary entry count is invalid." }
-            require(savedTensorCount in 1..128) { "ARG4 tensor count is invalid." }
+            require(savedTensorCount in 1..2048) { "ARG4 tensor count is invalid: $savedTensorCount." }
             require(architectureIdLength in 1..512) { "ARG4 architecture ID length is invalid." }
             require(savedPayloadBytes >= architectureIdLength.toLong()) {
                 "ARG4 payload length is invalid."
@@ -2496,15 +2682,45 @@ class ArgusNeuralEngine private constructor(
                     )
                 }
 
+                val isLearnedBpe = savedTokenizerAlgorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1.checkpointId
+                val loadedMerges = if (isLearnedBpe) {
+                    val mergeCount = readIntLittleEndian(input)
+                    require(mergeCount in 0..config.tokenizerConfig.maxVocabularySize) {
+                        "ARG4 merge count is invalid: $mergeCount"
+                    }
+                    measuredPayloadBytes = Math.addExact(measuredPayloadBytes, 4L)
+                    val mergeList = ArrayList<Pair<String, String>>(mergeCount)
+                    repeat(mergeCount) {
+                        val leftLen = readIntLittleEndian(input)
+                        require(leftLen in 1..(config.tokenizerConfig.maxTokenLength * 4)) {
+                            "ARG4 merge left component length is invalid."
+                        }
+                        val leftBytes = input.readFully(leftLen)
+                        val rightLen = readIntLittleEndian(input)
+                        require(rightLen in 1..(config.tokenizerConfig.maxTokenLength * 4)) {
+                            "ARG4 merge right component length is invalid."
+                        }
+                        val rightBytes = input.readFully(rightLen)
+                        measuredPayloadBytes = Math.addExact(measuredPayloadBytes, 8L + leftLen.toLong() + rightLen.toLong())
+                        mergeList.add(
+                            String(leftBytes, Charsets.UTF_8) to String(rightBytes, Charsets.UTF_8)
+                        )
+                    }
+                    mergeList
+                } else emptyList()
+
                 val candidateTokenizer = Tokenizer(config.tokenizerConfig)
                 candidateTokenizer.importVocab(vocabulary)
+                if (isLearnedBpe) {
+                    candidateTokenizer.importMerges(loadedMerges)
+                }
                 require(candidateTokenizer.vocabSize == savedVocabSize) {
                     "ARG4 tokenizer vocabulary size does not match its metadata."
                 }
 
                 val expectedTensorSizes = expectedCheckpointTensorSizes(savedVocabCap)
                 require(savedTensorCount == expectedTensorSizes.size) {
-                    "ARG4 tensor count does not match the active engine."
+                    "ARG4 tensor count ($savedTensorCount) does not match the active engine (${expectedTensorSizes.size})."
                 }
                 val descriptors = ArrayList<CheckpointTensorDescriptor>(savedTensorCount)
                 val descriptorNames = HashSet<String>(savedTensorCount)
@@ -2517,12 +2733,17 @@ class ArgusNeuralEngine private constructor(
                     require(dataType == FLOAT32_TENSOR_TYPE) {
                         "ARG4 tensor data type is not supported by the FP32 trainer."
                     }
-                    val name = String(input.readFully(nameLength), Charsets.UTF_8)
-                    require(descriptorNames.add(name)) { "ARG4 tensor names must be unique." }
+                    val rawName = String(input.readFully(nameLength), Charsets.UTF_8)
+                    val name = if (!rawName.startsWith("layers.") && !rawName.startsWith("token.") && !rawName.startsWith("lm_head.")) {
+                        "layers.0.$rawName"
+                    } else {
+                        rawName
+                    }
+                    require(descriptorNames.add(name)) { "ARG4 tensor names must be unique: $name" }
                     val expectedCount = expectedTensorSizes[name]
-                        ?: throw IllegalArgumentException("ARG4 contains an unknown tensor.")
+                        ?: throw IllegalArgumentException("ARG4 contains an unknown tensor: $rawName (resolved as $name).")
                     require(elementCount == expectedCount) {
-                        "ARG4 tensor element count does not match the active architecture."
+                        "ARG4 tensor element count for $name does not match the active architecture: got $elementCount, expected $expectedCount."
                     }
                     descriptors.add(
                         CheckpointTensorDescriptor(name, elementCount, dataType)
@@ -2540,16 +2761,19 @@ class ArgusNeuralEngine private constructor(
                     "ARG4 tensor manifest is incomplete."
                 }
                 require(measuredPayloadBytes == savedPayloadBytes) {
-                    "ARG4 payload size does not match its tensor manifest."
+                    "ARG4 payload size does not match its tensor manifest: measured $measuredPayloadBytes, saved $savedPayloadBytes."
                 }
 
                 synchronized(modelLock) {
                     resizeVocabCapacityTo(savedVocabCap)
                     tokenizer.importVocab(vocabulary)
+                    if (isLearnedBpe) {
+                        tokenizer.importMerges(loadedMerges)
+                    }
                     val tensorsByName = checkpointTensors().associateBy { it.name }
                     for (descriptor in descriptors) {
                         val targetTensor = tensorsByName[descriptor.name]
-                            ?: throw IllegalStateException("ARG4 tensor target is unavailable.")
+                            ?: throw IllegalStateException("ARG4 tensor target is unavailable: ${descriptor.name}")
                         require(targetTensor.values.size.toLong() == descriptor.elementCount) {
                             "ARG4 tensor target size changed during restoration."
                         }
@@ -2613,6 +2837,9 @@ class ArgusNeuralEngine private constructor(
                             savedNHeads == nHeads && savedDFf == dFf &&
                             savedMaxSeq == maxSeqLen
                     ) { "ARG3 architecture dimensions do not match the active engine." }
+                    require(layerCount == 1) {
+                        "ARG3 legacy checkpoints can only be loaded into single-layer engines."
+                    }
                     require(savedVocabSize > 0) {
                         "ARG3 vocabulary size is invalid."
                     }

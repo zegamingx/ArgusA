@@ -87,7 +87,7 @@ data class ArgusArchitectureConfig(
  */
 fun EngineConfig.toArgusArchitectureConfig(
     vocabularySize: Int,
-    layerCount: Int = 1
+    layerCount: Int = this.layerCount
 ): ArgusArchitectureConfig = ArgusArchitectureConfig(
     layerCount = layerCount,
     hiddenSize = dModel,
