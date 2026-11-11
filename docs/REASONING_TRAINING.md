@@ -27,6 +27,12 @@ JSON object and a JSON array of training objects are also accepted. Each record 
 include a non-empty `instruction`/`prompt`/`question` and a non-empty
 `response`/`completion`/`answer`.
 
+File and ZIP imports use bounded streaming ingestion. Use JSONL (one complete object
+per line) for larger datasets. A single streamed JSON object or pretty-printed array
+is buffered as one structured value and is limited to 256 KiB; larger collections
+must be converted to JSONL. The importer rejects an oversized or incomplete structured
+value instead of splitting it into corrupted training chunks.
+
 Existing prompt/completion, instruction/response, and question/answer records without
 reasoning remain valid and retain their previous no-reasoning serialization.
 

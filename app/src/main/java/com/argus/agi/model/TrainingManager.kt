@@ -134,6 +134,7 @@ class TrainingManager(
         const val MAX_CORPUS_REPLAY_CHUNKS = 50_000
         private const val MAX_TOKENIZER_SAMPLE_CHUNKS = 256
         private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
+        private const val MAX_STREAMED_JSON_VALUE_CHARACTERS = 256 * 1024
         private const val IDLE_POLL_MS = 500L
         private val REASONING_BLOCK_PATTERN = Regex(
             "<THINK>(.*?)</THINK>",
@@ -495,6 +496,27 @@ class TrainingManager(
         val fingerprintDigest = MessageDigest.getInstance("SHA-256")
         var totalCharsRead = 0L
 
+        fun appendSegment(rawSegment: String) {
+            val normalizedSegment = TextModalityProcessor.normalizeTypography(rawSegment)
+            if (normalizedSegment.isBlank()) return
+
+            val formattedRecords =
+                TextModalityProcessor.formatTrainingDatasetRecords(normalizedSegment)
+            if (formattedRecords != null) {
+                appendFormattedTrainingRecords(
+                    records = formattedRecords,
+                    destination = rawChunks,
+                    chunkSize = chunkSize
+                )
+                return
+            }
+
+            val formattedText = normalizedSegment.lines().joinToString("\n") { line ->
+                TextModalityProcessor.formatStructuredLineIfJson(line)
+            }
+            if (formattedText.isNotBlank()) rawChunks.add(formattedText)
+        }
+
         while (true) {
             val readCount = reader.read(buffer)
             if (readCount < 0) break
@@ -517,23 +539,59 @@ class TrainingManager(
                 )
                 val punctuationBreak = max(lastNewLine, lastSentenceBreak)
 
-                val splitPosition = if (punctuationBreak >= 0) {
+                var splitPosition = if (punctuationBreak >= 0) {
                     minimumBreakPosition + punctuationBreak + 1
                 } else {
                     val lastSpace = searchText.lastIndexOf(' ')
                     if (lastSpace >= 0) minimumBreakPosition + lastSpace + 1 else chunkSize
                 }.coerceIn(1, chunkSize)
+                var structuredBoundary = false
 
-                val rawSegment = TextModalityProcessor.normalizeTypography(
-                    window.substring(0, splitPosition)
-                )
-                val normalizedSegment = rawSegment.lines().joinToString("\n") {
-                    TextModalityProcessor.formatStructuredLineIfJson(it)
+                // Never cut a JSON object/array in the middle. JSONL records are
+                // handled individually; pretty-printed values are buffered as one
+                // bounded value before the dataset formatter sees them.
+                val currentLineStart = window.lastIndexOf('\n', splitPosition - 1) + 1
+                var jsonStart = currentLineStart
+                while (jsonStart < splitPosition && window[jsonStart].isWhitespace()) {
+                    jsonStart++
                 }
-                if (normalizedSegment.isNotBlank()) rawChunks.add(normalizedSegment)
+                if (jsonStart < splitPosition && window[jsonStart] in charArrayOf('{', '[')) {
+                    if (jsonStart > 0) {
+                        splitPosition = jsonStart
+                        structuredBoundary = true
+                    } else {
+                        val jsonEnd = TextModalityProcessor.findCompleteJsonValueEnd(
+                            text = window.toString(),
+                            startIndex = jsonStart
+                        )
+                        if (jsonEnd == null) {
+                            val bufferedCharacters = window.length - jsonStart
+                            require(bufferedCharacters <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
+                                "A streamed JSON training value exceeds " +
+                                    "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
+                                    "Use JSONL with one training record per line."
+                            }
+                            break
+                        }
+                        val jsonLength = jsonEnd - jsonStart
+                        require(jsonLength <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
+                            "A streamed JSON training value exceeds " +
+                                "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
+                                "Use JSONL with one training record per line."
+                        }
+                        splitPosition = jsonEnd
+                        structuredBoundary = true
+                    }
+                }
 
-                val nextStart = (splitPosition - overlap).coerceAtLeast(0)
-                val safeNextStart = if (nextStart == 0 && splitPosition > 0) {
+                appendSegment(window.substring(0, splitPosition))
+
+                val nextStart = if (structuredBoundary) {
+                    splitPosition
+                } else {
+                    (splitPosition - overlap).coerceAtLeast(0)
+                }
+                val safeNextStart = if (!structuredBoundary && nextStart == 0 && splitPosition > 0) {
                     splitPosition
                 } else {
                     nextStart
@@ -549,11 +607,24 @@ class TrainingManager(
             return Pair(0, totalCharsRead)
         }
 
-        val trailingRaw = TextModalityProcessor.normalizeTypography(window.toString().trim())
-        val trailing = trailingRaw.lines().joinToString("\n") {
-            TextModalityProcessor.formatStructuredLineIfJson(it)
+        val trailingRaw = window.toString().trim()
+        if (trailingRaw.isNotBlank()) {
+            val firstContentIndex = trailingRaw.indexOfFirst { !it.isWhitespace() }
+            if (
+                firstContentIndex >= 0 &&
+                trailingRaw[firstContentIndex] in charArrayOf('{', '[') &&
+                TextModalityProcessor.findCompleteJsonValueEnd(
+                    text = trailingRaw,
+                    startIndex = firstContentIndex
+                ) == null
+            ) {
+                throw IllegalArgumentException(
+                    "The streamed JSON training value is incomplete. " +
+                        "Check the final JSONL record or closing JSON brackets."
+                )
+            }
+            appendSegment(trailingRaw)
         }
-        if (trailing.isNotBlank()) rawChunks.add(trailing)
 
         val chunksPerEpoch = rawChunks.size
         if (chunksPerEpoch == 0) return Pair(0, totalCharsRead)
@@ -750,6 +821,37 @@ class TrainingManager(
             reasoningMeanLoss = reasoningEvaluation.meanLoss,
             reasoningPerplexity = reasoningPerplexity
         )
+    }
+
+    /**
+     * Estimates a conservative queue cap from the current app heap.    private fun appendFormattedTrainingRecords(
+        records: List<String>,
+        destination: MutableList<String>,
+        chunkSize: Int
+    ) {
+        val buffer = StringBuilder()
+
+        fun flushBuffer() {
+            if (buffer.isNotEmpty()) {
+                destination.add(buffer.toString())
+                buffer.setLength(0)
+            }
+        }
+
+        for (record in records) {
+            if (record.isBlank()) continue
+            if (record.length > chunkSize) {
+                flushBuffer()
+                destination.add(record)
+                continue
+            }
+            if (buffer.isNotEmpty() && buffer.length + record.length + 1 > chunkSize) {
+                flushBuffer()
+            }
+            if (buffer.isNotEmpty()) buffer.append('\n')
+            buffer.append(record)
+        }
+        flushBuffer()
     }
 
     /**

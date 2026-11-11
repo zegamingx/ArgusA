@@ -119,6 +119,41 @@ class ReasoningTrainingTest {
     }
 
     @Test
+    fun legacyInstructionResponseFormatRemainsUnchangedWithoutReasoning() {    @Test
+    fun streamedJsonBoundaryScannerIgnoresBracesInsideQuotedStrings() {
+        val json = """{"instruction":"Explain the symbols { and } and escaped quote \\".","reasoning":["Keep nested [brackets] as text."],"response":"Done."} trailing text"""
+        val start = json.indexOf('{')
+        val end = TextModalityProcessor.findCompleteJsonValueEnd(json, start)
+
+        assertEquals(json.indexOf(" trailing text"), end)
+        assertEquals(null, TextModalityProcessor.findCompleteJsonValueEnd("""{"instruction":"unfinished"""", 0))
+    }
+
+    @Test
+    fun streamFormatterAcceptsJsonlAndPrettyPrintedReasoningRecords() {
+        val jsonl = listOf(
+            """{"instruction":"Add 1 and 2.","reasoning":["Identify the operands.","Add them."],"response":"3."}""",
+            """{"prompt":"Subtract 7 and 3.","steps":["Subtract the second value from the first."],"completion":"4."}"""
+        ).joinToString("\n")
+        val records = TextModalityProcessor.formatTrainingDatasetRecords(jsonl)
+
+        assertEquals(2, records?.size)
+        assertTrue(records.orEmpty().all { it.contains(Tokenizer.THINK_START) })
+        assertTrue(records.orEmpty().all { it.contains(Tokenizer.THINK_END) })
+
+        val prettyObject = """
+            {
+              "instruction": "Double 4.",
+              "reasoning": ["Multiply 4 by 2."],
+              "response": "8."
+            }
+        """.trimIndent()
+        val prettyRecords = TextModalityProcessor.formatTrainingDatasetRecords(prettyObject)
+        assertEquals(1, prettyRecords?.size)
+        assertTrue(prettyRecords.orEmpty().single().contains("Multiply 4 by 2."))
+    }
+
+    @Test
     fun legacyInstructionResponseFormatRemainsUnchangedWithoutReasoning() {
         val raw = """{"instruction":"Explain gravity.","input":"For a falling object.","response":"Gravity attracts masses."}"""
         val formatted = TextModalityProcessor.formatStructuredLineIfJson(raw)

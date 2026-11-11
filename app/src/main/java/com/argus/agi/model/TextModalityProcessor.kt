@@ -127,6 +127,72 @@ object TextModalityProcessor {
     }
 
     private fun firstNonBlankText(obj: JSONObject, keys: List<String>): String {
+    /**
+     * Returns the exclusive end offset of one complete JSON object or array.
+     * Braces inside quoted strings and escaped quotes do not affect nesting.
+     */
+    internal fun findCompleteJsonValueEnd(text: String, startIndex: Int): Int? {
+        if (startIndex !in text.indices) return null
+        val firstCharacter = text[startIndex]
+        if (firstCharacter != '{' && firstCharacter != '[') return null
+
+        val nesting = ArrayList<Char>()
+        var insideString = false
+        var escaped = false
+
+        for (index in startIndex until text.length) {
+            val character = text[index]
+            if (insideString) {
+                when {
+                    escaped -> escaped = false
+                    character == '\\\\' -> escaped = true
+                    character == '"' -> insideString = false
+                }
+                continue
+            }
+
+            when (character) {
+                '"' -> insideString = true
+                '{', '[' -> nesting.add(character)
+                '}', ']' -> {
+                    val expectedOpening = if (character == '}') '{' else '['
+                    if (nesting.isEmpty() || nesting.removeAt(nesting.lastIndex) != expectedOpening) {
+                        return null
+                    }
+                    if (nesting.isEmpty()) return index + 1
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Parses JSONL records, a pretty-printed object, or a JSON array of training
+     * records. Returns null unless every non-empty record is an instruction/answer
+     * example, so general JSON documents continue through the regular text path.
+     */
+    internal fun formatTrainingDatasetRecords(rawText: String): List<String>? {
+        val normalized = normalizeReasoningDatasetInput(normalizeTypography(rawText))
+        val serializedRecords = normalized.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .toList()
+        if (serializedRecords.isEmpty()) return null
+
+        val parsedRecords = serializedRecords.map { serialized ->
+            runCatching { JSONObject(serialized) }.getOrNull()
+        }
+        if (parsedRecords.any { it == null }) return null
+
+        val objects = parsedRecords.filterNotNull()
+        if (objects.isEmpty() || !objects.all(::isTrainingRecord)) return null
+
+        return objects.map { record ->
+            formatStructuredLineIfJson(record.toString())
+        }
+    }
+
+    private fun firstNonBlankText(obj: JSONObject, keys: List<String>): String {
         for (key in keys) {
             val value = obj.opt(key)
             if (value is String && value.isNotBlank()) return value.trim()
