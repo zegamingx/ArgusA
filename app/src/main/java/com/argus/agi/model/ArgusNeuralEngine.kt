@@ -248,6 +248,13 @@ data class NeuralTrainingStepResult(
     val vocabularySize: Int
 )
 
+/** Metrics for one real optimizer update over a serial micro-batch of independent samples. */
+data class NeuralTrainingBatchResult(
+    val samples: List<NeuralTrainingStepResult>,
+    val optimizerUpdateCount: Int,
+    val totalPredictionTargetCount: Int
+)
+
 internal data class GradientCheckResult(
     val parameterName: String,
     val parameterIndex: Int,
@@ -404,6 +411,12 @@ class ArgusNeuralEngine private constructor(
         Array(nHeads) { Array(maxSeqLen) { FloatArray(maxSeqLen) } }
 
     private val modelLock = Any()
+
+    private class BatchGradientAccumulator(
+        val gradients: Array<FloatArray>
+    ) {
+        var targetCount: Int = 0
+    }
 
     private data class GradientProbe(
         val parameterName: String,
@@ -1246,78 +1259,131 @@ class ArgusNeuralEngine private constructor(
 
     fun trainStep(text: String): Float = trainStepDetailed(text).loss
 
-    fun trainStepDetailed(text: String): NeuralTrainingStepResult {
+    fun trainStepDetailed(text: String): NeuralTrainingStepResult =
+        trainBatchDetailed(listOf(text)).samples.single()
+
+    /**
+     * Performs a serial micro-batch of independent sequences with one shared AdamW update.
+     * Activations are released between samples; only the accumulated parameter gradients
+     * remain resident. The accepted batch size is strictly bounded to 1..8.
+     */
+    fun trainBatchDetailed(texts: List<String>): NeuralTrainingBatchResult {
+        require(texts.size in 1..8) {
+            "Training batch size must be between 1 and 8."
+        }
+
         var shouldSaveCheckpoint = false
         val result = synchronized(modelLock) {
             val initialAdamStep = adamStep
-            val tokens = tokenizer.encode(text, autoRegister = false)
-            if (tokens.size < 2) {
-                return@synchronized NeuralTrainingStepResult(
-                    loss = Float.NaN,
+            val accumulator = createBatchGradientAccumulator()
+            val sampleResults = ArrayList<NeuralTrainingStepResult>(texts.size)
+
+            for (text in texts) {
+                val tokens = tokenizer.encode(text, autoRegister = false)
+                if (tokens.size < 2) {
+                    sampleResults += NeuralTrainingStepResult(
+                        loss = Float.NaN,
+                        inputTokenCount = tokens.size,
+                        predictionTargetCount = 0,
+                        contextWindowCount = 0,
+                        optimizerUpdateCount = 0,
+                        vocabularySize = tokenizer.vocabSize
+                    )
+                    continue
+                }
+
+                ensureVocabCapacity(tokenizer.vocabSize)
+                val currentVocab = tokenizer.vocabSize
+                var contextWindowCount = 0
+                var predictionTargetCount = 0
+                var weightedLoss = 0f
+                var trainedTargets = 0
+
+                if (tokens.size <= maxSeqLen) {
+                    val windowLoss = trainSingleWindow(
+                        seq = tokens,
+                        currentVocab = currentVocab,
+                        gradientAccumulator = accumulator
+                    )
+                    if (windowLoss.isFinite()) {
+                        contextWindowCount = 1
+                        predictionTargetCount = tokens.size - 1
+                        trainedTargets = tokens.size - 1
+                        weightedLoss = windowLoss * (tokens.size - 1)
+                    }
+                } else {
+                    val overlapTokens = min(24, maxSeqLen - 1)
+                    val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
+                    var start = 0
+
+                    while (start < tokens.size - 1) {
+                        val end = min(start + maxSeqLen, tokens.size)
+                        val windowSequence = tokens.subList(start, end)
+                        if (windowSequence.size >= 2) {
+                            val firstTargetIndex =
+                                if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
+                            val targetCount =
+                                (windowSequence.size - 1 - firstTargetIndex).coerceAtLeast(0)
+                            if (targetCount > 0) {
+                                val windowLoss = trainSingleWindow(
+                                    seq = windowSequence,
+                                    currentVocab = currentVocab,
+                                    firstTargetIndex = firstTargetIndex,
+                                    gradientAccumulator = accumulator
+                                )
+                                if (windowLoss.isFinite()) {
+                                    contextWindowCount++
+                                    weightedLoss += windowLoss * targetCount
+                                    trainedTargets += targetCount
+                                    predictionTargetCount += targetCount
+                                }
+                            }
+                        }
+                        if (end >= tokens.size) break
+                        start += stride
+                    }
+                }
+
+                sampleResults += NeuralTrainingStepResult(
+                    loss = if (trainedTargets > 0) {
+                        weightedLoss / trainedTargets
+                    } else {
+                        Float.NaN
+                    },
                     inputTokenCount = tokens.size,
-                    predictionTargetCount = 0,
-                    contextWindowCount = 0,
+                    predictionTargetCount = predictionTargetCount,
+                    contextWindowCount = contextWindowCount,
                     optimizerUpdateCount = 0,
-                    vocabularySize = tokenizer.vocabSize
+                    vocabularySize = currentVocab
                 )
             }
 
-            ensureVocabCapacity(tokenizer.vocabSize)
-            val currentVocab = tokenizer.vocabSize
-            var contextWindowCount = 0
-            var predictionTargetCount = 0
-
-            val meanLoss = if (tokens.size <= maxSeqLen) {
-                contextWindowCount = 1
-                predictionTargetCount = tokens.size - 1
-                trainSingleWindow(tokens, currentVocab)
-            } else {
-                val overlapTokens = min(24, maxSeqLen - 1)
-                val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
-                var weightedLoss = 0f
-                var trainedTargets = 0
-                var start = 0
-
-                while (start < tokens.size - 1) {
-                    val end = min(start + maxSeqLen, tokens.size)
-                    val windowSequence = tokens.subList(start, end)
-                    if (windowSequence.size >= 2) {
-                        val firstTargetIndex =
-                            if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
-                        val targetCount =
-                            (windowSequence.size - 1 - firstTargetIndex).coerceAtLeast(0)
-                        if (targetCount > 0) {
-                            val windowLoss = trainSingleWindow(
-                                seq = windowSequence,
-                                currentVocab = currentVocab,
-                                firstTargetIndex = firstTargetIndex
-                            )
-                            contextWindowCount++
-                            if (windowLoss.isFinite()) {
-                                weightedLoss += windowLoss * targetCount
-                                trainedTargets += targetCount
-                                predictionTargetCount += targetCount
-                            }
-                        }
-                    }
-                    if (end >= tokens.size) break
-                    start += stride
-                }
-
-                if (trainedTargets > 0) weightedLoss / trainedTargets else Float.NaN
+            if (accumulator.targetCount > 0) {
+                applyAccumulatedGradients(accumulator)
             }
 
+            val optimizerUpdates = (adamStep - initialAdamStep).coerceAtLeast(0)
             if (adamStep / CHECKPOINT_INTERVAL > initialAdamStep / CHECKPOINT_INTERVAL) {
                 shouldSaveCheckpoint = true
             }
 
-            NeuralTrainingStepResult(
-                loss = meanLoss,
-                inputTokenCount = tokens.size,
-                predictionTargetCount = predictionTargetCount,
-                contextWindowCount = contextWindowCount,
-                optimizerUpdateCount = (adamStep - initialAdamStep).coerceAtLeast(0),
-                vocabularySize = currentVocab
+            val firstTrainableSample = sampleResults.indexOfFirst {
+                it.loss.isFinite() && it.predictionTargetCount > 0
+            }
+            val reportedSamples = sampleResults.mapIndexed { index, sample ->
+                sample.copy(
+                    optimizerUpdateCount = if (index == firstTrainableSample) {
+                        optimizerUpdates
+                    } else {
+                        0
+                    }
+                )
+            }
+
+            NeuralTrainingBatchResult(
+                samples = reportedSamples,
+                optimizerUpdateCount = optimizerUpdates,
+                totalPredictionTargetCount = accumulator.targetCount
             )
         }
 
@@ -1376,13 +1442,14 @@ class ArgusNeuralEngine private constructor(
         currentVocab: Int,
         updateParameters: Boolean = true,
         firstTargetIndex: Int = 0,
-        gradientProbe: GradientProbe? = null
+        gradientProbe: GradientProbe? = null,
+        gradientAccumulator: BatchGradientAccumulator? = null
     ): Float {
         val seqLen = seq.size
         if (seqLen < 2) return Float.NaN
 
-        if (updateParameters) adamStep++
-        val lr = if (updateParameters) {
+        if (updateParameters && gradientAccumulator == null) adamStep++
+        val lr = if (updateParameters && gradientAccumulator == null) {
             baseLearningRate / (1f + 0.0002f * adamStep)
         } else {
             0f
@@ -2033,6 +2100,45 @@ class ArgusNeuralEngine private constructor(
             return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
 
+        if (gradientAccumulator != null) {
+            if (validSteps > 0) {
+                val sampleGradients = ArrayList<FloatArray>(2 + layerGrads.size * 11)
+                sampleGradients += gradWHead
+                sampleGradients += gradWEmbed
+                for (layerGradient in layerGrads) {
+                    sampleGradients += layerGradient.gradWDown
+                    sampleGradients += layerGradient.gradWUp
+                    sampleGradients += layerGradient.gradWGate
+                    sampleGradients += layerGradient.gradWO
+                    sampleGradients += layerGradient.gradWQ
+                    sampleGradients += layerGradient.gradWK
+                    sampleGradients += layerGradient.gradWV
+                    sampleGradients += layerGradient.gradLoraQa
+                    sampleGradients += layerGradient.gradLoraQb
+                    sampleGradients += layerGradient.gradLoraVa
+                    sampleGradients += layerGradient.gradLoraVb
+                }
+                require(sampleGradients.size == gradientAccumulator.gradients.size) {
+                    "Gradient accumulator tensor count does not match the active architecture."
+                }
+                for (tensorIndex in sampleGradients.indices) {
+                    val source = sampleGradients[tensorIndex]
+                    val destination = gradientAccumulator.gradients[tensorIndex]
+                    require(source.size == destination.size) {
+                        "Gradient accumulator tensor shape does not match the active architecture."
+                    }
+                    for (elementIndex in source.indices) {
+                        destination[elementIndex] += source[elementIndex] * validSteps
+                    }
+                }
+                gradientAccumulator.targetCount = Math.addExact(
+                    gradientAccumulator.targetCount,
+                    validSteps
+                )
+            }
+            return if (validSteps > 0) totalLoss / validSteps else Float.NaN
+        }
+
         var sumSquares = 0f
         sumSquares += computeSumSquares(gradWHead)
         sumSquares += computeSumSquares(gradWEmbed)
@@ -2118,6 +2224,154 @@ class ArgusNeuralEngine private constructor(
         }
 
         return if (validSteps > 0) totalLoss / validSteps else Float.NaN
+    }
+
+    private fun currentParameterArrays(): Array<FloatArray> {
+        val arrays = ArrayList<FloatArray>(2 + layerCount * 11)
+        arrays += wHead
+        arrays += wEmbed
+        for (block in blocks) {
+            arrays += block.wDown
+            arrays += block.wUp
+            arrays += block.wGate
+            arrays += block.wO
+            arrays += block.wQ
+            arrays += block.wK
+            arrays += block.wV
+            arrays += block.loraQa
+            arrays += block.loraQb
+            arrays += block.loraVa
+            arrays += block.loraVb
+        }
+        return arrays.toTypedArray()
+    }
+
+    private fun currentFirstMomentArrays(): Array<FloatArray> {
+        val arrays = ArrayList<FloatArray>(2 + layerCount * 11)
+        arrays += mHead
+        arrays += mEmbed
+        for (block in blocks) {
+            arrays += block.mWDown
+            arrays += block.mWUp
+            arrays += block.mWGate
+            arrays += block.mWO
+            arrays += block.mWQ
+            arrays += block.mWK
+            arrays += block.mWV
+            arrays += block.mLoraQa
+            arrays += block.mLoraQb
+            arrays += block.mLoraVa
+            arrays += block.mLoraVb
+        }
+        return arrays.toTypedArray()
+    }
+
+    private fun currentSecondMomentArrays(): Array<FloatArray> {
+        val arrays = ArrayList<FloatArray>(2 + layerCount * 11)
+        arrays += vHead
+        arrays += vEmbed
+        for (block in blocks) {
+            arrays += block.vWDown
+            arrays += block.vWUp
+            arrays += block.vWGate
+            arrays += block.vWO
+            arrays += block.vWQ
+            arrays += block.vWK
+            arrays += block.vWV
+            arrays += block.vLoraQa
+            arrays += block.vLoraQb
+            arrays += block.vLoraVa
+            arrays += block.vLoraVb
+        }
+        return arrays.toTypedArray()
+    }
+
+    private fun createBatchGradientAccumulator(): BatchGradientAccumulator {
+        val parameters = currentParameterArrays()
+        return BatchGradientAccumulator(
+            gradients = Array(parameters.size) { index ->
+                FloatArray(parameters[index].size)
+            }
+        )
+    }
+
+    /** Applies one target-weighted AdamW update after every micro-batch sample is processed. */
+    private fun applyAccumulatedGradients(accumulator: BatchGradientAccumulator) {
+        require(accumulator.targetCount > 0) {
+            "Cannot apply an empty gradient accumulation batch."
+        }
+
+        val parameters = currentParameterArrays()
+        val gradients = accumulator.gradients
+        val firstMoments = currentFirstMomentArrays()
+        val secondMoments = currentSecondMomentArrays()
+        require(
+            parameters.size == gradients.size &&
+                parameters.size == firstMoments.size &&
+                parameters.size == secondMoments.size
+        ) { "Optimizer tensor groups do not match the active architecture." }
+
+        var sumSquares = 0f
+        for (index in gradients.indices) {
+            require(
+                parameters[index].size == gradients[index].size &&
+                    parameters[index].size == firstMoments[index].size &&
+                    parameters[index].size == secondMoments[index].size
+            ) { "Optimizer tensor shape mismatch at index $index." }
+            normalizeGradient(gradients[index], accumulator.targetCount.toFloat())
+            sumSquares += computeSumSquares(gradients[index])
+        }
+
+        val totalNorm = sqrt(sumSquares)
+        if (!totalNorm.isFinite()) {
+            throw IllegalStateException("Accumulated gradient norm is not finite.")
+        }
+        val clipFactor =
+            if (totalNorm > maxGradNorm) maxGradNorm / (totalNorm + 1e-6f) else 1.0f
+
+        adamStep++
+        val learningRate = baseLearningRate / (1f + 0.0002f * adamStep)
+        val biasCorrection1 = 1f -
+            Math.pow(beta1.toDouble(), adamStep.toDouble()).toFloat()
+        val biasCorrection2 = 1f -
+            Math.pow(beta2.toDouble(), adamStep.toDouble()).toFloat()
+        val weightDecayByGroup = FloatArray(parameters.size).also { values ->
+            for (layer in 0 until layerCount) {
+                val offset = 2 + layer * 11
+                for (index in 0 until 7) values[offset + index] = weightDecay
+            }
+        }
+
+        val updatedByVulkan = VulkanTrainingBackend.tryApplyAdamWUpdate(
+            parameters = parameters,
+            gradients = gradients,
+            firstMoments = firstMoments,
+            secondMoments = secondMoments,
+            weightDecayByGroup = weightDecayByGroup,
+            learningRate = learningRate,
+            beta1 = beta1,
+            beta2 = beta2,
+            biasCorrection1 = biasCorrection1,
+            biasCorrection2 = biasCorrection2,
+            epsilon = epsilon,
+            gradientClipFactor = clipFactor
+        )
+
+        if (!updatedByVulkan) {
+            for (index in parameters.indices) {
+                applyClip(gradients[index], clipFactor)
+                adamUpdate(
+                    param = parameters[index],
+                    grad = gradients[index],
+                    m = firstMoments[index],
+                    v = secondMoments[index],
+                    lr = learningRate,
+                    biasCorr1 = biasCorrection1,
+                    biasCorr2 = biasCorrection2,
+                    wd = weightDecayByGroup[index]
+                )
+            }
+        }
     }
 
     private fun normalizeGradient(grad: FloatArray, div: Float) {
