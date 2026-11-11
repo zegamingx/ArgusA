@@ -501,12 +501,18 @@ class ArgusNeuralEngine private constructor(
                 }
             }.getOrNull()
 
-            val deviceConfig = EngineConfig.forDevice(
-                totalRamGb = totalRamGb,
-                maxHeapMb = maxHeapMb,
-                availableRamGb = availableRamGb,
-                cpuCores = cpuCores
-            )
+            val deviceConfig = runCatching {
+                EngineConfig.forDevice(
+                    totalRamGb = totalRamGb,
+                    maxHeapMb = maxHeapMb,
+                    availableRamGb = availableRamGb,
+                    cpuCores = cpuCores
+                )
+            }.getOrNull()
+
+            val resolvedConfig = savedConfig ?: requireNotNull(deviceConfig) {
+                "This device cannot currently allocate the minimum 1M-parameter Argus model safely."
+            }
             val accumulatedTrainingIsSafe = if (savedConfig == null) {
                 true
             } else {
@@ -514,20 +520,16 @@ class ArgusNeuralEngine private constructor(
                     savedConfig.copy(gradientAccumulationEnabled = true)
                 }.isSuccess
             }
-            val resolved = when {
-                savedConfig == null -> deviceConfig
-                accumulatedTrainingIsSafe ->
-                    savedConfig.copy(gradientAccumulationEnabled = true)
-                else ->
-                    savedConfig.copy(gradientAccumulationEnabled = false)
+            val selectedTier = deviceConfig?.modelTier ?: resolvedConfig.modelTier
+            val selectedBatchSize = when {
+                !accumulatedTrainingIsSafe -> 1
+                deviceConfig != null -> deviceConfig.trainingBatchSize
+                else -> 1
             }
-            return resolved.copy(
-                modelTier = deviceConfig.modelTier,
-                trainingBatchSize = if (accumulatedTrainingIsSafe) {
-                    deviceConfig.trainingBatchSize
-                } else {
-                    1
-                }
+            return resolvedConfig.copy(
+                modelTier = selectedTier,
+                trainingBatchSize = selectedBatchSize,
+                gradientAccumulationEnabled = accumulatedTrainingIsSafe
             )
         }
 
