@@ -171,6 +171,32 @@ class ReasoningTrainingTest {
     }
 
     @Test
+    fun reasoningInferenceUsesTheSameThinkPrefixAsTrainingSerialization() {
+        assertEquals(
+            "${Tokenizer.USER_TOKEN}Explain the result.${Tokenizer.ASSISTANT_TOKEN}${Tokenizer.THINK_START}",
+            ArgusNeuralEngine.formatGenerationPrompt("Explain the result.", reasoningMode = true)
+        )
+        assertEquals(
+            "${Tokenizer.USER_TOKEN}Explain the result.${Tokenizer.ASSISTANT_TOKEN}",
+            ArgusNeuralEngine.formatGenerationPrompt("Explain the result.", reasoningMode = false)
+        )
+        assertEquals(
+            "${Tokenizer.USER_TOKEN}Explain the result.${Tokenizer.ASSISTANT_TOKEN}${Tokenizer.THINK_START}",
+            ArgusNeuralEngine.formatGenerationPrompt(
+                "${Tokenizer.USER_TOKEN}Explain the result.${Tokenizer.ASSISTANT_TOKEN}",
+                reasoningMode = true
+            )
+        )
+        assertEquals(
+            "${Tokenizer.USER_TOKEN}Explain the result.${Tokenizer.ASSISTANT_TOKEN}${Tokenizer.THINK_START}",
+            ArgusNeuralEngine.formatGenerationPrompt(
+                "${Tokenizer.USER_TOKEN}Explain the result.${Tokenizer.ASSISTANT_TOKEN}${Tokenizer.THINK_START}",
+                reasoningMode = true
+            )
+        )
+    }
+
+    @Test
     fun generatedReasoningIsSeparatedFromFinalAnswerOnlyWhenComplete() {
         val generated = "${Tokenizer.THINK_START}Check the known values.\nCompute the ratio." +
             "${Tokenizer.THINK_END}${Tokenizer.ASSISTANT_TOKEN}The answer is 60." +
