@@ -920,6 +920,23 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
+    /**
+     * Generates a response beginning at the trained THINK prefix. The returned text
+     * retains <THINK> and </THINK> so callers can distinguish the reasoning trace
+     * from the final assistant answer.
+     */
+    suspend fun generateReasoning(
+        prompt: String,
+        maxNewTokens: Int = 120,
+        temperature: Float = 0.7f
+    ): String = generate(
+        prompt = prompt,
+        maxNewTokens = maxNewTokens,
+        temperature = temperature,
+        includeReasoningMarkers = true,
+        reasoningMode = true
+    )
+
     // =====================================================================
     // Training: Full-Parameter Backprop with Per-Window Gradient Accumulation
     // =====================================================================
