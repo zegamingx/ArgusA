@@ -71,7 +71,7 @@ object DeviceModelCapacityPolicy {
     fun recommend(availableRamGb: Double): DeviceModelCapacityRecommendation {
         if (!availableRamGb.isFinite() || availableRamGb < anchors.first().availableRamGb) {
             return DeviceModelCapacityRecommendation(
-                availableRamGb = availableRamGb.coerceAtLeast(0.0),
+                availableRamGb = availableRamGb.takeIf { it.isFinite() }?.coerceAtLeast(0.0) ?: 0.0,
                 minimumParametersBillions = null,
                 maximumParametersBillions = null,
                 isExtrapolated = false

@@ -28,8 +28,8 @@ class DeviceModelCapacityPolicyTest {
 
         expected.forEach { (ramGb, range) ->
             val recommendation = DeviceModelCapacityPolicy.recommend(ramGb)
-            assertEquals(range.first, recommendation.minimumParametersBillions!!, 0.0001)
-            assertEquals(range.second, recommendation.maximumParametersBillions!!, 0.0001)
+            assertEquals(range.first, requireNotNull(recommendation.minimumParametersBillions), 0.0001)
+            assertEquals(range.second, requireNotNull(recommendation.maximumParametersBillions), 0.0001)
             assertFalse(recommendation.isExtrapolated)
         }
     }
@@ -38,8 +38,8 @@ class DeviceModelCapacityPolicyTest {
     fun interpolatesBetweenDefinedAnchors() {
         val recommendation = DeviceModelCapacityPolicy.recommend(9.0)
 
-        assertEquals(8.0, recommendation.minimumParametersBillions!!, 0.0001)
-        assertEquals(10.5, recommendation.maximumParametersBillions!!, 0.0001)
+        assertEquals(8.0, requireNotNull(recommendation.minimumParametersBillions), 0.0001)
+        assertEquals(10.5, requireNotNull(recommendation.maximumParametersBillions), 0.0001)
         assertFalse(recommendation.isExtrapolated)
     }
 
@@ -47,8 +47,8 @@ class DeviceModelCapacityPolicyTest {
     fun extrapolatesAboveThirtyTwoGbUsingRequestedGrowth() {
         val recommendation = DeviceModelCapacityPolicy.recommend(33.0)
 
-        assertEquals(39.3, recommendation.minimumParametersBillions!!, 0.0001)
-        assertEquals(43.5, recommendation.maximumParametersBillions!!, 0.0001)
+        assertEquals(39.3, requireNotNull(recommendation.minimumParametersBillions), 0.0001)
+        assertEquals(43.5, requireNotNull(recommendation.maximumParametersBillions), 0.0001)
         assertTrue(recommendation.isExtrapolated)
     }
 
@@ -90,7 +90,7 @@ class InferenceMemoryEstimatorTest {
         )
 
         assertEquals(268_435_456L, estimate.keyValueCacheBytes)
-        assertTrue(estimate.totalRequiredBytes!! > estimate.weightBytes)
+        assertTrue(requireNotNull(estimate.totalRequiredBytes) > estimate.weightBytes)
         assertTrue(estimate.hasCompleteModelMetadata)
     }
 
