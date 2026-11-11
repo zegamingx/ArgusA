@@ -430,14 +430,14 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                         }
                         Spacer(modifier = Modifier.height(10.dp))
                         Text(
-                            text = "Architecture: Micro-Transformer · dModel=${modelConfig.dModel} · Heads=${modelConfig.nHeads} · FFN=${modelConfig.dFf} · Context=${modelConfig.maxSeqLen} · LoRA rank=${modelConfig.loraRank}",
+                            text = "Architecture: Argus Transformer · ${modelConfig.layerCount} layers · dModel=${modelConfig.dModel} · Heads=${modelConfig.nHeads} · FFN=${modelConfig.dFf} · Context=${modelConfig.maxSeqLen} · LoRA rank=${modelConfig.loraRank}",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted,
                             fontFamily = FontFamily.Monospace,
                             fontSize = 10.sp
                         )
                         Text(
-                            text = "Parameters: $formattedParams • LoRA adapter: $adapterSizeStr • Backend state: $backendState • Vulkan runtime: ${if (isVulkanRuntimeReady) "SELF-CHECKED" else "UNAVAILABLE"}",
+                            text = "Model profile: ${modelConfig.modelTier.displayName} • Parameters: $formattedParams • Training batch: ${modelConfig.trainingBatchSize}/8 • LoRA adapter: $adapterSizeStr",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted,
                             fontFamily = FontFamily.Monospace,
