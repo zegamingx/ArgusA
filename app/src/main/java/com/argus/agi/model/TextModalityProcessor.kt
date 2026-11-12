@@ -351,6 +351,24 @@ object TextModalityProcessor {
         }
     }
 
+    /**
+     * Serializes one user-approved exchange using the same role markers consumed
+     * by imported conversation datasets and the on-device next-token trainer.
+     */
+    fun formatConversationExchange(
+        userMessage: String,
+        assistantMessage: String
+    ): String? {
+        val normalizedUserMessage = normalizeTypography(userMessage)
+        val normalizedAssistantMessage = normalizeTypography(assistantMessage)
+        if (normalizedUserMessage.isBlank() || normalizedAssistantMessage.isBlank()) {
+            return null
+        }
+
+        return "${Tokenizer.USER_TOKEN} $normalizedUserMessage\n" +
+            "${Tokenizer.ASSISTANT_TOKEN} $normalizedAssistantMessage"
+    }
+
     private fun readReasoningStep(value: Any?): String {
         return when (value) {
             is String -> value.trim()

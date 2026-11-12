@@ -141,6 +141,34 @@ class ConversationalDatasetTest {
     }
 
     @Test
+    fun explicitlyApprovedExchangeUsesTheSameConversationTrainingFormat() {
+        val sample = TextModalityProcessor.formatConversationExchange(
+            userMessage = "Can you help me?",
+            assistantMessage = "Yes. What do you need?"
+        )
+
+        assertTrue(sample != null)
+        val chunks = TextModalityProcessor.process(
+            rawText = sample.orEmpty(),
+            documentTitle = "Approved exchange",
+            chunkSize = 512,
+            overlap = 0
+        )
+
+        assertEquals(1, chunks.size)
+        assertEquals(TextModality.CONVERSATION, chunks.single().modality)
+        assertTrue(chunks.single().content.contains("${Tokenizer.USER_TOKEN} Can you help me?"))
+        assertTrue(chunks.single().content.contains("${Tokenizer.ASSISTANT_TOKEN} Yes. What do you need?"))
+        assertTrue(chunks.single().content.endsWith(Tokenizer.EOS_TOKEN))
+        assertNull(
+            TextModalityProcessor.formatConversationExchange(
+                userMessage = " ",
+                assistantMessage = "An answer without a prompt."
+            )
+        )
+    }
+
+    @Test
     fun conversationRecordWithoutAssistantTurnIsRejectedAsTrainingRecord() {
         val raw = """
             {

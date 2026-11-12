@@ -12,6 +12,7 @@ import com.argus.agi.model.BenchmarkResult
 import com.argus.agi.model.GenesisLifecycleStage
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingManager
+import com.argus.agi.model.TextModalityProcessor
 import com.argus.agi.model.ReasoningOutputParser
 import com.argus.agi.model.TrainingSessionMetrics
 import com.argus.agi.model.WorldEntity
@@ -372,6 +373,49 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 )
             } finally {
                 _isBenchmarking.value = false
+            }
+        }
+    }
+
+    /**
+     * Adds exactly one user-selected text exchange to the durable local training corpus.
+     * No conversation is collected automatically; the caller must request this action
+     * for the specific exchange shown in the chat UI.
+     */
+    fun enqueueApprovedConversation(
+        userMessage: String,
+        assistantMessage: String,
+        onComplete: (Boolean) -> Unit
+    ) {
+        val trainingSample = TextModalityProcessor.formatConversationExchange(
+            userMessage = userMessage,
+            assistantMessage = assistantMessage
+        )
+        if (trainingSample == null) {
+            onComplete(false)
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val queuedChunks = try {
+                trainingManager.enqueueDocument(
+                    source = "user_approved_conversation",
+                    title = "Approved conversation ${System.currentTimeMillis()}",
+                    fullText = trainingSample,
+                    chunkSize = 380,
+                    overlap = 0,
+                    epochs = 1,
+                    rightsStatus = "USER_DECLARED"
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.e(TAG, "Failed to queue a user-approved conversation sample.", error)
+                0
+            }
+
+            withContext(Dispatchers.Main) {
+                onComplete(queuedChunks > 0)
             }
         }
     }

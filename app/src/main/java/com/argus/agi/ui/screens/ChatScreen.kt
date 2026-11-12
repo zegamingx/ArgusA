@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -337,8 +338,26 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                 contentPadding = PaddingValues(vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                items(messages, key = { it.id }) { msg ->
-                    ChatMessageItem(msg, onSpeak = { text -> viewModel.speakMessage(text) })
+                itemsIndexed(
+                    items = messages,
+                    key = { _, message -> message.id }
+                ) { index, msg ->
+                    val previousUserMessage = if (msg.isUser) {
+                        null
+                    } else {
+                        messages.subList(0, index)
+                            .lastOrNull { it.isUser }
+                            ?.takeIf { it.attachedImageUri == null }
+                            ?.text
+                    }
+                    ChatMessageItem(
+                        msg = msg,
+                        userPromptForTraining = previousUserMessage,
+                        onSpeak = { text -> viewModel.speakMessage(text) },
+                        onTrain = { prompt, answer, onComplete ->
+                            viewModel.enqueueApprovedConversation(prompt, answer, onComplete)
+                        }
+                    )
                 }
 
                 if (isGenerating) {
@@ -525,7 +544,9 @@ fun ChatScreen(viewModel: ArgusViewModel) {
 @Composable
 fun ChatMessageItem(
     msg: ChatMessage,
-    onSpeak: ((String) -> Unit)? = null
+    userPromptForTraining: String? = null,
+    onSpeak: ((String) -> Unit)? = null,
+    onTrain: ((String, String, (Boolean) -> Unit) -> Unit)? = null
 ) {
     val context = LocalContext.current
     val clipboard = LocalClipboard.current
@@ -534,6 +555,8 @@ fun ChatMessageItem(
     var isThinkingExpanded by remember { mutableStateOf(false) }
     var isLongTextExpanded by remember { mutableStateOf(false) }
     var isCopied by remember { mutableStateOf(false) }
+    var isTrainingRequestPending by remember(msg.id) { mutableStateOf(false) }
+    var isTrainingSubmitted by remember(msg.id) { mutableStateOf(false) }
 
     val isLongMessage = msg.text.length > 450
     val displayText = if (isLongMessage && !isLongTextExpanded) msg.text.take(380) + "..." else msg.text
@@ -611,6 +634,39 @@ fun ChatMessageItem(
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
                     if (!msg.isUser) {
+                        if (!userPromptForTraining.isNullOrBlank() && onTrain != null) {
+                            TextButton(
+                                enabled = !isTrainingRequestPending && !isTrainingSubmitted,
+                                onClick = {
+                                    val prompt = userPromptForTraining
+                                    if (!prompt.isNullOrBlank()) {
+                                        isTrainingRequestPending = true
+                                        onTrain.invoke(prompt, msg.text) { accepted ->
+                                            isTrainingRequestPending = false
+                                            isTrainingSubmitted = accepted
+                                            val feedback = if (accepted) {
+                                                "Exchange added to the local training corpus"
+                                            } else {
+                                                "Exchange was already stored or could not be queued"
+                                            }
+                                            Toast.makeText(context, feedback, Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+                            ) {
+                                val label = when {
+                                    isTrainingRequestPending -> "Adding…"
+                                    isTrainingSubmitted -> "Added"
+                                    else -> "Train exchange"
+                                }
+                                Text(
+                                    text = label,
+                                    color = if (isTrainingSubmitted) ArgusSuccess else ArgusCyanPrimary,
+                                    fontSize = 10.sp
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(4.dp))
+                        }
                         Row(
                             modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(ArgusDarkBg.copy(alpha = 0.45f)).clickable { onSpeak?.invoke(msg.text) }.padding(horizontal = 8.dp, vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically
