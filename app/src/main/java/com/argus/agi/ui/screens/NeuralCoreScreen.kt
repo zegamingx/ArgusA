@@ -1,6 +1,5 @@
 package com.argus.agi.ui.screens
 
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -28,13 +27,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
@@ -58,7 +54,6 @@ import com.argus.agi.ui.theme.ArgusTextSecondary
 import com.argus.agi.ui.theme.ArgusWarning
 import java.text.NumberFormat
 import java.util.Locale
-import kotlin.random.Random
 
 // =====================================================================
 // NEURAL CORE SCREEN
@@ -149,11 +144,8 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(ArgusDarkBg)
             .testTag("neural_core_screen")
     ) {
-        // Decorative neural background
-        NeuronBackground()
 
         // Main screen content
         LazyColumn(
@@ -553,39 +545,6 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                     }
                 } else EmptyQueueCard("No completed training items yet.")
             }
-        }
-    }
-}
-
-// =====================================================================
-// DECORATIVE NEURAL BACKGROUND
-// =====================================================================
-@Composable
-fun NeuronBackground() {
-    val nodes = remember { List(45) { Offset(Random.nextFloat(), Random.nextFloat()) } }
-    var pulse by remember { mutableStateOf(0f) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            pulse = if (pulse == 0f) 1f else 0f
-            kotlinx.coroutines.delay(1200)
-        }
-    }
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val w = size.width
-        val h = size.height
-        for (i in nodes.indices) {
-            for (j in i + 1 until nodes.size) {
-                val a = Offset(nodes[i].x * w, nodes[i].y * h)
-                val b = Offset(nodes[j].x * w, nodes[j].y * h)
-                if ((a - b).getDistance() < 220f) {
-                    drawLine(color = Color(0xFF00BFFF).copy(alpha = 0.16f), start = a, end = b, strokeWidth = 1f)
-                }
-            }
-        }
-        nodes.forEach { n ->
-            val pos = Offset(n.x * w, n.y * h)
-            drawCircle(color = Color(0xFF00BFFF).copy(alpha = 0.14f), radius = 18f + pulse * 8f, center = pos)
-            drawCircle(color = Color(0xFF4FC3FF), radius = 4f, center = pos)
         }
     }
 }
