@@ -124,6 +124,58 @@ class ConversationalValidationTest {
         assertTrue(rejected.reason.contains("instructionCompliance"))
     }
 
+    @Test
+    fun belowThresholdCandidateCanAdvanceAsBestKnownWithoutBecomingReleaseReady() {
+        val baseline = report(
+            factCoverage = 0.20f,
+            instructionCompliance = 0.30f,
+            multiTurnConsistency = 0.20f,
+            contradictionRate = 0.10f,
+            overallScore = 0.22f,
+            meetsThresholds = false
+        )
+        val improved = report(
+            factCoverage = 0.40f,
+            instructionCompliance = 0.50f,
+            multiTurnConsistency = 0.40f,
+            contradictionRate = 0.05f,
+            overallScore = 0.43f,
+            meetsThresholds = false
+        )
+
+        val decision = ConversationalValidationGate.assessPromotion(baseline, improved)
+
+        assertTrue(decision.accepted)
+        assertFalse(decision.qualityReady)
+        assertTrue(decision.reason.contains("not release-ready"))
+    }
+
+    @Test
+    fun previouslyReadyCheckpointCannotBeReplacedByCandidateBelowAbsoluteThresholds() {
+        val baseline = report(
+            factCoverage = 0.90f,
+            instructionCompliance = 0.90f,
+            multiTurnConsistency = 0.90f,
+            contradictionRate = 0f,
+            overallScore = 0.90f,
+            meetsThresholds = true
+        )
+        val regressed = report(
+            factCoverage = 0.86f,
+            instructionCompliance = 0.86f,
+            multiTurnConsistency = 0.86f,
+            contradictionRate = 0f,
+            overallScore = 0.88f,
+            meetsThresholds = false
+        )
+
+        val decision = ConversationalValidationGate.assessPromotion(baseline, regressed)
+
+        assertFalse(decision.accepted)
+        assertFalse(decision.qualityReady)
+        assertTrue(decision.reason.contains("absolute conversational quality thresholds"))
+    }
+
     private fun report(
         factCoverage: Float,
         instructionCompliance: Float,

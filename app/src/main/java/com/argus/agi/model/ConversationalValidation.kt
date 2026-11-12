@@ -113,7 +113,29 @@ data class ConversationPromotionDecision(
     val accepted: Boolean,
     val reason: String,
     val baselineScore: Float,
-    val candidateScore: Float
+    val candidateScore: Float,
+    val qualityReady: Boolean = false
+)
+
+enum class ConversationValidationStatus {
+    IDLE,
+    PREPARING_BASELINE,
+    BASELINE_READY,
+    TRAINING,
+    EVALUATING,
+    PROMOTED,
+    PROMOTED_NOT_READY,
+    ROLLED_BACK,
+    FAILED
+}
+
+data class ConversationValidationState(
+    val status: ConversationValidationStatus = ConversationValidationStatus.IDLE,
+    val baselineReport: ConversationalValidationReport? = null,
+    val latestReport: ConversationalValidationReport? = null,
+    val lastDecision: ConversationPromotionDecision? = null,
+    val message: String = "The conversational quality gate is waiting for a training run.",
+    val updatedAtEpochMs: Long? = null
 )
 
 /**
@@ -174,6 +196,45 @@ object ConversationValidationSuite {
                         setOf("kotlin")
                     ),
                     forbiddenClaims = setOf("android 14", "android 16", "java"),
+                    constraints = ConversationInstructionConstraints(
+                        minWordCount = 4,
+                        maxWordCount = 20,
+                        maxSentenceCount = 1
+                    )
+                )
+            )
+        )
+        ),
+        ConversationValidationCase(
+            id = "independent-arithmetic-check",
+            turns = listOf(
+                ConversationValidationTurn(
+                    userPrompt = "Calculate 3 + 3. Reply with only the result.",
+                    expectedFactGroups = listOf(setOf("6", "six")),
+                    constraints = ConversationInstructionConstraints(
+                        minWordCount = 1,
+                        maxWordCount = 2,
+                        maxSentenceCount = 1
+                    )
+                )
+            )
+        ),
+        ConversationValidationCase(
+            id = "corrected-multi-turn-context",
+            turns = listOf(
+                ConversationValidationTurn(
+                    userPrompt = "Remember these exact project choices: the release branch is main, and the test framework is JUnit. Confirm both briefly.",
+                    expectedFactGroups = listOf(setOf("main"), setOf("junit")),
+                    forbiddenClaims = setOf("master", "testng"),
+                    constraints = ConversationInstructionConstraints(
+                        minWordCount = 2,
+                        maxWordCount = 18
+                    )
+                ),
+                ConversationValidationTurn(
+                    userPrompt = "Which release branch and test framework did I specify? Answer in one sentence.",
+                    expectedFactGroups = listOf(setOf("main"), setOf("junit")),
+                    forbiddenClaims = setOf("master", "testng"),
                     constraints = ConversationInstructionConstraints(
                         minWordCount = 4,
                         maxWordCount = 20,
@@ -359,6 +420,11 @@ object ConversationalValidationEvaluator {
  */
 object ConversationalValidationGate {
 
+    /**
+     * A candidate advances only when it improves the accepted baseline and avoids
+     * material regression. A below-threshold model may advance as best-known, but it
+     * remains explicitly not release-ready until every absolute threshold is met.
+     */
     fun assessPromotion(
         baseline: ConversationalValidationReport,
         candidate: ConversationalValidationReport,
@@ -372,13 +438,12 @@ object ConversationalValidationGate {
             "Maximum metric regression must be finite and non-negative."
         }
 
-        if (!candidate.meetsThresholds) {
-            return ConversationPromotionDecision(
-                accepted = false,
-                reason = "Candidate failed absolute conversational thresholds: " +
-                    candidate.failedThresholds.joinToString() + ".",
-                baselineScore = baseline.overallScore,
-                candidateScore = candidate.overallScore
+        if (baseline.meetsThresholds && !candidate.meetsThresholds) {
+            return rejected(
+                baseline,
+                candidate,
+                "Candidate no longer clears the absolute conversational quality thresholds: " +
+                    candidate.failedThresholds.joinToString() + "."
             )
         }
 
@@ -392,29 +457,49 @@ object ConversationalValidationGate {
         ).filter { (_, regression) -> regression > maximumMetricRegression }
 
         if (regressions.isNotEmpty()) {
-            return ConversationPromotionDecision(
-                accepted = false,
-                reason = "Candidate regressed beyond tolerance in: " +
-                    regressions.joinToString { it.first } + ".",
-                baselineScore = baseline.overallScore,
-                candidateScore = candidate.overallScore
+            return rejected(
+                baseline,
+                candidate,
+                "Candidate regressed beyond tolerance in: " +
+                    regressions.joinToString { it.first } + "."
             )
         }
 
         if (candidate.overallScore < baseline.overallScore + minimumOverallGain) {
-            return ConversationPromotionDecision(
-                accepted = false,
-                reason = "Candidate did not improve overall conversational score by the required gain.",
-                baselineScore = baseline.overallScore,
-                candidateScore = candidate.overallScore
+            return rejected(
+                baseline,
+                candidate,
+                "Candidate did not improve overall conversational score by the required gain."
             )
         }
 
+        val qualityReady = candidate.meetsThresholds
+        val reason = if (qualityReady) {
+            "Candidate improved the baseline, cleared all absolute conversational thresholds, " +
+                "and stayed within per-metric regression tolerance."
+        } else {
+            "Candidate improved the best-known baseline without material metric regression. " +
+                "It is promoted for continued local training but is not release-ready; " +
+                "remaining thresholds: ${candidate.failedThresholds.joinToString()}."
+        }
         return ConversationPromotionDecision(
             accepted = true,
-            reason = "Candidate passed absolute thresholds, improved the baseline, and stayed within per-metric regression tolerance.",
+            reason = reason,
             baselineScore = baseline.overallScore,
-            candidateScore = candidate.overallScore
+            candidateScore = candidate.overallScore,
+            qualityReady = qualityReady
         )
     }
+
+    private fun rejected(
+        baseline: ConversationalValidationReport,
+        candidate: ConversationalValidationReport,
+        reason: String
+    ): ConversationPromotionDecision = ConversationPromotionDecision(
+        accepted = false,
+        reason = reason,
+        baselineScore = baseline.overallScore,
+        candidateScore = candidate.overallScore,
+        qualityReady = false
+    )
 }

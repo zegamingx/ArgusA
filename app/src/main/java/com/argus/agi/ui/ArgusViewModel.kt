@@ -129,6 +129,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     val currentContextSummary: StateFlow<String> = worldModel.currentContextSummary
     val genesisState: StateFlow<com.argus.agi.model.GenesisLifecycleState> = genesisModelManager.lifecycleState
     val activeDocument: StateFlow<com.argus.agi.model.ActiveDocumentTraining?> = trainingManager.activeDocument
+    val conversationalValidationState: StateFlow<com.argus.agi.model.ConversationValidationState> =
+        trainingManager.conversationalValidationState
 
     private val _benchmarkState = MutableStateFlow<BenchmarkResult?>(null)
     val benchmarkState: StateFlow<BenchmarkResult?> = _benchmarkState.asStateFlow()
@@ -352,6 +354,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     fun setForceTrainingOverride(enabled: Boolean) = deviceGuard.setForceTrainingOverride(enabled)
     fun triggerImmediateTrainingStep() = trainingManager.triggerImmediateTrainingStep()
     fun toggleTrainingPause() = trainingManager.togglePauseTraining()
+    fun runConversationalValidation() = trainingManager.runConversationalValidation()
+    fun retryConversationalValidation() = trainingManager.retryConversationalValidation()
 
     fun onNotificationPermissionResult(granted: Boolean) {
         _isNotificationPermissionGranted.value = granted

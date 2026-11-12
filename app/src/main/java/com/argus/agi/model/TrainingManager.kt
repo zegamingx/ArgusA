@@ -28,6 +28,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.Closeable
+import java.io.File
 import java.io.Reader
 import java.io.StringReader
 import java.security.MessageDigest
@@ -104,6 +105,9 @@ class TrainingManager(
 
     private val repo: com.argus.agi.data.repository.ArgusRepository? =
         repository ?: runCatching { com.argus.agi.data.repository.ArgusRepository(context) }.getOrNull()
+    private val validationFilesDirectory = context.applicationContext.filesDir
+    private val conversationalValidationPersistence =
+        ConversationalValidationPersistence(validationFilesDirectory)
 
     private sealed interface QueuePersistenceOperation {
         data class Save(
@@ -190,6 +194,14 @@ class TrainingManager(
         )
     )
     val trainingMetrics: StateFlow<TrainingSessionMetrics> = _trainingMetrics.asStateFlow()
+
+    private val _conversationalValidationState = MutableStateFlow(
+        conversationalValidationPersistence.loadState()
+    )
+    val conversationalValidationState: StateFlow<ConversationValidationState> =
+        _conversationalValidationState.asStateFlow()
+    private val conversationalValidationMutex = Mutex()
+    private var manualValidationJob: Job? = null
 
     @Volatile private var closed = false
 
@@ -876,6 +888,213 @@ class TrainingManager(
         )
     }
 
+    fun retryConversationalValidation() {
+        resumeTraining()
+    }
+
+    /**
+     * Runs the fixed evaluation suite on the accepted model without training or promotion.
+     * Manual evaluation is blocked while any training item is active or queued.
+     */
+    fun runConversationalValidation() {
+        if (manualValidationJob?.isActive == true) return
+        manualValidationJob = scope.launch {
+            conversationalValidationMutex.lock()
+            try {
+                if (_currentTrainingItem.value != null || _nextQueue.value.isNotEmpty()) {
+                    _conversationalValidationState.update { current ->
+                        current.copy(
+                            message = "Wait until the training queue is empty before running a manual conversational evaluation."
+                        )
+                    }
+                    return@launch
+                }
+
+                setConversationalValidationStatus(
+                    ConversationValidationStatus.EVALUATING,
+                    "Evaluating the current local model against the fixed conversational suite."
+                )
+                val activeCheckpoint = File(validationFilesDirectory, "argus_model_weights.bin")
+                if ((!activeCheckpoint.isFile || activeCheckpoint.length() < 4L) &&
+                    !neuralEngine.saveCheckpoint()
+                ) {
+                    throw IllegalStateException("The current model checkpoint could not be saved.")
+                }
+                check(conversationalValidationPersistence.ensureAcceptedCheckpoint(activeCheckpoint)) {
+                    "The accepted checkpoint could not be secured."
+                }
+
+                val currentBaseline = conversationalValidationPersistence.loadState().baselineReport
+                if (currentBaseline == null) {
+                    check(restoreAcceptedConversationCheckpoint()) {
+                        "The accepted checkpoint could not be restored before baseline evaluation."
+                    }
+                    val baseline = evaluateConversationalValidation()
+                    check(conversationalValidationPersistence.saveBaseline(baseline)) {
+                        "The conversational baseline could not be persisted."
+                    }
+                } else {
+                    val report = evaluateConversationalValidation()
+                    check(
+                        conversationalValidationPersistence.recordCandidate(
+                            report = report,
+                            decision = null,
+                            status = ConversationValidationStatus.BASELINE_READY,
+                            message = "Manual evaluation completed. No training or checkpoint promotion was performed."
+                        )
+                    ) { "The conversational evaluation report could not be persisted." }
+                }
+                _conversationalValidationState.value = conversationalValidationPersistence.loadState()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                Log.e(TAG, "Manual conversational validation failed.", error)
+                setConversationalValidationStatus(
+                    ConversationValidationStatus.FAILED,
+                    "Conversational evaluation failed: ${error.message}"
+                )
+            } finally {
+                conversationalValidationMutex.unlock()
+            }
+        }
+    }
+
+    private fun restoreAcceptedConversationCheckpoint(): Boolean {
+        val activeCheckpoint = File(validationFilesDirectory, "argus_model_weights.bin")
+        return conversationalValidationPersistence.restoreAcceptedCheckpoint(activeCheckpoint) &&
+            neuralEngine.loadCheckpointIfExists()
+    }
+
+    private suspend fun prepareConversationalTrainingRun() {
+        conversationalValidationMutex.lock()
+        try {
+            setConversationalValidationStatus(
+                ConversationValidationStatus.PREPARING_BASELINE,
+                "Securing the accepted checkpoint and preparing a fixed conversational baseline."
+            )
+
+            val activeCheckpoint = File(validationFilesDirectory, "argus_model_weights.bin")
+            if ((!activeCheckpoint.isFile || activeCheckpoint.length() < 4L) &&
+                !neuralEngine.saveCheckpoint()
+            ) {
+                throw IllegalStateException("The current model checkpoint could not be saved.")
+            }
+            check(conversationalValidationPersistence.ensureAcceptedCheckpoint(activeCheckpoint)) {
+                "The accepted checkpoint could not be secured."
+            }
+
+            if (conversationalValidationPersistence.loadState().baselineReport == null) {
+                check(restoreAcceptedConversationCheckpoint()) {
+                    "The accepted checkpoint could not be restored before baseline evaluation."
+                }
+                val baseline = evaluateConversationalValidation()
+                check(conversationalValidationPersistence.saveBaseline(baseline)) {
+                    "The conversational baseline could not be persisted."
+                }
+            }
+
+            setConversationalValidationStatus(
+                ConversationValidationStatus.TRAINING,
+                "Training is running against a secured conversational baseline. Evaluation will begin after the complete queue drains."
+            )
+        } finally {
+            conversationalValidationMutex.unlock()
+        }
+    }
+
+    private suspend fun completeConversationalTrainingRun(hadFailures: Boolean) {
+        conversationalValidationMutex.lock()
+        try {
+            if (hadFailures) {
+                check(restoreAcceptedConversationCheckpoint()) {
+                    "The previous accepted checkpoint could not be restored after a failed training item."
+                }
+                check(
+                    conversationalValidationPersistence.recordStatus(
+                        ConversationValidationStatus.ROLLED_BACK,
+                        "At least one training item failed. The candidate run was rejected and the previous accepted checkpoint was restored.",
+                        clearDecision = true
+                    )
+                ) { "The rollback result could not be persisted." }
+                _conversationalValidationState.value = conversationalValidationPersistence.loadState()
+                return
+            }
+
+            setConversationalValidationStatus(
+                ConversationValidationStatus.EVALUATING,
+                "The training queue is complete. Evaluating factual coverage, instruction compliance, multi-turn consistency, and contradictions."
+            )
+            check(neuralEngine.saveCheckpoint()) {
+                "The trained candidate checkpoint could not be saved for evaluation."
+            }
+
+            val baseline = conversationalValidationPersistence.loadState().baselineReport
+                ?: throw IllegalStateException("The accepted conversational baseline is missing.")
+            val (candidate, decision) = assessConversationalCandidate(baseline)
+
+            if (decision.accepted) {
+                check(
+                    conversationalValidationPersistence.promoteCheckpoint(
+                        activeCheckpoint = File(validationFilesDirectory, "argus_model_weights.bin"),
+                        report = candidate,
+                        decision = decision
+                    )
+                ) { "The improved checkpoint could not be committed as the new best-known model." }
+                _conversationalValidationState.value = conversationalValidationPersistence.loadState()
+            } else {
+                check(restoreAcceptedConversationCheckpoint()) {
+                    "The candidate failed validation and the previous accepted checkpoint could not be restored."
+                }
+                check(
+                    conversationalValidationPersistence.recordCandidate(
+                        report = candidate,
+                        decision = decision,
+                        status = ConversationValidationStatus.ROLLED_BACK,
+                        message = "${decision.reason} The previous accepted checkpoint was restored."
+                    )
+                ) { "The rejected candidate report could not be persisted." }
+                _conversationalValidationState.value = conversationalValidationPersistence.loadState()
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            Log.e(TAG, "Conversational checkpoint evaluation or promotion failed.", error)
+            val restored = runCatching { restoreAcceptedConversationCheckpoint() }.getOrDefault(false)
+            val status = if (restored) {
+                ConversationValidationStatus.ROLLED_BACK
+            } else {
+                ConversationValidationStatus.FAILED
+            }
+            val message = if (restored) {
+                "Conversational evaluation failed: ${error.message}. The previous accepted checkpoint was restored."
+            } else {
+                "Conversational evaluation failed and the previous accepted checkpoint could not be restored: ${error.message}"
+            }
+            conversationalValidationPersistence.recordStatus(status, message, clearDecision = true)
+            _conversationalValidationState.value = conversationalValidationPersistence.loadState().copy(
+                status = status,
+                message = message,
+                updatedAtEpochMs = System.currentTimeMillis()
+            )
+        } finally {
+            conversationalValidationMutex.unlock()
+        }
+    }
+
+    private fun setConversationalValidationStatus(
+        status: ConversationValidationStatus,
+        message: String
+    ) {
+        conversationalValidationPersistence.recordStatus(status, message)
+        _conversationalValidationState.update { current ->
+            current.copy(
+                status = status,
+                message = message,
+                updatedAtEpochMs = System.currentTimeMillis()
+            )
+        }
+    }
+
     private fun appendFormattedTrainingRecords(
         records: List<String>,
         destination: MutableList<String>,
@@ -1213,6 +1432,24 @@ class TrainingManager(
 
     private fun startTrainingWorker() {
         workerJob = scope.launch {
+            try {
+                if (conversationalValidationPersistence.hasAcceptedCheckpoint()) {
+                    check(restoreAcceptedConversationCheckpoint()) {
+                        "The last accepted conversational checkpoint could not be restored."
+                    }
+                }
+            } catch (error: Throwable) {
+                Log.e(TAG, "Failed to restore the accepted conversational checkpoint.", error)
+                _isTrainingPaused.value = true
+                setConversationalValidationStatus(
+                    ConversationValidationStatus.FAILED,
+                    "Training is paused because the last accepted checkpoint could not be restored: ${error.message}"
+                )
+            }
+
+            var validationRunActive = false
+            var validationRunHadFailures = false
+
             while (isActive && !closed) {
                 if (_isTrainingPaused.value) {
                     _isTrainingPaused.first { !it || closed }
@@ -1224,11 +1461,35 @@ class TrainingManager(
 
                 resetForceOverrideIfSet()
 
+                val firstQueuedItem = _nextQueue.value.firstOrNull()
+                if (!validationRunActive && firstQueuedItem?.status == TrainingStatus.QUEUED) {
+                    try {
+                        prepareConversationalTrainingRun()
+                        validationRunActive = true
+                        validationRunHadFailures = false
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Throwable) {
+                        Log.e(TAG, "Could not prepare the conversational training baseline.", error)
+                        _isTrainingPaused.value = true
+                        setConversationalValidationStatus(
+                            ConversationValidationStatus.FAILED,
+                            "Training is paused because its conversational baseline could not be secured: ${error.message}"
+                        )
+                        continue
+                    }
+                }
+
                 val firstItem = popNext()
                 if (firstItem == null) {
                     if (_nextQueue.value.isEmpty()) {
                         _currentTrainingItem.value = null
                         _activeDocument.value = null
+                        if (validationRunActive) {
+                            completeConversationalTrainingRun(validationRunHadFailures)
+                            validationRunActive = false
+                            validationRunHadFailures = false
+                        }
                     }
                     withTimeoutOrNull(IDLE_POLL_MS) {
                         wakeupSignal.receiveCatching()
@@ -1248,10 +1509,13 @@ class TrainingManager(
                 updateActiveDocumentEntering(activeItems.first())
 
                 try {
-                    processBatch(activeItems)
+                    if (!processBatch(activeItems)) {
+                        validationRunHadFailures = true
+                    }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Throwable) {
+                    validationRunHadFailures = true
                     Log.e(
                         TAG,
                         "Training micro-batch failed (${activeItems.size} samples).",
@@ -1483,7 +1747,7 @@ class TrainingManager(
         }
     }
 
-    private suspend fun processBatch(items: List<TrainingData>) {
+    private suspend fun processBatch(items: List<TrainingData>): Boolean {
         require(items.isNotEmpty()) { "A training micro-batch cannot be empty." }
 
         for (item in items) {
@@ -1509,16 +1773,21 @@ class TrainingManager(
         }
         val perItemDurationMs = (elapsedMs / items.size).coerceAtLeast(1L)
 
-        items.zip(batchResult.samples).forEach { (item, stepResult) ->
+        var allItemsSucceeded = true
+        for ((item, stepResult) in items.zip(batchResult.samples)) {
             try {
-                processItem(item, stepResult, perItemDurationMs)
+                if (!processItem(item, stepResult, perItemDurationMs)) {
+                    allItemsSucceeded = false
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
+                allItemsSucceeded = false
                 Log.e(TAG, "Failed to finalize training item '${item.title}'.", error)
                 markTrainingItemFailed(item, error.message)
             }
         }
+        return allItemsSucceeded
     }
 
     private fun markTrainingItemFailed(item: TrainingData, reason: String?) {
@@ -1549,14 +1818,14 @@ class TrainingManager(
         item: TrainingData,
         stepResult: NeuralTrainingStepResult,
         durationMs: Long
-    ) {
+    ): Boolean {
         updateActiveDocumentEntering(item)
         val stepLoss = stepResult.loss
         // Invalid loss is a failed step, never a completed training item.
         if (!stepLoss.isFinite()) {
             Log.w(TAG, "trainBatchDetailed returned non-finite loss=$stepLoss for '${item.title}'")
             markTrainingItemFailed(item, "The model produced a non-finite loss.")
-            return
+            return false
         }
 
         val reasoningSpans = REASONING_BLOCK_PATTERN.findAll(item.content)
@@ -1665,6 +1934,7 @@ class TrainingManager(
                 }
             }
         }
+        return true
     }
 
     /**

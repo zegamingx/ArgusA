@@ -38,6 +38,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.argus.agi.model.ConversationValidationState
+import com.argus.agi.model.ConversationValidationStatus
 import com.argus.agi.model.DeviceModelCapacityPolicy
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingStatus
@@ -80,6 +82,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
     val totalSteps by viewModel.totalStepsExecuted.collectAsState()
     val trainingMetrics by viewModel.trainingMetrics.collectAsState()
     val activeDoc by viewModel.activeDocument.collectAsState()
+    val conversationalValidation by viewModel.conversationalValidationState.collectAsState()
     val vocabSize = trainingMetrics.vocabularySize
     val worldEntities by viewModel.worldEntities.collectAsState()
     val modelConfig = viewModel.engineConfig
@@ -332,6 +335,23 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                         color = ArgusTextMuted
                     )
                 }
+            }
+
+            // CONVERSATIONAL QUALITY GATE
+            item {
+                val validationNeedsRetry = conversationalValidation.status == ConversationValidationStatus.FAILED &&
+                    nextQueue.isNotEmpty()
+                ConversationValidationCard(
+                    state = conversationalValidation,
+                    trainingIsActive = currentItem != null || nextQueue.isNotEmpty(),
+                    onAction = {
+                        if (validationNeedsRetry) {
+                            viewModel.retryConversationalValidation()
+                        } else {
+                            viewModel.runConversationalValidation()
+                        }
+                    }
+                )
             }
 
             // INFERENCE CAPACITY — informational target only; not the active training model.
@@ -591,6 +611,179 @@ fun StatMetricBox(label: String, value: String, unit: String, valueColor: Color,
         Spacer(modifier = Modifier.height(4.dp))
         Text(text = value, style = MaterialTheme.typography.titleMedium, color = valueColor, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, fontSize = 14.sp)
         Text(text = unit, style = MaterialTheme.typography.labelSmall, color = ArgusTextSecondary, fontSize = 9.sp)
+    }
+}
+
+@Composable
+private fun ConversationValidationCard(
+    state: ConversationValidationState,
+    trainingIsActive: Boolean,
+    onAction: () -> Unit
+) {
+    val report = state.latestReport ?: state.baselineReport
+    val busy = state.status == ConversationValidationStatus.PREPARING_BASELINE ||
+        state.status == ConversationValidationStatus.TRAINING ||
+        state.status == ConversationValidationStatus.EVALUATING
+    val retrying = state.status == ConversationValidationStatus.FAILED && trainingIsActive
+    val statusColor = when (state.status) {
+        ConversationValidationStatus.PROMOTED -> ArgusSuccess
+        ConversationValidationStatus.PROMOTED_NOT_READY,
+        ConversationValidationStatus.ROLLED_BACK,
+        ConversationValidationStatus.FAILED -> ArgusWarning
+        else -> ArgusCyanGlow
+    }
+    val score = report?.overallScore?.coerceIn(0f, 1f) ?: 0f
+    val scoreLabel = report?.let {
+        String.format(Locale.US, "%.0f%%", it.overallScore * 100f)
+    } ?: "Not measured"
+
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .background(Color.White.copy(alpha = 0.04f), RoundedCornerShape(18.dp))
+            .padding(14.dp)
+            .testTag("conversation_validation_card")
+    ) {
+        Column {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "CONVERSATIONAL QUALITY GATE",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = ArgusTextPrimary,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = state.status.name.replace('_', ' '),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = statusColor,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = state.message,
+                style = MaterialTheme.typography.bodySmall,
+                color = ArgusTextSecondary
+            )
+
+            if (report != null) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "OVERALL CONVERSATION SCORE",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ArgusTextMuted,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = scoreLabel,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = statusColor,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+                LinearProgressIndicator(
+                    progress = { score },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(3.dp)),
+                    color = statusColor,
+                    trackColor = Color.White.copy(alpha = 0.08f)
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    StatMetricBox(
+                        label = "FACT COVERAGE",
+                        value = String.format(Locale.US, "%.0f%%", report.factCoverage * 100f),
+                        unit = "${report.matchedFactGroupCount}/${report.expectedFactGroupCount} fact groups",
+                        valueColor = ArgusCyanPrimary,
+                        modifier = Modifier.weight(1f)
+                    )
+                    StatMetricBox(
+                        label = "INSTRUCTIONS",
+                        value = String.format(Locale.US, "%.0f%%", report.instructionCompliance * 100f),
+                        unit = "${report.passedInstructionCheckCount}/${report.instructionCheckCount} checks",
+                        valueColor = ArgusCyanGlow,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    StatMetricBox(
+                        label = "MULTI-TURN",
+                        value = String.format(Locale.US, "%.0f%%", report.multiTurnConsistency * 100f),
+                        unit = "${report.matchedFollowUpFactGroupCount}/${report.followUpFactGroupCount} follow-up facts",
+                        valueColor = ArgusSuccess,
+                        modifier = Modifier.weight(1f)
+                    )
+                    StatMetricBox(
+                        label = "CONTRADICTIONS",
+                        value = String.format(Locale.US, "%.0f%%", report.contradictionRate * 100f),
+                        unit = "${report.matchedForbiddenClaimCount}/${report.forbiddenClaimCount} forbidden claims",
+                        valueColor = if (report.contradictionRate > 0f) ArgusWarning else ArgusSuccess,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Text(
+                    text = if (report.meetsThresholds) {
+                        "All absolute conversational quality thresholds are met."
+                    } else {
+                        "Best-known checkpoint is not release-ready. Remaining checks: ${report.failedThresholds.joinToString()}."
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (report.meetsThresholds) ArgusSuccess else ArgusWarning
+                )
+            } else {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "A fixed, held-out conversation suite measures factual coverage, instruction following, multi-turn recall, and explicit contradictions.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = ArgusTextMuted
+                )
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+            Button(
+                onClick = onAction,
+                enabled = !busy && (!trainingIsActive || retrying),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = ArgusCyanPrimary,
+                    contentColor = ArgusDarkBg,
+                    disabledContainerColor = Color.White.copy(alpha = 0.08f),
+                    disabledContentColor = ArgusTextMuted
+                ),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("run_conversation_validation_button")
+            ) {
+                Text(
+                    text = when {
+                        busy -> "Validation in progress..."
+                        retrying -> "Retry validation before training"
+                        trainingIsActive -> "Available after the queue drains"
+                        else -> "Evaluate current model"
+                    },
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
     }
 }
 
