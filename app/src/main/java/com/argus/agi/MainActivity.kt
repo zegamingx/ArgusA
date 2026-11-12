@@ -14,7 +14,9 @@ import androidx.activity.viewModels
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.matchParentSize
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.ime
@@ -36,6 +38,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -46,6 +49,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import com.argus.agi.ui.ArgusViewModel
+import com.argus.agi.ui.components.background.ArgusWorldMapBackground
 import com.argus.agi.ui.screens.ChatScreen
 import com.argus.agi.ui.screens.GenesisBootScreen
 import com.argus.agi.ui.screens.NeuralCoreScreen
@@ -160,11 +164,20 @@ fun MainScreen(viewModel: ArgusViewModel) {
         currentScreen = ArgusScreen.CHAT
     }
 
-    Scaffold(
+    Box(
         modifier = Modifier
             .fillMaxSize()
-            .testTag("main_screen_scaffold"),
-        containerColor = ArgusDarkBg,
+            .background(ArgusDarkBg)
+    ) {
+        ArgusWorldMapBackground(
+            modifier = Modifier.matchParentSize()
+        )
+
+        Scaffold(
+            modifier = Modifier
+                .fillMaxSize()
+                .testTag("main_screen_scaffold"),
+            containerColor = Color.Transparent,
         contentWindowInsets = WindowInsets.systemBars,
         bottomBar = {
             // Smoothly slide NavigationBar away when keyboard is open to maximize chat/terminal viewport
@@ -222,6 +235,7 @@ fun MainScreen(viewModel: ArgusViewModel) {
                 ArgusScreen.PERCEPTION -> PerceptionScreen(viewModel = viewModel)
                 ArgusScreen.SETTINGS -> SkillsAndSettingsScreen(viewModel = viewModel)
             }
+        }
         }
     }
 }
