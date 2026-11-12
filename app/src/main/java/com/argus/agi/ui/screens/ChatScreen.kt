@@ -634,14 +634,15 @@ fun ChatMessageItem(
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
                     if (!msg.isUser) {
-                        if (!userPromptForTraining.isNullOrBlank() && onTrain != null) {
+                        val trainCallback = onTrain
+                        if (!userPromptForTraining.isNullOrBlank() && trainCallback != null) {
                             TextButton(
                                 enabled = !isTrainingRequestPending && !isTrainingSubmitted,
                                 onClick = {
                                     val prompt = userPromptForTraining
                                     if (!prompt.isNullOrBlank()) {
                                         isTrainingRequestPending = true
-                                        onTrain.invoke(prompt, msg.text) { accepted ->
+                                        trainCallback.invoke(prompt, msg.text) { accepted ->
                                             isTrainingRequestPending = false
                                             isTrainingSubmitted = accepted
                                             val feedback = if (accepted) {

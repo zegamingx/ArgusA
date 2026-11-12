@@ -141,6 +141,33 @@ class ConversationalDatasetTest {
     }
 
     @Test
+    fun jsonlChatMlAndShareGptRecordsAreAcceptedInSourceOrder() {
+        val raw = listOf(
+            """{"messages":[{"role":"user","content":"First prompt."},{"role":"assistant","content":"First reply."}]}""",
+            """{"conversations":[{"from":"human","value":"Second prompt."},{"from":"gpt","value":"Second reply."}]}"""
+        ).joinToString("\n")
+
+        val records = TextModalityProcessor.formatTrainingDatasetRecords(raw).orEmpty()
+        assertEquals(2, records.size)
+        assertTrue(records[0].contains("First prompt."))
+        assertTrue(records[0].contains("First reply."))
+        assertTrue(records[1].contains("Second prompt."))
+        assertTrue(records[1].contains("Second reply."))
+
+        val chunks = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Conversation JSONL",
+            chunkSize = 512,
+            overlap = 0
+        )
+        assertTrue(chunks.isNotEmpty())
+        assertTrue(chunks.all { it.modality == TextModality.CONVERSATION })
+        val combined = chunks.joinToString("\n") { it.content }
+        assertTrue(combined.contains("First prompt."))
+        assertTrue(combined.contains("Second prompt."))
+    }
+
+    @Test
     fun explicitlyApprovedExchangeUsesTheSameConversationTrainingFormat() {
         val sample = TextModalityProcessor.formatConversationExchange(
             userMessage = "Can you help me?",

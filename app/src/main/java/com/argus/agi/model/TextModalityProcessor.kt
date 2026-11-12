@@ -116,7 +116,7 @@ object TextModalityProcessor {
      * Canonicalizes JSONL, ChatML/OpenAI messages, ShareGPT conversations, and
      * instruction-tuning records before modality detection and chunking.
      */
-    private fun normalizeReasoningDatasetInput(text: String): String {
+    private fun normalizeTrainingDatasetInput(text: String): String {
         val records = parseTrainingDatasetObjects(text) ?: return text
         return records.joinToString("\n\n") { record ->
             formatConversationRecord(record) ?: record.toString()
@@ -436,7 +436,7 @@ object TextModalityProcessor {
      * Mendeteksi modalitas konten teks.
      */
     fun detectModality(text: String): TextModality {
-        val normalizedInput = normalizeReasoningDatasetInput(text)
+        val normalizedInput = normalizeTrainingDatasetInput(text)
         val trimmed = normalizedInput.trim()
         if (trimmed.isEmpty()) return TextModality.GENERAL_PROSE
 
@@ -522,7 +522,7 @@ object TextModalityProcessor {
         require(overlap >= 0) { "overlap tidak boleh negatif, diterima: $overlap" }
         require(overlap < chunkSize) { "overlap ($overlap) harus < chunkSize ($chunkSize)" }
 
-        val normalized = normalizeReasoningDatasetInput(normalizeTypography(rawText))
+        val normalized = normalizeTrainingDatasetInput(normalizeTypography(rawText))
         if (normalized.isBlank()) return emptyList()
 
         val modality = detectModality(normalized)
@@ -555,8 +555,9 @@ object TextModalityProcessor {
         val currentTurnText = StringBuilder()
 
         fun flushTurn() {
-            if (currentRole != null && currentTurnText.isNotBlank()) {
-                val prefix = currentRole.token
+            val role = currentRole
+            if (role != null && currentTurnText.isNotBlank()) {
+                val prefix = role.token
                 val clean = currentTurnText.toString().trim()
                 val fullTurn = "$prefix $clean"
                 val available = chunkSize - prefix.length - 1
