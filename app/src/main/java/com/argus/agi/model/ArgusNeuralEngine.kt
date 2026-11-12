@@ -2169,7 +2169,7 @@ class ArgusNeuralEngine private constructor(
                 Array(3) { Array(attentionBackwardRows) { FloatArray(dModel) } }
             computeBatchedLinear(
                 inputs = arrayOf(queryGradientRows, keyGradientRows, valueGradientRows),
-                weights = arrayOf(wQEff, b.wK, wVEff),
+                weights = arrayOf(wQEff, b.wK.toFloatArray(), wVEff),
                 outputs = inputGradientByProjection,
                 inputColumns = dModel,
                 outputColumns = dModel,
