@@ -203,7 +203,6 @@ object ConversationValidationSuite {
                     )
                 )
             )
-        )
         ),
         ConversationValidationCase(
             id = "independent-arithmetic-check",

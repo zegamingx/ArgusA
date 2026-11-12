@@ -202,6 +202,8 @@ class TrainingManager(
         _conversationalValidationState.asStateFlow()
     private val conversationalValidationMutex = Mutex()
     private var manualValidationJob: Job? = null
+    private val validationRunDocumentIds = LinkedHashSet<String>()
+    private val validationRunFailedDocumentIds = LinkedHashSet<String>()
 
     @Volatile private var closed = false
 
@@ -1009,10 +1011,56 @@ class TrainingManager(
                 check(restoreAcceptedConversationCheckpoint()) {
                     "The previous accepted checkpoint could not be restored after a failed training item."
                 }
+
+                val successfulDocumentIds =
+                    validationRunDocumentIds - validationRunFailedDocumentIds
+                var replayedDocumentCount = 0
+                if (successfulDocumentIds.isNotEmpty()) {
+                    val activeRepository = requireNotNull(repo) {
+                        "Local corpus storage is unavailable; successful documents cannot be replayed after rollback."
+                    }
+                    val memoryActiveDocumentIds = _nextQueue.value
+                        .mapNotNull(TrainingData::documentId)
+                        .toSet()
+                    val persistedActiveDocumentIds =
+                        activeRepository.getActiveCorpusTrainingDocumentIds()
+                    val replayDocumentIds = successfulDocumentIds -
+                        memoryActiveDocumentIds - persistedActiveDocumentIds
+
+                    if (replayDocumentIds.isNotEmpty()) {
+                        activeRepository.markCorpusDocumentsQueued(replayDocumentIds)
+                        for (documentId in replayDocumentIds.sorted()) {
+                            val document = activeRepository.getCorpusDocument(documentId)
+                                ?: throw IllegalStateException(
+                                    "Training corpus document disappeared during rollback recovery: $documentId"
+                                )
+                            val replayedChunks = replayCorpusDocument(
+                                documentId = documentId,
+                                epochs = document.plannedEpochs
+                            )
+                            check(replayedChunks > 0) {
+                                "Successful training document could not be re-queued after checkpoint rollback: $documentId"
+                            }
+                            replayedDocumentCount++
+                        }
+                    }
+                }
+
+                val rollbackMessage = buildString {
+                    append("At least one training item failed. The candidate run was rejected and the previous accepted checkpoint was restored.")
+                    if (replayedDocumentCount > 0) {
+                        append(" Re-queued ")
+                        append(replayedDocumentCount)
+                        append(" previously successful document(s) because their weight updates were rolled back.")
+                    }
+                    if (validationRunFailedDocumentIds.isNotEmpty()) {
+                        append(" Failed documents remain marked partial for explicit recovery.")
+                    }
+                }
                 check(
                     conversationalValidationPersistence.recordStatus(
                         ConversationValidationStatus.ROLLED_BACK,
-                        "At least one training item failed. The candidate run was rejected and the previous accepted checkpoint was restored.",
+                        rollbackMessage,
                         clearDecision = true
                     )
                 ) { "The rollback result could not be persisted." }
@@ -1463,6 +1511,8 @@ class TrainingManager(
 
                 val firstQueuedItem = _nextQueue.value.firstOrNull()
                 if (!validationRunActive && firstQueuedItem?.status == TrainingStatus.QUEUED) {
+                    validationRunDocumentIds.clear()
+                    validationRunFailedDocumentIds.clear()
                     try {
                         prepareConversationalTrainingRun()
                         validationRunActive = true
@@ -1516,6 +1566,8 @@ class TrainingManager(
                     throw cancelled
                 } catch (error: Throwable) {
                     validationRunHadFailures = true
+                    activeItems.mapNotNull(TrainingData::documentId)
+                        .forEach(validationRunFailedDocumentIds::add)
                     Log.e(
                         TAG,
                         "Training micro-batch failed (${activeItems.size} samples).",
@@ -1749,6 +1801,8 @@ class TrainingManager(
 
     private suspend fun processBatch(items: List<TrainingData>): Boolean {
         require(items.isNotEmpty()) { "A training micro-batch cannot be empty." }
+        items.mapNotNull(TrainingData::documentId)
+            .forEach(validationRunDocumentIds::add)
 
         for (item in items) {
             item.documentId?.let { documentId ->
@@ -1778,11 +1832,13 @@ class TrainingManager(
             try {
                 if (!processItem(item, stepResult, perItemDurationMs)) {
                     allItemsSucceeded = false
+                    item.documentId?.let(validationRunFailedDocumentIds::add)
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
                 allItemsSucceeded = false
+                item.documentId?.let(validationRunFailedDocumentIds::add)
                 Log.e(TAG, "Failed to finalize training item '${item.title}'.", error)
                 markTrainingItemFailed(item, error.message)
             }
