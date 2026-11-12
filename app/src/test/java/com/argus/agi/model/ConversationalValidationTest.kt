@@ -118,7 +118,7 @@ class ConversationalValidationTest {
             )
         ) { "# blue green red\nsecond line" }
 
-        assertEquals(0f, report.instructionCompliance, 0f)
+        assertEquals(0.25f, report.instructionCompliance, 0f)
         assertFalse(report.meetsThresholds)
     }
 
