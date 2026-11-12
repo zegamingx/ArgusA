@@ -21,11 +21,20 @@ internal object VulkanTrainingBackend {
     @Volatile
     private var _currentBackend = "Kotlin CPU"
 
+    @Volatile
+    private var fp16RuntimeReady = false
+
+    @Volatile
+    private var fp16DisabledAfterRuntimeFailure = false
+
     val currentBackend: String
         get() = _currentBackend
 
     val isRuntimeAvailable: Boolean
         get() = nativeReady && !disabledAfterRuntimeFailure
+
+    val isFp16ComputeAvailable: Boolean
+        get() = isRuntimeAvailable && fp16RuntimeReady && !fp16DisabledAfterRuntimeFailure
 
     private val nativeReady: Boolean = try {
         System.loadLibrary("argus_training")
@@ -33,6 +42,12 @@ internal object VulkanTrainingBackend {
         val verified = initialized && runCatching {
             verifyNativeKernels()
         }.getOrDefault(false)
+        if (verified && runCatching { nativeSupportsFp16() }.getOrDefault(false)) {
+            fp16RuntimeReady = runCatching { verifyNativeFp16Kernel() }.getOrDefault(false)
+            if (!fp16RuntimeReady) {
+                Log.w(TAG, "Vulkan FP16 kernel self-check failed; retaining the verified FP32 Vulkan path.")
+            }
+        }
 
         if (initialized && !verified) {
             runCatching { nativeDestroy() }
@@ -201,6 +216,189 @@ internal object VulkanTrainingBackend {
                 return false
             }
         }
+        return true
+    }
+
+    private fun verifyNativeFp16Kernel(): Boolean {
+        val input = floatArrayOf(
+            0.5f, 1.0f, 1.5f,
+            2.0f, 2.5f, 3.0f
+        )
+        val weights = Float16ParameterArray.fromFloatArray(
+            floatArrayOf(
+                0.5f, 1.0f,
+                1.5f, 2.0f,
+                2.5f, 3.0f
+            )
+        ).toShortArray()
+        val output = FloatArray(4)
+        val succeeded = nativeApplyFp16Linear(
+            input = input,
+            weights = weights,
+            output = output,
+            rows = 2,
+            batchCount = 1,
+            rowsPerBatch = 2,
+            inputColumns = 3,
+            outputColumns = 2,
+            transposeWeights = false
+        )
+        return succeeded &&
+            approximatelyEqual(output, floatArrayOf(5.5f, 7.0f, 12.25f, 15.0f), 1e-3f)
+    }
+
+    @Synchronized
+    fun tryApplyFp16Linear(
+        inputRows: Array<FloatArray>,
+        weights: Float16ParameterArray,
+        outputRows: Array<FloatArray>,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean = false
+    ): Boolean = tryApplyFp16BatchedLinear(
+        inputBatches = arrayOf(inputRows),
+        weightBatches = arrayOf(weights.toShortArray()),
+        outputBatches = arrayOf(outputRows),
+        inputColumns = inputColumns,
+        outputColumns = outputColumns,
+        transposeWeights = transposeWeights
+    )
+
+    @Synchronized
+    fun tryApplyFp16BatchedLinear(
+        inputBatches: Array<Array<FloatArray>>,
+        weightBatches: Array<ShortArray>,
+        outputBatches: Array<Array<FloatArray>>,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean = false
+    ): Boolean {
+        require(inputBatches.isNotEmpty()) { "FP16 batched linear input must contain at least one batch." }
+        require(inputColumns > 0 && outputColumns > 0) {
+            "FP16 batched linear dimensions must be positive."
+        }
+        val batchCount = inputBatches.size
+        require(weightBatches.size == batchCount && outputBatches.size == batchCount) {
+            "FP16 batched linear inputs, weights, and outputs must have the same batch count."
+        }
+        val rowsPerBatch = inputBatches[0].size
+        require(rowsPerBatch > 0) { "Every FP16 batched linear input must contain at least one row." }
+        val requiredWeightElements = Math.multiplyExact(inputColumns, outputColumns)
+
+        for (batchIndex in 0 until batchCount) {
+            require(inputBatches[batchIndex].size == rowsPerBatch) {
+                "FP16 batched linear inputs must have an identical row count."
+            }
+            require(outputBatches[batchIndex].size == rowsPerBatch) {
+                "FP16 batched linear outputs must match the input row count."
+            }
+            require(weightBatches[batchIndex].size == requiredWeightElements) {
+                "FP16 weight tensor $batchIndex must exactly match its matrix dimensions."
+            }
+            for (row in 0 until rowsPerBatch) {
+                require(inputBatches[batchIndex][row].size == inputColumns) {
+                    "FP16 input row $row in batch $batchIndex has an unexpected width."
+                }
+                require(outputBatches[batchIndex][row].size == outputColumns) {
+                    "FP16 output row $row in batch $batchIndex has an unexpected width."
+                }
+            }
+        }
+
+        val totalRowsLong = batchCount.toLong() * rowsPerBatch.toLong()
+        val inputElementsLong = totalRowsLong * inputColumns.toLong()
+        val weightElementsLong = batchCount.toLong() * requiredWeightElements.toLong()
+        val outputElementsLong = totalRowsLong * outputColumns.toLong()
+        if (totalRowsLong > Int.MAX_VALUE.toLong() ||
+            inputElementsLong > Int.MAX_VALUE.toLong() ||
+            weightElementsLong > Int.MAX_VALUE.toLong() ||
+            outputElementsLong > Int.MAX_VALUE.toLong()) {
+            return false
+        }
+
+        val operationCount = totalRowsLong *
+            inputColumns.toLong() *
+            outputColumns.toLong()
+        if (!isFp16ComputeAvailable ||
+            operationCount < MIN_LINEAR_OPERATION_COUNT) {
+            return false
+        }
+
+        val flattenedInput: FloatArray
+        val flattenedWeights: ShortArray
+        val flattenedOutput: FloatArray
+        try {
+            flattenedInput = FloatArray(inputElementsLong.toInt())
+            flattenedWeights = ShortArray(weightElementsLong.toInt())
+            flattenedOutput = FloatArray(outputElementsLong.toInt())
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Not enough heap memory to stage a Vulkan FP16 linear operation.", error)
+            return false
+        }
+
+        val inputBatchSize = rowsPerBatch * inputColumns
+        val weightBatchSize = requiredWeightElements
+        for (batchIndex in 0 until batchCount) {
+            val inputOffset = batchIndex * inputBatchSize
+            for (row in 0 until rowsPerBatch) {
+                System.arraycopy(
+                    inputBatches[batchIndex][row],
+                    0,
+                    flattenedInput,
+                    inputOffset + row * inputColumns,
+                    inputColumns
+                )
+            }
+            System.arraycopy(
+                weightBatches[batchIndex],
+                0,
+                flattenedWeights,
+                batchIndex * weightBatchSize,
+                weightBatchSize
+            )
+        }
+
+        val updated = try {
+            nativeApplyFp16Linear(
+                input = flattenedInput,
+                weights = flattenedWeights,
+                output = flattenedOutput,
+                rows = totalRowsLong.toInt(),
+                batchCount = batchCount,
+                rowsPerBatch = rowsPerBatch,
+                inputColumns = inputColumns,
+                outputColumns = outputColumns,
+                transposeWeights = transposeWeights
+            )
+        } catch (error: UnsatisfiedLinkError) {
+            Log.e(TAG, "Vulkan FP16 linear entry point is unavailable; disabling FP16 dispatch.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Vulkan FP16 linear dispatch failed; disabling FP16 dispatch.", error)
+            false
+        }
+
+        if (!updated) {
+            fp16DisabledAfterRuntimeFailure = true
+            fp16RuntimeReady = false
+            Log.w(TAG, "Vulkan FP16 dispatch was not completed; the verified FP32 Vulkan/CPU path remains available.")
+            return false
+        }
+
+        val outputBatchSize = rowsPerBatch * outputColumns
+        for (batchIndex in 0 until batchCount) {
+            val outputBatchOffset = batchIndex * outputBatchSize
+            for (row in 0 until rowsPerBatch) {
+                System.arraycopy(
+                    flattenedOutput,
+                    outputBatchOffset + row * outputColumns,
+                    outputBatches[batchIndex][row],
+                    0,
+                    outputColumns
+                )
+            }
+        }
+        _currentBackend = "Vulkan Compute (FP16 multiply / FP32 accumulation)"
         return true
     }
 
@@ -456,6 +654,20 @@ internal object VulkanTrainingBackend {
     }
 
     private external fun nativeInitialize(): Boolean
+
+    private external fun nativeSupportsFp16(): Boolean
+
+    private external fun nativeApplyFp16Linear(
+        input: FloatArray,
+        weights: ShortArray,
+        output: FloatArray,
+        rows: Int,
+        batchCount: Int,
+        rowsPerBatch: Int,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean
+    ): Boolean
 
     private external fun nativeApplyLinear(
         input: FloatArray,

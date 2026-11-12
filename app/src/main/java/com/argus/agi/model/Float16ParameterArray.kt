@@ -60,6 +60,9 @@ class Float16ParameterArray(size: Int) {
 
     fun toFloatArray(): FloatArray = FloatArray(size) { index -> get(index) }
 
+    /** Returns a defensive copy of the underlying IEEE-754 binary16 values. */
+    fun toShortArray(): ShortArray = storage.copyOf()
+
     companion object {
         fun fromFloatArray(values: FloatArray): Float16ParameterArray =
             Float16ParameterArray(values.size).also { result ->

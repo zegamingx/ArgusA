@@ -4,6 +4,7 @@
 
 #include "adamw_shader_spv.h"
 #include "linear_shader_spv.h"
+#include "linear_fp16_shader_spv.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -68,6 +69,10 @@ struct VulkanRuntime {
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipeline linearPipeline = VK_NULL_HANDLE;
+    VkPipeline fp16LinearPipeline = VK_NULL_HANDLE;
+
+    uint32_t instanceApiVersion = VK_API_VERSION_1_0;
+    bool supportsFp16Compute = false;
 
     VkBuffer storageBuffer = VK_NULL_HANDLE;
     VkDeviceMemory storageMemory = VK_NULL_HANDLE;
@@ -132,6 +137,9 @@ void destroyRuntime() {
         vkDeviceWaitIdle(gRuntime.device);
         destroyStorageBuffer();
 
+        if (gRuntime.fp16LinearPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(gRuntime.device, gRuntime.fp16LinearPipeline, nullptr);
+        }
         if (gRuntime.linearPipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(gRuntime.device, gRuntime.linearPipeline, nullptr);
         }
@@ -327,7 +335,19 @@ bool initializeRuntime() {
     applicationInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     applicationInfo.pEngineName = "Argus On-Device Trainer";
     applicationInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    applicationInfo.apiVersion = VK_API_VERSION_1_0;
+    uint32_t loaderApiVersion = VK_API_VERSION_1_0;
+    const auto enumerateInstanceVersion =
+        reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
+            vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion")
+        );
+    if (enumerateInstanceVersion != nullptr) {
+        uint32_t reportedVersion = VK_API_VERSION_1_0;
+        if (enumerateInstanceVersion(&reportedVersion) == VK_SUCCESS) {
+            loaderApiVersion = reportedVersion;
+        }
+    }
+    gRuntime.instanceApiVersion = std::min(loaderApiVersion, VK_API_VERSION_1_2);
+    applicationInfo.apiVersion = gRuntime.instanceApiVersion;
 
     VkInstanceCreateInfo instanceInfo{};
     instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -453,13 +473,55 @@ bool initializeRuntime() {
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &queuePriority;
 
+    VkPhysicalDevice16BitStorageFeatures supportedStorage16{};
+    VkPhysicalDeviceShaderFloat16Int8Features supportedShaderFloat16{};
+    VkPhysicalDeviceFeatures2 supportedFeatures{};
+    if (gRuntime.instanceApiVersion >= VK_API_VERSION_1_1 &&
+        gRuntime.physicalDeviceProperties.apiVersion >= VK_API_VERSION_1_2) {
+        supportedStorage16.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+        supportedStorage16.pNext = &supportedShaderFloat16;
+        supportedShaderFloat16.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+        supportedFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        supportedFeatures.pNext = &supportedStorage16;
+
+        const auto getPhysicalDeviceFeatures2 =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+                vkGetInstanceProcAddr(gRuntime.instance, "vkGetPhysicalDeviceFeatures2")
+            );
+        if (getPhysicalDeviceFeatures2 != nullptr) {
+            getPhysicalDeviceFeatures2(gRuntime.physicalDevice, &supportedFeatures);
+            gRuntime.supportsFp16Compute =
+                supportedStorage16.storageBuffer16BitAccess == VK_TRUE &&
+                supportedShaderFloat16.shaderFloat16 == VK_TRUE;
+        }
+    }
+
     VkPhysicalDeviceFeatures deviceFeatures{};
+    VkPhysicalDevice16BitStorageFeatures enabledStorage16{};
+    VkPhysicalDeviceShaderFloat16Int8Features enabledShaderFloat16{};
+    VkPhysicalDeviceFeatures2 enabledFeatures{};
 
     VkDeviceCreateInfo deviceInfo{};
     deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
-    deviceInfo.pEnabledFeatures = &deviceFeatures;
+    if (gRuntime.supportsFp16Compute) {
+        enabledStorage16.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+        enabledStorage16.storageBuffer16BitAccess = VK_TRUE;
+        enabledStorage16.pNext = &enabledShaderFloat16;
+        enabledShaderFloat16.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+        enabledShaderFloat16.shaderFloat16 = VK_TRUE;
+        enabledFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        enabledFeatures.pNext = &enabledStorage16;
+        deviceInfo.pNext = &enabledFeatures;
+        deviceInfo.pEnabledFeatures = nullptr;
+    } else {
+        deviceInfo.pEnabledFeatures = &deviceFeatures;
+    }
 
     result = vkCreateDevice(
         gRuntime.physicalDevice,
@@ -654,6 +716,50 @@ bool initializeRuntime() {
         return false;
     }
 
+    if (gRuntime.supportsFp16Compute) {
+        VkShaderModuleCreateInfo fp16ShaderInfo{};
+        fp16ShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        fp16ShaderInfo.codeSize = kArgusLinearFp16ShaderSpvSize;
+        fp16ShaderInfo.pCode =
+            reinterpret_cast<const uint32_t*>(kArgusLinearFp16ShaderSpv);
+
+        VkShaderModule fp16ShaderModule = VK_NULL_HANDLE;
+        VkResult fp16Result = vkCreateShaderModule(
+            gRuntime.device,
+            &fp16ShaderInfo,
+            nullptr,
+            &fp16ShaderModule
+        );
+        if (fp16Result == VK_SUCCESS) {
+            VkPipelineShaderStageCreateInfo fp16ShaderStage{};
+            fp16ShaderStage.sType =
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            fp16ShaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            fp16ShaderStage.module = fp16ShaderModule;
+            fp16ShaderStage.pName = "main";
+
+            VkComputePipelineCreateInfo fp16PipelineInfo{};
+            fp16PipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            fp16PipelineInfo.stage = fp16ShaderStage;
+            fp16PipelineInfo.layout = gRuntime.pipelineLayout;
+
+            fp16Result = vkCreateComputePipelines(
+                gRuntime.device,
+                VK_NULL_HANDLE,
+                1,
+                &fp16PipelineInfo,
+                nullptr,
+                &gRuntime.fp16LinearPipeline
+            );
+            vkDestroyShaderModule(gRuntime.device, fp16ShaderModule, nullptr);
+        }
+
+        if (fp16Result != VK_SUCCESS) {
+            logError("Vulkan FP16 linear pipeline is unavailable; retaining FP32 kernels.", fp16Result);
+            gRuntime.supportsFp16Compute = false;
+        }
+    }
+
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     poolSize.descriptorCount = 1;
@@ -704,6 +810,75 @@ bool initializeRuntime() {
     return true;
 }
 
+uint16_t floatToHalf(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16u) & 0x8000u;
+    const uint32_t absoluteBits = bits & 0x7FFFFFFFu;
+
+    if (absoluteBits >= 0x7F800000u) {
+        const uint32_t payload = absoluteBits == 0x7F800000u ? 0u : 0x0200u;
+        return static_cast<uint16_t>(sign | 0x7C00u | payload);
+    }
+
+    const int32_t exponent =
+        static_cast<int32_t>((bits >> 23u) & 0xFFu) - 127 + 15;
+    const uint32_t mantissa = bits & 0x007FFFFFu;
+
+    if (exponent >= 31) {
+        return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+
+    if (exponent <= 0) {
+        if (exponent < -10) {
+            return static_cast<uint16_t>(sign);
+        }
+
+        const uint32_t significand = mantissa | 0x00800000u;
+        const uint32_t shift = static_cast<uint32_t>(14 - exponent);
+        uint32_t rounded = significand >> shift;
+        const uint32_t remainderMask = (1u << shift) - 1u;
+        const uint32_t remainder = significand & remainderMask;
+        const uint32_t halfway = 1u << (shift - 1u);
+        if (remainder > halfway ||
+            (remainder == halfway && (rounded & 1u) != 0u)) {
+            ++rounded;
+        }
+        return static_cast<uint16_t>(sign | rounded);
+    }
+
+    uint32_t halfMantissa = mantissa >> 13u;
+    const uint32_t discarded = mantissa & 0x1FFFu;
+    if (discarded > 0x1000u ||
+        (discarded == 0x1000u && (halfMantissa & 1u) != 0u)) {
+        ++halfMantissa;
+    }
+
+    int32_t halfExponent = exponent;
+    if (halfMantissa == 0x0400u) {
+        halfMantissa = 0u;
+        ++halfExponent;
+        if (halfExponent >= 31) {
+            return static_cast<uint16_t>(sign | 0x7C00u);
+        }
+    }
+
+    return static_cast<uint16_t>(
+        sign |
+        (static_cast<uint32_t>(halfExponent) << 10u) |
+        halfMantissa
+    );
+}
+
+void storePackedHalf(uint32_t* words, size_t halfIndex, uint16_t value) {
+    const size_t wordIndex = halfIndex >> 1u;
+    const uint32_t shift = (halfIndex & 1u) == 0u ? 0u : 16u;
+    const uint32_t mask = 0xFFFFu << shift;
+    words[wordIndex] =
+        (words[wordIndex] & ~mask) |
+        (static_cast<uint32_t>(value) << shift);
+}
+
 void releaseGroupReferences(JNIEnv* env, std::vector<GroupArrays>& groups) {
     for (GroupArrays& group : groups) {
         if (group.parameters != nullptr) {
@@ -737,6 +912,19 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeInitialize(
 
     destroyRuntime();
     return JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeSupportsFp16(
+    JNIEnv*,
+    jobject
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    return gRuntime.device != VK_NULL_HANDLE &&
+        gRuntime.supportsFp16Compute &&
+        gRuntime.fp16LinearPipeline != VK_NULL_HANDLE
+        ? JNI_TRUE
+        : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -1401,6 +1589,311 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         return JNI_FALSE;
     }
 
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
+    JNIEnv* env,
+    jobject,
+    jfloatArray inputArray,
+    jshortArray weightArray,
+    jfloatArray outputArray,
+    jint rowCount,
+    jint batchCount,
+    jint rowsPerBatch,
+    jint inputColumns,
+    jint outputColumns,
+    jboolean transposeWeights
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        !gRuntime.supportsFp16Compute ||
+        gRuntime.fp16LinearPipeline == VK_NULL_HANDLE ||
+        inputArray == nullptr ||
+        weightArray == nullptr ||
+        outputArray == nullptr ||
+        rowCount <= 0 ||
+        batchCount <= 0 ||
+        rowsPerBatch <= 0 ||
+        static_cast<int64_t>(batchCount) * static_cast<int64_t>(rowsPerBatch) != rowCount ||
+        inputColumns <= 0 ||
+        outputColumns <= 0) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t inputElements =
+        static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(inputColumns);
+    const uint64_t weightElements =
+        static_cast<uint64_t>(batchCount) *
+        static_cast<uint64_t>(inputColumns) *
+        static_cast<uint64_t>(outputColumns);
+    const uint64_t outputElements =
+        static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(outputColumns);
+
+    if (inputElements > static_cast<uint64_t>(std::numeric_limits<jsize>::max()) ||
+        weightElements > static_cast<uint64_t>(std::numeric_limits<jsize>::max()) ||
+        outputElements > static_cast<uint64_t>(std::numeric_limits<jsize>::max()) ||
+        inputElements > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
+        weightElements > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
+        outputElements > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+        return JNI_FALSE;
+    }
+
+    if (env->GetArrayLength(inputArray) != static_cast<jsize>(inputElements) ||
+        env->GetArrayLength(weightArray) != static_cast<jsize>(weightElements) ||
+        env->GetArrayLength(outputArray) != static_cast<jsize>(outputElements)) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t weightOffsetHalf = (inputElements + 1u) & ~1ull;
+    const uint64_t outputOffsetWords =
+        (weightOffsetHalf + weightElements + 1u) / 2u;
+    const uint64_t totalWords = outputOffsetWords + outputElements;
+    if (weightOffsetHalf > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
+        outputOffsetWords > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
+        totalWords > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(uint32_t))) {
+        return JNI_FALSE;
+    }
+
+    const size_t totalByteCount = static_cast<size_t>(totalWords) * sizeof(uint32_t);
+    if (totalByteCount > static_cast<size_t>(
+            gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange
+        )) {
+        return JNI_FALSE;
+    }
+
+    std::vector<jfloat> inputValues;
+    std::vector<jshort> weightValues;
+    std::vector<uint32_t> packedWords;
+    try {
+        inputValues.resize(static_cast<size_t>(inputElements));
+        weightValues.resize(static_cast<size_t>(weightElements));
+        packedWords.assign(static_cast<size_t>(totalWords), 0u);
+    } catch (const std::bad_alloc&) {
+        logError("Not enough host memory to prepare a Vulkan FP16 linear operation.");
+        return JNI_FALSE;
+    }
+
+    env->GetFloatArrayRegion(
+        inputArray,
+        0,
+        static_cast<jsize>(inputElements),
+        inputValues.data()
+    );
+    env->GetShortArrayRegion(
+        weightArray,
+        0,
+        static_cast<jsize>(weightElements),
+        weightValues.data()
+    );
+    if (env->ExceptionCheck()) {
+        return JNI_FALSE;
+    }
+
+    for (size_t index = 0; index < inputValues.size(); ++index) {
+        if (!std::isfinite(inputValues[index])) {
+            return JNI_FALSE;
+        }
+        storePackedHalf(
+            packedWords.data(),
+            index,
+            floatToHalf(inputValues[index])
+        );
+    }
+    for (size_t index = 0; index < weightValues.size(); ++index) {
+        storePackedHalf(
+            packedWords.data(),
+            static_cast<size_t>(weightOffsetHalf) + index,
+            static_cast<uint16_t>(weightValues[index])
+        );
+    }
+
+    if (!ensureStorageBuffer(static_cast<VkDeviceSize>(totalByteCount))) {
+        logError("Vulkan FP16 linear storage-buffer allocation failed.");
+        return JNI_FALSE;
+    }
+    std::memcpy(gRuntime.mappedStorage, packedWords.data(), totalByteCount);
+
+    if (!gRuntime.hostCoherent) {
+        VkMappedMemoryRange flushRange{};
+        flushRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        flushRange.memory = gRuntime.storageMemory;
+        flushRange.offset = 0;
+        flushRange.size = VK_WHOLE_SIZE;
+        const VkResult flushResult = vkFlushMappedMemoryRanges(
+            gRuntime.device,
+            1,
+            &flushRange
+        );
+        if (flushResult != VK_SUCCESS) {
+            logError("Failed to flush Vulkan FP16 linear input memory.", flushResult);
+            return JNI_FALSE;
+        }
+    }
+
+    const uint64_t workGroupCount =
+        (outputElements + kLocalWorkGroupSize - 1u) / kLocalWorkGroupSize;
+    if (workGroupCount == 0 ||
+        workGroupCount > gRuntime.maxComputeWorkGroupCountX) {
+        logError("Vulkan FP16 linear dispatch exceeds the device work-group limit.");
+        return JNI_FALSE;
+    }
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset the Vulkan FP16 linear command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin the Vulkan FP16 linear command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkMemoryBarrier hostToComputeBarrier{};
+    hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    hostToComputeBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    hostToComputeBarrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        1,
+        &hostToComputeBarrier,
+        0,
+        nullptr,
+        0,
+        nullptr
+    );
+
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.fp16LinearPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0,
+        1,
+        &gRuntime.descriptorSet,
+        0,
+        nullptr
+    );
+
+    const LinearPushConstants pushConstants{
+        static_cast<uint32_t>(rowCount),
+        static_cast<uint32_t>(batchCount),
+        static_cast<uint32_t>(rowsPerBatch),
+        static_cast<uint32_t>(inputColumns),
+        static_cast<uint32_t>(outputColumns),
+        0u,
+        static_cast<uint32_t>(weightOffsetHalf),
+        static_cast<uint32_t>(outputOffsetWords),
+        transposeWeights == JNI_TRUE ? 1u : 0u
+    };
+    vkCmdPushConstants(
+        gRuntime.commandBuffer,
+        gRuntime.pipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        sizeof(LinearPushConstants),
+        &pushConstants
+    );
+    vkCmdDispatch(
+        gRuntime.commandBuffer,
+        static_cast<uint32_t>(workGroupCount),
+        1,
+        1
+    );
+
+    VkMemoryBarrier computeToHostBarrier{};
+    computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    computeToHostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    computeToHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        0,
+        1,
+        &computeToHostBarrier,
+        0,
+        nullptr,
+        0,
+        nullptr
+    );
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish the Vulkan FP16 linear command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
+    result = vkQueueSubmit(gRuntime.computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    if (result != VK_SUCCESS) {
+        logError("Vulkan FP16 linear queue submission failed.", result);
+        return JNI_FALSE;
+    }
+
+    result = vkQueueWaitIdle(gRuntime.computeQueue);
+    if (result != VK_SUCCESS) {
+        logError("Vulkan FP16 linear queue did not complete.", result);
+        return JNI_FALSE;
+    }
+
+    if (!gRuntime.hostCoherent) {
+        VkMappedMemoryRange invalidateRange{};
+        invalidateRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        invalidateRange.memory = gRuntime.storageMemory;
+        invalidateRange.offset = 0;
+        invalidateRange.size = VK_WHOLE_SIZE;
+        result = vkInvalidateMappedMemoryRanges(
+            gRuntime.device,
+            1,
+            &invalidateRange
+        );
+        if (result != VK_SUCCESS) {
+            logError("Failed to invalidate Vulkan FP16 linear output memory.", result);
+            return JNI_FALSE;
+        }
+    }
+
+    const auto* mappedWords = static_cast<const uint32_t*>(gRuntime.mappedStorage);
+    std::vector<jfloat> outputValues;
+    try {
+        outputValues.resize(static_cast<size_t>(outputElements));
+    } catch (const std::bad_alloc&) {
+        logError("Not enough host memory to collect Vulkan FP16 linear output.");
+        return JNI_FALSE;
+    }
+    std::memcpy(
+        outputValues.data(),
+        mappedWords + outputOffsetWords,
+        static_cast<size_t>(outputElements) * sizeof(jfloat)
+    );
+    env->SetFloatArrayRegion(
+        outputArray,
+        0,
+        static_cast<jsize>(outputElements),
+        outputValues.data()
+    );
+    if (env->ExceptionCheck()) {
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 

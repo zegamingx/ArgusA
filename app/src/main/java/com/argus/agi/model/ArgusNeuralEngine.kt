@@ -555,7 +555,7 @@ class ArgusNeuralEngine private constructor(
                     ))
             val selectedTier = deviceConfig?.modelTier ?: resolvedConfig.modelTier
             val selectedBatchSize = if (accumulatedTrainingIsSafe) {
-                deviceConfig?.trainingBatchSize ?: 1
+                deviceConfig.trainingBatchSize
             } else {
                 1
             }
@@ -2666,6 +2666,16 @@ class ArgusNeuralEngine private constructor(
         outputs: Array<FloatArray>,
         transposeWeights: Boolean = false
     ) {
+        val fp16Dispatched = VulkanTrainingBackend.tryApplyFp16Linear(
+            inputRows = inputs,
+            weights = weights,
+            outputRows = outputs,
+            inputColumns = inputColumns,
+            outputColumns = outputColumns,
+            transposeWeights = transposeWeights
+        )
+        if (fp16Dispatched) return
+
         computeLinearBatch(
             inputs = inputs,
             weights = weights.toFloatArray(),
@@ -2725,6 +2735,16 @@ class ArgusNeuralEngine private constructor(
         outputColumns: Int,
         transposeWeights: Boolean = false
     ) {
+        val fp16Dispatched = VulkanTrainingBackend.tryApplyFp16BatchedLinear(
+            inputBatches = inputs,
+            weightBatches = Array(weights.size) { index -> weights[index].toShortArray() },
+            outputBatches = outputs,
+            inputColumns = inputColumns,
+            outputColumns = outputColumns,
+            transposeWeights = transposeWeights
+        )
+        if (fp16Dispatched) return
+
         val fp32Weights = Array(weights.size) { index -> weights[index].toFloatArray() }
         computeBatchedLinear(
             inputs = inputs,

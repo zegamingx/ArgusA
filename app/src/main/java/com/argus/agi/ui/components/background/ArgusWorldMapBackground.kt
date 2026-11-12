@@ -61,7 +61,7 @@ fun ArgusWorldMapBackground(
                 )
                 Path().apply {
                     moveTo(start.x, start.y)
-                    quadraticBezierTo(
+                    quadraticTo(
                         control.x,
                         control.y,
                         end.x,
