@@ -200,7 +200,6 @@ fun ChatScreen(viewModel: ArgusViewModel) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(ArgusDarkBg)
             .imePadding()
     ) {
         // HEADER - Compact
