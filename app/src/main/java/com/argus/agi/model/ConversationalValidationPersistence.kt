@@ -15,7 +15,7 @@ internal class ConversationalValidationPersistence(
 ) {
     companion object {
         private const val METADATA_FILE = "argus_conversation_quality.json"
-        private const val FORMAT_VERSION = 1
+        private const val FORMAT_VERSION = 2
         private const val ACCEPTED_PREFIX = "argus_accepted_"
     }
 
@@ -264,7 +264,8 @@ internal class ConversationalValidationPersistence(
         if (!file.isFile) return null
         return try {
             val json = JSONObject(file.readText(Charsets.UTF_8))
-            require(json.optInt("version") == FORMAT_VERSION)
+            val storedVersion = json.optInt("version")
+            require(storedVersion in 1..FORMAT_VERSION)
             StoredSnapshot(
                 acceptedCheckpointFileName = json.optString("acceptedCheckpointFileName")
                     .takeIf(String::isNotBlank),
@@ -319,6 +320,10 @@ internal class ConversationalValidationPersistence(
         .put("contradictionRate", report.contradictionRate.toDouble())
         .put("overallScore", report.overallScore.toDouble())
         .put("meetsThresholds", report.meetsThresholds)
+        .put("suiteVersion", report.suiteVersion)
+        .put("evaluatorVersion", report.evaluatorVersion)
+        .put("suiteFingerprint", report.suiteFingerprint)
+        .put("generationProfileId", report.generationProfileId)
         .put("failedThresholds", JSONArray().apply {
             report.failedThresholds.forEach(::put)
         })
@@ -371,7 +376,11 @@ internal class ConversationalValidationPersistence(
                     forbiddenClaimCount = item.getInt("forbiddenClaimCount"),
                     matchedForbiddenClaimCount = item.getInt("matchedForbiddenClaimCount")
                 )
-            }
+            },
+            suiteVersion = json.optInt("suiteVersion", 0),
+            evaluatorVersion = json.optInt("evaluatorVersion", 0),
+            suiteFingerprint = json.optString("suiteFingerprint", "legacy"),
+            generationProfileId = json.optString("generationProfileId", "legacy")
         )
     }
 

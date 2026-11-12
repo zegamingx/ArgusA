@@ -61,6 +61,106 @@ class ConversationalValidationTest {
         assertEquals(1f, report.multiTurnConsistency, 0f)
         assertEquals(0f, report.contradictionRate, 0f)
         assertTrue(report.meetsThresholds)
+        assertEquals(ConversationValidationContract.SUITE_VERSION, report.suiteVersion)
+        assertEquals(ConversationValidationContract.EVALUATOR_VERSION, report.evaluatorVersion)
+        assertTrue(report.suiteFingerprint.matches(Regex("[0-9a-f]{64}")))
+    }
+
+    @Test
+    fun evaluatorChecksPhraseOrderSingleLineAndMarkdownConstraints() = runBlocking {
+        val constraints = ConversationInstructionConstraints(
+            minWordCount = 1,
+            maxWordCount = 20,
+            requiredPhraseOrder = listOf("red", "green", "blue"),
+            requireSingleLine = true,
+            forbidMarkdown = true
+        )
+        val report = ConversationalValidationEvaluator.evaluate(
+            cases = listOf(
+                ConversationValidationCase(
+                    id = "ordered-output",
+                    turns = listOf(
+                        ConversationValidationTurn(
+                            userPrompt = "Return red, green, blue in this order on one plain line.",
+                            expectedFactGroups = listOf(
+                                setOf("red"),
+                                setOf("green"),
+                                setOf("blue")
+                            ),
+                            constraints = constraints
+                        )
+                    )
+                )
+            )
+        ) { "red, green, blue" }
+
+        assertEquals(1f, report.instructionCompliance, 0f)
+        assertTrue(report.meetsThresholds)
+    }
+
+    @Test
+    fun evaluatorRejectsWrongPhraseOrderAndMarkdownFormatting() = runBlocking {
+        val report = ConversationalValidationEvaluator.evaluate(
+            cases = listOf(
+                ConversationValidationCase(
+                    id = "invalid-order-and-format",
+                    turns = listOf(
+                        ConversationValidationTurn(
+                            userPrompt = "Return red, green, blue in order on one plain line.",
+                            constraints = ConversationInstructionConstraints(
+                                requiredPhraseOrder = listOf("red", "green", "blue"),
+                                requireSingleLine = true,
+                                forbidMarkdown = true
+                            )
+                        )
+                    )
+                )
+            )
+        ) { "# blue green red\nsecond line" }
+
+        assertEquals(0.25f, report.instructionCompliance, 0f)
+        assertFalse(report.meetsThresholds)
+    }
+
+    @Test
+    fun promotionGateRejectsReportsFromDifferentEvaluationContracts() {
+        val baseline = report(
+            factCoverage = 0.80f,
+            instructionCompliance = 0.80f,
+            multiTurnConsistency = 0.80f,
+            contradictionRate = 0f,
+            overallScore = 0.80f,
+            meetsThresholds = true
+        )
+        val changedSuite = baseline.copy(suiteFingerprint = "b".repeat(64))
+        val decision = ConversationalValidationGate.assessPromotion(baseline, changedSuite)
+
+        assertFalse(decision.accepted)
+        assertTrue(decision.reason.contains("contracts do not match"))
+    }
+
+    @Test
+    fun evaluationFingerprintChangesWhenSuiteContentOrThresholdsChange() {
+        val thresholds = ConversationalValidationThresholds()
+        val original = ConversationValidationSuite.cases
+        val originalFingerprint = ConversationValidationContract.fingerprint(original, thresholds)
+        val changedCases = original.toMutableList()
+        val firstCase = changedCases.first()
+        val firstTurn = firstCase.turns.first()
+        changedCases[0] = firstCase.copy(
+            turns = listOf(firstTurn.copy(userPrompt = firstTurn.userPrompt + " Use the new wording."))
+        )
+
+        val changedContentFingerprint = ConversationValidationContract.fingerprint(changedCases, thresholds)
+        val changedThresholdFingerprint = ConversationValidationContract.fingerprint(
+            original,
+            thresholds.copy(minimumOverallScore = 0.76f)
+        )
+
+        assertFalse(originalFingerprint == changedContentFingerprint)
+        assertFalse(originalFingerprint == changedThresholdFingerprint)
+        assertTrue(original.size >= 15)
+        assertTrue(original.sumOf { it.turns.size } >= 20)
     }
 
     @Test
@@ -201,6 +301,10 @@ class ConversationalValidationTest {
         overallScore = overallScore,
         meetsThresholds = meetsThresholds,
         failedThresholds = emptyList(),
-        turnResults = emptyList()
+        turnResults = emptyList(),
+        suiteVersion = ConversationValidationContract.SUITE_VERSION,
+        evaluatorVersion = ConversationValidationContract.EVALUATOR_VERSION,
+        suiteFingerprint = "a".repeat(64),
+        generationProfileId = ConversationValidationContract.GENERATION_PROFILE_ID
     )
 }

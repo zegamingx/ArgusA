@@ -1,6 +1,7 @@
 package com.argus.agi.model
 
 import java.io.File
+import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -35,6 +36,8 @@ class ConversationalValidationPersistenceTest {
             val restored = secondStore.loadState()
             assertEquals(ConversationValidationStatus.BASELINE_READY, restored.status)
             assertEquals(0.30f, requireNotNull(restored.baselineReport).overallScore, 0f)
+            assertEquals(ConversationValidationContract.SUITE_VERSION, requireNotNull(restored.baselineReport).suiteVersion)
+            assertEquals("a".repeat(64), requireNotNull(restored.baselineReport).suiteFingerprint)
         } finally {
             directory.deleteRecursively()
         }
@@ -76,6 +79,48 @@ class ConversationalValidationPersistenceTest {
         }
     }
 
+    @Test
+    fun legacyVersionOneSnapshotLoadsButItsBaselineIsMarkedForReevaluation() {
+        val directory = createTemporaryDirectory()
+        try {
+            val activeCheckpoint = File(directory, "argus_model_weights.bin")
+            val acceptedBytes = ByteArray(64) { 11 }
+            activeCheckpoint.writeBytes(acceptedBytes)
+
+            val store = ConversationalValidationPersistence(directory)
+            assertTrue(store.ensureAcceptedCheckpoint(activeCheckpoint))
+            assertTrue(store.saveBaseline(report(0.30f, meetsThresholds = false)))
+
+            val metadata = File(directory, "argus_conversation_quality.json")
+            val root = JSONObject(metadata.readText(Charsets.UTF_8))
+            root.put("version", 1)
+            for (key in listOf("baselineReport", "latestReport")) {
+                if (!root.isNull(key)) {
+                    val reportJson = root.getJSONObject(key)
+                    reportJson.remove("suiteVersion")
+                    reportJson.remove("evaluatorVersion")
+                    reportJson.remove("suiteFingerprint")
+                    reportJson.remove("generationProfileId")
+                }
+            }
+            metadata.writeText(root.toString(), Charsets.UTF_8)
+
+            val recreated = ConversationalValidationPersistence(directory)
+            val restored = recreated.loadState()
+            val legacyBaseline = requireNotNull(restored.baselineReport)
+
+            assertTrue(recreated.hasAcceptedCheckpoint())
+            assertEquals(ConversationValidationStatus.BASELINE_READY, restored.status)
+            assertEquals(0, legacyBaseline.suiteVersion)
+            assertEquals("legacy", legacyBaseline.suiteFingerprint)
+            assertFalse(ConversationValidationContract.isCurrent(legacyBaseline))
+            assertTrue(recreated.restoreAcceptedCheckpoint(activeCheckpoint))
+            assertArrayEquals(acceptedBytes, activeCheckpoint.readBytes())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
     private fun createTemporaryDirectory(): File {
         val directory = File.createTempFile("argus-quality-gate", "test")
         assertTrue(directory.delete())
@@ -104,6 +149,10 @@ class ConversationalValidationPersistenceTest {
         overallScore = score,
         meetsThresholds = meetsThresholds,
         failedThresholds = if (meetsThresholds) emptyList() else listOf("factCoverage"),
-        turnResults = emptyList()
+        turnResults = emptyList(),
+        suiteVersion = ConversationValidationContract.SUITE_VERSION,
+        evaluatorVersion = ConversationValidationContract.EVALUATOR_VERSION,
+        suiteFingerprint = "a".repeat(64),
+        generationProfileId = ConversationValidationContract.GENERATION_PROFILE_ID
     )
 }

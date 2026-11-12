@@ -671,6 +671,13 @@ private fun ConversationValidationCard(
             )
 
             if (report != null) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "EVALUATION V${report.suiteVersion} · ${report.caseCount} CASES · ${report.turnCount} TURNS",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ArgusTextMuted,
+                    fontFamily = FontFamily.Monospace
+                )
                 Spacer(modifier = Modifier.height(10.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
