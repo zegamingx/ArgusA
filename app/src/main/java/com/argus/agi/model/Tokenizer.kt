@@ -36,7 +36,7 @@ data class TokenizerConfig(
 
     companion object {
         const val CURRENT_SCHEMA_VERSION = 1
-        const val DEFAULT_MAX_VOCAB_SIZE = 1024
+        const val DEFAULT_MAX_VOCAB_SIZE = 2048
         const val DEFAULT_MAX_TOKEN_LENGTH = 16
         const val MINIMUM_VOCAB_SIZE = 256
         const val MINIMUM_TOKEN_LENGTH = 11

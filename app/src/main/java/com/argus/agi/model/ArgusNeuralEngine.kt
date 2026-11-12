@@ -44,7 +44,8 @@ data class EngineConfig(
     val tokenizerConfig: TokenizerConfig = TokenizerConfig(),
     val modelTier: ArgusDeviceModelTier = ArgusDeviceModelTier.COMPACT,
     val trainingBatchSize: Int = modelTier.defaultTrainingBatchSize,
-    val gradientAccumulationEnabled: Boolean = true
+    val gradientAccumulationEnabled: Boolean = true,
+    val initialVocabularyCapacity: Int = tokenizerConfig.maxVocabularySize
 ) {
     init {
         require(dModel > 0) { "dModel must be positive." }
@@ -62,9 +63,14 @@ data class EngineConfig(
         require(trainingBatchSize in 1..8) {
             "Training batch size must be between 1 and 8."
         }
+        require(initialVocabularyCapacity > 0) {
+            "Initial vocabulary capacity must be positive."
+        }
+        require(initialVocabularyCapacity <= tokenizerConfig.maxVocabularySize) {
+            "Initial vocabulary capacity cannot exceed the tokenizer's configured maximum."
+        }
 
-        // This FP32 training engine still uses JVM arrays. Reject checkpoint
-        // metadata that would overflow array indexes or exceed the app heap.
+        // FP16 parameter storage with FP32 gradients and AdamW state.
         val hidden = dModel.toLong()
         val feedForward = dFf.toLong()
         val estimatedArchitecture = ArgusArchitectureConfig(
@@ -72,7 +78,7 @@ data class EngineConfig(
             hiddenSize = dModel,
             attentionHeadCount = nHeads,
             feedForwardSize = dFf,
-            vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+            vocabularySize = initialVocabularyCapacity,
             contextLength = maxSeqLen,
             adapterRank = loraRank
         )
@@ -105,7 +111,7 @@ data class EngineConfig(
         )
         val safeHeapBudgetBytes = Runtime.getRuntime().maxMemory().toDouble() * 0.7
         require(minimumRuntimeBytes.toDouble() <= safeHeapBudgetBytes) {
-            "The FP32 engine configuration exceeds the safe app-heap budget."
+            "The FP16/FP32 engine configuration exceeds the safe app-heap budget."
         }
         require(Math.multiplyExact(hidden, feedForward) <= Int.MAX_VALUE.toLong()) {
             "Feed-forward tensor dimensions exceed JVM array limits."
@@ -136,21 +142,23 @@ data class EngineConfig(
                 availableRamGb = availableRamGb,
                 cpuCores = cpuCores
             )
-            val shape = selectExecutableShape(profile.targetParameterCount)
+            val tier = profile.tier
+            val shape = selectExecutableShape(
+                targetParameters = profile.targetParameterCount,
+                tier = tier
+            )
+            val tokenizerConfig = TokenizerConfig(maxVocabularySize = tier.vocabularyCapacity)
             return EngineConfig(
                 dModel = shape.dModel,
                 nHeads = shape.nHeads,
                 dFf = shape.dFf,
-                maxSeqLen = when (profile.tier) {
-                    ArgusDeviceModelTier.COMPACT -> 64
-                    ArgusDeviceModelTier.BALANCED -> 96
-                    ArgusDeviceModelTier.PERFORMANCE,
-                    ArgusDeviceModelTier.FLAGSHIP -> 128
-                },
+                maxSeqLen = shape.contextLength,
                 loraRank = shape.loraRank,
                 layerCount = shape.layerCount,
-                modelTier = profile.tier,
-                trainingBatchSize = profile.trainingBatchSize
+                tokenizerConfig = tokenizerConfig,
+                modelTier = tier,
+                trainingBatchSize = profile.trainingBatchSize,
+                initialVocabularyCapacity = tier.vocabularyCapacity
             )
         }
 
@@ -160,64 +168,69 @@ data class EngineConfig(
             val dFf: Int,
             val layerCount: Int,
             val loraRank: Int,
+            val contextLength: Int,
             val parameterCount: Long
         )
 
         /**
-         * Chooses the largest executable Transformer shape below the device's safe
-         * parameter target. The full 1M–7B family range is a design envelope; the
-         * active FP32 engine is deliberately constrained by its JVM heap budget.
+         * Selects a real device-tier architecture using its configured vocabulary.
+         * Balanced is fixed at d_model 128, d_ff 512, four heads, context 128,
+         * and vocabulary capacity 2,048.
          */
-        private fun selectExecutableShape(targetParameters: Long): ExecutableShape {
-            val minimumParameters = ArgusDeviceModelProfile.MINIMUM_MODEL_PARAMETERS
+        private fun selectExecutableShape(
+            targetParameters: Long,
+            tier: ArgusDeviceModelTier
+        ): ExecutableShape {
             val candidates = ArrayList<ExecutableShape>()
-            val hiddenSizes = intArrayOf(
-                128, 160, 192, 256, 320, 384, 512, 640, 768, 1024,
-                1280, 1536, 2048, 2560, 3072, 4096
-            )
-            val feedForwardMultipliers = intArrayOf(2, 3, 4)
-            val adapterRanks = intArrayOf(2, 4, 8)
+            val dimensions = when (tier) {
+                ArgusDeviceModelTier.COMPACT -> Triple(128, 384, 4)
+                ArgusDeviceModelTier.BALANCED -> Triple(128, 512, 4)
+                ArgusDeviceModelTier.PERFORMANCE -> Triple(192, 768, 8)
+                ArgusDeviceModelTier.FLAGSHIP -> Triple(256, 1_024, 8)
+            }
+            val hidden = dimensions.first
+            val feedForward = dimensions.second
+            val heads = dimensions.third
+            val rank = if (
+                tier == ArgusDeviceModelTier.PERFORMANCE ||
+                tier == ArgusDeviceModelTier.FLAGSHIP
+            ) 8 else 4
+            val contextLength = when (tier) {
+                ArgusDeviceModelTier.COMPACT -> 64
+                ArgusDeviceModelTier.BALANCED -> 128
+                ArgusDeviceModelTier.PERFORMANCE -> 160
+                ArgusDeviceModelTier.FLAGSHIP -> 192
+            }
 
-            for (hidden in hiddenSizes) {
-                val heads = (hidden / 64).coerceIn(2, 16)
-                if (hidden % heads != 0) continue
-                for (multiplier in feedForwardMultipliers) {
-                    val feedForward = Math.multiplyExact(hidden, multiplier)
-                    for (rank in adapterRanks) {
-                        if (rank > hidden) continue
-                        for (layers in 1..32) {
-                            val architecture = ArgusArchitectureConfig(
-                                layerCount = layers,
-                                hiddenSize = hidden,
-                                attentionHeadCount = heads,
-                                feedForwardSize = feedForward,
-                                vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
-                                contextLength = 64,
-                                adapterRank = rank
-                            )
-                            val parameterCount = ArgusArchitectureParameterEstimator
-                                .estimate(architecture)
-                                .totalTrainableParameters
-                            if (
-                                parameterCount in minimumParameters..targetParameters
-                            ) {
-                                candidates += ExecutableShape(
-                                    dModel = hidden,
-                                    nHeads = heads,
-                                    dFf = feedForward,
-                                    layerCount = layers,
-                                    loraRank = rank,
-                                    parameterCount = parameterCount
-                                )
-                            }
-                        }
-                    }
+            for (layers in 1..32) {
+                val architecture = ArgusArchitectureConfig(
+                    layerCount = layers,
+                    hiddenSize = hidden,
+                    attentionHeadCount = heads,
+                    feedForwardSize = feedForward,
+                    vocabularySize = tier.vocabularyCapacity,
+                    contextLength = contextLength,
+                    adapterRank = rank
+                )
+                val parameterCount = ArgusArchitectureParameterEstimator
+                    .estimate(architecture)
+                    .totalTrainableParameters
+                if (parameterCount <= targetParameters) {
+                    candidates += ExecutableShape(
+                        dModel = hidden,
+                        nHeads = heads,
+                        dFf = feedForward,
+                        layerCount = layers,
+                        loraRank = rank,
+                        contextLength = contextLength,
+                        parameterCount = parameterCount
+                    )
                 }
             }
 
             return candidates.maxByOrNull(ExecutableShape::parameterCount)
                 ?: throw IllegalArgumentException(
-                    "The device budget cannot fit Argus's minimum 1M-parameter FP32 training model."
+                    "The available budget cannot fit the minimum ${tier.displayName} architecture."
                 )
         }
     }
@@ -298,14 +311,14 @@ class ArgusNeuralEngine private constructor(
         get() = CHECKPOINT_INTERVAL
     private val scale = 1.0f / sqrt(headDim.toFloat())
 
-    private var vocabCap = max(tokenizer.vocabSize + 32, 160)
+    private var vocabCap = max(tokenizer.vocabSize + 32, config.initialVocabularyCapacity)
 
-    // Embeddings
-    private var wEmbed = FloatArray(vocabCap * dModel)
+    // Embeddings and trainable weights use FP16; activations and optimizer state remain FP32.
+    private var wEmbed = Float16ParameterArray(vocabCap * dModel)
     private val wPos = FloatArray(maxSeqLen * dModel)
 
     // LM Output Head
-    private var wHead = FloatArray(vocabCap * dModel)
+    private var wHead = Float16ParameterArray(vocabCap * dModel)
 
     // LM and Embedding Optimizer Moments
     private var mHead = FloatArray(vocabCap * dModel)
@@ -319,19 +332,19 @@ class ArgusNeuralEngine private constructor(
         dFf: Int,
         loraRank: Int
     ) {
-        val wQ = FloatArray(dModel * dModel)
-        val wK = FloatArray(dModel * dModel)
-        val wV = FloatArray(dModel * dModel)
-        val wO = FloatArray(dModel * dModel)
+        val wQ = Float16ParameterArray(dModel * dModel)
+        val wK = Float16ParameterArray(dModel * dModel)
+        val wV = Float16ParameterArray(dModel * dModel)
+        val wO = Float16ParameterArray(dModel * dModel)
 
-        val loraQa = FloatArray(dModel * loraRank)
-        val loraQb = FloatArray(loraRank * dModel)
-        val loraVa = FloatArray(dModel * loraRank)
-        val loraVb = FloatArray(loraRank * dModel)
+        val loraQa = Float16ParameterArray(dModel * loraRank)
+        val loraQb = Float16ParameterArray(loraRank * dModel)
+        val loraVa = Float16ParameterArray(dModel * loraRank)
+        val loraVb = Float16ParameterArray(loraRank * dModel)
 
-        val wGate = FloatArray(dModel * dFf)
-        val wUp = FloatArray(dModel * dFf)
-        val wDown = FloatArray(dFf * dModel)
+        val wGate = Float16ParameterArray(dModel * dFf)
+        val wUp = Float16ParameterArray(dModel * dFf)
+        val wDown = Float16ParameterArray(dFf * dModel)
 
         val mWQ = FloatArray(dModel * dModel)
         val vWQ = FloatArray(dModel * dModel)
@@ -502,7 +515,7 @@ class ArgusNeuralEngine private constructor(
             }.getOrNull()
 
             val resolvedConfig = savedConfig ?: requireNotNull(deviceConfig) {
-                "This device cannot currently allocate the minimum 1M-parameter Argus model safely."
+                "This device cannot currently allocate the minimum executable Argus model safely."
             }
             val savedParameterCount = savedConfig?.let { saved ->
                 ArgusArchitectureParameterEstimator.estimate(
@@ -511,7 +524,7 @@ class ArgusNeuralEngine private constructor(
                         hiddenSize = saved.dModel,
                         attentionHeadCount = saved.nHeads,
                         feedForwardSize = saved.dFf,
-                        vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+                        vocabularySize = saved.initialVocabularyCapacity,
                         contextLength = saved.maxSeqLen,
                         adapterRank = saved.loraRank
                     )
@@ -524,7 +537,7 @@ class ArgusNeuralEngine private constructor(
                         hiddenSize = selected.dModel,
                         attentionHeadCount = selected.nHeads,
                         feedForwardSize = selected.dFf,
-                        vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+                        vocabularySize = selected.initialVocabularyCapacity,
                         contextLength = selected.maxSeqLen,
                         adapterRank = selected.loraRank
                     )
@@ -606,6 +619,7 @@ class ArgusNeuralEngine private constructor(
                 tokenizerConfig = TokenizerConfig(
                     algorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1
                 ),
+                initialVocabularyCapacity = savedVocabCap,
                 gradientAccumulationEnabled = false
             )
         }
@@ -691,6 +705,7 @@ class ArgusNeuralEngine private constructor(
                 layerCount = layerCount,
                 isFullTrainingEnabled = true,
                 tokenizerConfig = tokenizerConfig,
+                initialVocabularyCapacity = savedVocabCap,
                 gradientAccumulationEnabled = false
             )
         }
@@ -763,7 +778,7 @@ class ArgusNeuralEngine private constructor(
         for (i in wHead.indices) wHead[i] = (Random.nextFloat() * 2f - 1f) * stdHead
     }
 
-    private fun initFlatMatrix(mat: FloatArray, inDim: Int, outDim: Int, std: Float) {
+    private fun initFlatMatrix(mat: Float16ParameterArray, inDim: Int, outDim: Int, std: Float) {
         val size = inDim * outDim
         for (i in 0 until size) {
             mat[i] = (Random.nextFloat() * 2f - 1f) * std
@@ -775,7 +790,7 @@ class ArgusNeuralEngine private constructor(
      */
     val architectureConfig: ArgusArchitectureConfig
         get() = config.toArgusArchitectureConfig(
-            vocabularySize = tokenizer.vocabSize,
+            vocabularySize = vocabCap,
             layerCount = layerCount
         )
 
@@ -794,7 +809,8 @@ class ArgusNeuralEngine private constructor(
         parameterBreakdown.totalTrainableParameters
 
     fun calculateAdapterSizeBytes(): Long =
-        ((dModel * loraRank + loraRank * dModel) * 2).toLong() * 4L * layerCount.toLong()
+        ((dModel.toLong() * loraRank + loraRank.toLong() * dModel) * 2L) *
+            Short.SIZE_BYTES.toLong() * layerCount.toLong()
 
     // =====================================================================
     // Vocab Capacity Management
@@ -846,15 +862,15 @@ class ArgusNeuralEngine private constructor(
         if (targetCap <= 0 || targetCap == vocabCap) return
         requireSafeVocabularyCapacity(targetCap)
         val targetElements = Math.multiplyExact(targetCap, dModel)
-        val newEmbed = FloatArray(targetElements)
-        val newHead = FloatArray(targetElements)
+        val newEmbed = Float16ParameterArray(targetElements)
+        val newHead = Float16ParameterArray(targetElements)
         val newMEmbed = FloatArray(targetElements)
         val newVEmbed = FloatArray(targetElements)
         val newMHead = FloatArray(targetElements)
         val newVHead = FloatArray(targetElements)
 
-        System.arraycopy(wEmbed, 0, newEmbed, 0, min(wEmbed.size, newEmbed.size))
-        System.arraycopy(wHead, 0, newHead, 0, min(wHead.size, newHead.size))
+        newEmbed.copyFrom(wEmbed, 0, 0, min(wEmbed.size, newEmbed.size))
+        newHead.copyFrom(wHead, 0, 0, min(wHead.size, newHead.size))
         System.arraycopy(mEmbed, 0, newMEmbed, 0, min(mEmbed.size, newMEmbed.size))
         System.arraycopy(vEmbed, 0, newVEmbed, 0, min(vEmbed.size, newVEmbed.size))
         System.arraycopy(mHead, 0, newMHead, 0, min(mHead.size, newMHead.size))
@@ -1239,11 +1255,16 @@ class ArgusNeuralEngine private constructor(
         val originalValue = parameter[resolvedIndex]
         var plusLoss = Float.NaN
         var minusLoss = Float.NaN
+        var plusParameterValue = originalValue
+        var minusParameterValue = originalValue
+        val probeEpsilon = max(epsilon, 0.05f)
         try {
-            parameter[resolvedIndex] = originalValue + epsilon
+            parameter[resolvedIndex] = originalValue + probeEpsilon
+            plusParameterValue = parameter[resolvedIndex]
             plusLoss = trainSingleWindow(tokens, currentVocab, updateParameters = false)
 
-            parameter[resolvedIndex] = originalValue - epsilon
+            parameter[resolvedIndex] = originalValue - probeEpsilon
+            minusParameterValue = parameter[resolvedIndex]
             minusLoss = trainSingleWindow(tokens, currentVocab, updateParameters = false)
         } finally {
             parameter[resolvedIndex] = originalValue
@@ -1252,7 +1273,11 @@ class ArgusNeuralEngine private constructor(
         check(plusLoss.isFinite() && minusLoss.isFinite()) {
             "Finite-difference loss evaluation returned a non-finite value."
         }
-        val numericalGradient = (plusLoss - minusLoss) / (2f * epsilon)
+        val representedDelta = plusParameterValue - minusParameterValue
+        check(representedDelta != 0f) {
+            "FP16 parameter quantization is too coarse for this finite-difference probe."
+        }
+        val numericalGradient = (plusLoss - minusLoss) / representedDelta
         val absoluteError = kotlin.math.abs(probe.analyticalGradient - numericalGradient)
         val magnitude = max(
             kotlin.math.abs(probe.analyticalGradient),
@@ -1275,7 +1300,7 @@ class ArgusNeuralEngine private constructor(
         )
     }
 
-    private fun gradientParameterArray(parameterName: String): FloatArray {
+    private fun gradientParameterArray(parameterName: String): Float16ParameterArray {
         if (parameterName == "wHead") return wHead
         if (parameterName == "wEmbed") return wEmbed
 
@@ -2144,7 +2169,7 @@ class ArgusNeuralEngine private constructor(
                 Array(3) { Array(attentionBackwardRows) { FloatArray(dModel) } }
             computeBatchedLinear(
                 inputs = arrayOf(queryGradientRows, keyGradientRows, valueGradientRows),
-                weights = arrayOf(wQEff, b.wK, wVEff),
+                weights = arrayOf(wQEff, b.wK.toFloatArray(), wVEff),
                 outputs = inputGradientByProjection,
                 inputColumns = dModel,
                 outputColumns = dModel,
@@ -2322,7 +2347,7 @@ class ArgusNeuralEngine private constructor(
         val biasCorr1 = 1f - beta1Pow
         val biasCorr2 = 1f - beta2Pow
 
-        val parameterList = mutableListOf<FloatArray>()
+        val parameterList = mutableListOf<Float16ParameterArray>()
         val gradientList = mutableListOf<FloatArray>()
         val firstMomentList = mutableListOf<FloatArray>()
         val secondMomentList = mutableListOf<FloatArray>()
@@ -2349,42 +2374,27 @@ class ArgusNeuralEngine private constructor(
             parameterList.add(b.loraVb); gradientList.add(lg.gradLoraVb); firstMomentList.add(b.mLoraVb); secondMomentList.add(b.vLoraVb); weightDecayList.add(0f)
         }
 
-        val updatedByVulkan = VulkanTrainingBackend.tryApplyAdamWUpdate(
-            parameters = parameterList.toTypedArray(),
-            gradients = gradientList.toTypedArray(),
-            firstMoments = firstMomentList.toTypedArray(),
-            secondMoments = secondMomentList.toTypedArray(),
-            weightDecayByGroup = weightDecayList.toFloatArray(),
-            learningRate = lr,
-            beta1 = beta1,
-            beta2 = beta2,
-            biasCorrection1 = biasCorr1,
-            biasCorrection2 = biasCorr2,
-            epsilon = epsilon,
-            gradientClipFactor = clipFactor
-        )
-
-        if (!updatedByVulkan) {
-            for (i in parameterList.indices) {
-                applyClip(gradientList[i], clipFactor)
-                adamUpdate(
-                    parameterList[i],
-                    gradientList[i],
-                    firstMomentList[i],
-                    secondMomentList[i],
-                    lr,
-                    biasCorr1,
-                    biasCorr2,
-                    weightDecayList[i]
-                )
-            }
+        // FP16 parameters are updated on CPU with FP32 AdamW state. The current
+        // Vulkan optimizer accepts FloatArray parameters only.
+        for (index in parameterList.indices) {
+            applyClip(gradientList[index], clipFactor)
+            adamUpdate(
+                param = parameterList[index],
+                grad = gradientList[index],
+                m = firstMomentList[index],
+                v = secondMomentList[index],
+                lr = lr,
+                biasCorr1 = biasCorr1,
+                biasCorr2 = biasCorr2,
+                wd = weightDecayList[index]
+            )
         }
 
         return if (validSteps > 0) totalLoss / validSteps else Float.NaN
     }
 
-    private fun currentParameterArrays(): Array<FloatArray> {
-        val arrays = ArrayList<FloatArray>(2 + layerCount * 11)
+    private fun currentParameterArrays(): Array<Float16ParameterArray> {
+        val arrays = ArrayList<Float16ParameterArray>(2 + layerCount * 11)
         arrays += wHead
         arrays += wEmbed
         for (block in blocks) {
@@ -2499,38 +2509,20 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
-        val equalTensorShapes = parameters.indices.all { index ->
-            parameters[index].size == gradients[index].size
-        }
-        val updatedByVulkan = equalTensorShapes && VulkanTrainingBackend.tryApplyAdamWUpdate(
-            parameters = parameters,
-            gradients = gradients,
-            firstMoments = firstMoments,
-            secondMoments = secondMoments,
-            weightDecayByGroup = weightDecayByGroup,
-            learningRate = learningRate,
-            beta1 = beta1,
-            beta2 = beta2,
-            biasCorrection1 = biasCorrection1,
-            biasCorrection2 = biasCorrection2,
-            epsilon = epsilon,
-            gradientClipFactor = clipFactor
-        )
-
-        if (!updatedByVulkan) {
-            for (index in parameters.indices) {
-                applyClip(gradients[index], clipFactor)
-                adamUpdate(
-                    param = parameters[index],
-                    grad = gradients[index],
-                    m = firstMoments[index],
-                    v = secondMoments[index],
-                    lr = learningRate,
-                    biasCorr1 = biasCorrection1,
-                    biasCorr2 = biasCorrection2,
-                    wd = weightDecayByGroup[index]
-                )
-            }
+        // Accumulation buffers and AdamW moments stay FP32. Quantize the
+        // parameter only once, after the optimizer update.
+        for (index in parameters.indices) {
+            applyClip(gradients[index], clipFactor)
+            adamUpdate(
+                param = parameters[index],
+                grad = gradients[index],
+                m = firstMoments[index],
+                v = secondMoments[index],
+                lr = learningRate,
+                biasCorr1 = biasCorrection1,
+                biasCorr2 = biasCorrection2,
+                wd = weightDecayByGroup[index]
+            )
         }
     }
 
@@ -2548,6 +2540,37 @@ class ArgusNeuralEngine private constructor(
     private fun applyClip(arr: FloatArray, factor: Float) {
         if (factor == 1.0f) return
         for (i in arr.indices) arr[i] *= factor
+    }
+
+    private fun adamUpdate(
+        param: Float16ParameterArray,
+        grad: FloatArray,
+        m: FloatArray,
+        v: FloatArray,
+        lr: Float,
+        biasCorr1: Float,
+        biasCorr2: Float,
+        wd: Float = 0f
+    ) {
+        require(param.size == m.size && param.size == v.size) {
+            "FP16 parameters and FP32 AdamW moments must have matching tensor sizes."
+        }
+        val limit = min(param.size, grad.size)
+        for (index in 0 until limit) {
+            val gradient = grad[index]
+            val parameter = param[index]
+            m[index] = beta1 * m[index] + (1f - beta1) * gradient
+            v[index] = beta2 * v[index] + (1f - beta2) * gradient * gradient
+            val correctedFirstMoment = m[index] / biasCorr1
+            val correctedSecondMoment = v[index] / biasCorr2
+            val update = correctedFirstMoment / (sqrt(correctedSecondMoment) + epsilon) +
+                wd * parameter
+            val updatedParameter = parameter - lr * update
+            require(updatedParameter.isFinite()) {
+                "FP16 AdamW produced a non-finite parameter update."
+            }
+            param[index] = updatedParameter
+        }
     }
 
     private fun adamUpdate(
@@ -2575,6 +2598,25 @@ class ArgusNeuralEngine private constructor(
         val embOffset = if (tokenId in 0 until vocabCap) tokenId * dModel else 0
         val posOffset = (pos % maxSeqLen) * dModel
         for (d in 0 until dModel) out[d] = wEmbed[embOffset + d] * scale + wPos[posOffset + d]
+    }
+
+    private fun computeLinear(
+        x: FloatArray,
+        weights: Float16ParameterArray,
+        inputColumns: Int,
+        outputColumns: Int,
+        output: FloatArray
+    ) {
+        require(weights.size == Math.multiplyExact(inputColumns, outputColumns)) {
+            "FP16 linear matrix shape does not match its storage."
+        }
+        for (column in 0 until outputColumns) {
+            var sum = 0f
+            for (row in 0 until inputColumns) {
+                sum += x[row] * weights[row * outputColumns + column]
+            }
+            output[column] = sum
+        }
     }
 
     private fun computeLinear(x: FloatArray, w: FloatArray, inDim: Int, outDim: Int, out: FloatArray) {
@@ -2618,6 +2660,24 @@ class ArgusNeuralEngine private constructor(
 
     private fun computeLinearBatch(
         inputs: Array<FloatArray>,
+        weights: Float16ParameterArray,
+        inputColumns: Int,
+        outputColumns: Int,
+        outputs: Array<FloatArray>,
+        transposeWeights: Boolean = false
+    ) {
+        computeLinearBatch(
+            inputs = inputs,
+            weights = weights.toFloatArray(),
+            inputColumns = inputColumns,
+            outputColumns = outputColumns,
+            outputs = outputs,
+            transposeWeights = transposeWeights
+        )
+    }
+
+    private fun computeLinearBatch(
+        inputs: Array<FloatArray>,
         weights: FloatArray,
         inputColumns: Int,
         outputColumns: Int,
@@ -2655,6 +2715,25 @@ class ArgusNeuralEngine private constructor(
                 )
             }
         }
+    }
+
+    private fun computeBatchedLinear(
+        inputs: Array<Array<FloatArray>>,
+        weights: Array<Float16ParameterArray>,
+        outputs: Array<Array<FloatArray>>,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean = false
+    ) {
+        val fp32Weights = Array(weights.size) { index -> weights[index].toFloatArray() }
+        computeBatchedLinear(
+            inputs = inputs,
+            weights = fp32Weights,
+            outputs = outputs,
+            inputColumns = inputColumns,
+            outputColumns = outputColumns,
+            transposeWeights = transposeWeights
+        )
     }
 
     private fun computeBatchedLinear(
@@ -2709,6 +2788,26 @@ class ArgusNeuralEngine private constructor(
 
     private fun computeLinearTransposed(
         input: FloatArray,
+        weights: Float16ParameterArray,
+        inputColumns: Int,
+        outputColumns: Int,
+        output: FloatArray
+    ) {
+        require(weights.size == Math.multiplyExact(inputColumns, outputColumns)) {
+            "FP16 transposed matrix shape does not match its storage."
+        }
+        for (column in 0 until outputColumns) {
+            var sum = 0f
+            val weightOffset = column * inputColumns
+            for (inner in 0 until inputColumns) {
+                sum += input[inner] * weights[weightOffset + inner]
+            }
+            output[column] = sum
+        }
+    }
+
+    private fun computeLinearTransposed(
+        input: FloatArray,
         weights: FloatArray,
         inputColumns: Int,
         outputColumns: Int,
@@ -2725,7 +2824,8 @@ class ArgusNeuralEngine private constructor(
     }
 
     private fun computeLinearWithLora(
-        x: FloatArray, wBase: FloatArray, loraA: FloatArray, loraB: FloatArray,
+        x: FloatArray, wBase: Float16ParameterArray,
+        loraA: Float16ParameterArray, loraB: Float16ParameterArray,
         inDim: Int, outDim: Int, rank: Int,
         midBuf: FloatArray, finalOut: FloatArray
     ) {
@@ -2735,8 +2835,8 @@ class ArgusNeuralEngine private constructor(
 
     private fun addLoraProjection(
         input: FloatArray,
-        loraA: FloatArray,
-        loraB: FloatArray,
+        loraA: Float16ParameterArray,
+        loraB: Float16ParameterArray,
         inputColumns: Int,
         outputColumns: Int,
         rank: Int,
@@ -2834,7 +2934,7 @@ class ArgusNeuralEngine private constructor(
         val tokens = 20
         val tps = if (seconds > 0) tokens / seconds else 0f
         val msPerToken = if (tokens > 0) elapsedMs.toFloat() / tokens else 0f
-        val memMb = (countTotalParameters() * 4L) / (1024f * 1024f)
+        val memMb = (countTrainableParameters() * Short.SIZE_BYTES.toLong()) / (1024f * 1024f)
         BenchmarkResult(tps, msPerToken, memMb, tokens, elapsedMs)
     }
 
@@ -2854,10 +2954,35 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
-    private data class NamedCheckpointTensor(
+    private class NamedCheckpointTensor private constructor(
         val name: String,
-        val values: FloatArray
-    )
+        private val floatValues: FloatArray?,
+        private val fp16Values: Float16ParameterArray?
+    ) {
+        constructor(name: String, values: FloatArray) : this(name, values, null)
+        constructor(name: String, values: Float16ParameterArray) : this(name, null, values)
+
+        val size: Int
+            get() = when {
+                floatValues != null -> floatValues.size
+                fp16Values != null -> fp16Values.size
+                else -> throw IllegalStateException("Checkpoint tensor has no backing storage.")
+            }
+
+        operator fun get(index: Int): Float = when {
+            floatValues != null -> floatValues[index]
+            fp16Values != null -> fp16Values[index]
+            else -> throw IllegalStateException("Checkpoint tensor has no backing storage.")
+        }
+
+        operator fun set(index: Int, value: Float) {
+            when {
+                floatValues != null -> floatValues[index] = value
+                fp16Values != null -> fp16Values[index] = value
+                else -> throw IllegalStateException("Checkpoint tensor has no backing storage.")
+            }
+        }
+    }
 
     private data class CheckpointTensorDescriptor(
         val name: String,
@@ -2958,7 +3083,7 @@ class ArgusNeuralEngine private constructor(
             payloadLength = Math.addExact(payloadLength, 16L + nameBytes.size.toLong())
             payloadLength = Math.addExact(
                 payloadLength,
-                Math.multiplyExact(tensor.values.size.toLong(), 4L)
+                Math.multiplyExact(tensor.size.toLong(), 4L)
             )
         }
 
@@ -2974,7 +3099,7 @@ class ArgusNeuralEngine private constructor(
         header.putInt(architecture.feedForwardSize)
         header.putInt(architecture.contextLength)
         header.putInt(architecture.adapterRank)
-        header.putInt(architecture.vocabularySize)
+        header.putInt(vocabEntries.size) // Persist the actual tokenizer entry count.
         header.putInt(vocabCap)
         header.putInt(adamStep)
         header.putInt(config.tokenizerConfig.schemaVersion)
@@ -3020,13 +3145,13 @@ class ArgusNeuralEngine private constructor(
                     for (tensor in tensors) {
                         val nameBytes = tensor.name.toByteArray(Charsets.UTF_8)
                         writeIntLittleEndian(checked, nameBytes.size)
-                        writeLongLittleEndian(checked, tensor.values.size.toLong())
+                        writeLongLittleEndian(checked, tensor.size.toLong())
                         writeIntLittleEndian(checked, FLOAT32_TENSOR_TYPE)
                         checked.write(nameBytes)
                     }
 
                     for (tensor in tensors) {
-                        writeFloatArrayLittleEndian(checked, tensor.values, tensor.name)
+                        writeFloatArrayLittleEndian(checked, tensor)
                     }
 
                     checked.flush()
@@ -3072,13 +3197,13 @@ class ArgusNeuralEngine private constructor(
 
     private fun writeFloatArrayLittleEndian(
         output: OutputStream,
-        values: FloatArray,
-        tensorName: String
+        tensor: NamedCheckpointTensor
     ) {
         val buffer = ByteBuffer.allocate(TENSOR_WRITE_BUFFER_BYTES).order(ByteOrder.LITTLE_ENDIAN)
-        for (value in values) {
+        for (index in 0 until tensor.size) {
+            val value = tensor[index]
             require(value.isFinite()) {
-                "Cannot save a non-finite value in tensor $tensorName."
+                "Cannot save a non-finite value in tensor ${tensor.name}."
             }
             if (buffer.remaining() < Float.SIZE_BYTES) {
                 output.write(buffer.array(), 0, buffer.position())
@@ -3116,22 +3241,21 @@ class ArgusNeuralEngine private constructor(
 
     private fun readFloatArrayLittleEndian(
         input: InputStream,
-        values: FloatArray,
-        tensorName: String
+        tensor: NamedCheckpointTensor
     ) {
         val floatsPerChunk = TENSOR_WRITE_BUFFER_BYTES / Float.SIZE_BYTES
         var offset = 0
-        while (offset < values.size) {
-            val chunkCount = min(floatsPerChunk, values.size - offset)
+        while (offset < tensor.size) {
+            val chunkCount = min(floatsPerChunk, tensor.size - offset)
             val byteCount = chunkCount * Float.SIZE_BYTES
             val chunk = ByteBuffer.wrap(input.readFully(byteCount))
                 .order(ByteOrder.LITTLE_ENDIAN)
             for (index in 0 until chunkCount) {
                 val value = chunk.float
                 require(value.isFinite()) {
-                    "ARG4 contains a non-finite value in tensor $tensorName."
+                    "Checkpoint contains a non-finite value in tensor ${tensor.name}."
                 }
-                values[offset + index] = value
+                tensor[offset + index] = value
             }
             offset += chunkCount
         }
@@ -3147,17 +3271,12 @@ class ArgusNeuralEngine private constructor(
         require(targetElements <= Int.MAX_VALUE.toLong()) {
             "Checkpoint vocabulary tensor dimensions exceed JVM array limits."
         }
-        val tensorBuffersPerParameter = if (config.gradientAccumulationEnabled) {
-            // Six resident model/moment arrays, one sample gradient, and one accumulator
-            // gradient for each of the embedding and output-head parameter groups.
-            10L
-        } else {
-            // Six resident model/moment arrays plus one sample gradient per group.
-            8L
-        }
+        // Paired embedding/head rows: two FP16 weights, four FP32 moments,
+        // two FP32 sample gradients and optionally two FP32 accumulation buffers.
+        val bytesPerPairedElement = if (config.gradientAccumulationEnabled) 36L else 28L
         val newVocabularyArrayBytes = Math.multiplyExact(
             targetElements,
-            tensorBuffersPerParameter * Float.SIZE_BYTES.toLong()
+            bytesPerPairedElement
         )
         val runtime = Runtime.getRuntime()
         val availableHeap = runtime.maxMemory() -
@@ -3182,7 +3301,7 @@ class ArgusNeuralEngine private constructor(
             tensor.name to if (tensor.name in dynamicVocabularyTensors) {
                 vocabularyElementCount
             } else {
-                tensor.values.size.toLong()
+                tensor.size.toLong()
             }
         }
     }
@@ -3354,7 +3473,15 @@ class ArgusNeuralEngine private constructor(
                 if (isLearnedBpe) {
                     candidateTokenizer.importMerges(loadedMerges)
                 }
-                require(candidateTokenizer.vocabSize == savedVocabSize) {
+                require(candidateTokenizer.vocabSize == savedVocabularyEntryCount) {
+                    "ARG4 tokenizer vocabulary entry count does not match its metadata."
+                }
+                // Earlier ARG4 writers stored vocabCap in the savedVocabSize field.
+                // Accept that legacy convention while validating the serialized entry count.
+                require(
+                    savedVocabSize == candidateTokenizer.vocabSize ||
+                        savedVocabSize == savedVocabCap
+                ) {
                     "ARG4 tokenizer vocabulary size does not match its metadata."
                 }
 
@@ -3414,10 +3541,10 @@ class ArgusNeuralEngine private constructor(
                     for (descriptor in descriptors) {
                         val targetTensor = tensorsByName[descriptor.name]
                             ?: throw IllegalStateException("ARG4 tensor target is unavailable: ${descriptor.name}")
-                        require(targetTensor.values.size.toLong() == descriptor.elementCount) {
+                        require(targetTensor.size.toLong() == descriptor.elementCount) {
                             "ARG4 tensor target size changed during restoration."
                         }
-                        readFloatArrayLittleEndian(input, targetTensor.values, descriptor.name)
+                        readFloatArrayLittleEndian(input, targetTensor)
                     }
                     adamStep = savedAdamStep
                 }
@@ -3513,23 +3640,49 @@ class ArgusNeuralEngine private constructor(
                     synchronized(modelLock) {
                         tokenizer.importVocab(entries)
                         resizeVocabCapacityTo(savedVocabCap)
-                        val arrays = listOf(
-                            wEmbed, mEmbed, vEmbed,
-                            wHead, mHead, vHead,
-                            loraQa, loraQb, loraVa, loraVb,
-                            mLoraQa, mLoraQb, mLoraVa, mLoraVb,
-                            vLoraQa, vLoraQb, vLoraVa, vLoraVb,
-                            wQ, wK, wV, wO,
-                            mWQ, vWQ, mWK, vWK, mWV, vWV, mWO, vWO,
-                            wGate, wUp, wDown,
-                            mWGate, vWGate, mWUp, vWUp, mWDown, vWDown
+                        val tensors = listOf(
+                            NamedCheckpointTensor("token.embedding.weight", wEmbed),
+                            NamedCheckpointTensor("token.embedding.adam_m", mEmbed),
+                            NamedCheckpointTensor("token.embedding.adam_v", vEmbed),
+                            NamedCheckpointTensor("lm_head.weight", wHead),
+                            NamedCheckpointTensor("lm_head.adam_m", mHead),
+                            NamedCheckpointTensor("lm_head.adam_v", vHead),
+                            NamedCheckpointTensor("adapter.q.a", loraQa),
+                            NamedCheckpointTensor("adapter.q.b", loraQb),
+                            NamedCheckpointTensor("adapter.v.a", loraVa),
+                            NamedCheckpointTensor("adapter.v.b", loraVb),
+                            NamedCheckpointTensor("adapter.q.a.adam_m", mLoraQa),
+                            NamedCheckpointTensor("adapter.q.b.adam_m", mLoraQb),
+                            NamedCheckpointTensor("adapter.v.a.adam_m", mLoraVa),
+                            NamedCheckpointTensor("adapter.v.b.adam_m", mLoraVb),
+                            NamedCheckpointTensor("adapter.q.a.adam_v", vLoraQa),
+                            NamedCheckpointTensor("adapter.q.b.adam_v", vLoraQb),
+                            NamedCheckpointTensor("adapter.v.a.adam_v", vLoraVa),
+                            NamedCheckpointTensor("adapter.v.b.adam_v", vLoraVb),
+                            NamedCheckpointTensor("attention.query.weight", wQ),
+                            NamedCheckpointTensor("attention.key.weight", wK),
+                            NamedCheckpointTensor("attention.value.weight", wV),
+                            NamedCheckpointTensor("attention.output.weight", wO),
+                            NamedCheckpointTensor("attention.query.adam_m", mWQ),
+                            NamedCheckpointTensor("attention.query.adam_v", vWQ),
+                            NamedCheckpointTensor("attention.key.adam_m", mWK),
+                            NamedCheckpointTensor("attention.key.adam_v", vWK),
+                            NamedCheckpointTensor("attention.value.adam_m", mWV),
+                            NamedCheckpointTensor("attention.value.adam_v", vWV),
+                            NamedCheckpointTensor("attention.output.adam_m", mWO),
+                            NamedCheckpointTensor("attention.output.adam_v", vWO),
+                            NamedCheckpointTensor("feed_forward.gate.weight", wGate),
+                            NamedCheckpointTensor("feed_forward.up.weight", wUp),
+                            NamedCheckpointTensor("feed_forward.down.weight", wDown),
+                            NamedCheckpointTensor("feed_forward.gate.adam_m", mWGate),
+                            NamedCheckpointTensor("feed_forward.gate.adam_v", vWGate),
+                            NamedCheckpointTensor("feed_forward.up.adam_m", mWUp),
+                            NamedCheckpointTensor("feed_forward.up.adam_v", vWUp),
+                            NamedCheckpointTensor("feed_forward.down.adam_m", mWDown),
+                            NamedCheckpointTensor("feed_forward.down.adam_v", vWDown)
                         )
-                        arrays.forEachIndexed { index, values ->
-                            readFloatArrayLittleEndian(
-                                input = input,
-                                values = values,
-                                tensorName = "ARG3 tensor $index"
-                            )
+                        tensors.forEach { tensor ->
+                            readFloatArrayLittleEndian(input, tensor)
                         }
                         adamStep = savedAdamStep
                     }

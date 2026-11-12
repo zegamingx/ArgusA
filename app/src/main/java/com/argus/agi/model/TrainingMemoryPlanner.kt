@@ -1,22 +1,20 @@
 package com.argus.agi.model
 
 /**
- * Lower-bound accounting for full-parameter FP32 training with Adam.
+ * Lower-bound accounting for FP16 model parameters with FP32 AdamW state.
  *
- * The 16-byte baseline accounts for FP32 parameters, FP32 gradients, and two FP32 Adam
- * moment buffers. It deliberately excludes activations, temporary tensors, tokenizer data,
- * allocator fragmentation, checkpoint buffers, and runtime overhead. It is therefore a
- * lower bound, never a "fits in RAM" guarantee.
+ * The 14-byte baseline accounts for a 2-byte FP16 parameter, a 4-byte gradient,
+ * and two 4-byte FP32 Adam moments. Serial micro-batch accumulation adds one
+ * further 4-byte FP32 gradient buffer, bringing the state floor to 18 bytes per
+ * parameter. Activations, scratch tensors, tokenizer data, allocator fragmentation,
+ * checkpoint buffers, and runtime overhead are additional.
  */
 object TrainingMemoryPlanner {
 
-    const val BASELINE_BYTES_PER_PARAMETER: Long = 16L
+    const val BASELINE_BYTES_PER_PARAMETER: Long = 14L
 
-    /**
-     * Adds one FP32 gradient-accumulation buffer to the ordinary weights, gradients,
-     * and two Adam moments used by the current serial micro-batch implementation.
-     */
-    const val ACCUMULATED_BYTES_PER_PARAMETER: Long = 20L
+    /** Adds one FP32 gradient-accumulation buffer to the FP16/FP32 training state. */
+    const val ACCUMULATED_BYTES_PER_PARAMETER: Long = 18L
 
     fun minimumAccumulatedTrainingStateBytes(parameterCount: Long): Long {
         require(parameterCount >= 0L) { "parameterCount cannot be negative." }
