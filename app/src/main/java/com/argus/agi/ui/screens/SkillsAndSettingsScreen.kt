@@ -145,7 +145,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
     }
 
     LazyColumn(
-        modifier = Modifier.fillMaxSize().background(ArgusDarkBg).imePadding().padding(horizontal = 12.dp),
+        modifier = Modifier.fillMaxSize().imePadding().padding(horizontal = 12.dp),
         contentPadding = PaddingValues(vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
