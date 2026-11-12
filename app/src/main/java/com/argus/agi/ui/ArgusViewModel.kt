@@ -12,6 +12,7 @@ import com.argus.agi.model.BenchmarkResult
 import com.argus.agi.model.GenesisLifecycleStage
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingManager
+import com.argus.agi.model.TextModalityProcessor
 import com.argus.agi.model.ReasoningOutputParser
 import com.argus.agi.model.TrainingSessionMetrics
 import com.argus.agi.model.WorldEntity
@@ -128,6 +129,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     val currentContextSummary: StateFlow<String> = worldModel.currentContextSummary
     val genesisState: StateFlow<com.argus.agi.model.GenesisLifecycleState> = genesisModelManager.lifecycleState
     val activeDocument: StateFlow<com.argus.agi.model.ActiveDocumentTraining?> = trainingManager.activeDocument
+    val conversationalValidationState: StateFlow<com.argus.agi.model.ConversationValidationState> =
+        trainingManager.conversationalValidationState
 
     private val _benchmarkState = MutableStateFlow<BenchmarkResult?>(null)
     val benchmarkState: StateFlow<BenchmarkResult?> = _benchmarkState.asStateFlow()
@@ -351,6 +354,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     fun setForceTrainingOverride(enabled: Boolean) = deviceGuard.setForceTrainingOverride(enabled)
     fun triggerImmediateTrainingStep() = trainingManager.triggerImmediateTrainingStep()
     fun toggleTrainingPause() = trainingManager.togglePauseTraining()
+    fun runConversationalValidation() = trainingManager.runConversationalValidation()
+    fun retryConversationalValidation() = trainingManager.retryConversationalValidation()
 
     fun onNotificationPermissionResult(granted: Boolean) {
         _isNotificationPermissionGranted.value = granted
@@ -372,6 +377,49 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 )
             } finally {
                 _isBenchmarking.value = false
+            }
+        }
+    }
+
+    /**
+     * Adds exactly one user-selected text exchange to the durable local training corpus.
+     * No conversation is collected automatically; the caller must request this action
+     * for the specific exchange shown in the chat UI.
+     */
+    fun enqueueApprovedConversation(
+        userMessage: String,
+        assistantMessage: String,
+        onComplete: (Boolean) -> Unit
+    ) {
+        val trainingSample = TextModalityProcessor.formatConversationExchange(
+            userMessage = userMessage,
+            assistantMessage = assistantMessage
+        )
+        if (trainingSample == null) {
+            onComplete(false)
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val queuedChunks = try {
+                trainingManager.enqueueDocument(
+                    source = "user_approved_conversation",
+                    title = "Approved conversation ${System.currentTimeMillis()}",
+                    fullText = trainingSample,
+                    chunkSize = 380,
+                    overlap = 0,
+                    epochs = 1,
+                    rightsStatus = "USER_DECLARED"
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.e(TAG, "Failed to queue a user-approved conversation sample.", error)
+                0
+            }
+
+            withContext(Dispatchers.Main) {
+                onComplete(queuedChunks > 0)
             }
         }
     }

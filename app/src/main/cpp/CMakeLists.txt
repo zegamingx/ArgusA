@@ -39,6 +39,10 @@ if(NOT ARGUS_GLSLC)
 endif()
 
 function(argus_compile_shader source_file binary_name header_name array_symbol size_symbol)
+    set(shader_target_environment "vulkan1.0")
+    if(ARGC GREATER 5)
+        set(shader_target_environment "${ARGV5}")
+    endif()
     set(shader_binary "${CMAKE_CURRENT_BINARY_DIR}/${binary_name}")
     set(shader_header "${CMAKE_CURRENT_BINARY_DIR}/${header_name}")
 
@@ -50,7 +54,7 @@ function(argus_compile_shader source_file binary_name header_name array_symbol s
     execute_process(
         COMMAND
             "${ARGUS_GLSLC}"
-            --target-env=vulkan1.0
+            --target-env=${shader_target_environment}
             -O
             "${source_file}"
             -o "${shader_binary}"
@@ -116,6 +120,15 @@ argus_compile_shader(
     "linear_shader_spv.h"
     "kArgusLinearShaderSpv"
     "kArgusLinearShaderSpvSize"
+)
+
+argus_compile_shader(
+    "${CMAKE_CURRENT_SOURCE_DIR}/linear_fp16.comp"
+    "linear_fp16.comp.spv"
+    "linear_fp16_shader_spv.h"
+    "kArgusLinearFp16ShaderSpv"
+    "kArgusLinearFp16ShaderSpvSize"
+    "vulkan1.2"
 )
 
 add_library(argus_training SHARED vulkan_training_jni.cpp)
