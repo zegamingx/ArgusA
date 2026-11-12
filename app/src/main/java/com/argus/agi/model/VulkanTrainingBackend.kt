@@ -292,8 +292,12 @@ internal object VulkanTrainingBackend {
             require(outputBatches[batchIndex].size == rowsPerBatch) {
                 "FP16 batched linear outputs must match the input row count."
             }
-            require(weightBatches[batchIndex].size == requiredWeightElements) {
-                "FP16 weight tensor $batchIndex must exactly match its matrix dimensions."
+            // Some model tensors are allocated to their maximum capacity while a
+            // training pass only uses an active prefix (for example, wHead when the
+            // tokenizer vocabulary has not filled its configured capacity).
+            // The staging copy below intentionally copies only this active matrix.
+            if (weightBatches[batchIndex].size < requiredWeightElements) {
+                return false
             }
             for (row in 0 until rowsPerBatch) {
                 require(inputBatches[batchIndex][row].size == inputColumns) {
