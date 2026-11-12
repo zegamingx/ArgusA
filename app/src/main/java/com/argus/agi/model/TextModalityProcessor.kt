@@ -1,5 +1,6 @@
 package com.argus.agi.model
 
+import java.util.Locale
 import java.util.regex.Pattern
 import org.json.JSONArray
 import org.json.JSONObject
@@ -28,7 +29,16 @@ data class ProcessedChunk(
  */
 object TextModalityProcessor {
 
-    private enum class TurnRole { USER, ASSISTANT }
+    private enum class TurnRole(val token: String) {
+        SYSTEM(Tokenizer.SYSTEM_TOKEN),
+        USER(Tokenizer.USER_TOKEN),
+        ASSISTANT(Tokenizer.ASSISTANT_TOKEN)
+    }
+
+    private data class ConversationTurn(
+        val role: TurnRole,
+        val content: String
+    )
 
     // Regex pengenal giliran percakapan.
     // Kolon diwajibkan untuk kata biasa (User:, Pengguna:, Bot:, ...) agar tidak
@@ -40,6 +50,11 @@ object TextModalityProcessor {
     )
     private val ASSISTANT_TURN_PATTERN = Pattern.compile(
         "^\\s*(?:<ASSISTANT>\\s*:?|Assistant\\s*:|Asisten\\s*:|Argus\\s*:|A\\.R\\.G\\.U\\.S\\s*:|Bot\\s*:|J\\s*:)\\s*",
+        Pattern.CASE_INSENSITIVE
+    )
+
+    private val SYSTEM_TURN_PATTERN = Pattern.compile(
+        "^\\s*(?:<SYSTEM>\\s*:?|System\\s*:|Developer\\s*:)\\s*",
         Pattern.CASE_INSENSITIVE
     )
 
@@ -98,12 +113,14 @@ object TextModalityProcessor {
     }
 
     /**
-     * Canonicalizes a pretty-printed training object or an array of JSONL-style
-     * records. Other JSON documents are left untouched.
+     * Canonicalizes JSONL, ChatML/OpenAI messages, ShareGPT conversations, and
+     * instruction-tuning records before modality detection and chunking.
      */
     private fun normalizeReasoningDatasetInput(text: String): String {
         val records = parseTrainingDatasetObjects(text) ?: return text
-        return records.joinToString("\n") { it.toString() }
+        return records.joinToString("\n\n") { record ->
+            formatConversationRecord(record) ?: record.toString()
+        }
     }
 
         /**
@@ -234,9 +251,104 @@ object TextModalityProcessor {
     }
 
     private fun isTrainingRecord(obj: JSONObject): Boolean {
-        val hasPrompt = firstNonBlankText(obj, listOf("instruction", "prompt", "question")).isNotBlank()
-        val hasAnswer = firstNonBlankText(obj, listOf("response", "completion", "answer")).isNotBlank()
-        return hasPrompt && hasAnswer
+        val hasPrompt = firstNonBlankText(
+            obj,
+            listOf("instruction", "prompt", "question")
+        ).isNotBlank()
+        val hasAnswer = firstNonBlankText(
+            obj,
+            listOf("response", "completion", "answer")
+        ).isNotBlank()
+        return (hasPrompt && hasAnswer) || isConversationRecord(obj)
+    }
+
+    private fun isConversationRecord(obj: JSONObject): Boolean =
+        extractConversationTurns(obj) != null
+
+    /**
+     * Reads text-only ChatML/OpenAI message content. Unsupported multimodal payloads
+     * are ignored rather than converted into arbitrary JSON strings.
+     */
+    private fun readConversationMessageContent(value: Any?): String {
+        return when (value) {
+            is String -> value.trim()
+            is JSONArray -> {
+                val textParts = mutableListOf<String>()
+                for (index in 0 until value.length()) {
+                    val part = value.opt(index)
+                    val text = when (part) {
+                        is String -> part.trim()
+                        is JSONObject -> {
+                            val type = part.optString("type", "text")
+                                .trim()
+                                .lowercase(Locale.ROOT)
+                            if (type in setOf("text", "input_text", "output_text")) {
+                                firstNonBlankText(part, listOf("text", "content", "value"))
+                            } else {
+                                ""
+                            }
+                        }
+                        else -> ""
+                    }
+                    if (text.isNotBlank()) textParts += text
+                }
+                textParts.joinToString("\n")
+            }
+            is JSONObject -> firstNonBlankText(value, listOf("text", "content", "value"))
+            else -> ""
+        }
+    }
+
+    /**
+     * Accepts:
+     * - ChatML/OpenAI: {"messages":[{"role":"user","content":"..."}]}
+     * - ShareGPT: {"conversations":[{"from":"human","value":"..."}]}
+     *
+     * System and developer messages are preserved as SYSTEM turns. Tool/function
+     * messages and unsupported modalities are deliberately excluded from SFT text.
+     */
+    private fun extractConversationTurns(obj: JSONObject): List<ConversationTurn>? {
+        val messages = obj.optJSONArray("messages")
+            ?: obj.optJSONArray("conversations")
+            ?: return null
+        if (messages.length() == 0) return null
+
+        val turns = ArrayList<ConversationTurn>(messages.length())
+        for (index in 0 until messages.length()) {
+            val message = messages.optJSONObject(index) ?: continue
+            val roleName = firstNonBlankText(
+                message,
+                listOf("role", "from", "speaker")
+            ).lowercase(Locale.ROOT)
+            val role = when (roleName) {
+                "system", "developer" -> TurnRole.SYSTEM
+                "user", "human", "prompter" -> TurnRole.USER
+                "assistant", "gpt", "bot", "model" -> TurnRole.ASSISTANT
+                else -> null
+            } ?: continue
+
+            val rawContent = when {
+                message.has("content") && !message.isNull("content") -> message.opt("content")
+                message.has("value") && !message.isNull("value") -> message.opt("value")
+                message.has("text") && !message.isNull("text") -> message.opt("text")
+                else -> null
+            }
+            val content = readConversationMessageContent(rawContent)
+            if (content.isNotBlank()) {
+                turns += ConversationTurn(role = role, content = content)
+            }
+        }
+
+        val hasUser = turns.any { it.role == TurnRole.USER }
+        val hasAssistant = turns.any { it.role == TurnRole.ASSISTANT }
+        return turns.takeIf { hasUser && hasAssistant }
+    }
+
+    private fun formatConversationRecord(obj: JSONObject): String? {
+        val turns = extractConversationTurns(obj) ?: return null
+        return turns.joinToString("\n") { turn ->
+            "${turn.role.token} ${turn.content}"
+        }
     }
 
     private fun readReasoningStep(value: Any?): String {
@@ -426,7 +538,7 @@ object TextModalityProcessor {
 
         fun flushTurn() {
             if (currentRole != null && currentTurnText.isNotBlank()) {
-                val prefix = if (currentRole == TurnRole.USER) Tokenizer.USER_TOKEN else Tokenizer.ASSISTANT_TOKEN
+                val prefix = currentRole.token
                 val clean = currentTurnText.toString().trim()
                 val fullTurn = "$prefix $clean"
                 val available = chunkSize - prefix.length - 1
@@ -444,10 +556,15 @@ object TextModalityProcessor {
             val line = rawLine.trim()
             if (line.isBlank()) continue
 
+            val systemMatcher = SYSTEM_TURN_PATTERN.matcher(line)
             val userMatcher = USER_TURN_PATTERN.matcher(line)
             val assistantMatcher = ASSISTANT_TURN_PATTERN.matcher(line)
 
-            if (userMatcher.find()) {
+            if (systemMatcher.find()) {
+                flushTurn()
+                currentRole = TurnRole.SYSTEM
+                currentTurnText.append(line.substring(systemMatcher.end()).trim())
+            } else if (userMatcher.find()) {
                 flushTurn()
                 currentRole = TurnRole.USER
                 currentTurnText.append(line.substring(userMatcher.end()).trim())
@@ -675,6 +792,9 @@ object TextModalityProcessor {
                         val sumber = obj.optString("sumber")
                         val extra = if (sumber.isNotBlank()) " [sumber: $sumber]" else ""
                         "Kata: $kata -> Kata dasar: $dasar$extra"
+                    }
+                    isConversationRecord(obj) -> {
+                        requireNotNull(formatConversationRecord(obj))
                     }
                     isTrainingRecord(obj) -> {
                         val explicitInstruction = firstNonBlankText(
