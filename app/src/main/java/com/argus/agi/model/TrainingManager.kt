@@ -927,11 +927,14 @@ class TrainingManager(
                 }
 
                 val currentBaseline = conversationalValidationPersistence.loadState().baselineReport
-                if (currentBaseline == null) {
+                if (currentBaseline == null || !ConversationValidationContract.isCurrent(currentBaseline)) {
                     check(restoreAcceptedConversationCheckpoint()) {
                         "The accepted checkpoint could not be restored before baseline evaluation."
                     }
                     val baseline = evaluateConversationalValidation()
+                    check(ConversationValidationContract.isCurrent(baseline)) {
+                        "The conversational baseline was produced with an unexpected evaluation contract."
+                    }
                     check(conversationalValidationPersistence.saveBaseline(baseline)) {
                         "The conversational baseline could not be persisted."
                     }
@@ -985,11 +988,15 @@ class TrainingManager(
                 "The accepted checkpoint could not be secured."
             }
 
-            if (conversationalValidationPersistence.loadState().baselineReport == null) {
+            val storedBaseline = conversationalValidationPersistence.loadState().baselineReport
+            if (storedBaseline == null || !ConversationValidationContract.isCurrent(storedBaseline)) {
                 check(restoreAcceptedConversationCheckpoint()) {
                     "The accepted checkpoint could not be restored before baseline evaluation."
                 }
                 val baseline = evaluateConversationalValidation()
+                check(ConversationValidationContract.isCurrent(baseline)) {
+                    "The conversational baseline was produced with an unexpected evaluation contract."
+                }
                 check(conversationalValidationPersistence.saveBaseline(baseline)) {
                     "The conversational baseline could not be persisted."
                 }
