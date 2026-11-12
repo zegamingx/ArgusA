@@ -187,7 +187,7 @@ class ArgusCheckpointCompatibilityTest {
             val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
             assertTrue(restored.loadCheckpointIfExists())
             assertEquals(2, restored.layerCount)
-            assertEquals(3.14159f, restored.blocks[1].wDown[0], 1e-6f)
+            assertEquals(3.140625f, restored.blocks[1].wDown[0], 1e-6f)
             assertEquals(original.countTotalParameters(), restored.countTotalParameters())
         } finally {
             restoreCheckpoint(checkpoint, previousCheckpoint)

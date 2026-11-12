@@ -3099,7 +3099,7 @@ class ArgusNeuralEngine private constructor(
         header.putInt(architecture.feedForwardSize)
         header.putInt(architecture.contextLength)
         header.putInt(architecture.adapterRank)
-        header.putInt(architecture.vocabularySize)
+        header.putInt(vocabEntries.size) // Persist the actual tokenizer entry count.
         header.putInt(vocabCap)
         header.putInt(adamStep)
         header.putInt(config.tokenizerConfig.schemaVersion)
@@ -3473,7 +3473,15 @@ class ArgusNeuralEngine private constructor(
                 if (isLearnedBpe) {
                     candidateTokenizer.importMerges(loadedMerges)
                 }
-                require(candidateTokenizer.vocabSize == savedVocabSize) {
+                require(candidateTokenizer.vocabSize == savedVocabularyEntryCount) {
+                    "ARG4 tokenizer vocabulary entry count does not match its metadata."
+                }
+                // Earlier ARG4 writers stored vocabCap in the savedVocabSize field.
+                // Accept that legacy convention while validating the serialized entry count.
+                require(
+                    savedVocabSize == candidateTokenizer.vocabSize ||
+                        savedVocabSize == savedVocabCap
+                ) {
                     "ARG4 tokenizer vocabulary size does not match its metadata."
                 }
 

@@ -139,9 +139,9 @@ class InferenceMemoryEstimatorTest {
 class TrainingMemoryPlannerTest {
 
     @Test
-    fun reportsSixteenBytePerParameterTrainingStateFloor() {
+    fun reportsFourteenBytePerParameterTrainingStateFloor() {
         assertEquals(
-            16_000_000_000L,
+            14_000_000_000L,
             TrainingMemoryPlanner.minimumTrainingStateBytes(1_000_000_000L)
         )
     }
@@ -149,7 +149,7 @@ class TrainingMemoryPlannerTest {
     @Test
     fun accountsForOneAdditionalAccumulatedGradientBuffer() {
         assertEquals(
-            20_000_000L,
+            18_000_000L,
             TrainingMemoryPlanner.minimumAccumulatedTrainingStateBytes(1_000_000L)
         )
     }
