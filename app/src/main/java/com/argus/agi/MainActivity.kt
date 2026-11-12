@@ -16,7 +16,6 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.matchParentSize
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.ime
@@ -170,7 +169,7 @@ fun MainScreen(viewModel: ArgusViewModel) {
             .background(ArgusDarkBg)
     ) {
         ArgusWorldMapBackground(
-            modifier = Modifier.matchParentSize()
+            modifier = Modifier.fillMaxSize()
         )
 
         Scaffold(
