@@ -2,9 +2,15 @@ package com.argus.agi.model
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [33])
 class Float16ParameterArrayTest {
 
     @Test
@@ -18,6 +24,21 @@ class Float16ParameterArrayTest {
 
         exported[2] = Float16Codec.fromFloat(9f)
         assertEquals(0.5f, parameters[2], 0f)
+    }
+
+    @Test
+    fun linearBackendAcceptsWeightCapacityAboveTheActiveMatrixSize() {
+        val dispatched = VulkanTrainingBackend.tryApplyFp16Linear(
+            inputRows = arrayOf(floatArrayOf(1f)),
+            weights = Float16ParameterArray.fromFloatArray(floatArrayOf(2f, 99f)),
+            outputRows = arrayOf(FloatArray(1)),
+            inputColumns = 1,
+            outputColumns = 1
+        )
+
+        // A one-element operation stays on the CPU/FP32 fallback, but validating
+        // the active 1x1 matrix must not reject the larger backing capacity.
+        assertFalse(dispatched)
     }
 
     @Test
