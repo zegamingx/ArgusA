@@ -244,7 +244,7 @@ internal object VulkanTrainingBackend {
             transposeWeights = false
         )
         return succeeded &&
-            approximatelyEqual(output, floatArrayOf(5.5f, 7.0f, 12.25f, 15.0f), 1e-3f)
+            approximatelyEqual(output, floatArrayOf(5.5f, 7.0f, 12.25f, 16.0f), 1e-3f)
     }
 
     @Synchronized

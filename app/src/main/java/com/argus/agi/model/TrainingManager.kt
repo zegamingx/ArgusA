@@ -837,6 +837,45 @@ class TrainingManager(
         )
     }
 
+    /**
+     * Runs a hand-authored conversational SFT evaluation suite against the live model.
+     * Answers are generated deterministically and are never queued or persisted as
+     * training examples. Reference facts stay independent from model outputs.
+     */
+    suspend fun evaluateConversationalValidation(
+        cases: List<ConversationValidationCase> = ConversationValidationSuite.cases,
+        thresholds: ConversationalValidationThresholds = ConversationalValidationThresholds()
+    ): ConversationalValidationReport {
+        return ConversationalValidationEvaluator.evaluate(
+            cases = cases,
+            thresholds = thresholds
+        ) { conversationPrompt ->
+            neuralEngine.generate(
+                prompt = conversationPrompt,
+                maxNewTokens = 80,
+                temperature = 0f,
+                includeReasoningMarkers = false,
+                reasoningMode = false
+            )
+        }
+    }
+
+    /**
+     * Returns an explicit candidate eligibility decision. It does not replace a
+     * checkpoint or equate lower training loss with conversational improvement.
+     */
+    suspend fun assessConversationalCandidate(
+        baseline: ConversationalValidationReport,
+        cases: List<ConversationValidationCase> = ConversationValidationSuite.cases,
+        thresholds: ConversationalValidationThresholds = ConversationalValidationThresholds()
+    ): Pair<ConversationalValidationReport, ConversationPromotionDecision> {
+        val candidate = evaluateConversationalValidation(cases, thresholds)
+        return candidate to ConversationalValidationGate.assessPromotion(
+            baseline = baseline,
+            candidate = candidate
+        )
+    }
+
     private fun appendFormattedTrainingRecords(
         records: List<String>,
         destination: MutableList<String>,

@@ -7,6 +7,7 @@
 #include "linear_fp16_shader_spv.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
