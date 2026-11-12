@@ -26,7 +26,7 @@ class TokenizerLearningTest {
             )
         )
         assertEquals(ArgusTokenizerAlgorithm.LEARNED_BPE_V1, tokenizer.config.algorithm)
-        assertEquals(1_024, TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE)
+        assertEquals(2_048, TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE)
 
         val initialVocabulary = tokenizer.exportVocab()
         assertTrue(
