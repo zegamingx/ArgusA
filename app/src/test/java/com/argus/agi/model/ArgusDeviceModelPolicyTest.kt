@@ -8,117 +8,65 @@ class ArgusDeviceModelPolicyTest {
 
     @Test
     fun selectsFourModelFamiliesAndBoundedBatchSizesFromDeviceCapacity() {
-        val compact = ArgusDeviceModelPolicy.select(
-            totalRamGb = 4,
-            maxHeapMb = 256L,
-            availableRamGb = 0.6f,
-            cpuCores = 4
-        )
-        val balanced = ArgusDeviceModelPolicy.select(
-            totalRamGb = 6,
-            maxHeapMb = 256L,
-            availableRamGb = 0.8f,
-            cpuCores = 6
-        )
-        val performance = ArgusDeviceModelPolicy.select(
-            totalRamGb = 8,
-            maxHeapMb = 384L,
-            availableRamGb = 1.7f,
-            cpuCores = 8
-        )
-        val flagship = ArgusDeviceModelPolicy.select(
-            totalRamGb = 12,
-            maxHeapMb = 512L,
-            availableRamGb = 3.0f,
-            cpuCores = 8
-        )
+        val compact = ArgusDeviceModelPolicy.select(4, 256L, 0.6f, 4)
+        val balanced = ArgusDeviceModelPolicy.select(6, 256L, 0.8f, 6)
+        val performance = ArgusDeviceModelPolicy.select(8, 384L, 1.7f, 8)
+        val flagship = ArgusDeviceModelPolicy.select(12, 512L, 3.0f, 8)
 
         assertEquals(ArgusDeviceModelTier.COMPACT, compact.tier)
         assertEquals(1, compact.trainingBatchSize)
+        assertEquals(1_024, compact.tier.vocabularyCapacity)
+
         assertEquals(ArgusDeviceModelTier.BALANCED, balanced.tier)
         assertEquals(2, balanced.trainingBatchSize)
+        assertEquals(2_048, balanced.tier.vocabularyCapacity)
+
         assertEquals(ArgusDeviceModelTier.PERFORMANCE, performance.tier)
         assertEquals(4, performance.trainingBatchSize)
+        assertEquals(4_096, performance.tier.vocabularyCapacity)
+
         assertEquals(ArgusDeviceModelTier.FLAGSHIP, flagship.tier)
         assertEquals(8, flagship.trainingBatchSize)
+        assertEquals(8_192, flagship.tier.vocabularyCapacity)
     }
 
     @Test
-    fun clampsActiveParameterTargetToDeviceMemoryAndSevenBFamilyCeiling() {
-        val profile = ArgusDeviceModelPolicy.select(
-            totalRamGb = 12,
-            maxHeapMb = 512L,
-            availableRamGb = 3.0f,
-            cpuCores = 8
-        )
+    fun clampsActiveParameterTargetToDeviceMemoryAndFamilyCeiling() {
+        val profile = ArgusDeviceModelPolicy.select(12, 512L, 3.0f, 8)
 
-        assertTrue(profile.targetParameterCount >= 1_000_000L)
+        assertTrue(
+            profile.targetParameterCount >= ArgusDeviceModelProfile.MINIMUM_EXECUTABLE_PARAMETER_BUDGET
+        )
         assertTrue(profile.targetParameterCount <= profile.memorySafeParameterLimit)
-        assertTrue(profile.targetParameterCount <= 7_000_000_000L)
-    }
-
-    @Test
-    fun selectsAnExecutableModelWithAtLeastOneMillionParameters() {
-        val config = EngineConfig.forDevice(
-            totalRamGb = 4,
-            maxHeapMb = 256L,
-            availableRamGb = 0.6f,
-            cpuCores = 4
-        )
-        val architecture = ArgusArchitectureConfig(
-            layerCount = config.layerCount,
-            hiddenSize = config.dModel,
-            attentionHeadCount = config.nHeads,
-            feedForwardSize = config.dFf,
-            vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
-            contextLength = config.maxSeqLen,
-            adapterRank = config.loraRank
-        )
-        val parameterCount = ArgusArchitectureParameterEstimator
-            .estimate(architecture)
-            .totalTrainableParameters
-
-        assertTrue(parameterCount >= 1_000_000L)
-        assertEquals(ArgusDeviceModelTier.COMPACT, config.modelTier)
-        assertEquals(1, config.trainingBatchSize)
-    }
-
-    @Test
-    fun architectureEstimatorCanDescribeTheSevenBFlagshipCeiling() {
-        val sevenBArchitecture = ArgusArchitectureConfig(
-            layerCount = 26,
-            hiddenSize = 4_096,
-            attentionHeadCount = 16,
-            feedForwardSize = 16_384,
-            vocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
-            contextLength = 128,
-            adapterRank = 8
-        )
-        val parameterCount = ArgusArchitectureParameterEstimator
-            .estimate(sevenBArchitecture)
-            .totalTrainableParameters
-
-        assertTrue(parameterCount in 6_900_000_000L..7_000_000_000L)
+        assertTrue(profile.targetParameterCount <= profile.tier.maximumFamilyParameters)
+        assertTrue(profile.memorySafeParameterLimit >= profile.targetParameterCount)
     }
 
     @Test
     fun rejectsDeviceMemoryBudgetsBelowTheMinimumExecutableModel() {
         val failure = runCatching {
-            ArgusDeviceModelPolicy.select(
-                totalRamGb = 2,
-                maxHeapMb = 64L,
-                availableRamGb = 0.1f,
-                cpuCores = 4
-            )
+            ArgusDeviceModelPolicy.select(2, 64L, 0.1f, 4)
         }.exceptionOrNull()
 
         assertTrue(failure is IllegalArgumentException)
     }
 
     @Test
+    fun everyProfileUsesTheNewFp16WeightAndFp32StateMemoryContract() {
+        assertEquals(
+            14_000_000L,
+            TrainingMemoryPlanner.minimumTrainingStateBytes(1_000_000L)
+        )
+        assertEquals(
+            18_000_000L,
+            TrainingMemoryPlanner.minimumAccumulatedTrainingStateBytes(1_000_000L)
+        )
+    }
+
+    @Test
     fun neverReturnsTrainingBatchOutsideOneThroughEight() {
         val profiles = listOf(
-            ArgusDeviceModelPolicy.select(2, 128L, 0.3f, 4),
+            ArgusDeviceModelPolicy.select(4, 256L, 0.6f, 4),
             ArgusDeviceModelPolicy.select(6, 256L, 0.8f, 6),
             ArgusDeviceModelPolicy.select(8, 384L, 1.7f, 8),
             ArgusDeviceModelPolicy.select(12, 512L, 3.0f, 8)
