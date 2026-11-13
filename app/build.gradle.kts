@@ -35,8 +35,8 @@ android {
 
     defaultConfig {
         applicationId = "com.argus.agi"
-        minSdk = 33
-        targetSdk = 36
+        minSdk = 34
+        targetSdk = 37
         versionCode = readVersion("VERSION_BUILD")
         versionName = "${readVersion("VERSION_MAJOR")}.${readVersion("VERSION_MINOR")}.${readVersion("VERSION_PATCH")}"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -105,8 +105,8 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
 
     buildFeatures {

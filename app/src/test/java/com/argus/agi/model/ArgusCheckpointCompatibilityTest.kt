@@ -33,10 +33,14 @@ class ArgusCheckpointCompatibilityTest {
             )
             val engineConfig = smallEngineConfig(tokenizerConfig)
             val original = ArgusNeuralEngine.createBlocking(context, engineConfig)
-            val learnedToken = "argus_neural_checkpoint"
-            val learnedTokenId = original.tokenizer.registerToken(learnedToken)
-
-            assertTrue(learnedTokenId >= Tokenizer.THINK_END_ID)
+            val trainingText = "argus neural checkpoint tokenizer"
+            val learnedMergeCount = original.tokenizer.trainBpe(
+                corpus = List(64) { trainingText },
+                targetVocabSize = original.tokenizer.vocabSize + 10,
+                maxNewMerges = 10
+            )
+            assertTrue(learnedMergeCount > 0)
+            val encodedTrainingText = original.tokenizer.encode(trainingText)
             assertTrue(original.saveCheckpoint())
 
             val checkpointBytes = checkpoint.readBytes()
@@ -63,7 +67,8 @@ class ArgusCheckpointCompatibilityTest {
             val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
             assertTrue(restored.loadCheckpointIfExists())
             assertEquals(original.tokenizer.exportVocab(), restored.tokenizer.exportVocab())
-            assertEquals(learnedTokenId, restored.tokenizer.encode(learnedToken).single())
+            assertEquals(original.tokenizer.exportMerges(), restored.tokenizer.exportMerges())
+            assertEquals(encodedTrainingText, restored.tokenizer.encode(trainingText))
             assertEquals(original.countTrainableParameters(), restored.countTrainableParameters())
             assertEquals(original.countTotalParameters(), restored.countTotalParameters())
             assertTrue(restored.saveCheckpoint())

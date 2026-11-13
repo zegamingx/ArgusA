@@ -12,7 +12,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [33])
+@Config(sdk = [34])
 class ArgusNeuralEngineGradientTest {
 
     private val context: Context
@@ -34,7 +34,7 @@ class ArgusNeuralEngineGradientTest {
                     dModel = 16,
                     nHeads = 4,
                     dFf = 32,
-                    maxSeqLen = 16,
+                    maxSeqLen = 32,
                     loraRank = 2,
                     isFullTrainingEnabled = true
                 )

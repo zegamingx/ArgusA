@@ -24,7 +24,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [33])
+@Config(sdk = [34])
 class CorpusPersistenceTest {
 
 
@@ -159,9 +159,9 @@ class CorpusPersistenceTest {
             )
 
             val heldOut = repository.getCorpusDocuments()
-                .single { it.validationText == validationText.trim() }
+                .single { it.validationText == validationText }
             assertEquals("VALIDATION", heldOut.datasetSplit)
-            assertEquals(validationText.trim(), heldOut.validationText)
+            assertEquals(validationText, heldOut.validationText)
             assertEquals(0, heldOut.chunkCount)
             assertTrue(repository.getCorpusChunks(heldOut.id).isEmpty())
             assertTrue(repository.getPendingQueueSnapshot().isEmpty())

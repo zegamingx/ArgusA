@@ -242,6 +242,14 @@ class TokenizerByteLevelBpeTest {
     }
 
     @Test
+    fun malformedGeneratedByteSequencesDecodeWithReplacement() {
+        val tokenizer = newTokenizer()
+        val invalidUtf8Token = tokenizer.baseByteTokenId(0xFF)
+
+        assertEquals("\uFFFD", tokenizer.decode(listOf(invalidUtf8Token)))
+    }
+
+    @Test
     fun malformedUtf16IsRejectedInsteadOfSilentlyReplacingInput() {
         val tokenizer = newTokenizer()
         val malformed = "valid prefix followed by an unpaired high surrogate: " + 0xD800.toChar()
