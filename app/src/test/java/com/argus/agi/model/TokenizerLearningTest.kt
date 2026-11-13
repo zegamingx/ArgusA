@@ -21,6 +21,7 @@ class TokenizerLearningTest {
     fun freshTokenizerLearnsBpeMergesFromCorpusAndPreservesExistingIds() {
         val tokenizer = Tokenizer(
             TokenizerConfig(
+                algorithm = ArgusTokenizerAlgorithm.LEARNED_BPE_V1,
                 maxVocabularySize = 512,
                 maxTokenLength = 16
             )
@@ -88,6 +89,7 @@ class TokenizerLearningTest {
     fun bpeTrainingDoesNotConsumeMergesOnControlTokenMarkup() {
         val tokenizer = Tokenizer(
             TokenizerConfig(
+                algorithm = ArgusTokenizerAlgorithm.LEARNED_BPE_V1,
                 maxVocabularySize = 512,
                 maxTokenLength = 16
             )
