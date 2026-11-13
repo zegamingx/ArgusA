@@ -324,6 +324,11 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         }
 
         val resolved = id ?: nextId
+        if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
+            require(resolved == nextId) {
+                "Byte-Level BPE vocabulary IDs are append-only; expected ID $nextId, received $resolved."
+            }
+        }
         require(resolved in 0 until config.maxVocabularySize) {
             "Token ID $resolved exceeds configured vocabulary capacity ${config.maxVocabularySize}."
         }
