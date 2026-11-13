@@ -1701,7 +1701,7 @@ class TrainingManager(
 
     private suspend fun popNext(): TrainingData? {
         val startCompletion = CompletableDeferred<Result<Unit>>()
-        val item = synchronized(queueLock) {
+        val reservation = synchronized(queueLock) {
             val list = _nextQueue.value
             val first = list.firstOrNull() ?: return@synchronized null
             if (first.status != TrainingStatus.QUEUED) return@synchronized null
@@ -1718,26 +1718,32 @@ class TrainingManager(
             }
 
             _nextQueue.value = list.drop(1)
-            first
-        }
+            first to queueGeneration
+        } ?: return null
+
+        val (item, reservationGeneration) = reservation
 
         // Start is ordered in the same persistence channel as Clear. Training must not
         // begin until Room confirms that the queue row is now TRAINING.
-        if (item != null) {
-            val persistenceResult = startCompletion.await()
-            if (persistenceResult.isFailure) {
-                synchronized(queueLock) {
-                    if (!closed && _nextQueue.value.none { queued -> queued.id == item.id }) {
-                        _nextQueue.value = listOf(item) + _nextQueue.value
-                    }
+        val persistenceResult = startCompletion.await()
+        if (persistenceResult.isFailure) {
+            synchronized(queueLock) {
+                // A clear that happened while the Room update was pending must win.
+                // Never resurrect a queue item from an older generation.
+                if (
+                    !closed &&
+                    queueGeneration == reservationGeneration &&
+                    _nextQueue.value.none { queued -> queued.id == item.id }
+                ) {
+                    _nextQueue.value = listOf(item) + _nextQueue.value
                 }
-                Log.e(
-                    TAG,
-                    "Training item '${item.id}' was returned to the queue because its start state was not persisted.",
-                    persistenceResult.exceptionOrNull()
-                )
-                return null
             }
+            Log.e(
+                TAG,
+                "Training item '${item.id}' was returned to the queue because its start state was not persisted.",
+                persistenceResult.exceptionOrNull()
+            )
+            return null
         }
         return item
     }
