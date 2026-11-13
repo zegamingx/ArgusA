@@ -15,7 +15,9 @@ Argus is a native Android application built with Kotlin and Jetpack Compose.
 | Android SDK Platform | 37 | Compile SDK and target SDK |
 | Android minimum SDK | 34 | Minimum supported Android API |
 | Android SDK Build Tools | 36.0.0 | APK packaging and signing tools |
-| Android NDK | 30.0.16248370 | Native C/C++ toolchain |\n| C++ language standard | C++23 | Vulkan JNI native library |\n| JUnit | 6.1.3 | Host-side unit-test platform and Jupiter API |
+| Android NDK | 30.0.16248370 | Native C/C++ toolchain |
+| C++ language standard | C++23 | Vulkan JNI native library |
+| JUnit | 6.1.3 | Host-side unit-test platform and Jupiter API |
 | CMake | 3.31.6 | Native build configuration; minimum project requirement is 3.28.0 |
 
 JDK 25 is the runtime for Gradle; it does not set the application's Java
