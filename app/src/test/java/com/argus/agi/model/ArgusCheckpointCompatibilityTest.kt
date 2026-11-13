@@ -13,7 +13,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [33])
+@Config(sdk = [34])
 class ArgusCheckpointCompatibilityTest {
 
     private val context: Context
@@ -27,7 +27,7 @@ class ArgusCheckpointCompatibilityTest {
         try {
             checkpoint.delete()
             val tokenizerConfig = TokenizerConfig(
-                algorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
+                algorithm = ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2,
                 maxVocabularySize = 512,
                 maxTokenLength = 32
             )
@@ -110,7 +110,7 @@ class ArgusCheckpointCompatibilityTest {
     }
 
     @Test
-    fun arg3HeaderStillResolvesItsOriginalEngineDimensions() {
+    fun arg3HeaderDoesNotOverrideCurrentByteLevelDeviceConfiguration() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
@@ -140,17 +140,18 @@ class ArgusCheckpointCompatibilityTest {
                 availableRamGb = 8.0f
             )
 
-            assertEquals(16, restoredConfig.dModel)
-            assertEquals(4, restoredConfig.nHeads)
-            assertEquals(32, restoredConfig.dFf)
-            assertEquals(16, restoredConfig.maxSeqLen)
-            assertEquals(2, restoredConfig.loraRank)
-            assertEquals(
-                TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE,
-                restoredConfig.tokenizerConfig.maxVocabularySize
+            val expected = EngineConfig.forDevice(
+                totalRamGb = 12,
+                maxHeapMb = 512L,
+                availableRamGb = 8.0f
             )
+            assertEquals(expected.dModel, restoredConfig.dModel)
+            assertEquals(expected.nHeads, restoredConfig.nHeads)
+            assertEquals(expected.dFf, restoredConfig.dFf)
+            assertEquals(expected.maxSeqLen, restoredConfig.maxSeqLen)
+            assertEquals(expected.loraRank, restoredConfig.loraRank)
             assertEquals(
-                ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
+                ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2,
                 restoredConfig.tokenizerConfig.algorithm
             )
         } finally {
@@ -200,14 +201,14 @@ class ArgusCheckpointCompatibilityTest {
     }
 
     @Test
-    fun learnedBpeTokenizerTrainsMergesAndPersistsInArg4Checkpoint() {
+    fun byteLevelBpeTokenizerTrainsMergesAndPersistsInArg4Checkpoint() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
         try {
             checkpoint.delete()
             val tokenizerConfig = TokenizerConfig(
-                algorithm = ArgusTokenizerAlgorithm.LEARNED_BPE_V1,
+                algorithm = ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2,
                 maxVocabularySize = 512,
                 maxTokenLength = 32
             )
@@ -239,7 +240,7 @@ class ArgusCheckpointCompatibilityTest {
                 maxHeapMb = 128L,
                 availableRamGb = 1.0f
             )
-            assertEquals(ArgusTokenizerAlgorithm.LEARNED_BPE_V1, restoredConfig.tokenizerConfig.algorithm)
+            assertEquals(ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2, restoredConfig.tokenizerConfig.algorithm)
 
             val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
             assertTrue(restored.loadCheckpointIfExists())
@@ -322,13 +323,16 @@ class ArgusTokenizerConfigTest {
                 maxTokenLength = TokenizerConfig.MINIMUM_TOKEN_LENGTH
             )
         )
-        var tokenIndex = 0
-        while (tokenizer.vocabSize < TokenizerConfig.MINIMUM_VOCAB_SIZE) {
-            tokenizer.registerToken("v${tokenIndex++}")
-        }
-
         assertEquals(TokenizerConfig.MINIMUM_VOCAB_SIZE, tokenizer.vocabSize)
-        assertEquals(Tokenizer.UNK_ID, tokenizer.registerToken("overflow"))
+        val failure = runCatching {
+            tokenizer.registerToken("overflow")
+        }.exceptionOrNull()
+
+        assertTrue(
+            "Vocabulary exhaustion must fail explicitly instead of silently mapping to UNK.",
+            failure is IllegalStateException
+        )
+        assertEquals(TokenizerConfig.MINIMUM_VOCAB_SIZE, tokenizer.vocabSize)
     }
 
     @Test
