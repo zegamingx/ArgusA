@@ -170,7 +170,7 @@ class TextModalityPreservationTest {
 
     @Test
     fun validationConversationUsesTrainingRoleAndEosSerialization() {
-        val raw = "${Tokenizer.USER_TOKEN}  What is Argus?  \\n" +
+        val raw = "${Tokenizer.USER_TOKEN}  What is Argus?  \n" +
             "${Tokenizer.ASSISTANT_TOKEN}  A local model.  "
 
         val trainingSerialization = TextModalityProcessor.process(
@@ -178,7 +178,7 @@ class TextModalityPreservationTest {
             documentTitle = "Training conversation",
             chunkSize = Int.MAX_VALUE,
             overlap = 0
-        ).joinToString("\\n") { it.content }
+        ).joinToString("\n") { it.content }
 
         assertEquals(
             trainingSerialization,
@@ -189,14 +189,14 @@ class TextModalityPreservationTest {
 
     @Test
     fun validationQuestionAnswerUsesTrainingEosSerialization() {
-        val raw = "Question:  Why preserve bytes?  \\nAnswer:  Because exact text matters.  "
+        val raw = "Question:  Why preserve bytes?  \nAnswer:  Because exact text matters.  "
 
         val trainingSerialization = TextModalityProcessor.process(
             rawText = raw,
             documentTitle = "Training Q&A",
             chunkSize = Int.MAX_VALUE,
             overlap = 0
-        ).joinToString("\\n") { it.content }
+        ).joinToString("\n") { it.content }
 
         assertEquals(
             trainingSerialization,
