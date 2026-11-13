@@ -241,7 +241,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             thinkReasoning = "Genesis Origin: ${identity.originId} | " +
                                     "Created: ${identity.formattedBirthDate} | " +
                                     "Architecture: ${identity.architectureTier}. " +
-                                    "Total parameters: ${identity.parameterCount} (FP32)."
+                                    "Total parameters: ${identity.parameterCount} (FP16 weights / FP32 state)."
                         )
                         withContext(Dispatchers.Main) {
                             appendMessage(initialMsg)
@@ -257,7 +257,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         thinkReasoning = "Genesis Origin: ${existing.originId} | " +
                                 "Created: ${existing.formattedBirthDate} | " +
                                 "Architecture: ${existing.architectureTier}. " +
-                                "Total parameters: ${existing.parameterCount} (FP32)."
+                                "Total parameters: ${existing.parameterCount} (FP16 weights / FP32 state)."
                     )
                     withContext(Dispatchers.Main) {
                         appendMessage(initialMsg)
@@ -528,7 +528,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 thinking.append("Self-Reflection: ").append(reflection.reasoningNote)
                 thinking.append(" | Confidence: ")
-                    .append(String.format("%.0f%%", reflection.confidenceScore * 100))
+                    .append(String.format(Locale.US, "%.0f%%", reflection.confidenceScore * 100))
 
                 val shouldSearchWeb = explicitWebQuery != null ||
                     !reflection.isConfident ||
@@ -1033,7 +1033,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             entryCount++
                             if (entryCount > MAX_ZIP_ENTRIES) {
                                 throw IOException(
-                                    "ZIP archive exceeds the limit of " + MAX_ZIP_ENTRIES + " entri."
+                                    "ZIP archive exceeds the limit of " + MAX_ZIP_ENTRIES + " entries."
                                 )
                             }
 
@@ -1053,7 +1053,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             )
 
                             if (unsafePath) {
-                                Log.w(TAG, "Zip entry mencurigakan diabaikan: " + normalizedName)
+                                Log.w(TAG, "Skipped suspicious ZIP entry: " + normalizedName)
                             } else if (!entry.isDirectory && isSupported) {
                                 val entryTitle = normalizedName.substringAfterLast('/')
                                 val source = "zip_file|archive=" +
@@ -1156,8 +1156,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             drainLimitedInput(boundedEntry)
                             if (boundedEntry.limitExceeded) {
                                 throw IOException(
-                                    "Arsip ZIP melewati batas " +
-                                        (maxZipEntryBytes / 1024L / 1024L) + " MB pada entri " + normalizedName + "."
+                                    "ZIP archive exceeds the " +
+                                        (maxZipEntryBytes / 1024L / 1024L) + " MB limit on entry " + normalizedName + "."
                                 )
                             }
 

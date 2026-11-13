@@ -17,17 +17,24 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -134,6 +141,7 @@ private fun CoreInitializationFailureScreen(
         contentAlignment = Alignment.Center
     ) {
         Column(
+            modifier = Modifier.widthIn(max = 600.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
@@ -147,7 +155,10 @@ private fun CoreInitializationFailureScreen(
                 style = androidx.compose.material3.MaterialTheme.typography.bodyMedium,
                 color = ArgusTextMuted
             )
-            Button(onClick = onRetry) {
+            Button(
+                onClick = onRetry,
+                modifier = Modifier.testTag("core_retry_button")
+            ) {
                 Text("Retry initialization")
             }
         }
@@ -217,11 +228,13 @@ fun MainScreen(viewModel: ArgusViewModel) {
         currentScreen = ArgusScreen.CHAT
     }
 
-    Box(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .background(ArgusDarkBg)
     ) {
+        val useNavigationRail = maxWidth >= 600.dp
+
         ArgusWorldMapBackground(
             modifier = Modifier.fillMaxSize()
         )
@@ -231,64 +244,116 @@ fun MainScreen(viewModel: ArgusViewModel) {
                 .fillMaxSize()
                 .testTag("main_screen_scaffold"),
             containerColor = Color.Transparent,
-        contentWindowInsets = WindowInsets.systemBars,
-        bottomBar = {
-            // Smoothly slide NavigationBar away when keyboard is open to maximize chat/terminal viewport
-            AnimatedVisibility(
-                visible = !isKeyboardOpen,
-                enter = slideInVertically(initialOffsetY = { it }),
-                exit = slideOutVertically(targetOffsetY = { it })
-            ) {
-                NavigationBar(
-                    containerColor = ArgusSurface,
-                    tonalElevation = 6.dp,
-                    windowInsets = WindowInsets(0, 0, 0, 0)
-                ) {
-                    ArgusScreen.entries.forEach { screen ->
-                        val isSelected = currentScreen == screen
-                        NavigationBarItem(
-                            selected = isSelected,
-                            onClick = { currentScreen = screen },
-                            icon = {
-                                Icon(
-                                    painter = painterResource(screen.iconRes),
-                                    contentDescription = screen.label
+            contentWindowInsets = WindowInsets.systemBars,
+            bottomBar = {
+                if (!useNavigationRail) {
+                    // Smoothly slide NavigationBar away when keyboard is open to maximize chat/terminal viewport
+                    AnimatedVisibility(
+                        visible = !isKeyboardOpen,
+                        enter = slideInVertically(initialOffsetY = { it }),
+                        exit = slideOutVertically(targetOffsetY = { it })
+                    ) {
+                        NavigationBar(
+                            containerColor = ArgusSurface,
+                            tonalElevation = 6.dp,
+                            windowInsets = WindowInsets(0, 0, 0, 0)
+                        ) {
+                            ArgusScreen.entries.forEach { screen ->
+                                val isSelected = currentScreen == screen
+                                NavigationBarItem(
+                                    selected = isSelected,
+                                    onClick = { currentScreen = screen },
+                                    icon = {
+                                        Icon(
+                                            painter = painterResource(screen.iconRes),
+                                            contentDescription = screen.label
+                                        )
+                                    },
+                                    label = {
+                                        Text(
+                                            text = screen.label,
+                                            fontSize = 10.sp,
+                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                                        )
+                                    },
+                                    colors = NavigationBarItemDefaults.colors(
+                                        selectedIconColor = ArgusDarkBg,
+                                        selectedTextColor = ArgusCyanPrimary,
+                                        indicatorColor = ArgusCyanPrimary,
+                                        unselectedIconColor = ArgusTextMuted,
+                                        unselectedTextColor = ArgusTextMuted
+                                    ),
+                                    modifier = Modifier.testTag("nav_tab_${screen.name.lowercase()}")
                                 )
-                            },
-                            label = {
-                                Text(
-                                    text = screen.label,
-                                    fontSize = 10.sp,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
-                                )
-                            },
-                            colors = NavigationBarItemDefaults.colors(
-                                selectedIconColor = ArgusDarkBg,
-                                selectedTextColor = ArgusCyanPrimary,
-                                indicatorColor = ArgusCyanPrimary,
-                                unselectedIconColor = ArgusTextMuted,
-                                unselectedTextColor = ArgusTextMuted
-                            ),
-                            modifier = Modifier.testTag("nav_tab_${screen.name.lowercase()}")
-                        )
+                            }
+                        }
                     }
                 }
             }
-        }
-    ) { innerPadding ->
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .testTag("main_content_container")
-        ) {
-            when (currentScreen) {
-                ArgusScreen.CHAT -> ChatScreen(viewModel = viewModel)
-                ArgusScreen.NEURAL_CORE -> NeuralCoreScreen(viewModel = viewModel)
-                ArgusScreen.PERCEPTION -> PerceptionScreen(viewModel = viewModel)
-                ArgusScreen.SETTINGS -> SkillsAndSettingsScreen(viewModel = viewModel)
+        ) { innerPadding ->
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+                    .testTag("main_content_container")
+            ) {
+                if (useNavigationRail) {
+                    NavigationRail(
+                        containerColor = ArgusSurface,
+                        modifier = Modifier.fillMaxHeight(),
+                        windowInsets = WindowInsets(0, 0, 0, 0)
+                    ) {
+                        ArgusScreen.entries.forEach { screen ->
+                            val isSelected = currentScreen == screen
+                            NavigationRailItem(
+                                selected = isSelected,
+                                onClick = { currentScreen = screen },
+                                icon = {
+                                    Icon(
+                                        painter = painterResource(screen.iconRes),
+                                        contentDescription = screen.label
+                                    )
+                                },
+                                label = {
+                                    Text(
+                                        text = screen.label,
+                                        fontSize = 10.sp,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                                    )
+                                },
+                                colors = NavigationRailItemDefaults.colors(
+                                    selectedIconColor = ArgusDarkBg,
+                                    selectedTextColor = ArgusCyanPrimary,
+                                    indicatorColor = ArgusCyanPrimary,
+                                    unselectedIconColor = ArgusTextMuted,
+                                    unselectedTextColor = ArgusTextMuted
+                                ),
+                                modifier = Modifier.testTag("nav_tab_${screen.name.lowercase()}")
+                            )
+                        }
+                    }
+                }
+
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight(),
+                    contentAlignment = Alignment.TopCenter
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .widthIn(max = 840.dp)
+                    ) {
+                        when (currentScreen) {
+                            ArgusScreen.CHAT -> ChatScreen(viewModel = viewModel)
+                            ArgusScreen.NEURAL_CORE -> NeuralCoreScreen(viewModel = viewModel)
+                            ArgusScreen.PERCEPTION -> PerceptionScreen(viewModel = viewModel)
+                            ArgusScreen.SETTINGS -> SkillsAndSettingsScreen(viewModel = viewModel)
+                        }
+                    }
+                }
             }
-        }
         }
     }
 }

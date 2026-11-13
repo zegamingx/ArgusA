@@ -59,6 +59,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -173,7 +174,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
         item {
             Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
-                    Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { isBatteryExpanded = !isBatteryExpanded }.padding(vertical = 2.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Row(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp)).clickable { isBatteryExpanded = !isBatteryExpanded }.padding(vertical = 2.dp).testTag("battery_section_toggle"), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(modifier = Modifier.size(34.dp).clip(CircleShape).background(if (isIgnoringOpt) ArgusSuccess.copy(alpha = 0.15f) else ArgusWarning.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
                                 Icon(painter = if (isIgnoringOpt) painterResource(R.drawable.ic_symbol_battery_charging_full) else painterResource(R.drawable.ic_symbol_battery_alert), contentDescription = "Battery", tint = if (isIgnoringOpt) ArgusSuccess else ArgusWarning, modifier = Modifier.size(18.dp))
@@ -204,7 +205,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                     } catch (_: Exception) {
                                         context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
                                     }
-                                }, colors = ButtonDefaults.buttonColors(containerColor = ArgusCyanPrimary, contentColor = ArgusDarkBg), shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
+                                }, colors = ButtonDefaults.buttonColors(containerColor = ArgusCyanPrimary, contentColor = ArgusDarkBg), shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth().testTag("open_battery_settings_button")) {
                                     Text(text = "Open battery settings", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                 }
                             }
@@ -218,7 +219,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
         item {
             Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
-                    Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { isSkillsExpanded = !isSkillsExpanded }.padding(vertical = 2.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Row(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp)).clickable { isSkillsExpanded = !isSkillsExpanded }.padding(vertical = 2.dp).testTag("skills_section_toggle"), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(modifier = Modifier.size(34.dp).clip(CircleShape).background(ArgusCyanPrimary.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
                                 Icon(painter = painterResource(R.drawable.ic_symbol_extension), contentDescription = "Skills", tint = ArgusCyanPrimary, modifier = Modifier.size(18.dp))
@@ -244,8 +245,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                             SkillRow(number = "07", title = "Local Model Training", desc = "Trains the on-device model using the local document queue.")
 
                             Spacer(modifier = Modifier.height(10.dp))
-                            // TESTER - pisah, default ketutup biar gak berat
-                            Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(ArgusSurfaceVariant).clickable { isTesterExpanded = !isTesterExpanded }.padding(horizontal = 10.dp, vertical = 9.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Row(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(10.dp)).background(ArgusSurfaceVariant).clickable { isTesterExpanded = !isTesterExpanded }.padding(horizontal = 10.dp, vertical = 9.dp).testTag("tester_section_toggle"), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                 Text(text = "Test Skills • Web & Tap", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusCyanGlow, fontWeight = FontWeight.Bold)
                                 Icon(painter = if (isTesterExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down), contentDescription = null, tint = ArgusCyanPrimary, modifier = Modifier.size(18.dp))
                             }
@@ -255,9 +255,9 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                     Text(text = "Test Web Search", style = MaterialTheme.typography.labelSmall, color = ArgusCyanGlow, fontWeight = FontWeight.Bold)
                                     Spacer(modifier = Modifier.height(6.dp))
                                     Row(verticalAlignment = Alignment.CenterVertically) {
-                                        OutlinedTextField(value = searchQuery, onValueChange = { searchQuery = it }, placeholder = { Text("Search query (e.g. on-device AI)", color = ArgusTextMuted, fontSize = 12.sp) }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = ArgusCyanPrimary, unfocusedBorderColor = ArgusCardBorder, focusedTextColor = ArgusTextPrimary, unfocusedTextColor = ArgusTextPrimary, focusedContainerColor = ArgusSurfaceVariant, unfocusedContainerColor = ArgusSurfaceVariant), singleLine = true)
+                                        OutlinedTextField(value = searchQuery, onValueChange = { searchQuery = it }, placeholder = { Text("Search query (e.g. on-device AI)", color = ArgusTextMuted, fontSize = 12.sp) }, modifier = Modifier.weight(1f).testTag("web_search_query_input"), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = ArgusCyanPrimary, unfocusedBorderColor = ArgusCardBorder, focusedTextColor = ArgusTextPrimary, unfocusedTextColor = ArgusTextPrimary, focusedContainerColor = ArgusSurfaceVariant, unfocusedContainerColor = ArgusSurfaceVariant), singleLine = true)
                                         Spacer(modifier = Modifier.width(8.dp))
-                                        Button(onClick = { if (searchQuery.isNotBlank()) viewModel.searchWebDirectly(searchQuery) }, colors = ButtonDefaults.buttonColors(containerColor = ArgusCyanPrimary, contentColor = ArgusDarkBg), shape = RoundedCornerShape(12.dp)) {
+                                        Button(onClick = { if (searchQuery.isNotBlank()) viewModel.searchWebDirectly(searchQuery) }, colors = ButtonDefaults.buttonColors(containerColor = ArgusCyanPrimary, contentColor = ArgusDarkBg), shape = RoundedCornerShape(12.dp), modifier = Modifier.testTag("web_search_button")) {
                                             Text("Search", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                         }
                                     }
@@ -294,16 +294,34 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                                 article.publishedAt?.let { Text(text = "Source date: $it", style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted) }
                                                 Text(text = article.canonicalUrl, style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted)
                                                 Text(text = article.text.take(2800), style = MaterialTheme.typography.bodySmall, color = ArgusTextSecondary)
-                                                Text(text = "Review konten, tanggal, publisher, dan URL sebelum masuk training.", style = MaterialTheme.typography.bodySmall, color = ArgusTextPrimary)
-                                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                                    Checkbox(checked = allowArticleTraining, onCheckedChange = { allowArticleTraining = it }, colors = CheckboxDefaults.colors(checkedColor = ArgusCyanPrimary, uncheckedColor = ArgusTextMuted, checkmarkColor = ArgusDarkBg))
-                                                    Text(text = "I confirm that I have the rights or permission to use this article for model training.", style = MaterialTheme.typography.bodySmall, color = ArgusTextSecondary)
+                                                Text(text = "Review the content, date, publisher, and URL before adding this article to training.", style = MaterialTheme.typography.bodySmall, color = ArgusTextPrimary)
+                                                Row(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .heightIn(min = 48.dp)
+                                                        .clip(RoundedCornerShape(8.dp))
+                                                        .clickable { allowArticleTraining = !allowArticleTraining }
+                                                        .padding(end = 6.dp),
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Checkbox(
+                                                        checked = allowArticleTraining,
+                                                        onCheckedChange = { allowArticleTraining = it },
+                                                        colors = CheckboxDefaults.colors(checkedColor = ArgusCyanPrimary, uncheckedColor = ArgusTextMuted, checkmarkColor = ArgusDarkBg),
+                                                        modifier = Modifier.testTag("article_rights_checkbox")
+                                                    )
+                                                    Text(
+                                                        text = "I confirm that I have the rights or permission to use this article for model training.",
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = ArgusTextSecondary,
+                                                        modifier = Modifier.weight(1f)
+                                                    )
                                                 }
                                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                                    Button(onClick = { viewModel.enqueueReviewedWebArticle() }, enabled = allowArticleTraining && !isQueueingArticle, colors = ButtonDefaults.buttonColors(containerColor = ArgusSuccess, contentColor = ArgusDarkBg, disabledContainerColor = ArgusSurface, disabledContentColor = ArgusTextMuted), shape = RoundedCornerShape(10.dp)) {
+                                                    Button(onClick = { viewModel.enqueueReviewedWebArticle() }, enabled = allowArticleTraining && !isQueueingArticle, colors = ButtonDefaults.buttonColors(containerColor = ArgusSuccess, contentColor = ArgusDarkBg, disabledContainerColor = ArgusSurface, disabledContentColor = ArgusTextMuted), shape = RoundedCornerShape(10.dp), modifier = Modifier.testTag("add_article_training_button")) {
                                                         Text(if (isQueueingArticle) "Adding…" else "Add to training", fontSize = 11.sp)
                                                     }
-                                                    Button(onClick = { viewModel.dismissWebArticlePreview() }, enabled = !isQueueingArticle, colors = ButtonDefaults.buttonColors(containerColor = ArgusSurface, contentColor = ArgusTextPrimary), shape = RoundedCornerShape(10.dp)) {
+                                                    Button(onClick = { viewModel.dismissWebArticlePreview() }, enabled = !isQueueingArticle, colors = ButtonDefaults.buttonColors(containerColor = ArgusSurface, contentColor = ArgusTextPrimary), shape = RoundedCornerShape(10.dp), modifier = Modifier.testTag("dismiss_article_preview_button")) {
                                                         Text("Close", fontSize = 11.sp)
                                                     }
                                                 }
@@ -315,14 +333,14 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                     Text(text = "Test Accessibility Action", style = MaterialTheme.typography.labelSmall, color = ArgusCyanGlow, fontWeight = FontWeight.Bold)
                                     Spacer(modifier = Modifier.height(6.dp))
                                     Row(verticalAlignment = Alignment.CenterVertically) {
-                                        OutlinedTextField(value = actionClickQuery, onValueChange = { actionClickQuery = it }, placeholder = { Text("Visible button text", color = ArgusTextMuted, fontSize = 12.sp) }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = ArgusCyanPrimary, unfocusedBorderColor = ArgusCardBorder, focusedTextColor = ArgusTextPrimary, unfocusedTextColor = ArgusTextPrimary, focusedContainerColor = ArgusSurfaceVariant, unfocusedContainerColor = ArgusSurfaceVariant), singleLine = true)
+                                        OutlinedTextField(value = actionClickQuery, onValueChange = { actionClickQuery = it }, placeholder = { Text("Visible button text", color = ArgusTextMuted, fontSize = 12.sp) }, modifier = Modifier.weight(1f).testTag("action_click_query_input"), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = ArgusCyanPrimary, unfocusedBorderColor = ArgusCardBorder, focusedTextColor = ArgusTextPrimary, unfocusedTextColor = ArgusTextPrimary, focusedContainerColor = ArgusSurfaceVariant, unfocusedContainerColor = ArgusSurfaceVariant), singleLine = true)
                                         Spacer(modifier = Modifier.width(8.dp))
                                         Button(onClick = {
                                             if (actionClickQuery.isNotBlank()) {
                                                 val success = viewModel.executeActionClick(actionClickQuery)
                                                 actionClickResult = if (success) "Success: click action sent to '$actionClickQuery'." else "Failed: '$actionClickQuery' was not found in the active window."
                                             }
-                                        }, colors = ButtonDefaults.buttonColors(containerColor = ArgusBlueAccent, contentColor = ArgusDarkBg), shape = RoundedCornerShape(12.dp)) {
+                                        }, colors = ButtonDefaults.buttonColors(containerColor = ArgusBlueAccent, contentColor = ArgusDarkBg), shape = RoundedCornerShape(12.dp), modifier = Modifier.testTag("action_click_button")) {
                                             Text("Tap", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                         }
                                     }
@@ -342,7 +360,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
         item {
             Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
-                    Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { isExcludeAppsExpanded = !isExcludeAppsExpanded }.padding(vertical = 2.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Row(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp)).clickable { isExcludeAppsExpanded = !isExcludeAppsExpanded }.padding(vertical = 2.dp).testTag("excluded_apps_section_toggle"), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(modifier = Modifier.size(34.dp).clip(CircleShape).background(ArgusCyanPrimary.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
                                 Icon(painter = painterResource(R.drawable.ic_symbol_visibility_off), contentDescription = "Exclude", tint = ArgusCyanPrimary, modifier = Modifier.size(18.dp))
@@ -365,21 +383,22 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(text = "ARGUS skips screen text from excluded apps. This reduces exposure but does not replace Android permissions or the app's own privacy controls.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextSecondary, lineHeight = 16.sp)
                             Spacer(modifier = Modifier.height(10.dp))
-                            OutlinedTextField(value = appFilterText, onValueChange = { appFilterText = it }, placeholder = { Text("Cari app...", color = ArgusTextMuted, fontSize = 12.sp) }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = ArgusCyanPrimary, unfocusedBorderColor = ArgusCardBorder, focusedTextColor = ArgusTextPrimary, unfocusedTextColor = ArgusTextPrimary, focusedContainerColor = ArgusSurfaceVariant, unfocusedContainerColor = ArgusSurfaceVariant), singleLine = true)
+                            OutlinedTextField(value = appFilterText, onValueChange = { appFilterText = it }, placeholder = { Text("Search apps...", color = ArgusTextMuted, fontSize = 12.sp) }, modifier = Modifier.fillMaxWidth().testTag("excluded_apps_search_input"), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = ArgusCyanPrimary, unfocusedBorderColor = ArgusCardBorder, focusedTextColor = ArgusTextPrimary, unfocusedTextColor = ArgusTextPrimary, focusedContainerColor = ArgusSurfaceVariant, unfocusedContainerColor = ArgusSurfaceVariant), singleLine = true)
                             Spacer(modifier = Modifier.height(8.dp))
-                            // FIX: LazyRow biar tab gak kepotong
                             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 val tabs = listOf("All (${installedApps.size})", "Excluded ($excludedCount)", "Privacy suggestions ($privacySuggestedCount)")
                                 items(tabs.indices.toList()) { idx ->
                                     val label = tabs[idx]
                                     val isSelected = appFilterTab == idx
-                                    Box(modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(if (isSelected) ArgusCyanPrimary else ArgusSurfaceVariant).clickable { appFilterTab = idx }.padding(horizontal = 10.dp, vertical = 6.dp)) {
-                                        Text(text = label, style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = if (isSelected) ArgusDarkBg else ArgusTextSecondary, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)
+                                    Box(modifier = Modifier.heightIn(min = 48.dp).clip(RoundedCornerShape(20.dp)).clickable { appFilterTab = idx }.testTag("excluded_apps_filter_$idx"), contentAlignment = Alignment.Center) {
+                                        Box(modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(if (isSelected) ArgusCyanPrimary else ArgusSurfaceVariant).padding(horizontal = 10.dp, vertical = 6.dp)) {
+                                            Text(text = label, style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = if (isSelected) ArgusDarkBg else ArgusTextSecondary, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)
+                                        }
                                     }
                                 }
                             }
                             Spacer(modifier = Modifier.height(10.dp))
-                            Text(text = "Showing ${filteredApps.size} apps • scroll di dalam kotak", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = ArgusCyanGlow, fontFamily = FontFamily.Monospace)
+                            Text(text = "Showing ${filteredApps.size} apps • scroll inside list", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = ArgusCyanGlow, fontFamily = FontFamily.Monospace)
                             Spacer(modifier = Modifier.height(6.dp))
                             Column(modifier = Modifier.fillMaxWidth().heightIn(max = 340.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                 if (filteredApps.isEmpty()) {
@@ -388,7 +407,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                     }
                                 } else {
                                     filteredApps.forEach { app ->
-                                        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(ArgusSurfaceVariant).clickable { viewModel.toggleAppExclusion(app.packageName) }.padding(horizontal = 10.dp, vertical = 7.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                        Row(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(10.dp)).background(ArgusSurfaceVariant).clickable { viewModel.toggleAppExclusion(app.packageName) }.padding(horizontal = 10.dp, vertical = 7.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                             Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                                                 Text(text = app.appName, style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary, fontWeight = if (app.isExcluded) FontWeight.Bold else FontWeight.Normal)
                                                 Text(text = app.packageName, style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = if (app.isExcluded) ArgusCyanGlow else ArgusTextMuted)
@@ -408,7 +427,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
         item {
             Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
-                    Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { isWorldModelExpanded = !isWorldModelExpanded }.padding(vertical = 2.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Row(modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp)).clickable { isWorldModelExpanded = !isWorldModelExpanded }.padding(vertical = 2.dp).testTag("world_model_section_toggle"), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(modifier = Modifier.size(34.dp).clip(CircleShape).background(ArgusCyanPrimary.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
                                 Icon(painter = painterResource(R.drawable.ic_symbol_extension), contentDescription = null, tint = ArgusCyanPrimary, modifier = Modifier.size(18.dp))

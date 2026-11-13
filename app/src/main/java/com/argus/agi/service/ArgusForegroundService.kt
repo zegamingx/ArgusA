@@ -18,6 +18,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.Locale
 
 class ArgusForegroundService : Service() {
 
@@ -126,13 +127,13 @@ class ArgusForegroundService : Service() {
             else -> "Monitoring local activity"
         }
 
-        val lossText = if (latestLoss != null) "Loss: ${String.format("%.4f", latestLoss)}" else "Loss: not available"
+        val lossText = if (latestLoss != null) "Loss: ${String.format(Locale.US, "%.4f", latestLoss)}" else "Loss: not available"
         val computeStatus = if (neuralEngine.isVulkanRuntimeReady) {
             "Vulkan runtime verified"
         } else {
             "Kotlin CPU fallback"
         }
-        val content = "$lossText | ${safety.batteryPct}% (${String.format("%.1f", safety.temperatureCelsius)}°C) | $computeStatus"
+        val content = "$lossText | ${safety.batteryPct}% (${String.format(Locale.US, "%.1f", safety.temperatureCelsius)}°C) | $computeStatus"
 
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP

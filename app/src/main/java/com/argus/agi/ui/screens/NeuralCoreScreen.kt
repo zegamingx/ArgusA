@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -23,6 +24,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -327,6 +329,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             modifier = Modifier.weight(1f)
                         )
                     }
+                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         text = "$predictionTargetsLabel next-token targets scored in this session. " +
                             "${trainingMetrics.completedDocuments} documents completed across " +
@@ -384,7 +387,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                     )
                     Text(
                         text = "RAM-only Argus INT4 planning range. The active model remains the separate " +
-                            "FP32 training engine. A model-specific memory and backend check is required " +
+                            "FP16/FP32 training engine. A model-specific memory and backend check is required " +
                             "before any quantized model can be loaded.",
                         style = MaterialTheme.typography.bodySmall,
                         color = ArgusTextMuted
@@ -545,7 +548,12 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
             }
 
             item {
-                QueueSectionHeader(title = "2. Next in Queue", count = nextQueue.size, onClear = { viewModel.clearTrainingQueue() })
+                QueueSectionHeader(
+                    title = "2. Next in Queue",
+                    count = nextQueue.size,
+                    clearTestTag = "clear_queue_button",
+                    onClear = { viewModel.clearTrainingQueue() }
+                )
                 Spacer(modifier = Modifier.height(8.dp))
                 if (nextQueue.isNotEmpty()) {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -556,7 +564,12 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
             }
 
             item {
-                QueueSectionHeader(title = "3. Recently Completed", count = completedQueue.size, onClear = { viewModel.clearCompletedTraining() })
+                QueueSectionHeader(
+                    title = "3. Recently Completed",
+                    count = completedQueue.size,
+                    clearTestTag = "clear_completed_button",
+                    onClear = { viewModel.clearCompletedTraining() }
+                )
                 Spacer(modifier = Modifier.height(8.dp))
                 if (completedQueue.isNotEmpty()) {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -747,6 +760,7 @@ private fun ConversationValidationCard(
                         modifier = Modifier.weight(1f)
                     )
                 }
+                Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = if (report.meetsThresholds) {
                         "All absolute conversational quality thresholds are met."
@@ -795,7 +809,12 @@ private fun ConversationValidationCard(
 }
 
 @Composable
-fun QueueSectionHeader(title: String, count: Int, onClear: (() -> Unit)? = null) {
+fun QueueSectionHeader(
+    title: String,
+    count: Int,
+    clearTestTag: String? = null,
+    onClear: (() -> Unit)? = null
+) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
         Text(text = title, style = MaterialTheme.typography.titleMedium.copy(fontSize = 14.sp), color = ArgusCyanGlow, fontWeight = FontWeight.SemiBold)
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -804,7 +823,18 @@ fun QueueSectionHeader(title: String, count: Int, onClear: (() -> Unit)? = null)
             }
             if (onClear != null && count > 0) {
                 Spacer(modifier = Modifier.width(6.dp))
-                Text(text = "Clear", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = ArgusTextMuted, modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable { onClear() }.padding(horizontal = 4.dp, vertical = 2.dp))
+                TextButton(
+                    onClick = onClear,
+                    modifier = Modifier
+                        .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                        .let { base -> if (clearTestTag != null) base.testTag(clearTestTag) else base }
+                ) {
+                    Text(
+                        text = "Clear",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                        color = ArgusTextMuted
+                    )
+                }
             }
         }
     }

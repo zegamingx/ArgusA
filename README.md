@@ -72,13 +72,14 @@ The private repository keeps the CI signing-key backup in the private GitHub Rel
 The native training module is built with Android NDK r30, CMake 3.31.6
 (project minimum 3.28.0), and C++23 for arm64-v8a, armeabi-v7a, and x86_64.
 It uses the NDK-bundled glslc compiler to
-compile the AdamW and batched-linear compute shaders to SPIR-V during the native build.
+compile the AdamW (`adamw.comp`), batched-linear (`linear.comp`), and Vulkan 1.2 FP16-weight linear (`linear_fp16.comp`) compute shaders to SPIR-V during the native build.
 
 When a compatible Vulkan GPU and compute queue are available, sufficiently large
 matrix products in batched Q/K/V projections, attention output projection, SwiGLU,
 the output head, output-head backward, attention output-projection backward,
 SwiGLU backward, batched attention backward, and Q/K/V weight-gradient accumulation
-can run through Vulkan Compute. The three Q/K/V input-gradient products used by
+can run through Vulkan Compute (using `linear_fp16.comp` with FP16 weights and FP32
+accumulation when GPU 16-bit storage/arithmetic passes startup self-checks, or `linear.comp` otherwise). The three Q/K/V input-gradient products used by
 embedding backpropagation are also batched through Vulkan. The fused AdamW update
 runs on Vulkan for workloads with at least 49,152 optimizer elements. Attention
 score generation, softmax, the softmax-Jacobian reduction, layer normalization,
@@ -101,7 +102,7 @@ CMake 3.31.6 distribution and NDK r30 for native builds.
 
 ## Background training service
 
-The foreground service uses the `specialUse` type alone on Android 14 (API 34) and later for the ongoing user-visible local compute workload. Android 13 (API 33) uses the legacy `dataSync` compatibility type because `specialUse` did not exist on that platform. The manifest retains both declarations for this version split and supplies the required `specialUse` subtype explanation. Google Play still reviews the declared `specialUse` use case; declaring it does not guarantee policy approval.
+The foreground service uses the `specialUse` type on Android 14 (API 34) and later (the app's supported `minSdk = 34` target) for the ongoing user-visible local compute workload. The manifest and service helper retain the legacy `dataSync` fallback only for Android 13 (API 33) compatibility tests, and supply the required `specialUse` subtype explanation. Google Play still reviews the declared `specialUse` use case; declaring it does not guarantee policy approval.
 
 ## Local knowledge ingestion
 
@@ -140,7 +141,7 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - `ArgusArchitectureParameterEstimator` calculates parameters across every declared block. Token embeddings and the output projection are counted once; attention, SwiGLU, and optional Q/V adapter matrices scale with layer count. Parameter arithmetic is overflow-checked.
 - The estimator distinguishes trainable parameters from resident model tensors. The current fixed sinusoidal position table occupies memory but is not a trainable parameter. The legacy `countTotalParameters()` method retains its historical resident-tensor count; `countTrainableParameters()` exposes the trainable-weight count.
 - The executable engine runs a configurable stack of causal multi-head attention + SwiGLU blocks with separate token embeddings/output projection and Q/V LoRA. Forward execution, reverse backpropagation, optimizer state, KV cache, and ARG4 checkpoint tensors use the configured layer count. ARG3 remains a legacy one-block compatibility format.
-- The tokenizer configuration is versioned and persisted with each ARG4 checkpoint. Its default is learned BPE with 1,024 vocabulary entries and a 16 UTF-16-code-unit token limit; larger capacities and token lengths can be selected explicitly. ARG3 checkpoints retain the legacy greedy-longest-match algorithm and deterministic Unicode fallback.
+- The tokenizer configuration is versioned and persisted with each ARG4 checkpoint. Its default is `BYTE_LEVEL_BPE_V2` (learned byte-level BPE with a `TokenizerConfig` default of 2,048 vocabulary entries—or tier-specific `1,024 / 2,048 / 4,096 / 8,192` capacities selected by `EngineConfig.forDevice`—and a 16 UTF-16-code-unit token limit), alongside `LEARNED_BPE_V1` and `GREEDY_LONGEST_MATCH_V1` compatibility modes; larger capacities and token lengths can be selected explicitly. ARG3 checkpoints retain the legacy greedy-longest-match algorithm and deterministic Unicode fallback.
 - The architecture contract is Argus-native metadata, not a third-party model format or runtime. It does not add a pretrained model, change random initialization, or alter existing ARG3 checkpoint bytes.
 - The inference memory estimator can consume the same validated architecture descriptor, deriving trainable weight count, KV-cache shape, and the fixed sinusoidal buffer instead of accepting unrelated parameter and shape values. Its result remains a planning estimate; it does not load or quantize tensors.
 
@@ -148,22 +149,22 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 
 Argus selects one of four native model families from installed RAM, the current available-system-memory snapshot, the app heap limit, and CPU core count:
 
-| Model family | Family parameter band | Default training batch |
-| --- | ---: | ---: |
-| Argus Compact | 1M–10M | 1 |
-| Argus Balanced | 10M–100M | 2 |
-| Argus Performance | 100M–1B | 4 |
-| Argus Flagship | 1B–7B | 8 |
+| Model family | Family parameter band | Default training batch | Tier vocabulary capacity |
+| --- | ---: | ---: | ---: |
+| Argus Compact | 1M–1.4M | 1 | 1,024 |
+| Argus Balanced | 1.4M–1.9M | 2 | 2,048 |
+| Argus Performance | 1.9M–4.8M | 4 | 4,096 |
+| Argus Flagship | 4.8M–7M | 8 | 8,192 |
 
-The family band is an architecture target, not a guarantee that the active model reaches either boundary. On current Android devices the active FP32 model can remain below the tier's lower family boundary because the safe training-memory budget is much smaller; Neural Core reports the family ceiling and actual active parameter count separately. The active FP32 shape is selected from supported hidden sizes, feed-forward multipliers, and layer counts, then capped by a conservative memory budget. The budget uses at most 45% of the app heap and 25% of currently available system RAM; only 55% of that smaller budget is assigned to the 20-byte-per-parameter accumulated-training state floor. Remaining memory is reserved for activations, attention scratch, tokenizer expansion, checkpoint buffers, and allocator overhead.
+The family band is an architecture target capped at the 7M executable parameter ceiling (`MINIMUM_EXECUTABLE_PARAMETER_BUDGET = 1,122,304`), not a guarantee that every device reaches the tier's upper boundary; Neural Core reports the family ceiling and actual active parameter count separately. The active model shape is selected from tier-specific dimensions (`d_model` 128–256, `d_ff` 384–1,024, 4–8 attention heads, 1–32 layers, context 64–192, and LoRA rank 4 or 8), then capped by a conservative memory budget. The budget uses at most 45% of the app heap and 25% of currently available system RAM; only 55% of that smaller budget is assigned to the 18-byte-per-parameter accumulated training-state floor (2-byte FP16 parameters + 4-byte FP32 gradients + 8-byte FP32 AdamW moments + 4-byte FP32 accumulation buffer). Remaining memory is reserved for activations, attention scratch, tokenizer expansion, checkpoint buffers, and allocator overhead.
 
-The native architecture search includes hidden sizes through 4,096 and up to 32 layers, so Argus can describe architectures approaching the 7B family ceiling. The Android runtime still rejects shapes that exceed JVM array limits or the measured app-heap budget.
+`ArgusArchitectureConfig` and `InferenceMemoryEstimator` still support planning descriptions for much larger architectures independently of active training. The active Android training runtime rejects shapes that exceed JVM array limits or the measured app-heap budget.
 
 The training queue uses a true serial micro-batch of 1–8 independent samples. Each sample's context windows are processed sequentially, their gradients are target-count weighted and accumulated, and one AdamW update is applied after the batch. Activations are not retained for all samples at once. The training worker assigns one optimizer update to the first trainable sample in the batch so session metrics do not count the same update more than once.
 
-Existing ARG3/ARG4 checkpoints retain their saved dimensions. When the current device cannot safely reserve the additional accumulation buffer, Argus keeps the saved model on its single-sample compatibility path and forces batch size 1; it does not resize or silently replace the user's model. A fresh installation requires enough memory for the 1M-parameter minimum before Genesis allocates its model.
+Existing ARG3/ARG4 checkpoints retain their saved dimensions. When the current device cannot safely reserve the additional accumulation buffer, Argus keeps the saved model on its single-sample compatibility path (14 bytes/parameter baseline) and forces batch size 1; it does not resize or silently replace the user's model. A fresh installation requires enough memory headroom before Genesis allocates its model.
 
-**7B is the upper family target, not a claim that the current Android FP32/JVM engine can allocate or train a 7B model.** Multi-billion-parameter on-device training still requires a separate memory-efficient execution design (for example, lower-precision state, optimizer sharding/offload, and streamed tensor execution) that is not currently integrated. The running model's actual parameter count is reported separately from its family label.
+**Note:** Multi-billion-parameter figures in the separate inference-planning policy do not represent active on-device training capacity; the current FP16-weight / FP32-state trainer caps executable training models at 7M parameters. The running model's actual parameter count is reported separately from its family ceiling and inference planning range.
 
 ## Device-adaptive inference capacity
 
@@ -171,21 +172,21 @@ Existing ARG3/ARG4 checkpoints retain their saved dimensions. When the current d
 - The planning anchors are 1 GB: 0.5B–1B; 2 GB: 1.5B–2.5B; 3 GB: 2.5B–3.5B; 4 GB: 3B–5B; 5 GB: 4B–6B; 6 GB: 5B–7B; 7 GB: 6B–8B; 8 GB: 7B–9B; 10 GB: 9B–12B; 12 GB: 12B–14B; 16 GB: 18B–21B; 24 GB: 28B–32B; and 32 GB: 38B–42B.
 - Values between anchors are linearly interpolated. Above 32 GB, the estimate grows by 1.3B–1.5B parameters per additional GB.
 - These values are RAM-only planning targets, not guaranteed model-load limits. A future inference loader must inspect the actual model quantization and architecture metadata, estimate KV cache and runtime workspace, and enforce a memory safety reserve before loading.
-- The custom FP32 training engine remains independent from inference sizing. Its 16-byte-per-parameter base floor accounts for parameters, gradients, and two Adam moments. The new serial gradient-accumulation path uses an additional FP32 gradient buffer, bringing its state floor to 20 bytes per parameter before activations and temporary buffers.
-- An Argus-native multi-billion-parameter inference runtime is not yet integrated. Argus must load its own checkpoint, architecture configuration, tokenizer state, and tensor data without requiring an external model format or runtime. Internal weight quantization is a future Argus-owned storage and execution feature.
+- The custom FP16-weight / FP32-state training engine remains independent from inference sizing. Its 14-byte-per-parameter base floor accounts for FP16 parameters (2B), FP32 gradients (4B), and two FP32 Adam moments (8B). The serial gradient-accumulation path adds an FP32 gradient buffer, bringing its state floor to 18 bytes per parameter before activations and temporary buffers.
+- An Argus-native multi-billion-parameter inference runtime is not yet integrated. Argus must load its own checkpoint, architecture configuration, tokenizer state, and tensor data without requiring an external model format or runtime. Quantized on-disk checkpoint storage is a future Argus-owned feature.
 
 ## Argus checkpoint format
 
 - `ARG3` remains a supported legacy read format. Its fixed tensor order is retained in the compatibility loader.
 - New checkpoints are written as `ARG4`. The fixed header records the architecture schema and dimensions, tokenizer schema/algorithm/capacity, optimizer step, payload size, and checksum.
-- The payload stores the Argus architecture ID, vocabulary entries, a named tensor directory, and FP32 tensor data. Tensor names and element counts are validated against the active engine before restore.
+- The payload stores the Argus architecture ID, vocabulary entries, learned BPE merge rules (when the tokenizer uses BPE merges), a named tensor directory, and `FLOAT32_TENSOR_TYPE` serialized tensor data. Active in-memory model weights use FP16 (`Float16ParameterArray`) while optimizer moments remain FP32; tensors quantize/dequantize cleanly across checkpoint load/save, and tensor names and element counts are validated against the active engine before restore.
 - Tensor payloads are written and read in bounded chunks. The writer uses a temporary file and atomic replacement; the payload CRC32 is verified before model or tokenizer state is changed.
 - Restoring an `ARG3` checkpoint does not discard it. The next successful checkpoint save writes the current state in `ARG4`.
-- The current engine supports configurable multi-layer execution and FP32 tensors only. The named manifest stores each layer's tensors; it is not a quantized runtime.
+- The current engine supports configurable multi-layer execution with FP16 in-memory weights, FP32 optimizer state, and `FLOAT32_TENSOR_TYPE` ARG4 checkpoint serialization. The named manifest stores each layer's tensors; it is not an INT4/INT8 quantized checkpoint format.
 
 ## On-device training scope
 
-Fresh model initialization selects tensor dimensions using total RAM, app heap, and current available RAM. Existing ARG3 checkpoints remain readable and retain their saved tensor dimensions. New saves use ARG4, an Argus-native checkpoint with architecture/tokenizer metadata, a named FP32 tensor manifest, streamed tensor I/O, and a CRC32 payload check.
+Fresh model initialization selects tensor dimensions using total RAM, app heap, and current available RAM. Existing ARG3 checkpoints remain readable and retain their saved tensor dimensions. New saves use ARG4, an Argus-native checkpoint with architecture/tokenizer metadata, learned BPE merge rules, a named tensor manifest, streamed tensor I/O, and a CRC32 payload check.
 
 Genesis currently seeds three short foundation notes as retained TRAIN corpus documents. Their scheduling is idempotent: already queued, active, or trained notes are not duplicated, while a cleared or interrupted note can be replayed from Room. These notes are a small bootstrap seed, not a general-purpose language dataset; no C4 or other broad offline language corpus is bundled.
 
@@ -195,7 +196,7 @@ For each training micro-batch, gradients are accumulated across all scored next-
 
 Current limitations:
 
-- The tokenizer uses the versioned greedy-longest-match algorithm, fixed seed vocabulary, and deterministic Unicode fallback. Its capacity and maximum token length are configurable and persisted, but learned BPE/Unigram training and merge-state storage are not implemented.
+- Learned BPE (`BYTE_LEVEL_BPE_V2` by default, plus `LEARNED_BPE_V1`) trains and persists merge rules in `ARG4` checkpoints up to the configured vocabulary capacity, while Unigram tokenization is not implemented and `ARG3` retains legacy `GREEDY_LONGEST_MATCH_V1` compatibility.
 - Corpus documents use a document-level TRAIN or VALIDATION split. Validation documents retain one normalized source-text payload, create no training chunks, never enter the training queue, and cannot be replayed into training.
 - Held-out evaluation uses evaluateValidationCorpus, aggregates cross-entropy by the exact number of scored next-token targets, and computes perplexity without updating model weights or optimizer state.
 - A content fingerprint cannot exist in both splits. Importing identical source text into the opposite split is rejected to prevent train/validation leakage.
@@ -206,7 +207,7 @@ Current limitations:
 - Corpus replay rejects documents that already have queued or active training work, preventing accidental duplicate scheduling. A completed or cleared corpus can be replayed again using the same seed.
 - Replay is bounded to 500 documents per scheduling request. Its default chunk limit is estimated from the current app heap (using a conservative 4 KiB per queue item) and capped at 4,096; callers may configure a larger limit up to the 50,000-item hard ceiling. Requests exceeding the configured limit are rejected before queue insertion.
 - `replayCorpusDocument` remains available for one-document replay and defaults to sequential chunk order.
-- Vulkan executes eligible batched forward/backward matrix products and AdamW updates after native numerical self-checks. Attention score generation, softmax, layer normalization, QKV/LoRA gradient accumulation, and global gradient-norm reduction remain Kotlin operations. NPU/APU hardware detection is informational only; no vendor-specific NPU/APU training runtime is integrated.
+- Vulkan executes eligible batched forward/backward matrix products (via `linear_fp16.comp` or `linear.comp`) and AdamW updates (`adamw.comp`) after native numerical self-checks. Attention score generation, softmax, layer normalization, QKV/LoRA gradient accumulation, and global gradient-norm reduction remain Kotlin operations. NPU/APU hardware detection is informational only; no vendor-specific NPU/APU training runtime is integrated.
 - This pipeline is not yet validated as scalable from-random-initialization pretraining or general intelligence training.
 
 ## Compatibility note

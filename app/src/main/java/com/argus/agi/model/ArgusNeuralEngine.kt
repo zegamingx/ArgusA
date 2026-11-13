@@ -3541,7 +3541,7 @@ class ArgusNeuralEngine private constructor(
                     require(nameLength in 1..128) { "ARG4 tensor name length is invalid." }
                     require(elementCount >= 0L) { "ARG4 tensor element count is invalid." }
                     require(dataType == FLOAT32_TENSOR_TYPE) {
-                        "ARG4 tensor data type is not supported by the FP32 trainer."
+                        "ARG4 tensor data type is not supported by the ARG4 trainer."
                     }
                     val rawName = String(input.readFully(nameLength), Charsets.UTF_8)
                     val name = if (!rawName.startsWith("layers.") && !rawName.startsWith("token.") && !rawName.startsWith("lm_head.")) {

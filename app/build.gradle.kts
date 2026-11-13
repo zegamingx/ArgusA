@@ -29,6 +29,7 @@ val releaseKeystorePath = providers.environmentVariable("KEYSTORE_PATH")
 android {
     namespace = "com.argus.agi"
     compileSdk { version = release(37) }
+    buildToolsVersion = "36.0.0"
     ndkVersion = "30.0.16248370"
 
     externalNativeBuild {

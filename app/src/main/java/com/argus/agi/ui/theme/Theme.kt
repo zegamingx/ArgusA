@@ -1,6 +1,8 @@
 package com.argus.agi.ui.theme
 
 import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
@@ -28,6 +30,12 @@ private val ArgusColorScheme = darkColorScheme(
     onError = ArgusDarkBg
 )
 
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
 @Composable
 fun ArgusTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
@@ -37,7 +45,7 @@ fun ArgusTheme(
     val view = LocalView.current
     if (!view.isInEditMode) {
         SideEffect {
-            val window = (view.context as Activity).window
+            val window = view.context.findActivity()?.window ?: return@SideEffect
             val insetsController = WindowCompat.getInsetsController(window, view)
             insetsController.isAppearanceLightStatusBars = false
             insetsController.isAppearanceLightNavigationBars = false

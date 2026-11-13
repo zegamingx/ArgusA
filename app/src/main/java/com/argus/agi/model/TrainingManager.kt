@@ -348,13 +348,13 @@ class TrainingManager(
         canonicalUrl: String? = null,
         rightsStatus: String = "UNVERIFIED"
     ): Int {
-        require(chunkSize > 0) { "chunkSize harus > 0." }
-        require(overlap >= 0) { "overlap tidak boleh negatif." }
+        require(chunkSize > 0) { "chunkSize must be > 0." }
+        require(overlap >= 0) { "overlap cannot be negative." }
         require(overlap < chunkSize) {
-            "overlap ($overlap) harus < chunkSize ($chunkSize) agar iterasi maju."
+            "overlap ($overlap) must be < chunkSize ($chunkSize) so iteration advances."
         }
         require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
-            "epochs harus berada pada rentang 1..$MAX_DOCUMENT_EPOCHS"
+            "epochs must be in the range 1..$MAX_DOCUMENT_EPOCHS."
         }
         require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
             "Unsupported corpus rights status: $rightsStatus"
@@ -527,16 +527,16 @@ class TrainingManager(
         canonicalUrl: String? = null,
         rightsStatus: String = "UNVERIFIED"
     ): Pair<Int, Long> {
-        require(chunkSize > 0) { "chunkSize harus > 0." }
-        require(overlap >= 0) { "overlap tidak boleh negatif." }
+        require(chunkSize > 0) { "chunkSize must be > 0." }
+        require(overlap >= 0) { "overlap cannot be negative." }
         require(overlap < chunkSize) {
-            "overlap ($overlap) harus < chunkSize ($chunkSize) agar iterasi maju."
+            "overlap ($overlap) must be < chunkSize ($chunkSize) so iteration advances."
         }
         require(overlap <= chunkSize / 3) {
-            "overlap ($overlap) harus <= chunkSize / 3 (${chunkSize / 3}) agar jaminan sliding window selalu maju"
+            "overlap ($overlap) must be <= chunkSize / 3 (${chunkSize / 3}) to ensure the sliding window always advances."
         }
         require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
-            "epochs harus berada pada rentang 1..$MAX_DOCUMENT_EPOCHS"
+            "epochs must be in the range 1..$MAX_DOCUMENT_EPOCHS."
         }
         require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
             "Unsupported corpus rights status: $rightsStatus"
@@ -2081,7 +2081,7 @@ class TrainingManager(
             if (deviceGuard.forceTrainingOverride.value) {
                 deviceGuard.consumeForceOverride()
             }
-        }.onFailure { Log.w(TAG, "Gagal reset force override", it) }
+        }.onFailure { Log.w(TAG, "Failed to reset force override", it) }
     }
 
     // =====================================================================
@@ -2089,7 +2089,7 @@ class TrainingManager(
     // =====================================================================
 
     private fun splitIntoTrainingChunks(text: String, chunkSize: Int, overlap: Int): List<String> {
-        require(chunkSize > overlap) { "chunkSize harus > overlap" }
+        require(chunkSize > overlap) { "chunkSize must be > overlap." }
         if (text.length <= chunkSize) return listOf(text)
 
         val chunks = mutableListOf<String>()
