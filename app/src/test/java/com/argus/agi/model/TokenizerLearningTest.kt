@@ -86,6 +86,32 @@ class TokenizerLearningTest {
     }
 
     @Test
+    fun legacySeedMergesCanBeExportedAndImportedWithoutIntermediateVocabularyTokens() {
+        val config = TokenizerConfig(
+            algorithm = ArgusTokenizerAlgorithm.LEARNED_BPE_V1,
+            maxVocabularySize = 512,
+            maxTokenLength = 16
+        )
+        val original = Tokenizer(config)
+        val exportedMerges = original.exportMerges()
+
+        assertTrue(exportedMerges.isNotEmpty())
+        assertTrue(
+            "Legacy seed merges intentionally contain intermediate symbols outside the vocabulary.",
+            exportedMerges.any { (left, _) ->
+                original.exportVocab().none { entry -> entry.first == left }
+            }
+        )
+
+        val restored = Tokenizer(config)
+        restored.importVocab(original.exportVocab())
+        restored.importMerges(exportedMerges)
+
+        assertEquals(exportedMerges, restored.exportMerges())
+        assertEquals(original.encode("yang"), restored.encode("yang"))
+    }
+
+    @Test
     fun bpeTrainingDoesNotConsumeMergesOnControlTokenMarkup() {
         val tokenizer = Tokenizer(
             TokenizerConfig(
