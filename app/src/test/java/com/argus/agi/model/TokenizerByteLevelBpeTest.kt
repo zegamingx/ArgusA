@@ -43,6 +43,21 @@ class TokenizerByteLevelBpeTest {
     }
 
     @Test
+    fun byteLevelVocabularyRejectsIdGapsAndAppendsSequentially() {
+        val tokenizer = newTokenizer()
+        val initialSize = tokenizer.vocabSize
+
+        val gapFailure = runCatching {
+            tokenizer.registerToken("invalid-gap", initialSize + 5)
+        }.exceptionOrNull()
+
+        assertTrue("Byte-Level BPE must reject non-sequential token IDs.", gapFailure is IllegalArgumentException)
+        assertEquals(initialSize, tokenizer.vocabSize)
+        assertEquals(initialSize, tokenizer.registerToken("appended-token"))
+        assertEquals(initialSize + 1, tokenizer.vocabSize)
+    }
+
+    @Test
     fun baseByteEncodingMatchesStableKnownTestVectors() {
         val tokenizer = newTokenizer()
         val vectors = listOf(
