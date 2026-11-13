@@ -9,6 +9,21 @@ plugins {
     alias(libs.plugins.google.devtools.ksp)
 }
 
+// Signing inputs are declared at script scope because the release validation task
+// runs outside the Android DSL block.
+val releaseStorePassword = providers.environmentVariable("STORE_PASSWORD")
+val releaseKeyPassword = providers.environmentVariable("KEY_PASSWORD")
+val jksFile = rootProject.file("my-upload-key.jks")
+val p12File = rootProject.file("signing/argus-release.p12")
+val defaultKeystore = when {
+    jksFile.isFile -> jksFile
+    p12File.isFile -> p12File
+    else -> jksFile
+}
+val releaseKeystorePath = providers.environmentVariable("KEYSTORE_PATH")
+    .orElse(defaultKeystore.absolutePath)
+    .get()
+
 android {
     namespace = "com.argus.agi"
     compileSdk { version = release(37) }
@@ -48,23 +63,9 @@ android {
 
     }
 
-    val jksFile = rootProject.file("my-upload-key.jks")
-    val p12File = rootProject.file("signing/argus-release.p12")
     // A release must never silently fall back to the Android debug identity.
-    // Keep the expected upload-key path so release packaging fails closed when
-    // the official signing material has not been provisioned.
-    val defaultKeystore = when {
-        jksFile.isFile -> jksFile
-        p12File.isFile -> p12File
-        else -> jksFile
-    }
-
-    val releaseKeystorePath = providers.environmentVariable("KEYSTORE_PATH")
-        .orElse(defaultKeystore.absolutePath)
-        .get()
-
-    val releaseStorePassword = providers.environmentVariable("STORE_PASSWORD")
-    val releaseKeyPassword = providers.environmentVariable("KEY_PASSWORD")
+    // The upload-key path is only a location default; its passwords remain required
+    // environment inputs and are validated by validateSigningRelease.
     val releaseKeyAlias = providers.environmentVariable("KEY_ALIAS")
         .orElse("upload")
         .get()
