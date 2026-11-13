@@ -323,10 +323,9 @@ class TrainingManager(
         }
         requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
 
-        val clean = fullText.trim()
-        if (clean.isBlank() || closed) return 0
+        if (fullText.isBlank() || closed) return 0
 
-        val processedChunks = TextModalityProcessor.process(clean, title, chunkSize, overlap)
+        val processedChunks = TextModalityProcessor.process(fullText, title, chunkSize, overlap)
         val chunksPerEpoch = processedChunks.size
         if (chunksPerEpoch == 0) return 0
 
@@ -339,7 +338,7 @@ class TrainingManager(
             title = title,
             language = language,
             canonicalUrl = canonicalUrl,
-            characterCount = clean.length,
+            characterCount = fullText.length,
             chunkCount = chunksPerEpoch,
             plannedEpochs = epochs,
             rightsStatus = rightsStatus,
@@ -399,7 +398,7 @@ class TrainingManager(
             if (_activeDocument.value == null && orderedItems.isNotEmpty()) {
                 _activeDocument.value = ActiveDocumentTraining(
                     docTitle = title,
-                    totalCharacters = clean.length,
+                    totalCharacters = fullText.length,
                     totalChunks = orderedItems.size,
                     completedChunks = 0,
                     currentChunkIndex = 1
@@ -512,11 +511,10 @@ class TrainingManager(
         var totalCharsRead = 0L
 
         fun appendSegment(rawSegment: String) {
-            val normalizedSegment = TextModalityProcessor.normalizeTypography(rawSegment)
-            if (normalizedSegment.isBlank()) return
+            if (rawSegment.isBlank()) return
 
             val formattedRecords =
-                TextModalityProcessor.formatTrainingDatasetRecords(normalizedSegment)
+                TextModalityProcessor.formatTrainingDatasetRecords(rawSegment)
             if (formattedRecords != null) {
                 appendFormattedTrainingRecords(
                     records = formattedRecords,
@@ -526,9 +524,8 @@ class TrainingManager(
                 return
             }
 
-            val formattedText = normalizedSegment.lines().joinToString("\n") { line ->
-                TextModalityProcessor.formatStructuredLineIfJson(line)
-            }
+            val formattedText =
+                TextModalityProcessor.formatStructuredTextPreservingLineEndings(rawSegment)
             if (formattedText.isNotBlank()) rawChunks.add(formattedText)
         }
 
@@ -644,7 +641,7 @@ class TrainingManager(
             return Pair(0, totalCharsRead)
         }
 
-        val trailingRaw = window.toString().trim()
+        val trailingRaw = window.toString()
         if (trailingRaw.isNotBlank()) {
             val firstContentIndex = trailingRaw.indexOfFirst { !it.isWhitespace() }
             if (
@@ -765,11 +762,10 @@ class TrainingManager(
             "Unsupported corpus rights status: $rightsStatus"
         }
         requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
-        val clean = fullText.trim()
-        if (clean.isBlank() || closed) return false
+        if (fullText.isBlank() || closed) return false
 
-        val normalizedText = TextModalityProcessor.formatTrainingDocument(clean)
-        if (normalizedText.isBlank()) return false
+        val formattedText = TextModalityProcessor.formatTrainingDocument(fullText)
+        if (formattedText.isBlank()) return false
 
         val documentId = sha256Utf16Be(fullText)
         val document = CorpusDocumentEntity(
@@ -780,10 +776,10 @@ class TrainingManager(
             title = title,
             language = language,
             canonicalUrl = canonicalUrl,
-            characterCount = clean.length,
+            characterCount = fullText.length,
             chunkCount = 0,
             datasetSplit = "VALIDATION",
-            validationText = normalizedText,
+            validationText = formattedText,
             plannedEpochs = 0,
             rightsStatus = rightsStatus,
             status = "READY",
@@ -1400,12 +1396,11 @@ class TrainingManager(
     }
 
     fun enqueueData(source: String, title: String, content: String) {
-        val trimmed = content.trim()
-        if (trimmed.isBlank() || closed) return
+        if (content.isBlank() || closed) return
 
-        if (trimmed.length > 380) {
+        if (content.length > 380) {
             scope.launch {
-                runSuspendCatching { enqueueDocument(source, title, trimmed) }
+                runSuspendCatching { enqueueDocument(source, title, content) }
                     .onFailure { error ->
                         Log.e(TAG, "Failed to persist long-form training input", error)
                     }
@@ -1413,7 +1408,7 @@ class TrainingManager(
             return
         }
 
-        val processed = TextModalityProcessor.process(trimmed, title, chunkSize = 380, overlap = 40)
+        val processed = TextModalityProcessor.process(content, title, chunkSize = 380, overlap = 40)
         if (processed.isEmpty()) return
 
         val newItems = processed.map { pChunk ->
@@ -1425,16 +1420,13 @@ class TrainingManager(
             )
         }
 
-        // Dedup atomic di bawah lock yang sama dengan dequeue
         synchronized(queueLock) {
             if (closed) return
             val current = _nextQueue.value
             val nonDuplicates = newItems.filter { item ->
                 current.none { it.content == item.content && it.documentTitle == null }
             }
-            if (nonDuplicates.isNotEmpty()) {
-                appendPersistingQueueItems(nonDuplicates)
-            }
+            if (nonDuplicates.isNotEmpty()) appendPersistingQueueItems(nonDuplicates)
         }
     }
 
