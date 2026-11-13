@@ -135,6 +135,21 @@ class TokenizerByteLevelBpeTest {
     }
 
     @Test
+    fun trainingAndInferenceUseIdenticalWhitespaceAndSpecialTokenBoundaries() {
+        val tokenizer = newTokenizer()
+        val sample = "  leading\\tspaces \\r\\nand<USER>adjacent marker  "
+        val corpus = List(64) { sample }
+
+        tokenizer.trainBpe(corpus, targetVocabSize = 512, maxNewMerges = 48)
+
+        assertTrue("Repeated text should produce at least one merge.", tokenizer.mergeCount > 0)
+        assertEquals(
+            sample,
+            tokenizer.decode(tokenizer.encode(sample), keepControlTokens = true)
+        )
+    }
+
+    @Test
     fun snapshotRoundTripPreservesVocabularyMergesFingerprintAndEncoding() {
         val tokenizer = newTokenizer()
         val corpus = List(64) {
