@@ -3,6 +3,8 @@ package com.argus.agi.model
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -908,11 +910,15 @@ class ArgusNeuralEngine private constructor(
         includeReasoningMarkers: Boolean = false,
         reasoningMode: Boolean = false
     ): String = withContext(Dispatchers.Default) {
+        val generationContext = currentCoroutineContext()
+        generationContext.ensureActive()
         synchronized(modelLock) {
+            generationContext.ensureActive()
             val formattedPrompt = formatGenerationPrompt(prompt, reasoningMode)
 
             // PENTING: autoRegister = false saat inference agar kamus token stabil
             val rawTokens = tokenizer.encode(formattedPrompt, autoRegister = false)
+            generationContext.ensureActive()
             if (rawTokens.isEmpty()) return@withContext "Input kosong."
 
             val currentVocab = tokenizer.vocabSize
@@ -945,8 +951,10 @@ class ArgusNeuralEngine private constructor(
 
             // Prefill: K,V untuk semua posisi prompt dan aktivasi multi-layer
             for (pos in 0 until initialLen) {
+                generationContext.ensureActive()
                 computeTokenEmbedAndPos(currentTokens[pos], pos, embedScale, hidden)
                 for (layer in 0 until layerCount) {
+                    generationContext.ensureActive()
                     val b = blocks[layer]
                     computeLinear(hidden, b.wK, dModel, dModel, k)
                     System.arraycopy(k, 0, kCache[layer], pos * dModel, dModel)
@@ -960,9 +968,11 @@ class ArgusNeuralEngine private constructor(
                     val scores = FloatArray(seqSoFar)
 
                     for (h in 0 until nHeads) {
+                        generationContext.ensureActive()
                         val hOffset = h * headDim
                         var maxScore = -Float.MAX_VALUE
                         for (j in 0 until seqSoFar) {
+                            if ((j and 0x3F) == 0) generationContext.ensureActive()
                             var dot = 0f
                             val kOffset = j * dModel + hOffset
                             for (d in 0 until headDim) dot += q[hOffset + d] * kCache[layer][kOffset + d]
@@ -981,6 +991,7 @@ class ArgusNeuralEngine private constructor(
                         for (d in 0 until headDim) {
                             var weightedV = 0f
                             for (j in 0 until seqSoFar) {
+                                if ((j and 0x3F) == 0) generationContext.ensureActive()
                                 val vOffset = j * dModel + hOffset
                                 weightedV += scores[j] * vCache[layer][vOffset + d]
                             }
@@ -1008,12 +1019,14 @@ class ArgusNeuralEngine private constructor(
             // Decode loop
             var currentPos = initialLen - 1
             for (step in 0 until maxNewTokens) {
+                generationContext.ensureActive()
                 if (currentPos >= maxSeqLen - 1) break
 
                 val lastTok = currentTokens[currentPos]
                 computeTokenEmbedAndPos(lastTok, currentPos, embedScale, hidden)
 
                 for (layer in 0 until layerCount) {
+                    generationContext.ensureActive()
                     val b = blocks[layer]
                     if (step > 0) {
                         computeLinear(hidden, b.wK, dModel, dModel, k)
@@ -1029,9 +1042,11 @@ class ArgusNeuralEngine private constructor(
                     val scores = FloatArray(seqSoFar)
 
                     for (h in 0 until nHeads) {
+                        generationContext.ensureActive()
                         val hOffset = h * headDim
                         var maxScore = -Float.MAX_VALUE
                         for (j in 0 until seqSoFar) {
+                            if ((j and 0x3F) == 0) generationContext.ensureActive()
                             var dot = 0f
                             val kOffset = j * dModel + hOffset
                             for (d in 0 until headDim) dot += q[hOffset + d] * kCache[layer][kOffset + d]
@@ -1050,6 +1065,7 @@ class ArgusNeuralEngine private constructor(
                         for (d in 0 until headDim) {
                             var weightedV = 0f
                             for (j in 0 until seqSoFar) {
+                                if ((j and 0x3F) == 0) generationContext.ensureActive()
                                 val vOffset = j * dModel + hOffset
                                 weightedV += scores[j] * vCache[layer][vOffset + d]
                             }
@@ -1074,6 +1090,7 @@ class ArgusNeuralEngine private constructor(
                 }
 
                 for (vIdx in 0 until currentVocab) {
+                    if ((vIdx and 0x3F) == 0) generationContext.ensureActive()
                     var sum = 0f
                     val wOff = vIdx * dModel
                     for (d in 0 until dModel) sum += hidden[d] * wHead[wOff + d]
@@ -1088,6 +1105,7 @@ class ArgusNeuralEngine private constructor(
                 currentPos++
             }
 
+            generationContext.ensureActive()
             val decoded = tokenizer.decode(
                 generatedTokens,
                 keepReasoningTokens = includeReasoningMarkers || reasoningMode

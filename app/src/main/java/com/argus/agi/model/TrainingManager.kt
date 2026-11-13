@@ -1699,7 +1699,12 @@ class TrainingManager(
         return ordered
     }
 
-    private suspend fun popNext(): TrainingData? {
+    /**
+     * Reserves the next item only after Room confirms its TRAINING transition.
+     * Internal visibility allows persistence-contract tests to exercise the same path
+     * used by the worker without starting the optimizer loop.
+     */
+    internal suspend fun popNext(): TrainingData? {
         val startCompletion = CompletableDeferred<Result<Unit>>()
         val reservation = synchronized(queueLock) {
             val list = _nextQueue.value

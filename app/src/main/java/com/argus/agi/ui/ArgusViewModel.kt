@@ -38,6 +38,8 @@ import com.argus.agi.skill.WebSearchSkill
 import com.argus.agi.skill.WebSearchSkillOutput
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -212,6 +214,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
     private val isSending = AtomicBoolean(false)
     private var generationJob: Job? = null
+    private var generationSequence = 0L
 
     init {
         runCatching { ArgusForegroundService.startService(application) }
@@ -467,6 +470,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         appendMessage(userMsg)
 
         _isGenerating.value = true
+        val requestGeneration = ++generationSequence
         generationJob = viewModelScope.launch {
             try {
                 val worldSummary = worldModel.currentContextSummary.value
@@ -511,6 +515,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             "Please try again shortly."
                 }
 
+                currentCoroutineContext().ensureActive()
                 val parsedOutput = ReasoningOutputParser.parse(rawOutput)
                 val reflection = worldModel.reflectOnResponse(text, parsedOutput.answer)
 
@@ -574,14 +579,17 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     audioVoiceManager.speak(finalAnswer)
                 }
             } finally {
-                isSending.set(false)
-                _isGenerating.value = false
-                generationJob = null
+                if (requestGeneration == generationSequence) {
+                    isSending.set(false)
+                    _isGenerating.value = false
+                    generationJob = null
+                }
             }
         }
     }
 
     fun stopGeneration() {
+        generationSequence += 1L
         generationJob?.cancel()
         generationJob = null
         isSending.set(false)
