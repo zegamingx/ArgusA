@@ -986,7 +986,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 if (id != null) {
                     result.add(id)
                 } else if (autoRegister) {
-                    result.add(runCatching { registerToken(piece) }.getOrDefault(UNK_ID))
+                    result.add(registerToken(piece))
                 } else {
                     var pieceIdx = 0
                     while (pieceIdx < piece.length) {
@@ -1078,7 +1078,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             if (existingId != null) {
                 result.add(existingId)
             } else if (autoRegister) {
-                result.add(runCatching { registerToken(charStr) }.getOrDefault(UNK_ID))
+                result.add(registerToken(charStr))
             } else {
                 // Stable Unicode escape fallback encoded with existing ASCII token IDs.
                 // No vocabulary or embedding resize is needed for unseen code points.
