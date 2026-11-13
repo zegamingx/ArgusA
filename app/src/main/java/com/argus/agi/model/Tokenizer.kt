@@ -492,22 +492,24 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             require(left !in CONTROL_TOKENS && right !in CONTROL_TOKENS) {
                 "Special tokens cannot be merge components."
             }
-            require(tokenToId.containsKey(left) && tokenToId.containsKey(right)) {
-                "Merge components must already exist in the vocabulary."
-            }
             val combined = left + right
-            require(tokenToId.containsKey(combined)) {
-                "Merged token '$combined' is missing from the vocabulary."
-            }
             require(combined !in CONTROL_TOKENS) {
                 "A merge cannot resolve to a reserved control token."
             }
             if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
-                require((left + right).all { character -> character.code <= 0xFF }) {
+                require(tokenToId.containsKey(left) && tokenToId.containsKey(right)) {
+                    "Byte-Level BPE merge components must already exist in the vocabulary."
+                }
+                require(tokenToId.containsKey(combined)) {
+                    "Merged byte-level token '$combined' is missing from the vocabulary."
+                }
+                require(combined.all { character -> character.code <= 0xFF }) {
                     "Byte-Level BPE merges must remain inside the byte-symbol alphabet."
                 }
             }
             if (config.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1) {
+                // Legacy seed merges intentionally contain intermediate symbols
+                // (for example "ya") that are not standalone vocabulary entries.
                 require(!left.contains('~') && !right.contains('~')) {
                     "LEARNED_BPE_V1 merge rules cannot consume the reserved '~' escape marker."
                 }
