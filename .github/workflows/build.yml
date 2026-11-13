@@ -15,6 +15,12 @@ on:
       - "README.md"
       - ".github/workflows/build.yml"
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish the signed APK to the GitHub Release tag."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -182,6 +188,7 @@ jobs:
           echo "APK signature verified against the persistent Argus upload certificate."
 
       - name: Publish latest signed APK to GitHub Release tag
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_release == true
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
