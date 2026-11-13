@@ -206,6 +206,49 @@ class TextModalityPreservationTest {
     }
 
     @Test
+    fun chunkBoundariesNeverSplitUtf16SurrogatePairs() {
+        val tokenizer = Tokenizer()
+
+        val endBoundarySample = "a".repeat(31) + "😀" + "b".repeat(80)
+        val nonOverlappingChunks = TextModalityProcessor.process(
+            rawText = endBoundarySample,
+            documentTitle = "Surrogate-safe chunk end",
+            chunkSize = 32,
+            overlap = 0
+        )
+
+        assertTrue(nonOverlappingChunks.size > 1)
+        assertEquals(
+            endBoundarySample,
+            nonOverlappingChunks.joinToString(separator = "") { it.content }
+        )
+        nonOverlappingChunks.forEach { chunk ->
+            assertEquals(
+                "Every chunk must remain valid UTF-16 at its end boundary.",
+                chunk.content,
+                tokenizer.decode(tokenizer.encode(chunk.content))
+            )
+        }
+
+        val overlapBoundarySample = "a".repeat(34) + "😀" + "b".repeat(90)
+        val overlappingChunks = TextModalityProcessor.process(
+            rawText = overlapBoundarySample,
+            documentTitle = "Surrogate-safe overlap start",
+            chunkSize = 40,
+            overlap = 5
+        )
+
+        assertTrue(overlappingChunks.size > 1)
+        overlappingChunks.forEach { chunk ->
+            assertEquals(
+                "Every chunk must remain valid UTF-16 at its overlap boundary.",
+                chunk.content,
+                tokenizer.decode(tokenizer.encode(chunk.content))
+            )
+        }
+    }
+
+    @Test
     fun structuredPlainTextFormattingPreservesCrLfLfAndCrSeparators() {
         val raw = "alpha  \r\nbeta\n  gamma\rdelta\r\n"
 
