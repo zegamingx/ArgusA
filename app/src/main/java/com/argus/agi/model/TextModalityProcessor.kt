@@ -45,6 +45,15 @@ object TextModalityProcessor {
         val separator: String
     )
 
+    private fun rolePayloadAfterHeader(line: String, headerEnd: Int): String {
+        val payloadStart = if (headerEnd < line.length && line[headerEnd] == ' ') {
+            headerEnd + 1
+        } else {
+            headerEnd
+        }
+        return line.substring(payloadStart)
+    }
+
     private fun splitTextLinesPreservingSeparators(text: String): List<SourceLine> {
         if (text.isEmpty()) return emptyList()
 
@@ -601,13 +610,13 @@ object TextModalityProcessor {
             val role = currentRole
             val payload = currentTurnText.toString()
             if (role != null && payload.isNotEmpty()) {
-                val availablePayloadLength = chunkSize - role.token.length
-                if (payload.length + role.token.length > chunkSize && availablePayloadLength > 0) {
+                val availablePayloadLength = chunkSize - role.token.length - 1
+                if (payload.length + role.token.length + 1 > chunkSize && availablePayloadLength > 0) {
                     splitBySentenceBoundaries(payload, availablePayloadLength, 0).forEach { piece ->
-                        formattedTurns.add(role.token + piece)
+                        formattedTurns.add(role.token + " " + piece)
                     }
                 } else {
-                    formattedTurns.add(role.token + payload)
+                    formattedTurns.add(role.token + " " + payload)
                 }
             }
             currentTurnText.setLength(0)
@@ -625,19 +634,19 @@ object TextModalityProcessor {
                 systemMatcher.find() -> {
                     flushTurn()
                     currentRole = TurnRole.SYSTEM
-                    currentTurnText.append(line.substring(systemMatcher.end()))
+                    currentTurnText.append(rolePayloadAfterHeader(line, systemMatcher.end()))
                     pendingSeparator = sourceLine.separator
                 }
                 userMatcher.find() -> {
                     flushTurn()
                     currentRole = TurnRole.USER
-                    currentTurnText.append(line.substring(userMatcher.end()))
+                    currentTurnText.append(rolePayloadAfterHeader(line, userMatcher.end()))
                     pendingSeparator = sourceLine.separator
                 }
                 assistantMatcher.find() -> {
                     flushTurn()
                     currentRole = TurnRole.ASSISTANT
-                    currentTurnText.append(line.substring(assistantMatcher.end()))
+                    currentTurnText.append(rolePayloadAfterHeader(line, assistantMatcher.end()))
                     pendingSeparator = sourceLine.separator
                 }
                 currentRole != null -> {
@@ -665,7 +674,7 @@ object TextModalityProcessor {
             if (window.isEmpty()) return
             chunks.add(
                 ProcessedChunk(
-                    content = window.toString() + Tokenizer.EOS_TOKEN,
+                    content = window.toString() + " " + Tokenizer.EOS_TOKEN,
                     modality = TextModality.CONVERSATION,
                     segmentTitle = "$documentTitle [Dialog ${chunks.size + 1}]",
                     tokenHint = "Turn Dialog: $turnCount giliran"
@@ -998,6 +1007,25 @@ object TextModalityProcessor {
         }
     }
 
+    private fun unclosedQuoteCloser(text: String): Char? {
+        val closers = ArrayList<Char>()
+        for (character in text) {
+            when (character) {
+                '"' -> {
+                    if (closers.lastOrNull() == '"') closers.removeAt(closers.lastIndex)
+                    else closers.add('"')
+                }
+                '“' -> closers.add('”')
+                '”' -> if (closers.lastOrNull() == '”') closers.removeAt(closers.lastIndex)
+                '‘' -> closers.add('’')
+                '’' -> if (closers.lastOrNull() == '’') closers.removeAt(closers.lastIndex)
+                '«' -> closers.add('»')
+                '»' -> if (closers.lastOrNull() == '»') closers.removeAt(closers.lastIndex)
+            }
+        }
+        return closers.lastOrNull()
+    }
+
     /**
      * Pembagi kalimat adaptif:
      * - Memprioritaskan pemisahan pada \n\n, \n, ". ", "? ", "! "
@@ -1029,10 +1057,9 @@ object TextModalityProcessor {
                 if (bestPunct > minBreak) {
                     var candidateEnd = start + bestPunct + 1
                     if (quoteAware) {
-                        val quotesBefore = text.substring(start, candidateEnd).count { it == '"' }
-                        if (quotesBefore % 2 == 1) {
-                            // Kita berada di dalam tanda kutip — geser ke setelah kutip penutup.
-                            val closingQuote = text.indexOf('"', candidateEnd)
+                        val expectedCloser = unclosedQuoteCloser(text.substring(start, candidateEnd))
+                        if (expectedCloser != null) {
+                            val closingQuote = text.indexOf(expectedCloser, candidateEnd)
                             val overshootLimit = start + chunkSize + 40
                             if (closingQuote in candidateEnd until overshootLimit) {
                                 candidateEnd = closingQuote + 1
