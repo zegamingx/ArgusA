@@ -75,22 +75,23 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         const val MAX_TOKEN_LEN = TokenizerConfig.DEFAULT_MAX_TOKEN_LENGTH
         const val MAX_VOCAB_SIZE = TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE
 
-        private val SPECIAL_TOKENS = listOf(
-            THINK_START, THINK_END, SYSTEM_TOKEN, USER_TOKEN,
-            ASSISTANT_TOKEN, BOS_TOKEN, EOS_TOKEN
-        )
-
         private val SPECIAL_IDS: Map<String, Int> = linkedMapOf(
-            PAD_TOKEN to PAD_ID,
-            UNK_TOKEN to UNK_ID,
-            BOS_TOKEN to BOS_ID,
-            EOS_TOKEN to EOS_ID,
-            SYSTEM_TOKEN to SYSTEM_ID,
-            USER_TOKEN to USER_ID,
-            ASSISTANT_TOKEN to ASSISTANT_ID,
-            THINK_START to THINK_START_ID,
-            THINK_END to THINK_END_ID
-        )
+        PAD_TOKEN to PAD_ID,
+        UNK_TOKEN to UNK_ID,
+        BOS_TOKEN to BOS_ID,
+        EOS_TOKEN to EOS_ID,
+        SYSTEM_TOKEN to SYSTEM_ID,
+        USER_TOKEN to USER_ID,
+        ASSISTANT_TOKEN to ASSISTANT_ID,
+        THINK_START to THINK_START_ID,
+        THINK_END to THINK_END_ID
+   )
+
+// Derived from SPECIAL_IDS — single source of truth.
+// Sorted longest-first for correct longest-match behavior
+// (important if you ever add overlapping prefixes like <USER> vs <USER_X>).
+        private val SPECIAL_TOKENS: List<String> =
+        SPECIAL_IDS.keys.sortedByDescending { it.length }
 
         private val CONTROL_TOKENS: Set<String> = SPECIAL_IDS.keys +
                 setOf(PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, UNK_TOKEN)
