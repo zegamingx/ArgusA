@@ -101,7 +101,7 @@ class TokenizerByteLevelBpeTest {
         val first = newTokenizer()
         val second = newTokenizer()
         first.trainBpe(corpus, targetVocabSize = 512, maxNewMerges = 64)
-        second.trainBpe(corpus, targetVocabSize = 512, maxNewMerges = 64)
+        second.trainBpe(corpus.reversed(), targetVocabSize = 512, maxNewMerges = 64)
 
         assertTrue("Training should learn at least one byte merge.", first.mergeCount > 0)
         assertEquals(first.exportVocab(), second.exportVocab())
