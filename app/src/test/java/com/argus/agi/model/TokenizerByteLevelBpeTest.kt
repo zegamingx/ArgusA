@@ -35,9 +35,26 @@ class TokenizerByteLevelBpeTest {
             val expectedId = 9 + byteValue
             assertEquals(expectedId, tokenizer.baseByteTokenId(byteValue))
             val symbol = tokensById[expectedId]
-            assertTrue("Missing base byte token $byteValue at ID $expectedId.", symbol != null)
-            assertEquals(1, symbol!!.length)
-            assertEquals(byteValue, symbol[0].code)
+            val resolvedSymbol = requireNotNull(symbol) {
+                "Missing base byte token $byteValue at ID $expectedId."
+            }
+            assertEquals(1, resolvedSymbol.length)
+            assertEquals(byteValue, resolvedSymbol[0].code)
+        }
+    }
+
+    @Test
+    fun baseByteEncodingMatchesStableKnownTestVectors() {
+        val tokenizer = newTokenizer()
+        val vectors = listOf(
+            "A" to listOf(74),
+            "hi" to listOf(113, 114),
+            " " to listOf(41),
+            "😀" to listOf(249, 168, 161, 137)
+        )
+
+        for ((input, expectedIds) in vectors) {
+            assertEquals(expectedIds, tokenizer.encode(input))
         }
     }
 
@@ -184,7 +201,7 @@ class TokenizerByteLevelBpeTest {
     @Test
     fun malformedUtf16IsRejectedInsteadOfSilentlyReplacingInput() {
         val tokenizer = newTokenizer()
-        val malformed = "valid prefix followed by an unpaired high surrogate: \uD800"
+        val malformed = "valid prefix followed by an unpaired high surrogate: " + 0xD800.toChar()
 
         val failure = runCatching { tokenizer.encode(malformed) }.exceptionOrNull()
         assertTrue("Malformed UTF-16 must be rejected.", failure is IllegalArgumentException)
