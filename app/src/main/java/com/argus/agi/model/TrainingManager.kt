@@ -312,8 +312,10 @@ class TrainingManager(
         canonicalUrl: String? = null,
         rightsStatus: String = "UNVERIFIED"
     ): Int {
-        require(chunkSize > overlap) {
-            "chunkSize ($chunkSize) harus > overlap ($overlap) agar iterasi maju"
+        require(chunkSize > 0) { "chunkSize harus > 0." }
+        require(overlap >= 0) { "overlap tidak boleh negatif." }
+        require(overlap < chunkSize) {
+            "overlap ($overlap) harus < chunkSize ($chunkSize) agar iterasi maju."
         }
         require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
             "epochs harus berada pada rentang 1..$MAX_DOCUMENT_EPOCHS"
@@ -489,8 +491,10 @@ class TrainingManager(
         canonicalUrl: String? = null,
         rightsStatus: String = "UNVERIFIED"
     ): Pair<Int, Long> {
-        require(chunkSize > overlap) {
-            "chunkSize ($chunkSize) harus > overlap ($overlap) agar iterasi maju"
+        require(chunkSize > 0) { "chunkSize harus > 0." }
+        require(overlap >= 0) { "overlap tidak boleh negatif." }
+        require(overlap < chunkSize) {
+            "overlap ($overlap) harus < chunkSize ($chunkSize) agar iterasi maju."
         }
         require(overlap <= chunkSize / 3) {
             "overlap ($overlap) harus <= chunkSize / 3 (${chunkSize / 3}) agar jaminan sliding window selalu maju"
