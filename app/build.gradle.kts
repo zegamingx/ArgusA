@@ -1,6 +1,7 @@
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.Properties
+import org.gradle.api.tasks.testing.Test
 
 plugins {
     alias(libs.plugins.android.application)
@@ -16,7 +17,7 @@ android {
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
+            version = "3.31.6"
         }
     }
 
@@ -45,11 +46,6 @@ android {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
 
-        externalNativeBuild {
-            cmake {
-                cppFlags += listOf("-std=c++20")
-            }
-        }
     }
 
     val jksFile = rootProject.file("my-upload-key.jks")
@@ -131,6 +127,13 @@ android {
     }
 }
 
+// Android local unit-test tasks run on the JUnit Platform. Vintage keeps the
+// existing JUnit 4 Robolectric runners operational while Jupiter 6 is available
+// for new tests and gradual migration.
+tasks.withType<Test>().configureEach {
+    useJUnitPlatform()
+}
+
 dependencies {
     implementation(platform(libs.androidx.compose.bom))
 
@@ -162,12 +165,16 @@ dependencies {
     implementation(libs.retrofit)
 
     testImplementation(platform(libs.androidx.compose.bom))
+    testImplementation(platform(libs.junit.bom))
     testImplementation(libs.androidx.compose.ui.test.junit4)
     testImplementation(libs.androidx.core)
     testImplementation(libs.androidx.junit)
-    testImplementation(libs.junit)
+    testImplementation(libs.junit4)
+    testImplementation(libs.junit.jupiter)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.robolectric)
+    testRuntimeOnly(libs.junit.platform.launcher)
+    testRuntimeOnly(libs.junit.vintage.engine)
 
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

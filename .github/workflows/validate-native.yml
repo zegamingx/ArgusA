@@ -59,24 +59,39 @@ jobs:
           fi
           test -s "${platform_alias}/android.jar"
 
-      - name: Install pinned Vulkan NDK and CMake
+      - name: Install Android NDK r30 and CMake 3.31.6
         shell: bash
         run: |
           set -euo pipefail
+
           sdkmanager_path="$(command -v sdkmanager || true)"
           if [[ -z "${sdkmanager_path}" ]]; then
             sdkmanager_path="$(find "${ANDROID_HOME}/cmdline-tools" -type f -name sdkmanager -print -quit)"
           fi
           test -n "${sdkmanager_path}"
+
           set +o pipefail
           yes | "${sdkmanager_path}" --licenses >/dev/null
           set -o pipefail
-          "${sdkmanager_path}" --install "ndk;30.0.16248370" "cmake;3.22.1"
+          "${sdkmanager_path}" --install "ndk;30.0.16248370"
+
+          cmake_version="3.31.6"
+          cmake_archive="cmake-${cmake_version}-linux-x86_64.tar.gz"
+          cmake_archive_path="${RUNNER_TEMP}/${cmake_archive}"
+          cmake_root="${RUNNER_TEMP}/cmake-${cmake_version}"
+          curl --fail --location --retry 3 --silent --show-error \
+            "https://cmake.org/files/v3.31/${cmake_archive}" \
+            --output "${cmake_archive_path}"
+          printf '%s  %s\n' "5a1133ff103c71eb5120e2cc3de922733e7d8a26a98ae716397e8676adb367bf" "${cmake_archive_path}" | sha256sum --check --status
+          mkdir -p "${cmake_root}"
+          tar -xzf "${cmake_archive_path}" --strip-components=1 -C "${cmake_root}"
+          echo "${cmake_root}/bin" >> "${GITHUB_PATH}"
+          "${cmake_root}/bin/cmake" --version | grep -Fx "cmake version ${cmake_version}"
+
           glslc_path="$(find "${ANDROID_HOME}/ndk/30.0.16248370/shader-tools" -type f -name glslc -print -quit)"
           test -n "${glslc_path}"
           test -x "${glslc_path}"
-          test -d "${ANDROID_HOME}/cmake/3.22.1"
-
+          echo "NDK r30, CMake ${cmake_version}, and NDK glslc are ready."
       - name: Verify Gradle and Java toolchain
         run: |
           chmod +x gradlew

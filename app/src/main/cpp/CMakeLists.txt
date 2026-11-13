@@ -1,6 +1,10 @@
-cmake_minimum_required(VERSION 3.22.1)
+cmake_minimum_required(VERSION 3.28.0)
 
 project(argus_training LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(ARGUS_NDK_ROOT "${CMAKE_ANDROID_NDK}")
 if(NOT ARGUS_NDK_ROOT AND DEFINED ANDROID_NDK)
@@ -133,7 +137,7 @@ argus_compile_shader(
 
 add_library(argus_training SHARED vulkan_training_jni.cpp)
 
-target_compile_features(argus_training PRIVATE cxx_std_20)
+target_compile_features(argus_training PRIVATE cxx_std_23)
 target_compile_options(argus_training PRIVATE -Wall -Wextra -Wpedantic)
 target_include_directories(
     argus_training

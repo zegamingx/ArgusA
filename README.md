@@ -15,8 +15,8 @@ Argus is a native Android application built with Kotlin and Jetpack Compose.
 | Android SDK Platform | 37 | Compile SDK and target SDK |
 | Android minimum SDK | 34 | Minimum supported Android API |
 | Android SDK Build Tools | 36.0.0 | APK packaging and signing tools |
-| Android NDK | 30.0.16248370 | Native C/C++ toolchain |
-| CMake | 3.22.1 | Native build configuration |
+| Android NDK | 30.0.16248370 | Native C/C++ toolchain |\n| C++ language standard | C++23 | Vulkan JNI native library |\n| JUnit | 6.1.3 | Host-side unit-test platform and Jupiter API |
+| CMake | 3.31.6 | Native build configuration; minimum project requirement is 3.28.0 |
 
 JDK 25 is the runtime for Gradle; it does not set the application's Java
 bytecode target. Argus compiles Java-compatible application bytecode for
@@ -35,6 +35,13 @@ project's actual combination before it is treated as build-verified.
 The wrapper distribution is checksum-pinned in
 `gradle/wrapper/gradle-wrapper.properties`. Do not replace it with an
 unversioned system Gradle installation.
+
+Local JVM unit tests use JUnit 6.1.3 on the JDK 25 host runtime. Existing
+JUnit 4 test classes, including Robolectric suites that require
+`RobolectricTestRunner`, run through the JUnit Vintage 6.1.3 engine while
+new tests can use JUnit Jupiter. AndroidX instrumentation dependencies remain
+on their AndroidX/JUnit 4 runner path; JUnit 6 is not placed on the
+instrumentation runtime for the API 34 minimum-device tier.
 
 ## Local builds
 
@@ -60,8 +67,9 @@ The private repository keeps the CI signing-key backup in the private GitHub Rel
 
 ## Vulkan training backend
 
-The native training module is built with Android NDK r30 and CMake 3.22.1 for
-arm64-v8a, armeabi-v7a, and x86_64. It uses the NDK-bundled glslc compiler to
+The native training module is built with Android NDK r30, CMake 3.31.6
+(project minimum 3.28.0), and C++23 for arm64-v8a, armeabi-v7a, and x86_64.
+It uses the NDK-bundled glslc compiler to
 compile the AdamW and batched-linear compute shaders to SPIR-V during the native build.
 
 When a compatible Vulkan GPU and compute queue are available, sufficiently large
@@ -86,8 +94,8 @@ runtime is currently integrated.
 The CI pull-request workflow builds the native library and verifies that the
 APK contains the configured ABI libraries. Main, pull-request, and release
 workflows execute Gradle on JDK 25; the Android app's Java source and bytecode
-compatibility target remains Java 21. All workflows use the pinned NDK r30 and
-CMake 3.22.1 versions for native builds.
+compatibility target remains Java 21. All workflows install the checksum-pinned
+CMake 3.31.6 distribution and NDK r30 for native builds.
 
 ## Background training service
 
