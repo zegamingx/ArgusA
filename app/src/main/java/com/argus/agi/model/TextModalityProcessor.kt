@@ -281,10 +281,15 @@ object TextModalityProcessor {
     internal fun formatTrainingDocument(rawText: String): String {
         if (rawText.isBlank()) return ""
 
-        val records = formatTrainingDatasetRecords(rawText)
-        if (records != null) return records.joinToString("\n")
-
-        return formatStructuredTextPreservingLineEndings(rawText)
+        // Validation keeps each source document whole so the engine can own context
+        // windowing and target weighting. Reuse the exact modality serializer used
+        // by training, including its control-token framing and EOS policy.
+        return process(
+            rawText = rawText,
+            documentTitle = "Validation",
+            chunkSize = Int.MAX_VALUE,
+            overlap = 0
+        ).joinToString("\n") { chunk -> chunk.content }
     }
 
     private fun firstNonBlankText(obj: JSONObject, keys: List<String>): String {
