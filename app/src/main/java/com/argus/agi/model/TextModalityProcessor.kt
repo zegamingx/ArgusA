@@ -715,7 +715,7 @@ object TextModalityProcessor {
         fun flushPair() {
             val question = currentQuestion
             if (question != null && answerStarted && currentAnswer.isNotBlank()) {
-                pairs += question.toString() to currentAnswer.toString()
+                pairs.add(question.toString() to currentAnswer.toString())
             }
             currentQuestion = null
             answerStarted = false
@@ -741,15 +741,15 @@ object TextModalityProcessor {
                     }
                     pendingSeparator = sourceLine.separator
                 }
-                currentQuestion != null -> {
-                    if (answerStarted) {
-                        currentAnswer.append(pendingSeparator).append(line)
-                    } else {
-                        currentQuestion.append(pendingSeparator).append(line)
-                    }
-                    pendingSeparator = sourceLine.separator
-                }
                 else -> {
+                    val activeQuestion = currentQuestion
+                    if (activeQuestion != null) {
+                        if (answerStarted) {
+                            currentAnswer.append(pendingSeparator).append(line)
+                        } else {
+                            activeQuestion.append(pendingSeparator).append(line)
+                        }
+                    }
                     pendingSeparator = sourceLine.separator
                 }
             }
