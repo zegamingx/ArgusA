@@ -2,6 +2,8 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.Properties
 import org.gradle.api.tasks.testing.Test
+import org.gradle.api.tasks.testing.logging.TestExceptionFormat
+import org.gradle.api.tasks.testing.logging.TestLogEvent
 
 plugins {
     alias(libs.plugins.android.application)
@@ -126,6 +128,15 @@ android {
 // for new tests and gradual migration.
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
+    testLogging {
+        events(
+            TestLogEvent.STARTED,
+            TestLogEvent.PASSED,
+            TestLogEvent.SKIPPED,
+            TestLogEvent.FAILED
+        )
+        exceptionFormat = TestExceptionFormat.FULL
+    }
 }
 
 dependencies {

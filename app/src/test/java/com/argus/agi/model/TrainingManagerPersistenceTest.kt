@@ -6,7 +6,7 @@ import androidx.test.core.app.ApplicationProvider
 import com.argus.agi.data.local.ArgusDatabase
 import com.argus.agi.data.repository.ArgusRepository
 import com.argus.agi.sensor.DeviceGuard
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
@@ -17,6 +17,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
+import java.util.concurrent.Executors
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -42,7 +43,13 @@ class TrainingManagerPersistenceTest {
 
             database.close()
 
-            assertNull(manager.popNext())
+            val nextItem = withTimeout(5_000L) {
+                manager.popNext()
+            }
+            assertNull(
+                "A Room start-state failure must resolve instead of leaving popNext suspended.",
+                nextItem
+            )
             assertEquals(listOf(queuedItem.id), manager.nextQueue.value.map(TrainingData::id))
             assertEquals(TrainingStatus.QUEUED, manager.nextQueue.value.single().status)
             assertEquals(0, manager.totalStepsExecuted.value)
@@ -89,6 +96,11 @@ class TrainingManagerPersistenceTest {
             ArgusDatabase::class.java
         ).build()
         val repository = ArgusRepository(context, database)
+        val trainingDispatcher = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "ArgusTrainingManagerPersistenceTest").apply {
+                isDaemon = true
+            }
+        }.asCoroutineDispatcher()
         var manager: TrainingManager? = null
 
         try {
@@ -114,14 +126,18 @@ class TrainingManagerPersistenceTest {
                 neuralEngine = engine,
                 deviceGuard = deviceGuard,
                 worldModel = worldModel,
-                trainingDispatcher = Dispatchers.Unconfined,
+                trainingDispatcher = trainingDispatcher,
                 repository = repository
             )
             manager = activeManager
             test(database, repository, activeManager)
         } finally {
-            manager?.close()
-            database.close()
+            try {
+                manager?.close()
+            } finally {
+                runCatching { database.close() }
+                trainingDispatcher.close()
+            }
             if (previousCheckpoint == null) {
                 checkpoint.delete()
             } else {

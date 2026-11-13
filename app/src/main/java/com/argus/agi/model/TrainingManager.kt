@@ -19,6 +19,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
@@ -162,6 +163,8 @@ class TrainingManager(
     private val persistenceOperations =
         Channel<QueuePersistenceOperation>(capacity = Channel.UNLIMITED)
 
+    private val workerShutdown = MutableStateFlow(false)
+
     private val _nextQueue = MutableStateFlow<List<TrainingData>>(emptyList())
     val nextQueue: StateFlow<List<TrainingData>> = _nextQueue.asStateFlow()
 
@@ -217,8 +220,33 @@ class TrainingManager(
 
     init {
         persistenceJob = scope.launch {
-            for (operation in persistenceOperations) {
-                processQueuePersistenceOperation(operation)
+            var activeOperation: QueuePersistenceOperation? = null
+            try {
+                for (operation in persistenceOperations) {
+                    activeOperation = operation
+                    try {
+                        processQueuePersistenceOperation(operation)
+                    } catch (cancelled: CancellationException) {
+                        failPendingPersistenceOperation(operation, cancelled)
+                        throw cancelled
+                    } catch (error: Exception) {
+                        failPendingPersistenceOperation(operation, error)
+                        Log.e(TAG, "Training queue persistence operation failed unexpectedly.", error)
+                    } finally {
+                        activeOperation = null
+                    }
+                }
+            } finally {
+                val stopped = CancellationException(
+                    "Training queue persistence worker stopped before all operations completed."
+                )
+                activeOperation?.let { operation ->
+                    failPendingPersistenceOperation(operation, stopped)
+                }
+                while (true) {
+                    val pending = persistenceOperations.tryReceive().getOrNull() ?: break
+                    failPendingPersistenceOperation(pending, stopped)
+                }
             }
         }
 
@@ -1490,7 +1518,9 @@ class TrainingManager(
                     if (closed) break
                 }
 
-                deviceGuard.safetyState.first { it.isSafeToTrain || closed }
+                combine(deviceGuard.safetyState, workerShutdown) { safety, shutdownRequested ->
+                    safety.isSafeToTrain || shutdownRequested
+                }.first { canContinue -> canContinue }
                 if (closed) break
 
                 resetForceOverrideIfSet()
@@ -1600,6 +1630,22 @@ class TrainingManager(
         }
 
         return orderedItems
+    }
+
+    private fun failPendingPersistenceOperation(
+        operation: QueuePersistenceOperation,
+        error: Throwable
+    ) {
+        when (operation) {
+            is QueuePersistenceOperation.Start -> {
+                operation.completion.complete(Result.failure(error))
+            }
+            is QueuePersistenceOperation.Barrier -> {
+                operation.completion.completeExceptionally(error)
+            }
+            is QueuePersistenceOperation.Clear,
+            is QueuePersistenceOperation.Save -> Unit
+        }
     }
 
     private suspend fun processQueuePersistenceOperation(
@@ -2084,7 +2130,9 @@ class TrainingManager(
      * Pending queue items remain persisted in Room and can be restored by the next manager.
      */
     override fun close() {
+        if (closed) return
         closed = true
+        workerShutdown.value = true
         _isTrainingPaused.value = false
         persistenceOperations.close()
         wakeupSignal.trySend(Unit)
