@@ -1,6 +1,17 @@
 name: Argus Native Validation
 
 on:
+  push:
+    branches:
+      - master
+    paths:
+      - "app/**"
+      - "gradle/**"
+      - "gradlew"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - ".github/workflows/validate-native.yml"
   pull_request:
     branches:
       - main
