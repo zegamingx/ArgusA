@@ -534,7 +534,7 @@ object TextModalityProcessor {
         if (qCount >= 1 && aCount >= 1) return TextModality.QA_PAIR
 
         // 3. Cerita & Narasi
-        val quoteCount = trimmed.count { it == '"' }
+        val quoteCount = trimmed.count { character -> character in "\"“”‘’«»" }
         val narrativeKeywords = listOf(
             "berkata", "ujarnya", "sahut", "jawabnya", "bisiknya", "gumam",
             "langkah", "malam itu", "tiba-tiba", "pada suatu", "kerajaan", "hutan",
@@ -767,13 +767,13 @@ object TextModalityProcessor {
         for ((question, answer) in pairs) {
             val header = "${Tokenizer.USER_TOKEN} Tanya:$question\n" +
                 "${Tokenizer.ASSISTANT_TOKEN} Jawab:"
-            val availableForAnswer = chunkSize - header.length - Tokenizer.EOS_TOKEN.length
+            val availableForAnswer = chunkSize - header.length - Tokenizer.EOS_TOKEN.length - 1
 
             if (availableForAnswer <= 0 || answer.length <= availableForAnswer) {
                 pairIndex++
                 chunks.add(
                     ProcessedChunk(
-                        content = header + answer + Tokenizer.EOS_TOKEN,
+                        content = header + answer + " " + Tokenizer.EOS_TOKEN,
                         modality = TextModality.QA_PAIR,
                         segmentTitle = "$documentTitle [T&J $pairIndex/$totalPairs]",
                         tokenHint = "Q&A Pasangan #$pairIndex"
@@ -786,7 +786,7 @@ object TextModalityProcessor {
                     val isLast = pieceIndex == answerPieces.lastIndex
                     chunks.add(
                         ProcessedChunk(
-                            content = header + piece + if (isLast) Tokenizer.EOS_TOKEN else "",
+                            content = header + piece + if (isLast) " " + Tokenizer.EOS_TOKEN else "",
                             modality = TextModality.QA_PAIR,
                             segmentTitle = "$documentTitle [T&J $pairIndex/$totalPairs]",
                             tokenHint = "Q&A Pasangan #$pairIndex (part ${pieceIndex + 1}/${answerPieces.size})"
