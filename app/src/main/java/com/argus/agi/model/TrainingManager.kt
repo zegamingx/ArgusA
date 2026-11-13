@@ -513,20 +513,16 @@ class TrainingManager(
         fun appendSegment(rawSegment: String) {
             if (rawSegment.isBlank()) return
 
-            val formattedRecords =
-                TextModalityProcessor.formatTrainingDatasetRecords(rawSegment)
-            if (formattedRecords != null) {
-                appendFormattedTrainingRecords(
-                    records = formattedRecords,
-                    destination = rawChunks,
-                    chunkSize = chunkSize
-                )
-                return
-            }
-
-            val formattedText =
-                TextModalityProcessor.formatStructuredTextPreservingLineEndings(rawSegment)
-            if (formattedText.isNotBlank()) rawChunks.add(formattedText)
+            // The stream reader already applies document-level overlap. Reuse the
+            // shared modality processor with zero additional overlap so JSONL,
+            // conversations, Q&A, reasoning, and plain text follow one contract.
+            val processedChunks = TextModalityProcessor.process(
+                rawText = rawSegment,
+                documentTitle = title,
+                chunkSize = chunkSize,
+                overlap = 0
+            )
+            rawChunks.addAll(processedChunks.map(ProcessedChunk::content))
         }
 
         while (true) {
@@ -1143,36 +1139,6 @@ class TrainingManager(
                 updatedAtEpochMs = System.currentTimeMillis()
             )
         }
-    }
-
-    private fun appendFormattedTrainingRecords(
-        records: List<String>,
-        destination: MutableList<String>,
-        chunkSize: Int
-    ) {
-        val buffer = StringBuilder()
-
-        fun flushBuffer() {
-            if (buffer.isNotEmpty()) {
-                destination.add(buffer.toString())
-                buffer.setLength(0)
-            }
-        }
-
-        for (record in records) {
-            if (record.isBlank()) continue
-            if (record.length > chunkSize) {
-                flushBuffer()
-                destination.add(record)
-                continue
-            }
-            if (buffer.isNotEmpty() && buffer.length + record.length + 1 > chunkSize) {
-                flushBuffer()
-            }
-            if (buffer.isNotEmpty()) buffer.append('\n')
-            buffer.append(record)
-        }
-        flushBuffer()
     }
 
     /**
