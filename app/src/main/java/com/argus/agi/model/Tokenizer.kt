@@ -522,9 +522,8 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         targetVocabSize: Int = config.maxVocabularySize,
         maxNewMerges: Int = DEFAULT_MAX_MERGES_PER_TRAINING_PASS
     ): Int {
-        require(config.algorithm.usesBpeMerges) {
-            "BPE training is not supported by ${config.algorithm}."
-        }
+        // Legacy GREEDY_LONGEST_MATCH_V1 may still register corpus-derived
+        // vocabulary entries; its encoder intentionally ignores the merge table.
         require(maxNewMerges > 0) { "maxNewMerges must be positive." }
         val target = minOf(targetVocabSize, config.maxVocabularySize)
         if (vocabSize >= target || corpus.isEmpty()) return vocabSize
