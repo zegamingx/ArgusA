@@ -764,9 +764,8 @@ class TrainingManager(
         requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
         if (fullText.isBlank() || closed) return false
 
-        val formattedText = TextModalityProcessor.formatTrainingDocument(fullText)
-        if (formattedText.isBlank()) return false
-
+        // Store the exact source document. The validation evaluator applies the
+        // modality serializer once, immediately before tokenization.
         val documentId = sha256Utf16Be(fullText)
         val document = CorpusDocumentEntity(
             id = documentId,
@@ -779,7 +778,7 @@ class TrainingManager(
             characterCount = fullText.length,
             chunkCount = 0,
             datasetSplit = "VALIDATION",
-            validationText = formattedText,
+            validationText = fullText,
             plannedEpochs = 0,
             rightsStatus = rightsStatus,
             status = "READY",
