@@ -182,7 +182,7 @@ class TokenizerLearningTest {
     }
 
     @Test
-    fun legacyGreedyCheckpointKeepsItsAlgorithmAndUsesLearnedVocabulary() {
+    fun legacyGreedyCheckpointIsNotRestoredUnderByteLevelBpeV2() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
@@ -201,37 +201,30 @@ class TokenizerLearningTest {
                     maxTokenLength = 16
                 )
             )
-            val original = ArgusNeuralEngine.createBlocking(context, config)
+            val legacyEngine = ArgusNeuralEngine.createBlocking(context, config)
             val corpus = List(48) {
                 "Greedy legacy tokenizer learns repeated local language patterns from corpus documents."
             }
-            val update = original.trainTokenizerFromCorpus(corpus)
+            val update = legacyEngine.trainTokenizerFromCorpus(corpus)
 
             assertTrue(update.tokensAdded > 0)
             assertEquals(0, update.mergeCount)
             assertTrue(checkpoint.isFile)
 
-            val restoredConfig = ArgusNeuralEngine.resolveConfig(
+            val freshConfig = ArgusNeuralEngine.resolveConfig(
                 context = context,
                 totalRamGb = 2,
                 maxHeapMb = 128L,
                 availableRamGb = 1.0f
             )
             assertEquals(
-                ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
-                restoredConfig.tokenizerConfig.algorithm
+                ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2,
+                freshConfig.tokenizerConfig.algorithm
             )
-            val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
 
-            assertTrue(restored.loadCheckpointIfExists())
-            assertEquals(original.tokenizer.exportVocab(), restored.tokenizer.exportVocab())
-
-            val trainingText = "Greedy legacy tokenizer keeps stable token IDs."
-            assertEquals(
-                original.tokenizer.encode(trainingText, autoRegister = false),
-                restored.tokenizer.encode(trainingText, autoRegister = false)
-            )
-            assertTrue(restored.trainStepDetailed(trainingText).loss.isFinite())
+            val freshEngine = ArgusNeuralEngine.createBlocking(context, freshConfig)
+            assertTrue(!freshEngine.loadCheckpointIfExists())
+            assertEquals(265, freshEngine.tokenizer.vocabSize)
         } finally {
             if (previousCheckpoint == null) {
                 checkpoint.delete()
