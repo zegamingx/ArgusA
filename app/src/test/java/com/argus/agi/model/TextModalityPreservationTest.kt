@@ -139,6 +139,36 @@ class TextModalityPreservationTest {
     }
 
     @Test
+    fun instructionAndReasoningJsonFieldsPreservePayloadWhitespace() {
+        val instruction = "  Explain this — carefully…  "
+        val reasoning = "  first thought\\r\\nsecond thought  "
+        val response = "\\t  final answer  "
+        val raw = JSONObject()
+            .put("instruction", instruction)
+            .put("reasoning", reasoning)
+            .put("response", response)
+            .toString()
+
+        val expected = "${Tokenizer.USER_TOKEN} $instruction\\n" +
+            "${Tokenizer.ASSISTANT_TOKEN}${Tokenizer.THINK_START}\\n" +
+            "$reasoning\\n" +
+            "${Tokenizer.THINK_END}\\n" +
+            "${Tokenizer.ASSISTANT_TOKEN} $response ${Tokenizer.EOS_TOKEN}"
+
+        assertEquals(expected, TextModalityProcessor.formatTrainingDocument(raw))
+
+        val chunks = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Reasoning payload preservation",
+            chunkSize = 1024,
+            overlap = 0
+        )
+        assertEquals(1, chunks.size)
+        assertEquals(TextModality.REASONING, chunks.single().modality)
+        assertEquals(expected, chunks.single().content)
+    }
+
+    @Test
     fun structuredPlainTextFormattingPreservesCrLfLfAndCrSeparators() {
         val raw = "alpha  \r\nbeta\n  gamma\rdelta\r\n"
 
