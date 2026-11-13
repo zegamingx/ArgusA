@@ -2,14 +2,39 @@
 
 Argus is a native Android application built with Kotlin and Jetpack Compose.
 
-## Requirements
+## Build toolchain
 
-- JDK 25
-- Android NDK r30 (30.0.16248370)
-- CMake 3.22.1
-- Android SDK Platform 37
-- Android SDK Build Tools 36.0.0
-- Gradle Wrapper (repository-pinned)
+| Component | Pinned version | Purpose |
+| --- | ---: | --- |
+| Android Gradle Plugin (AGP) | 9.5.1 | Android build integration |
+| Kotlin | 2.4.21 | Kotlin compiler and Compose compiler plugin |
+| Kotlin Symbol Processing (KSP) | 2.3.12 | Room code generation |
+| Gradle Wrapper | 9.8.1 | Build orchestration |
+| JDK | 25 | JVM runtime used to execute Gradle |
+| Java source/bytecode target | 21 | Language and bytecode compatibility for app sources |
+| Android SDK Platform | 37 | Compile SDK and target SDK |
+| Android minimum SDK | 34 | Minimum supported Android API |
+| Android SDK Build Tools | 36.0.0 | APK packaging and signing tools |
+| Android NDK | 30.0.16248370 | Native C/C++ toolchain |
+| CMake | 3.22.1 | Native build configuration |
+
+JDK 25 is the runtime for Gradle; it does not set the application's Java
+bytecode target. Argus compiles Java-compatible application bytecode for
+Java 21.
+
+KSP is pinned to 2.3.12 rather than 2.3.13 because the latter has a reported
+regression affecting concurrent symbol-processing executions. Keep the KSP
+version explicit until a fixed release is verified.
+
+**Compatibility gate:** Kotlin 2.4.21's published fully supported range ends
+at Gradle 9.7.0 and AGP 9.3.1. Argus intentionally retains Gradle 9.8.1 and
+AGP 9.5.1, which are newer than those documented maxima. Kotlin documents
+newer combinations as usable but not fully verified; CI must validate this
+project's actual combination before it is treated as build-verified.
+
+The wrapper distribution is checksum-pinned in
+`gradle/wrapper/gradle-wrapper.properties`. Do not replace it with an
+unversioned system Gradle installation.
 
 ## Local builds
 
@@ -59,8 +84,10 @@ NPU/APU detection is informational only; no vendor-specific NPU training
 runtime is currently integrated.
 
 The CI pull-request workflow builds the native library and verifies that the
-APK contains the configured ABI libraries. Main/release workflows use JDK 21
-and the pinned NDK/CMake versions before packaging.
+APK contains the configured ABI libraries. Main, pull-request, and release
+workflows execute Gradle on JDK 25; the Android app's Java source and bytecode
+compatibility target remains Java 21. All workflows use the pinned NDK r30 and
+CMake 3.22.1 versions for native builds.
 
 ## Background training service
 

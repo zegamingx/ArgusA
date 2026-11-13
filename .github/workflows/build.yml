@@ -12,6 +12,7 @@ on:
       - "settings.gradle.kts"
       - "gradle.properties"
       - "version.properties"
+      - "README.md"
       - ".github/workflows/build.yml"
   workflow_dispatch:
 
