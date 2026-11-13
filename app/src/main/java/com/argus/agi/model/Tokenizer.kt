@@ -120,7 +120,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         private val REASONING_TOKENS: Set<String> = setOf(THINK_START, THINK_END)
     }
 
-    // Atomic mutation via synchronized; reads are safe via CHM
+    // All public reads and writes share this tokenizer's monitor.
     private val tokenToId = ConcurrentHashMap<String, Int>()
     private val idToToken = ConcurrentHashMap<Int, String>()
     private val merges = mutableListOf<Pair<String, String>>()
@@ -340,9 +340,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
      * Validasi dilakukan SEBELUM mutasi. Special token yang di-import wajib
      * memiliki ID canonical; override akan melempar exception.
      *
-     * Catatan: metode ini melakukan clear + putAll di bawah lock. Jangan
-     * memanggilnya secara bersamaan dengan encode() dari thread lain — panggil
-     * saat cold start (genesis) sebelum tokenizer dipakai.
+     * The complete replacement is validated before commit. Encoding, decoding,
+     * vocabulary reads, merge reads, and imports use the same monitor, so readers
+     * cannot observe a partially replaced vocabulary.
      */
     @Synchronized
     fun importVocab(entries: List<Pair<String, Int>>) {
@@ -1215,6 +1215,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         // not changed if any vocabulary or merge invariant fails.
         val candidate = Tokenizer(config)
         candidate.importVocab(vocabulary)
+        require(candidate.vocabSize == vocabularyCount) {
+            "Tokenizer snapshot vocabulary count does not match its canonical entries."
+        }
         if (config.algorithm.usesBpeMerges) {
             candidate.importMerges(importedMerges)
         }
