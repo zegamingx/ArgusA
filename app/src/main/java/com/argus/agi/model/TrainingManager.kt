@@ -2045,8 +2045,8 @@ class TrainingManager(
                     end = start + lastBreak + 1
                 }
             }
-            val sub = text.substring(start, end).trim()
-            if (sub.isNotBlank()) chunks.add(sub)
+            val sub = text.substring(start, end)
+            if (sub.isNotEmpty()) chunks.add(sub)
             if (end >= text.length) break
 
             val nextStart = end - overlap
