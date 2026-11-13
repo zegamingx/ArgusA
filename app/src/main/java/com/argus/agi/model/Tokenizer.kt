@@ -124,10 +124,21 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
     private val tokenToId = ConcurrentHashMap<String, Int>()
     private val idToToken = ConcurrentHashMap<Int, String>()
     private val merges = mutableListOf<Pair<String, String>>()
-    private val mergeRanks = ConcurrentHashMap<Pair<String, String>, Int>()
+    // Nested lookup avoids allocating a Pair for every adjacent-token probe at encode time.
+    private val mergeRanks = HashMap<String, HashMap<String, Int>>()
 
     @Volatile private var nextId = 0
     @Volatile private var maxRegisteredLen = 1
+
+    private fun hasMerge(left: String, right: String): Boolean =
+        mergeRanks[left]?.containsKey(right) == true
+
+    private fun mergeRank(left: String, right: String): Int? =
+        mergeRanks[left]?.get(right)
+
+    private fun putMergeRank(left: String, right: String, rank: Int) {
+        mergeRanks.getOrPut(left) { HashMap() }[right] = rank
+    }
 
     init {
         initBaseVocabulary()
@@ -244,9 +255,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             val pieces = word.map { character -> character.toString() }.toMutableList()
             while (pieces.size > 1 && merges.size < mergeLimit) {
                 val pair = pieces[0] to pieces[1]
-                if (!mergeRanks.containsKey(pair)) {
+                if (!hasMerge(pair.first, pair.second)) {
                     merges.add(pair)
-                    mergeRanks[pair] = merges.lastIndex
+                    putMergeRank(pair.first, pair.second, merges.lastIndex)
                 }
                 pieces[0] = pair.first + pair.second
                 pieces.removeAt(1)
@@ -488,6 +499,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             require(tokenToId.containsKey(combined)) {
                 "Merged token '$combined' is missing from the vocabulary."
             }
+            require(combined !in CONTROL_TOKENS) {
+                "A merge cannot resolve to a reserved control token."
+            }
             if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
                 require((left + right).all { character -> character.code <= 0xFF }) {
                     "Byte-Level BPE merges must remain inside the byte-symbol alphabet."
@@ -506,7 +520,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         merges.clear()
         merges.addAll(importedMerges)
         mergeRanks.clear()
-        mergeRanks.putAll(candidateRanks)
+        for ((pair, rank) in candidateRanks) {
+            putMergeRank(pair.first, pair.second, rank)
+        }
     }
 
     /**
@@ -594,7 +610,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 val symbols = wordSymbols[word] ?: continue
                 for (index in 0 until symbols.size - 1) {
                     val pair = symbols[index] to symbols[index + 1]
-                    if (mergeRanks.containsKey(pair)) continue
+                    if (hasMerge(pair.first, pair.second)) continue
                     if (
                         config.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1 &&
                         (pair.first.contains('~') || pair.second.contains('~'))
@@ -621,7 +637,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             if (tokenId == UNK_ID && combined != UNK_TOKEN) break
 
             merges.add(bestPair)
-            mergeRanks[bestPair] = merges.lastIndex
+            putMergeRank(bestPair.first, bestPair.second, merges.lastIndex)
             newMergeCount++
             for (symbols in wordSymbols.values) {
                 applyMerge(symbols, bestPair.first, bestPair.second, combined)
@@ -764,7 +780,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
         fun offer(left: BpeNode?, right: BpeNode?) {
             if (left == null || right == null || !left.active || !right.active) return
-            val rank = mergeRanks[left.value to right.value] ?: return
+            val rank = mergeRank(left.value, right.value) ?: return
             queue.add(
                 MergeCandidate(
                     rank = rank,
@@ -956,8 +972,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                     var bestIdx = -1
 
                     for (pIdx in 0 until pieces.size - 1) {
-                        val pair = pieces[pIdx] to pieces[pIdx + 1]
-                        val rank = mergeRanks[pair]
+                        val rank = mergeRank(pieces[pIdx], pieces[pIdx + 1])
                         if (rank != null && rank < minRank) {
                             minRank = rank
                             bestIdx = pIdx
@@ -1228,7 +1243,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         merges.clear()
         merges.addAll(candidate.merges)
         mergeRanks.clear()
-        mergeRanks.putAll(candidate.mergeRanks)
+        for ((left, rightRanks) in candidate.mergeRanks) {
+            mergeRanks[left] = HashMap(rightRanks)
+        }
         nextId = candidate.nextId
         maxRegisteredLen = candidate.maxRegisteredLen
     }
