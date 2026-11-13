@@ -169,6 +169,43 @@ class TextModalityPreservationTest {
     }
 
     @Test
+    fun validationConversationUsesTrainingRoleAndEosSerialization() {
+        val raw = "${Tokenizer.USER_TOKEN}  What is Argus?  \\n" +
+            "${Tokenizer.ASSISTANT_TOKEN}  A local model.  "
+
+        val trainingSerialization = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Training conversation",
+            chunkSize = Int.MAX_VALUE,
+            overlap = 0
+        ).joinToString("\\n") { it.content }
+
+        assertEquals(
+            trainingSerialization,
+            TextModalityProcessor.formatTrainingDocument(raw)
+        )
+        assertTrue(trainingSerialization.endsWith(" ${Tokenizer.EOS_TOKEN}"))
+    }
+
+    @Test
+    fun validationQuestionAnswerUsesTrainingEosSerialization() {
+        val raw = "Question:  Why preserve bytes?  \\nAnswer:  Because exact text matters.  "
+
+        val trainingSerialization = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Training Q&A",
+            chunkSize = Int.MAX_VALUE,
+            overlap = 0
+        ).joinToString("\\n") { it.content }
+
+        assertEquals(
+            trainingSerialization,
+            TextModalityProcessor.formatTrainingDocument(raw)
+        )
+        assertTrue(trainingSerialization.endsWith(" ${Tokenizer.EOS_TOKEN}"))
+    }
+
+    @Test
     fun structuredPlainTextFormattingPreservesCrLfLfAndCrSeparators() {
         val raw = "alpha  \r\nbeta\n  gamma\rdelta\r\n"
 
