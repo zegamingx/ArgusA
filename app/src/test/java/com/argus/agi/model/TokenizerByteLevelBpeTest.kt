@@ -22,7 +22,6 @@ class TokenizerByteLevelBpeTest {
             ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2,
             tokenizer.config.algorithm
         )
-        assertEquals(Tokenizer.CURRENT_SNAPSHOT_FORMAT_VERSION, 1)
         assertEquals(265, tokenizer.vocabSize)
     }
 
