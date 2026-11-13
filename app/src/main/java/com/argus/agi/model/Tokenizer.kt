@@ -627,7 +627,13 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 }
             }
 
-            val bestEntry = pairCounts.entries.maxByOrNull { it.value } ?: break
+            // Count wins first; lexical byte-symbol order breaks ties so the
+            // learned merge table is independent of corpus document ordering.
+            val bestEntry = pairCounts.entries.maxWithOrNull(
+                compareBy<Map.Entry<Pair<String, String>, Int>> { entry -> entry.value }
+                    .thenBy { entry -> entry.key.first }
+                    .thenBy { entry -> entry.key.second }
+            ) ?: break
             if (bestEntry.value < 2) break
             val bestPair = bestEntry.key
             val combined = bestPair.first + bestPair.second
@@ -707,7 +713,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT)
                 .encode(CharBuffer.wrap(text))
-            ByteArray(encoded.remaining()).also(encoded::get)
+            val bytes = ByteArray(encoded.remaining())
+            encoded.get(bytes)
+            bytes
         } catch (exception: CharacterCodingException) {
             throw IllegalArgumentException(
                 "Tokenizer input contains malformed UTF-16 and cannot be encoded as UTF-8.",
