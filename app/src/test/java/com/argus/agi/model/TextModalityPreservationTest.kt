@@ -1,0 +1,150 @@
+package com.argus.agi.model
+
+import org.json.JSONArray
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [33])
+class TextModalityPreservationTest {
+
+    @Test
+    fun plainTextFormattingPreservesTypographyWhitespaceAndLineEndings() {
+        val raw = "  “Argus”—… ﬁ\\u00A0wide\\u200Bzero\\u00ADsoft\\r\\n  second line  "
+
+        assertEquals(raw, TextModalityProcessor.formatTrainingDocument(raw))
+
+        val chunks = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Lossless prose",
+            chunkSize = 1024,
+            overlap = 0
+        )
+
+        assertEquals(1, chunks.size)
+        assertEquals(TextModality.GENERAL_PROSE, chunks.single().modality)
+        assertEquals(raw, chunks.single().content)
+        assertFalse(raw == TextModalityProcessor.normalizeTypography(raw))
+    }
+
+    @Test
+    fun chunkingWithZeroOverlapPreservesEverySourceCharacter() {
+        val raw = buildString {
+            repeat(14) { index ->
+                append("  segment-$index — … ﬁ\\u00A0wide\\u200Bzero\\u00ADsoft  \\r\\n")
+            }
+        }
+
+        val chunks = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Long lossless prose",
+            chunkSize = 52,
+            overlap = 0
+        )
+
+        assertTrue(chunks.size > 1)
+        assertEquals(raw, chunks.joinToString(separator = "") { it.content })
+    }
+
+    @Test
+    fun approvedConversationPreservesPayloadAndRoundTripsThroughByteLevelTokenizer() {
+        val userMessage = "  “first” — … ﬁ\\u00A0\\u200B\\u00AD\\r\\nsecond line  "
+        val assistantMessage = "\\t  response with trailing spaces  "
+        val serialized = requireNotNull(
+            TextModalityProcessor.formatConversationExchange(
+                userMessage = userMessage,
+                assistantMessage = assistantMessage
+            )
+        )
+        val expected = "${Tokenizer.USER_TOKEN} $userMessage\\n" +
+            "${Tokenizer.ASSISTANT_TOKEN} $assistantMessage"
+        assertEquals(expected, serialized)
+
+        val chunks = TextModalityProcessor.process(
+            rawText = serialized,
+            documentTitle = "Approved Unicode exchange",
+            chunkSize = 1024,
+            overlap = 0
+        )
+        assertEquals(1, chunks.size)
+        assertEquals(TextModality.CONVERSATION, chunks.single().modality)
+
+        val expectedTrainingText = "$expected ${Tokenizer.EOS_TOKEN}"
+        assertEquals(expectedTrainingText, chunks.single().content)
+
+        val tokenizer = Tokenizer()
+        val tokenIds = tokenizer.encode(expectedTrainingText)
+        assertEquals(
+            expectedTrainingText,
+            tokenizer.decode(tokenIds, keepControlTokens = true)
+        )
+    }
+
+    @Test
+    fun chatMlJsonMessageValuesKeepWhitespaceAndUnicodeTypography() {
+        val userMessage = "  ChatML “user” — … ﬁ\\u00A0\\r\\nnext line  "
+        val assistantMessage = "\\t  ChatML response  "
+        val raw = JSONObject()
+            .put(
+                "messages",
+                JSONArray()
+                    .put(JSONObject().put("role", "user").put("content", userMessage))
+                    .put(JSONObject().put("role", "assistant").put("content", assistantMessage))
+            )
+            .toString()
+
+        val expected = "${Tokenizer.USER_TOKEN} $userMessage\\n" +
+            "${Tokenizer.ASSISTANT_TOKEN} $assistantMessage"
+        val formatted = TextModalityProcessor.formatTrainingDatasetRecords(raw).orEmpty()
+
+        assertEquals(1, formatted.size)
+        assertEquals(expected, formatted.single())
+
+        val chunks = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "ChatML preservation",
+            chunkSize = 1024,
+            overlap = 0
+        )
+        assertEquals(1, chunks.size)
+        assertEquals("${expected} ${Tokenizer.EOS_TOKEN}", chunks.single().content)
+    }
+
+    @Test
+    fun questionAndAnswerPayloadsAreNotTrimmedDuringModalityProcessing() {
+        val question = "  Why “now”?  "
+        val answer = "\\t  Because — 42…  "
+        val raw = "Question:$question\\r\\nAnswer:$answer"
+
+        val chunks = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Whitespace-preserving Q&A",
+            chunkSize = 1024,
+            overlap = 0
+        )
+
+        assertEquals(1, chunks.size)
+        assertEquals(TextModality.QA_PAIR, chunks.single().modality)
+        assertEquals(
+            "${Tokenizer.USER_TOKEN} Tanya:$question\\n" +
+                "${Tokenizer.ASSISTANT_TOKEN} Jawab:$answer ${Tokenizer.EOS_TOKEN}",
+            chunks.single().content
+        )
+    }
+
+    @Test
+    fun structuredPlainTextFormattingPreservesCrLfLfAndCrSeparators() {
+        val raw = "alpha  \\r\\nbeta\\n  gamma\\rdelta\\r\\n"
+
+        assertEquals(
+            raw,
+            TextModalityProcessor.formatStructuredTextPreservingLineEndings(raw)
+        )
+    }
+}
