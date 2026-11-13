@@ -1012,6 +1012,27 @@ object TextModalityProcessor {
         }
     }
 
+    /**
+     * Moves a UTF-16 boundary away from the middle of a surrogate pair.
+     * Chunk starts prefer the preceding boundary to retain the complete code point
+     * in the next window; chunk ends prefer the following boundary to retain it
+     * in the current window.
+     */
+    internal fun alignUtf16Boundary(
+        text: CharSequence,
+        boundary: Int,
+        preferAfter: Boolean
+    ): Int {
+        val index = boundary.coerceIn(0, text.length)
+        val splitsSurrogatePair = index > 0 &&
+            index < text.length &&
+            Character.isHighSurrogate(text[index - 1]) &&
+            Character.isLowSurrogate(text[index])
+
+        if (!splitsSurrogatePair) return index
+        return if (preferAfter) index + 1 else index - 1
+    }
+
     private fun unclosedQuoteCloser(text: String): Char? {
         val closers = ArrayList<Char>()
         for (character in text) {
@@ -1078,11 +1099,16 @@ object TextModalityProcessor {
                 }
             }
 
+            end = alignUtf16Boundary(text, end, preferAfter = true)
             val slice = text.substring(start, end)
             if (slice.isNotEmpty()) result.add(slice)
 
             if (end >= text.length) break
-            val nextStart = end - overlap
+            val nextStart = alignUtf16Boundary(
+                text,
+                end - overlap,
+                preferAfter = false
+            )
             start = if (nextStart <= start) end else nextStart
         }
         return result.ifEmpty { listOf(text) }
