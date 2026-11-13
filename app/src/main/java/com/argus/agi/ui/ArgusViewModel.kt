@@ -1648,8 +1648,9 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
-        super.onCleared()
+        stopGeneration()
         audioVoiceManager.close()
+        super.onCleared()
     }
 
     private class BoundedReader(

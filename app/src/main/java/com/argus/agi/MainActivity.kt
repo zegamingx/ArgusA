@@ -15,12 +15,15 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBars
+import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -36,6 +39,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -92,9 +96,59 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        val argusApp = application as ArgusApp
         setContent {
             ArgusTheme {
-                MainScreen(viewModel = viewModel)
+                val initializationState by argusApp.coreInitializationState.collectAsState()
+                when (val state = initializationState) {
+                    ArgusCoreInitializationState.Initializing ->
+                        com.argus.agi.ui.components.ArgusModernLoadingScreen(
+                            title = "A . R . G . U . S",
+                            subtitle = "INITIALIZING THE LOCAL MODEL & TRAINING RUNTIME..."
+                        )
+
+                    ArgusCoreInitializationState.Ready ->
+                        MainScreen(viewModel = viewModel)
+
+                    is ArgusCoreInitializationState.Failed ->
+                        CoreInitializationFailureScreen(
+                            message = state.message,
+                            onRetry = argusApp::retryCoreInitialization
+                        )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CoreInitializationFailureScreen(
+    message: String,
+    onRetry: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(ArgusDarkBg)
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Text(
+                text = "A.R.G.U.S could not initialize",
+                style = androidx.compose.material3.MaterialTheme.typography.titleLarge,
+                color = Color.White
+            )
+            Text(
+                text = message,
+                style = androidx.compose.material3.MaterialTheme.typography.bodyMedium,
+                color = ArgusTextMuted
+            )
+            Button(onClick = onRetry) {
+                Text("Retry initialization")
             }
         }
     }

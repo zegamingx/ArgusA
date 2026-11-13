@@ -15,9 +15,19 @@ import com.argus.agi.sensor.DeviceGuard
 import com.argus.agi.sensor.HardwareProfile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+sealed interface ArgusCoreInitializationState {
+    data object Initializing : ArgusCoreInitializationState
+    data object Ready : ArgusCoreInitializationState
+    data class Failed(val message: String) : ArgusCoreInitializationState
+}
 
 class ArgusApp : Application() {
 
@@ -55,7 +65,7 @@ class ArgusApp : Application() {
         val neuralEngine: ArgusNeuralEngine get() = _neuralEngine.value
 
         private val _worldModel = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
-            WorldModel(instance)
+            WorldModel(instance, repository)
         }
         val worldModel: WorldModel get() = _worldModel.value
 
@@ -75,7 +85,13 @@ class ArgusApp : Application() {
         val genesisModelManager: GenesisModelManager get() = _genesisModelManager.value
 
         private val _trainingManager = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
-            TrainingManager(instance, neuralEngine, deviceGuard, worldModel)
+            TrainingManager(
+                context = instance,
+                neuralEngine = neuralEngine,
+                deviceGuard = deviceGuard,
+                worldModel = worldModel,
+                repository = repository
+            )
         }
         val trainingManager: TrainingManager get() = _trainingManager.value
 
@@ -90,36 +106,53 @@ class ArgusApp : Application() {
 
     /** Scope aplikasi untuk pre-warm singleton. Di-cancel saat onTerminate (test). */
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val _coreInitializationState =
+        MutableStateFlow<ArgusCoreInitializationState>(ArgusCoreInitializationState.Initializing)
+    val coreInitializationState: StateFlow<ArgusCoreInitializationState> =
+        _coreInitializationState.asStateFlow()
+
+    @Volatile
+    private var coreInitializationJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
         _instance = this
-
         createNotificationChannel()
+        initializeCoreRuntime()
+    }
 
-        // Pre-warm: picu lazy pada IO thread agar main thread tidak kena I/O.
-        // Ini juga memicu load checkpoint neural engine di background.
-        applicationScope.launch {
-            runCatching { neuralEngine }
-                .onFailure { Log.e(TAG, "Failed to initialize the neural engine", it) }
+    /**
+     * Initializes blocking singletons on the application IO scope.
+     * The activity must not create its ViewModel until this state becomes Ready.
+     */
+    private fun initializeCoreRuntime() {
+        synchronized(this) {
+            if (coreInitializationJob?.isActive == true) return
 
-            runCatching { deviceGuard }
-                .onFailure { Log.e(TAG, "Failed to initialize the device guard", it) }
-
-            runCatching { worldModel }
-                .onFailure { Log.e(TAG, "Failed to initialize the World Model", it) }
-
-            runCatching { hardwareProfile }
-                .onFailure { Log.e(TAG, "Failed to initialize the hardware profile", it) }
-
-            runCatching { genesisModelManager }
-                .onFailure { Log.e(TAG, "Failed to initialize the Genesis model manager", it) }
-
-            // trainingManager memulai worker coroutine. Pre-warm setelah
-            // deviceGuard siap agar safetyState sudah terisi.
-            runCatching { trainingManager }
-                .onFailure { Log.e(TAG, "Failed to initialize the training manager", it) }
+            _coreInitializationState.value = ArgusCoreInitializationState.Initializing
+            coreInitializationJob = applicationScope.launch {
+                try {
+                    hardwareProfile
+                    deviceGuard
+                    repository
+                    neuralEngine
+                    worldModel
+                    genesisModelManager
+                    trainingManager
+                    _coreInitializationState.value = ArgusCoreInitializationState.Ready
+                    Log.i(TAG, "Core runtime initialization completed.")
+                } catch (error: Exception) {
+                    Log.e(TAG, "Core runtime initialization failed.", error)
+                    _coreInitializationState.value = ArgusCoreInitializationState.Failed(
+                        error.message ?: error.javaClass.simpleName
+                    )
+                }
+            }
         }
+    }
+
+    fun retryCoreInitialization() {
+        initializeCoreRuntime()
     }
 
     private fun createNotificationChannel() {

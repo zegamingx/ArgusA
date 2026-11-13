@@ -103,8 +103,9 @@ class TrainingManager(
     private val repository: com.argus.agi.data.repository.ArgusRepository? = null
 ) : Closeable {
 
-    private val repo: com.argus.agi.data.repository.ArgusRepository? =
-        repository ?: runCatching { com.argus.agi.data.repository.ArgusRepository(context) }.getOrNull()
+    private val repositoryInitialization =
+        runCatching { repository ?: com.argus.agi.data.repository.ArgusRepository(context) }
+    private val repo = repositoryInitialization.getOrNull()
     private val validationFilesDirectory = context.applicationContext.filesDir
     private val conversationalValidationPersistence =
         ConversationalValidationPersistence(validationFilesDirectory)
@@ -121,7 +122,7 @@ class TrainingManager(
 
         data class Start(
             val itemId: String,
-            val completion: CompletableDeferred<Unit>
+            val completion: CompletableDeferred<Result<Unit>>
         ) : QueuePersistenceOperation
 
         data class Barrier(
@@ -252,6 +253,13 @@ class TrainingManager(
             }
         }
 
+        if (repo == null) {
+            Log.e(
+                TAG,
+                "Training persistence is unavailable; queued work will not be reported as durable.",
+                repositoryInitialization.exceptionOrNull()
+            )
+        }
         startTrainingWorker()
     }
 
@@ -1599,32 +1607,35 @@ class TrainingManager(
     ) {
         when (operation) {
             is QueuePersistenceOperation.Clear -> {
-                repo?.let { repository ->
-                    runSuspendCatching {
-                        repository.clearPendingQueueAndMarkInterruptedCorpusDocumentsPartial()
-                    }
-                        .onFailure { error ->
-                            Log.e(TAG, "Failed to clear persisted training queue", error)
-                        }
+                runSuspendCatching {
+                    val repository = repo ?: throw IllegalStateException(
+                        "Training queue persistence is unavailable.",
+                        repositoryInitialization.exceptionOrNull()
+                    )
+                    repository.clearPendingQueueAndMarkInterruptedCorpusDocumentsPartial()
+                }.onFailure { error ->
+                    Log.e(TAG, "Failed to clear persisted training queue", error)
                 }
             }
 
             is QueuePersistenceOperation.Start -> {
-                try {
-                    repo?.let { repository ->
-                        runSuspendCatching {
-                            repository.markTrainingStarted(operation.itemId)
-                        }.onFailure { error ->
-                            Log.e(
-                                TAG,
-                                "Failed to persist active training state for '${operation.itemId}'",
-                                error
-                            )
-                        }
+                val result = runSuspendCatching {
+                    val repository = repo ?: throw IllegalStateException(
+                        "Training queue persistence is unavailable.",
+                        repositoryInitialization.exceptionOrNull()
+                    )
+                    check(repository.markTrainingStarted(operation.itemId)) {
+                        "Training queue item '${operation.itemId}' was not marked as TRAINING in Room."
                     }
-                } finally {
-                    operation.completion.complete(Unit)
                 }
+                result.onFailure { error ->
+                    Log.e(
+                        TAG,
+                        "Failed to persist active training state for '${operation.itemId}'",
+                        error
+                    )
+                }
+                operation.completion.complete(result)
             }
 
             is QueuePersistenceOperation.Barrier -> {
@@ -1637,11 +1648,13 @@ class TrainingManager(
                 }
                 if (!isCurrentGeneration) return
 
-                val persistenceFailure = repo?.let { repository ->
-                    runSuspendCatching {
-                        repository.saveTrainingItems(operation.items)
-                    }.exceptionOrNull()
-                }
+                val persistenceFailure = runSuspendCatching {
+                    val repository = repo ?: throw IllegalStateException(
+                        "Training queue persistence is unavailable.",
+                        repositoryInitialization.exceptionOrNull()
+                    )
+                    repository.saveTrainingItems(operation.items)
+                }.exceptionOrNull()
 
                 synchronized(queueLock) {
                     if (operation.generation != queueGeneration) return@synchronized
@@ -1687,7 +1700,7 @@ class TrainingManager(
     }
 
     private suspend fun popNext(): TrainingData? {
-        val startCompletion = CompletableDeferred<Unit>()
+        val startCompletion = CompletableDeferred<Result<Unit>>()
         val item = synchronized(queueLock) {
             val list = _nextQueue.value
             val first = list.firstOrNull() ?: return@synchronized null
@@ -1708,9 +1721,24 @@ class TrainingManager(
             first
         }
 
-        // Start is ordered in the same persistence channel as Clear. The worker waits for
-        // that update so a concurrent clear cannot delete an already-active queue row.
-        if (item != null) startCompletion.await()
+        // Start is ordered in the same persistence channel as Clear. Training must not
+        // begin until Room confirms that the queue row is now TRAINING.
+        if (item != null) {
+            val persistenceResult = startCompletion.await()
+            if (persistenceResult.isFailure) {
+                synchronized(queueLock) {
+                    if (!closed && _nextQueue.value.none { queued -> queued.id == item.id }) {
+                        _nextQueue.value = listOf(item) + _nextQueue.value
+                    }
+                }
+                Log.e(
+                    TAG,
+                    "Training item '${item.id}' was returned to the queue because its start state was not persisted.",
+                    persistenceResult.exceptionOrNull()
+                )
+                return null
+            }
+        }
         return item
     }
 

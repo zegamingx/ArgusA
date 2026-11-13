@@ -5,15 +5,46 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
 class ArgusDatabaseMigrationTest {
+
+    @Test
+    fun concurrentAccessReturnsOneRoomSingleton() {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val executor = Executors.newFixedThreadPool(8)
+        val startGate = CountDownLatch(1)
+
+        try {
+            val results = (0 until 8).map {
+                executor.submit<ArgusDatabase> {
+                    check(startGate.await(5, TimeUnit.SECONDS))
+                    ArgusDatabase.getInstance(context)
+                }
+            }
+
+            startGate.countDown()
+            val databases = results.map { it.get(10, TimeUnit.SECONDS) }
+            val first = databases.first()
+            databases.forEach { database ->
+                assertSame(first, database)
+            }
+        } finally {
+            startGate.countDown()
+            executor.shutdownNow()
+            executor.awaitTermination(5, TimeUnit.SECONDS)
+        }
+    }
 
     @Test
     fun versionOneUserDataSurvivesAdditiveCorpusMigration() {

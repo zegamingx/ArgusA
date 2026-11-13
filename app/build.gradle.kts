@@ -63,25 +63,18 @@ android {
         .orElse(defaultKeystore.absolutePath)
         .get()
 
-    val defaultPass = "arguspassword"
-    val defaultAlias = "upload"
-
     val releaseStorePassword = providers.environmentVariable("STORE_PASSWORD")
-        .orElse(defaultPass)
-        .get()
     val releaseKeyPassword = providers.environmentVariable("KEY_PASSWORD")
-        .orElse(defaultPass)
-        .get()
     val releaseKeyAlias = providers.environmentVariable("KEY_ALIAS")
-        .orElse(defaultAlias)
+        .orElse("upload")
         .get()
 
     signingConfigs {
         create("release") {
             storeFile = file(releaseKeystorePath)
-            storePassword = releaseStorePassword
+            storePassword = releaseStorePassword.orNull
             keyAlias = releaseKeyAlias
-            keyPassword = releaseKeyPassword
+            keyPassword = releaseKeyPassword.orNull
         }
     }
 
@@ -150,19 +143,14 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
-    implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.room.ktx)
     implementation(libs.androidx.room.runtime)
     implementation(libs.coil.compose)
-    implementation(libs.converter.moshi)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.core)
-    implementation(libs.logging.interceptor)
-    implementation(libs.moshi)
     implementation(libs.okhttp)
     implementation(libs.jsoup)
     implementation(libs.pdfbox.android)
-    implementation(libs.retrofit)
 
     testImplementation(platform(libs.androidx.compose.bom))
     testImplementation(platform(libs.junit.bom))
@@ -188,11 +176,8 @@ dependencies {
     ksp(libs.androidx.room.compiler)
 }
 
-// =====================================================================
-// Copy APK ke root project supaya bisa diunduh dari AI Studio.
-// HANYA 1 FILE APK DI ROOT: ARGUS.apk.
-// File APK lama atau varian lain otomatis dibersihkan.
-// =====================================================================
+// Artifact export and version changes are explicit operations. A normal assemble
+// must not mutate project files or delete APKs outside the build directory.
 abstract class CopyApkTask : DefaultTask() {
 
     @get:InputFiles
@@ -203,86 +188,93 @@ abstract class CopyApkTask : DefaultTask() {
 
     @TaskAction
     fun copy() {
-        val dst = target.get().asFile
-        val rootDir = dst.parentFile ?: return
-        rootDir.mkdirs()
-
-        // 1) Hapus semua APK lain di root project (mis. ARGUS-release.apk, ARGUS-debug.apk)
-        //    sehingga HANYA ADA 1 FILE APK di root: ARGUS.apk
-        rootDir.listFiles { f -> f.isFile && f.extension.equals("apk", true) }
-            ?.filter { it.name != dst.name }
-            ?.forEach { stale ->
-                if (stale.delete()) {
-                    logger.lifecycle("Dihapus APK lama: ${stale.name}")
-                }
-            }
-
-        // 2) Salin APK release (atau fallback debug jika hanya debug yang dibuild)
         val src = apk.files.firstOrNull { it.isFile }
-        if (src == null) {
-            logger.warn("APK sumber belum tersedia untuk disalin.")
-            return
-        }
+            ?: throw IllegalStateException("The requested APK artifact was not produced.")
+        val dst = target.get().asFile
+        val parent = dst.parentFile
+            ?: throw IllegalStateException("APK export target has no parent directory.")
 
-        try {
-            src.copyTo(dst, overwrite = true)
-            logger.lifecycle("Tersimpan 1 APK utama di root: ${dst.absolutePath} (${src.length() / 1024} KB, dari ${src.name})")
-        } catch (e: Exception) {
-            logger.warn("Gagal menyalin APK ke root: $e")
+        check(parent.isDirectory || parent.mkdirs()) {
+            "Could not create APK export directory: ${parent.absolutePath}"
         }
+        src.copyTo(dst, overwrite = true)
+        logger.lifecycle(
+            "Exported ${src.name} to ${dst.absolutePath} (${src.length() / 1024} KB)."
+        )
     }
 }
 
-abstract class AutoUpdateVersionTask : DefaultTask() {
+abstract class BumpVersionTask : DefaultTask() {
 
     @get:OutputFile
     abstract val versionFile: RegularFileProperty
 
     @TaskAction
-    fun updateVersion() {
+    fun bumpVersion() {
         val file = versionFile.get().asFile
-        val props = Properties()
-        if (file.exists()) {
-            FileInputStream(file).use { props.load(it) }
+        check(file.isFile) { "Missing version.properties: ${file.absolutePath}" }
+
+        val props = Properties().apply {
+            FileInputStream(file).use { stream -> load(stream) }
         }
-        val maj = props.getProperty("VERSION_MAJOR", "1").toIntOrNull() ?: 1
-        val min = props.getProperty("VERSION_MINOR", "0").toIntOrNull() ?: 0
-        var pat = props.getProperty("VERSION_PATCH", "7").toIntOrNull() ?: 7
-        var bld = props.getProperty("VERSION_BUILD", "10007").toIntOrNull() ?: 10007
 
-        pat += 1
-        bld += 1
+        fun requiredVersionPart(key: String): Int =
+            props.getProperty(key)?.toIntOrNull()
+                ?: throw IllegalStateException("Missing or invalid $key in version.properties.")
 
-        props["VERSION_MAJOR"] = maj.toString()
-        props["VERSION_MINOR"] = min.toString()
-        props["VERSION_PATCH"] = pat.toString()
-        props["VERSION_BUILD"] = bld.toString()
-        FileOutputStream(file).use { props.store(it, "Auto-updated by ARGUS Build System") }
-        logger.lifecycle("Version auto-updated untuk build berikutnya: $maj.$min.$pat (Build: $bld)")
+        val major = requiredVersionPart("VERSION_MAJOR")
+        val minor = requiredVersionPart("VERSION_MINOR")
+        val patch = requiredVersionPart("VERSION_PATCH")
+        val build = requiredVersionPart("VERSION_BUILD")
+        val nextPatch = Math.addExact(patch, 1)
+        val nextBuild = Math.addExact(build, 1)
+
+        props["VERSION_PATCH"] = nextPatch.toString()
+        props["VERSION_BUILD"] = nextBuild.toString()
+        FileOutputStream(file).use {
+            props.store(it, "Updated by the explicit bumpVersion task")
+        }
+        logger.lifecycle(
+            "Version bumped for the next build: $major.$minor.$nextPatch (Build: $nextBuild)."
+        )
     }
 }
 
-val copyArgusApkToRoot = tasks.register<CopyApkTask>("copyArgusApkToRoot") {
-    // Prioritaskan release, fallback ke debug bila hanya debug yang dibuild
+val exportReleaseApk = tasks.register<CopyApkTask>("exportReleaseApk") {
+    group = "distribution"
+    description = "Builds and exports the signed release APK to the repository root."
+    dependsOn("assembleRelease")
     apk.from(layout.buildDirectory.file("outputs/apk/release/app-release.apk"))
+    target.set(layout.projectDirectory.file("../ARGUS.apk"))
+    outputs.upToDateWhen { false }
+}
+
+val exportDebugApk = tasks.register<CopyApkTask>("exportDebugApk") {
+    group = "distribution"
+    description = "Builds and exports the debug APK to the repository root."
+    dependsOn("assembleDebug")
     apk.from(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk"))
     target.set(layout.projectDirectory.file("../ARGUS.apk"))
     outputs.upToDateWhen { false }
 }
 
-val autoUpdateVersionTask = tasks.register<AutoUpdateVersionTask>("autoUpdateVersion") {
+tasks.register<BumpVersionTask>("bumpVersion") {
+    group = "versioning"
+    description = "Explicitly increments VERSION_PATCH and VERSION_BUILD for the next build."
     versionFile.set(layout.projectDirectory.file("../version.properties"))
     outputs.upToDateWhen { false }
 }
 
-tasks.matching {
-    it.name in setOf("assembleRelease", "assemble", "assembleDebug")
-}.configureEach {
-    finalizedBy(copyArgusApkToRoot)
-}
-
-tasks.matching {
-    it.name in setOf("assembleRelease", "assemble")
-}.configureEach {
-    finalizedBy(autoUpdateVersionTask)
+tasks.matching { it.name == "validateSigningRelease" }.configureEach {
+    doFirst {
+        check(releaseStorePassword.isPresent) {
+            "STORE_PASSWORD must be provided to build a signed release APK."
+        }
+        check(releaseKeyPassword.isPresent) {
+            "KEY_PASSWORD must be provided to build a signed release APK."
+        }
+        check(file(releaseKeystorePath).isFile) {
+            "Release keystore not found: $releaseKeystorePath"
+        }
+    }
 }

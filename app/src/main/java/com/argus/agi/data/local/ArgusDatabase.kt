@@ -141,15 +141,14 @@ abstract class ArgusDatabase : RoomDatabase() {
 
         fun getInstance(context: Context): ArgusDatabase {
             return INSTANCE ?: synchronized(this) {
-                val instance = Room.databaseBuilder(
+                INSTANCE ?: Room.databaseBuilder(
                     context.applicationContext,
                     ArgusDatabase::class.java,
                     "argus_ondevice.db"
                 )
                     .addMigrations(MIGRATION_1_2)
                     .build()
-                INSTANCE = instance
-                instance
+                    .also { database -> INSTANCE = database }
             }
         }
     }
