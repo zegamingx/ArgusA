@@ -186,6 +186,20 @@ class TokenizerByteLevelBpeTest {
     }
 
     @Test
+    fun importedMergesCannotResolveToReservedControlTokens() {
+        val tokenizer = newTokenizer()
+        tokenizer.registerToken("USER>")
+        val originalMerges = tokenizer.exportMerges()
+
+        val failure = runCatching {
+            tokenizer.importMerges(listOf("<" to "USER>"))
+        }.exceptionOrNull()
+
+        assertTrue("A merge output must not become a control token.", failure is IllegalArgumentException)
+        assertEquals(originalMerges, tokenizer.exportMerges())
+    }
+
+    @Test
     fun byteLevelEncodingDoesNotGrowVocabularyEvenWhenAutoRegisterIsRequested() {
         val tokenizer = newTokenizer()
         val vocabularySizeBefore = tokenizer.vocabSize
