@@ -63,7 +63,7 @@ jobs:
           fi
 
           test -s "${platform_alias}/android.jar"
-          echo "Android SDK ready: API 37.0, Build Tools 36.0.0."
+          echo "Android SDK ready: minSdk 34, compileSdk 37, targetSdk 37, Build Tools 36.0.0."
 
       - name: Install pinned Vulkan NDK and CMake
         shell: bash
