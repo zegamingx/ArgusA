@@ -541,7 +541,7 @@ class TrainingManager(
             window.append(buffer, 0, readCount)
             totalCharsRead += readCount.toLong()
 
-            while (window.length >= chunkSize) {
+            while (window.length > chunkSize) {
                 val minimumBreakPosition = chunkSize / 3
                 val searchText = window.substring(minimumBreakPosition, chunkSize)
                 val lastNewLine = searchText.lastIndexOf('\n')
@@ -618,6 +618,11 @@ class TrainingManager(
                     }
                 }
 
+                splitPosition = TextModalityProcessor.alignUtf16Boundary(
+                    window,
+                    splitPosition,
+                    preferAfter = true
+                )
                 appendSegment(window.substring(0, splitPosition))
 
                 val nextStart = if (structuredBoundary) {
@@ -625,10 +630,15 @@ class TrainingManager(
                 } else {
                     (splitPosition - overlap).coerceAtLeast(0)
                 }
-                val safeNextStart = if (!structuredBoundary && nextStart == 0 && splitPosition > 0) {
+                val alignedNextStart = TextModalityProcessor.alignUtf16Boundary(
+                    window,
+                    nextStart,
+                    preferAfter = false
+                )
+                val safeNextStart = if (!structuredBoundary && alignedNextStart == 0 && splitPosition > 0) {
                     splitPosition
                 } else {
-                    nextStart
+                    alignedNextStart
                 }
                 val tail = window.substring(safeNextStart)
                 window.setLength(0)
