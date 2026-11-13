@@ -1,10 +1,25 @@
 package com.argus.agi.model
 
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.nio.ByteBuffer
+import java.nio.CharBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.util.PriorityQueue
 import java.util.concurrent.ConcurrentHashMap
 
 enum class ArgusTokenizerAlgorithm(val checkpointId: Int) {
     GREEDY_LONGEST_MATCH_V1(1),
-    LEARNED_BPE_V1(2);
+    LEARNED_BPE_V1(2),
+    BYTE_LEVEL_BPE_V2(3);
+
+    val usesBpeMerges: Boolean
+        get() = this == LEARNED_BPE_V1 || this == BYTE_LEVEL_BPE_V2
 
     companion object {
         fun fromCheckpointId(value: Int): ArgusTokenizerAlgorithm =
@@ -15,7 +30,7 @@ enum class ArgusTokenizerAlgorithm(val checkpointId: Int) {
 
 data class TokenizerConfig(
     val schemaVersion: Int = CURRENT_SCHEMA_VERSION,
-    val algorithm: ArgusTokenizerAlgorithm = ArgusTokenizerAlgorithm.LEARNED_BPE_V1,
+    val algorithm: ArgusTokenizerAlgorithm = ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2,
     val maxVocabularySize: Int = DEFAULT_MAX_VOCAB_SIZE,
     val maxTokenLength: Int = DEFAULT_MAX_TOKEN_LENGTH
 ) {
@@ -38,7 +53,7 @@ data class TokenizerConfig(
         const val CURRENT_SCHEMA_VERSION = 1
         const val DEFAULT_MAX_VOCAB_SIZE = 2048
         const val DEFAULT_MAX_TOKEN_LENGTH = 16
-        const val MINIMUM_VOCAB_SIZE = 256
+        const val MINIMUM_VOCAB_SIZE = 265
         const val MINIMUM_TOKEN_LENGTH = 11
         const val MAX_SUPPORTED_VOCAB_SIZE = 1_000_000
         const val MAX_SUPPORTED_TOKEN_LENGTH = 256
@@ -71,6 +86,13 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         private const val SEED_CAPACITY_DIVISOR = 4
         private const val MAX_INITIAL_SEED_WORDS = 256
         private const val MAX_INITIAL_SEED_MERGES = 512
+        private const val FIRST_BYTE_TOKEN_ID = 9
+        private const val BYTE_ALPHABET_SIZE = 256
+        private const val SNAPSHOT_MAGIC = 0x41544B53 // "ATKS"
+        const val CURRENT_SNAPSHOT_FORMAT_VERSION = 1
+        private const val SNAPSHOT_DIGEST_BYTES = 32
+        private const val MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
+        private val BYTE_LEVEL_PRETOKENIZER = Regex("(?U)\\s+|[^\\s]+")
 
         const val MAX_TOKEN_LEN = TokenizerConfig.DEFAULT_MAX_TOKEN_LENGTH
         const val MAX_VOCAB_SIZE = TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE
@@ -113,6 +135,16 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
     private fun initBaseVocabulary() {
         ensureSpecialTokens()
+
+        if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
+            for (byteValue in 0 until BYTE_ALPHABET_SIZE) {
+                registerToken(
+                    byteSymbol(byteValue),
+                    FIRST_BYTE_TOKEN_ID + byteValue
+                )
+            }
+            return
+        }
 
         val baseChars = " abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,!?:;-_+*=/\\@#$%^&()[]{}|<>\"'~\n\r\t“”‘’—–…«»"
         for (c in baseChars) {
@@ -229,13 +261,37 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
     }
 
     val vocabSize: Int
-        get() = maxOf(nextId, tokenToId.size)
+        @Synchronized get() = maxOf(nextId, tokenToId.size)
+
+    internal fun baseByteTokenId(byteValue: Int): Int {
+        require(byteValue in 0 until BYTE_ALPHABET_SIZE) {
+            "Byte value must be in 0..255."
+        }
+        require(config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
+            "The byte alphabet is available only for BYTE_LEVEL_BPE_V2."
+        }
+        return FIRST_BYTE_TOKEN_ID + byteValue
+    }
 
     @Synchronized
     fun registerToken(token: String, id: Int? = null): Int {
         require(token.isNotEmpty()) { "Token tidak boleh kosong" }
         require(token.length <= config.maxTokenLength) {
             "Token length ${token.length} exceeds configured maxTokenLength=${config.maxTokenLength}."
+        }
+        if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
+            require(token.all { character -> character.code <= 0xFF || token in SPECIAL_IDS }) {
+                "Byte-Level BPE vocabulary entries must use the reversible 0..255 byte alphabet."
+            }
+        }
+        if (
+            config.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1 &&
+            token != "~" &&
+            token.contains('~')
+        ) {
+            throw IllegalArgumentException(
+                "LEARNED_BPE_V1 reserves '~' for its legacy Unicode escape format."
+            )
         }
 
         // Token sudah terdaftar? Kembalikan ID lama; tolak override eksplisit.
@@ -248,9 +304,12 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             return existingId
         }
 
-        // Guard kapasitas — berlaku untuk alokasi otomatis, TIDAK untuk special token / import
+        // Capacity exhaustion is explicit. Callers must choose a fallback deliberately;
+        // silently returning UNK would corrupt learned text and hide vocabulary overflow.
         if (id == null && nextId >= config.maxVocabularySize) {
-            return UNK_ID
+            throw IllegalStateException(
+                "Tokenizer vocabulary capacity ${config.maxVocabularySize} is exhausted."
+            )
         }
 
         val resolved = id ?: nextId
@@ -297,52 +356,100 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             "Duplicate tokens pada vocab import"
         }
 
-        // Validasi canonical IDs untuk special tokens
-        for ((tok, id) in entries) {
-            val canonical = SPECIAL_IDS[tok]
-            if (canonical != null && canonical != id) {
-                throw IllegalArgumentException(
-                    "Special token '$tok' wajib di id=$canonical, bukan id=$id"
-                )
+        val requiredEntries = requiredBaseEntries()
+        val importedIdsByToken = entries.toMap()
+        for ((token, canonicalId) in requiredEntries) {
+            val importedId = importedIdsByToken[token]
+            require(importedId == null || importedId == canonicalId) {
+                "Canonical token '$token' must keep ID $canonicalId, not $importedId."
             }
         }
 
-        // Bangun state baru secara lokal (validasi penuh sebelum commit)
-        val newTokenToId = HashMap<String, Int>(entries.size * 2)
-        val newIdToToken = HashMap<Int, String>(entries.size * 2)
+        // Build both maps completely before publishing either one. All public
+        // readers (encode/decode/export/vocabSize) use this same monitor.
+        val newTokenToId = HashMap<String, Int>(entries.size * 2 + requiredEntries.size)
+        val newIdToToken = HashMap<Int, String>(entries.size * 2 + requiredEntries.size)
+        var newMaxLen = 1
 
-        for ((tok, id) in SPECIAL_IDS) {
-            newTokenToId[tok] = id
-            newIdToToken[id] = tok
+        for ((token, id) in requiredEntries) {
+            require(token.length <= config.maxTokenLength) {
+                "Canonical token '$token' exceeds the configured token length."
+            }
+            newTokenToId[token] = id
+            newIdToToken[id] = token
+            newMaxLen = maxOf(newMaxLen, token.length)
         }
 
-        var newMaxLen = 1
-        for ((tok, id) in entries) {
-            require(tok.isNotEmpty()) { "Token kosong pada vocab import" }
-            require(tok.length <= config.maxTokenLength) {
-                "Token length ${tok.length} exceeds configured maxTokenLength=${config.maxTokenLength}."
+        for ((token, id) in entries) {
+            require(token.isNotEmpty()) { "Token kosong pada vocab import" }
+            require(token.length <= config.maxTokenLength) {
+                "Token length ${token.length} exceeds configured maxTokenLength=${config.maxTokenLength}."
             }
             require(id in 0 until config.maxVocabularySize) {
                 "Token ID $id exceeds configured vocabulary capacity ${config.maxVocabularySize}."
             }
-            val occupant = newIdToToken[id]
-            require(occupant == null || occupant == tok) {
-                "ID $id bentrok: '$occupant' vs '$tok'"
+            if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2 &&
+                token !in SPECIAL_IDS
+            ) {
+                require(token.all { character -> character.code <= 0xFF }) {
+                    "Imported Byte-Level BPE tokens must contain only byte symbols."
+                }
             }
-            newTokenToId[tok] = id
-            newIdToToken[id] = tok
-            if (tok.length > newMaxLen) newMaxLen = tok.length
+            if (
+                config.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1 &&
+                token != "~" &&
+                token.contains('~')
+            ) {
+                throw IllegalArgumentException(
+                    "Imported LEARNED_BPE_V1 tokens cannot contain the reserved '~' escape marker."
+                )
+            }
+
+            val existingTokenId = newTokenToId[token]
+            require(existingTokenId == null || existingTokenId == id) {
+                "Token '$token' is assigned to both ID $existingTokenId and ID $id."
+            }
+            val occupant = newIdToToken[id]
+            require(occupant == null || occupant == token) {
+                "ID $id bentrok: '$occupant' vs '$token'"
+            }
+
+            newTokenToId[token] = id
+            newIdToToken[id] = token
+            newMaxLen = maxOf(newMaxLen, token.length)
         }
 
         require(newTokenToId.size <= config.maxVocabularySize) {
             "Imported vocabulary plus canonical tokens exceeds configured capacity."
         }
 
-        // Commit
-        tokenToId.clear(); tokenToId.putAll(newTokenToId)
-        idToToken.clear(); idToToken.putAll(newIdToToken)
+        if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
+            val maximumId = newIdToToken.keys.maxOrNull() ?: -1
+            require(newIdToToken.size == maximumId + 1) {
+                "Byte-Level BPE vocabulary IDs must be contiguous and append-only."
+            }
+        }
+
+        // Atomic publication relative to every synchronized tokenizer operation.
+        tokenToId.clear()
+        tokenToId.putAll(newTokenToId)
+        idToToken.clear()
+        idToToken.putAll(newIdToToken)
         nextId = (newIdToToken.keys.maxOrNull() ?: -1) + 1
         maxRegisteredLen = newMaxLen
+    }
+
+    private fun requiredBaseEntries(): List<Pair<String, Int>> {
+        val required = ArrayList<Pair<String, Int>>(SPECIAL_IDS.size + BYTE_ALPHABET_SIZE)
+        for ((token, id) in SPECIAL_IDS) {
+            required += token to id
+        }
+        if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
+            for (byteValue in 0 until BYTE_ALPHABET_SIZE) {
+                required += byteSymbol(byteValue) to (FIRST_BYTE_TOKEN_ID + byteValue)
+            }
+        }
+        return required
     }
 
     @Synchronized
@@ -353,15 +460,53 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
     @Synchronized
     fun importMerges(importedMerges: List<Pair<String, String>>) {
-        merges.clear()
-        mergeRanks.clear()
-        for ((idx, pair) in importedMerges.withIndex()) {
-            require(pair.first.isNotEmpty() && pair.second.isNotEmpty()) {
+        require(config.algorithm.usesBpeMerges) {
+            "Merge rules are not supported by ${config.algorithm}."
+        }
+        require(importedMerges.size <= config.maxVocabularySize) {
+            "Merge count exceeds configured vocabulary capacity."
+        }
+
+        // Validate into a temporary map first. A malformed item must never leave
+        // the active merge table partially cleared or partially populated.
+        val candidateRanks = HashMap<Pair<String, String>, Int>(importedMerges.size * 2)
+        for ((index, pair) in importedMerges.withIndex()) {
+            val (left, right) = pair
+            require(left.isNotEmpty() && right.isNotEmpty()) {
                 "Merge pair components must not be empty."
             }
-            merges.add(pair)
-            mergeRanks[pair] = idx
+            require(left.length + right.length <= config.maxTokenLength) {
+                "Merge result exceeds configured maximum token length."
+            }
+            require(left !in CONTROL_TOKENS && right !in CONTROL_TOKENS) {
+                "Special tokens cannot be merge components."
+            }
+            require(tokenToId.containsKey(left) && tokenToId.containsKey(right)) {
+                "Merge components must already exist in the vocabulary."
+            }
+            val combined = left + right
+            require(tokenToId.containsKey(combined)) {
+                "Merged token '$combined' is missing from the vocabulary."
+            }
+            if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
+                require((left + right).all { character -> character.code <= 0xFF }) {
+                    "Byte-Level BPE merges must remain inside the byte-symbol alphabet."
+                }
+            }
+            if (config.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1) {
+                require(!left.contains('~') && !right.contains('~')) {
+                    "LEARNED_BPE_V1 merge rules cannot consume the reserved '~' escape marker."
+                }
+            }
+            require(candidateRanks.put(pair, index) == null) {
+                "Duplicate BPE merge pair: '$left' + '$right'."
+            }
         }
+
+        merges.clear()
+        merges.addAll(importedMerges)
+        mergeRanks.clear()
+        mergeRanks.putAll(candidateRanks)
     }
 
     /**
@@ -377,23 +522,41 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         targetVocabSize: Int = config.maxVocabularySize,
         maxNewMerges: Int = DEFAULT_MAX_MERGES_PER_TRAINING_PASS
     ): Int {
+        require(config.algorithm.usesBpeMerges) {
+            "BPE training is not supported by ${config.algorithm}."
+        }
         require(maxNewMerges > 0) { "maxNewMerges must be positive." }
         val target = minOf(targetVocabSize, config.maxVocabularySize)
         if (vocabSize >= target || corpus.isEmpty()) return vocabSize
 
         val wordFrequencies = LinkedHashMap<String, Int>()
-        for (document in corpus) {
-            var normalized = TextModalityProcessor.normalizeTypography(document)
-            // Control tokens already have fixed IDs and are split atomically during
-            // encoding. Do not spend BPE merges learning fragments of their markup,
-            // including when a marker touches the surrounding text.
-            for (specialToken in SPECIAL_TOKENS) {
-                normalized = normalized.replace(specialToken, " ")
+
+        fun addWordFrequency(word: String) {
+            if (word.isEmpty()) return
+            val previous = wordFrequencies[word] ?: 0
+            wordFrequencies[word] = if (previous == Int.MAX_VALUE) {
+                Int.MAX_VALUE
+            } else {
+                previous + 1
             }
-            for (word in normalized.split(Regex("\\s+"))) {
-                if (word.isEmpty()) continue
-                val frequency = wordFrequencies[word] ?: 0
-                wordFrequencies[word] = if (frequency == Int.MAX_VALUE) frequency else frequency + 1
+        }
+
+        for (document in corpus) {
+            if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
+                // Byte-Level BPE is intentionally lossless: no typography
+                // normalization, trimming, or Unicode code-point splitting.
+                forEachNormalTextSegment(document) { segment ->
+                    for (match in BYTE_LEVEL_PRETOKENIZER.findAll(segment)) {
+                        addWordFrequency(match.value)
+                    }
+                }
+            } else {
+                val normalized = TextModalityProcessor.normalizeTypography(document)
+                forEachNormalTextSegment(normalized) { segment ->
+                    for (word in segment.split(Regex("\\s+"))) {
+                        addWordFrequency(word)
+                    }
+                }
             }
         }
         if (wordFrequencies.isEmpty()) return vocabSize
@@ -401,12 +564,18 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         val wordSymbols = LinkedHashMap<String, MutableList<String>>(wordFrequencies.size)
         for (word in wordFrequencies.keys) {
             val symbols = mutableListOf<String>()
-            var index = 0
-            while (index < word.length) {
-                val codePoint = Character.codePointAt(word, index)
-                val codePointLength = Character.charCount(codePoint)
-                symbols.add(word.substring(index, index + codePointLength))
-                index += codePointLength
+            if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
+                for (byte in encodeUtf8Strict(word)) {
+                    symbols.add(byteSymbol(byte.toInt() and 0xFF))
+                }
+            } else {
+                var index = 0
+                while (index < word.length) {
+                    val codePoint = Character.codePointAt(word, index)
+                    val codePointLength = Character.charCount(codePoint)
+                    symbols.add(word.substring(index, index + codePointLength))
+                    index += codePointLength
+                }
             }
             wordSymbols[word] = symbols
         }
@@ -427,6 +596,10 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 for (index in 0 until symbols.size - 1) {
                     val pair = symbols[index] to symbols[index + 1]
                     if (mergeRanks.containsKey(pair)) continue
+                    if (
+                        config.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1 &&
+                        (pair.first.contains('~') || pair.second.contains('~'))
+                    ) continue
                     if (pair.first.length + pair.second.length > config.maxTokenLength) continue
                     val previous = pairCounts[pair] ?: 0
                     pairCounts[pair] = if (previous > Int.MAX_VALUE - frequency) {
@@ -443,7 +616,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             val combined = bestPair.first + bestPair.second
             if (combined.length > config.maxTokenLength) break
 
-            val tokenId = tokenToId[combined] ?: registerToken(combined)
+            val tokenId = tokenToId[combined] ?: runCatching {
+                registerToken(combined)
+            }.getOrNull() ?: break
             if (tokenId == UNK_ID && combined != UNK_TOKEN) break
 
             merges.add(bestPair)
@@ -463,15 +638,273 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         right: String,
         combined: String
     ) {
-        var index = 0
-        while (index < symbols.size - 1) {
-            if (symbols[index] == left && symbols[index + 1] == right) {
-                symbols[index] = combined
-                symbols.removeAt(index + 1)
+        // Single forward compaction pass. Repeated removeAt(index) shifted the
+        // remaining tail for every match and made this operation quadratic.
+        var readIndex = 0
+        var writeIndex = 0
+        while (readIndex < symbols.size) {
+            if (
+                readIndex + 1 < symbols.size &&
+                symbols[readIndex] == left &&
+                symbols[readIndex + 1] == right
+            ) {
+                symbols[writeIndex] = combined
+                writeIndex++
+                readIndex += 2
             } else {
-                index++
+                symbols[writeIndex] = symbols[readIndex]
+                writeIndex++
+                readIndex++
             }
         }
+        while (symbols.size > writeIndex) {
+            symbols.removeAt(symbols.lastIndex)
+        }
+    }
+
+    private class BpeNode(
+        val position: Int,
+        var value: String
+    ) {
+        var previous: BpeNode? = null
+        var next: BpeNode? = null
+        var generation: Int = 0
+        var active: Boolean = true
+    }
+
+    private data class MergeCandidate(
+        val rank: Int,
+        val position: Int,
+        val left: BpeNode,
+        val right: BpeNode,
+        val leftGeneration: Int,
+        val rightGeneration: Int
+    )
+
+    private fun byteSymbol(byteValue: Int): String =
+        (byteValue and 0xFF).toChar().toString()
+
+    private fun encodeUtf8Strict(text: String): ByteArray {
+        return try {
+            val encoded = StandardCharsets.UTF_8.newEncoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .encode(CharBuffer.wrap(text))
+            ByteArray(encoded.remaining()).also(encoded::get)
+        } catch (exception: CharacterCodingException) {
+            throw IllegalArgumentException(
+                "Tokenizer input contains malformed UTF-16 and cannot be encoded as UTF-8.",
+                exception
+            )
+        }
+    }
+
+    private fun decodeUtf8Strict(bytes: ByteArray): String {
+        return try {
+            StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes))
+                .toString()
+        } catch (exception: CharacterCodingException) {
+            throw IllegalStateException(
+                "Tokenizer byte sequence is not valid UTF-8.",
+                exception
+            )
+        }
+    }
+
+    private fun forEachNormalTextSegment(
+        text: String,
+        action: (String) -> Unit
+    ) {
+        var cursor = 0
+        var segmentStart = 0
+        while (cursor < text.length) {
+            val specialToken = if (text[cursor] == '<') {
+                SPECIAL_TOKENS.firstOrNull { token -> text.startsWith(token, cursor) }
+            } else {
+                null
+            }
+            if (specialToken != null) {
+                if (segmentStart < cursor) {
+                    action(text.substring(segmentStart, cursor))
+                }
+                cursor += specialToken.length
+                segmentStart = cursor
+            } else {
+                cursor++
+            }
+        }
+        if (segmentStart < text.length) {
+            action(text.substring(segmentStart))
+        }
+    }
+
+    /**
+     * Applies the learned merge ranks with a min-heap and a linked token sequence.
+     * Stale candidates are rejected by node generations, so each local neighborhood
+     * is reconsidered only when one of its nodes changes.
+     */
+    private fun applyRankedMerges(initialSymbols: List<String>): List<String> {
+        if (initialSymbols.size < 2 || mergeRanks.isEmpty()) return initialSymbols
+
+        val nodes = ArrayList<BpeNode>(initialSymbols.size)
+        for ((index, symbol) in initialSymbols.withIndex()) {
+            nodes += BpeNode(index, symbol)
+        }
+        for (index in 0 until nodes.lastIndex) {
+            nodes[index].next = nodes[index + 1]
+            nodes[index + 1].previous = nodes[index]
+        }
+
+        val queue = PriorityQueue<MergeCandidate>(
+            compareBy<MergeCandidate> { candidate -> candidate.rank }
+                .thenBy { candidate -> candidate.position }
+        )
+
+        fun offer(left: BpeNode?, right: BpeNode?) {
+            if (left == null || right == null || !left.active || !right.active) return
+            val rank = mergeRanks[left.value to right.value] ?: return
+            queue.add(
+                MergeCandidate(
+                    rank = rank,
+                    position = left.position,
+                    left = left,
+                    right = right,
+                    leftGeneration = left.generation,
+                    rightGeneration = right.generation
+                )
+            )
+        }
+
+        for (index in 0 until nodes.lastIndex) {
+            offer(nodes[index], nodes[index + 1])
+        }
+
+        while (queue.isNotEmpty()) {
+            val candidate = queue.remove()
+            val left = candidate.left
+            val right = candidate.right
+            if (
+                !left.active ||
+                !right.active ||
+                left.next !== right ||
+                left.generation != candidate.leftGeneration ||
+                right.generation != candidate.rightGeneration
+            ) {
+                continue
+            }
+
+            val next = right.next
+            left.value += right.value
+            left.generation++
+            left.next = next
+            right.active = false
+            right.generation++
+            right.previous = null
+            right.next = null
+            next?.previous = left
+
+            offer(left.previous, left)
+            offer(left, next)
+        }
+
+        val merged = ArrayList<String>(nodes.size)
+        var node: BpeNode? = nodes.first()
+        while (node != null) {
+            if (node.active) merged += node.value
+            node = node.next
+        }
+        return merged
+    }
+
+    private fun encodeByteLevelBpe(text: String): List<Int> {
+        if (text.isEmpty()) return emptyList()
+        val result = ArrayList<Int>(text.length)
+        var cursor = 0
+        var segmentStart = 0
+
+        while (cursor < text.length) {
+            val specialToken = if (text[cursor] == '<') {
+                SPECIAL_TOKENS.firstOrNull { token -> text.startsWith(token, cursor) }
+            } else {
+                null
+            }
+            if (specialToken != null) {
+                if (segmentStart < cursor) {
+                    encodeByteLevelSegment(text.substring(segmentStart, cursor), result)
+                }
+                result += tokenToId[specialToken]
+                    ?: throw IllegalStateException("Canonical special token '$specialToken' is missing.")
+                cursor += specialToken.length
+                segmentStart = cursor
+            } else {
+                cursor++
+            }
+        }
+
+        if (segmentStart < text.length) {
+            encodeByteLevelSegment(text.substring(segmentStart), result)
+        }
+        return result
+    }
+
+    private fun encodeByteLevelSegment(
+        segment: String,
+        destination: MutableList<Int>
+    ) {
+        for (match in BYTE_LEVEL_PRETOKENIZER.findAll(segment)) {
+            val bytes = encodeUtf8Strict(match.value)
+            val initialSymbols = ArrayList<String>(bytes.size)
+            for (byte in bytes) {
+                initialSymbols += byteSymbol(byte.toInt() and 0xFF)
+            }
+            for (piece in applyRankedMerges(initialSymbols)) {
+                destination += tokenToId[piece]
+                    ?: throw IllegalStateException(
+                        "Byte-Level BPE produced a token that is absent from the vocabulary."
+                    )
+            }
+        }
+    }
+
+    private fun decodeByteLevel(
+        tokenIds: List<Int>,
+        keepControlTokens: Boolean,
+        keepReasoningTokens: Boolean
+    ): String {
+        val output = StringBuilder(tokenIds.size * 2)
+        val byteBuffer = ByteArrayOutputStream()
+
+        fun flushBytes() {
+            if (byteBuffer.size() == 0) return
+            output.append(decodeUtf8Strict(byteBuffer.toByteArray()))
+            byteBuffer.reset()
+        }
+
+        for (id in tokenIds) {
+            val token = idToToken[id] ?: continue
+            if (token in CONTROL_TOKENS) {
+                val preserveToken = keepControlTokens ||
+                    (keepReasoningTokens && token in REASONING_TOKENS)
+                if (preserveToken) {
+                    flushBytes()
+                    output.append(token)
+                }
+                continue
+            }
+
+            for (symbol in token) {
+                require(symbol.code <= 0xFF) {
+                    "Byte-Level BPE token contains a non-byte symbol."
+                }
+                byteBuffer.write(symbol.code)
+            }
+        }
+
+        flushBytes()
+        return output.toString()
     }
 
     private fun encodeLearnedBpe(cleanText: String, autoRegister: Boolean): List<Int> {
@@ -578,7 +1011,12 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         return result
     }
 
+    @Synchronized
     fun encode(text: String, autoRegister: Boolean = false): List<Int> {
+        if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
+            return encodeByteLevelBpe(text)
+        }
+
         val cleanText = TextModalityProcessor.normalizeTypography(text)
         val n = cleanText.length
         if (n == 0) return emptyList()
@@ -663,11 +1101,16 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
      * @param keepReasoningTokens jika true, hanya <THINK> dan </THINK> yang
      *        dipertahankan sementara token kontrol lain tetap disembunyikan.
      */
+    @Synchronized
     fun decode(
         tokenIds: List<Int>,
         keepControlTokens: Boolean = false,
         keepReasoningTokens: Boolean = false
     ): String {
+        if (config.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2) {
+            return decodeByteLevel(tokenIds, keepControlTokens, keepReasoningTokens)
+        }
+
         val sb = StringBuilder(tokenIds.size * 2)
         for (id in tokenIds) {
             val token = idToToken[id] ?: continue
@@ -678,6 +1121,164 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             sb.append(token)
         }
         return decodeUnicodeFallbacks(sb.toString())
+    }
+
+    /**
+     * Serializes the complete tokenizer state into a deterministic, versioned snapshot.
+     * The final 32 bytes are SHA-256 over every preceding byte.
+     */
+    @Synchronized
+    fun saveSnapshot(): ByteArray {
+        val payload = buildSnapshotPayload()
+        val digest = MessageDigest.getInstance("SHA-256").digest(payload)
+        return payload + digest
+    }
+
+    /** Returns the lowercase SHA-256 fingerprint of the canonical snapshot payload. */
+    @Synchronized
+    fun snapshotFingerprint(): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(buildSnapshotPayload())
+            .joinToString(separator = "") { byte ->
+                "%02x".format(java.util.Locale.ROOT, byte.toInt() and 0xFF)
+            }
+
+    @Synchronized
+    fun loadSnapshot(snapshot: ByteArray) {
+        require(snapshot.size >= SNAPSHOT_DIGEST_BYTES + 28) {
+            "Tokenizer snapshot is truncated."
+        }
+        require(snapshot.size <= MAX_SNAPSHOT_BYTES) {
+            "Tokenizer snapshot exceeds the supported maximum size."
+        }
+
+        val payloadLength = snapshot.size - SNAPSHOT_DIGEST_BYTES
+        val payload = snapshot.copyOfRange(0, payloadLength)
+        val storedDigest = snapshot.copyOfRange(payloadLength, snapshot.size)
+        val actualDigest = MessageDigest.getInstance("SHA-256").digest(payload)
+        require(MessageDigest.isEqual(storedDigest, actualDigest)) {
+            "Tokenizer snapshot SHA-256 verification failed."
+        }
+
+        val input = DataInputStream(ByteArrayInputStream(payload))
+        require(input.readInt() == SNAPSHOT_MAGIC) {
+            "Tokenizer snapshot magic is invalid."
+        }
+        val formatVersion = input.readInt()
+        require(formatVersion == CURRENT_SNAPSHOT_FORMAT_VERSION) {
+            "Unsupported tokenizer snapshot format version: $formatVersion."
+        }
+        val schemaVersion = input.readInt()
+        require(schemaVersion == config.schemaVersion) {
+            "Tokenizer snapshot schema does not match the active configuration."
+        }
+        val algorithmId = input.readInt()
+        require(algorithmId == config.algorithm.checkpointId) {
+            "Tokenizer snapshot algorithm does not match the active configuration."
+        }
+        val vocabularyCapacity = input.readInt()
+        require(vocabularyCapacity == config.maxVocabularySize) {
+            "Tokenizer snapshot vocabulary capacity does not match the active configuration."
+        }
+        val maximumTokenLength = input.readInt()
+        require(maximumTokenLength == config.maxTokenLength) {
+            "Tokenizer snapshot maximum token length does not match the active configuration."
+        }
+
+        val vocabularyCount = input.readInt()
+        require(vocabularyCount in 1..config.maxVocabularySize) {
+            "Tokenizer snapshot vocabulary count is invalid."
+        }
+        val vocabulary = ArrayList<Pair<String, Int>>(vocabularyCount)
+        repeat(vocabularyCount) {
+            val id = input.readInt()
+            val token = readSnapshotString(input)
+            vocabulary += token to id
+        }
+
+        val mergeCount = input.readInt()
+        require(mergeCount in 0..config.maxVocabularySize) {
+            "Tokenizer snapshot merge count is invalid."
+        }
+        val importedMerges = ArrayList<Pair<String, String>>(mergeCount)
+        repeat(mergeCount) {
+            importedMerges += readSnapshotString(input) to readSnapshotString(input)
+        }
+        require(input.available() == 0) {
+            "Tokenizer snapshot contains unexpected trailing payload data."
+        }
+        require(config.algorithm.usesBpeMerges || importedMerges.isEmpty()) {
+            "A non-BPE tokenizer snapshot cannot contain merge rules."
+        }
+
+        // Restore into a fully validated candidate first. The active instance is
+        // not changed if any vocabulary or merge invariant fails.
+        val candidate = Tokenizer(config)
+        candidate.importVocab(vocabulary)
+        if (config.algorithm.usesBpeMerges) {
+            candidate.importMerges(importedMerges)
+        }
+
+        tokenToId.clear()
+        tokenToId.putAll(candidate.tokenToId)
+        idToToken.clear()
+        idToToken.putAll(candidate.idToToken)
+        merges.clear()
+        merges.addAll(candidate.merges)
+        mergeRanks.clear()
+        mergeRanks.putAll(candidate.mergeRanks)
+        nextId = candidate.nextId
+        maxRegisteredLen = candidate.maxRegisteredLen
+    }
+
+    private fun buildSnapshotPayload(): ByteArray {
+        val output = ByteArrayOutputStream()
+        DataOutputStream(output).use { data ->
+            data.writeInt(SNAPSHOT_MAGIC)
+            data.writeInt(CURRENT_SNAPSHOT_FORMAT_VERSION)
+            data.writeInt(config.schemaVersion)
+            data.writeInt(config.algorithm.checkpointId)
+            data.writeInt(config.maxVocabularySize)
+            data.writeInt(config.maxTokenLength)
+
+            val vocabulary = exportVocab()
+            data.writeInt(vocabulary.size)
+            for ((token, id) in vocabulary) {
+                data.writeInt(id)
+                writeSnapshotString(data, token)
+            }
+
+            val mergeRules = if (config.algorithm.usesBpeMerges) {
+                exportMerges()
+            } else {
+                emptyList()
+            }
+            data.writeInt(mergeRules.size)
+            for ((left, right) in mergeRules) {
+                writeSnapshotString(data, left)
+                writeSnapshotString(data, right)
+            }
+        }
+        return output.toByteArray()
+    }
+
+    private fun writeSnapshotString(output: DataOutputStream, value: String) {
+        val bytes = encodeUtf8Strict(value)
+        require(bytes.isNotEmpty() && bytes.size <= config.maxTokenLength * 4) {
+            "Tokenizer snapshot string length is invalid."
+        }
+        output.writeInt(bytes.size)
+        output.write(bytes)
+    }
+
+    private fun readSnapshotString(input: DataInputStream): String {
+        val length = input.readInt()
+        require(length in 1..(config.maxTokenLength * 4)) {
+            "Tokenizer snapshot string length is invalid."
+        }
+        val bytes = ByteArray(length)
+        input.readFully(bytes)
+        return decodeUtf8Strict(bytes)
     }
 
     private fun decodeUnicodeFallbacks(encoded: String): String {
