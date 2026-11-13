@@ -514,10 +514,16 @@ class ArgusNeuralEngine private constructor(
                 )
             }.getOrNull()
 
-            val resolvedConfig = savedConfig ?: requireNotNull(deviceConfig) {
+            // The tokenizer is moving to a new byte-level vocabulary contract.
+            // Old ARG3/ARG4 checkpoints are intentionally not restored; a fresh
+            // model must be initialized with the matching BYTE_LEVEL_BPE_V2 IDs.
+            val compatibleSavedConfig = savedConfig?.takeIf { saved ->
+                saved.tokenizerConfig.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2
+            }
+            val resolvedConfig = compatibleSavedConfig ?: requireNotNull(deviceConfig) {
                 "This device cannot currently allocate the minimum executable Argus model safely."
             }
-            val savedParameterCount = savedConfig?.let { saved ->
+            val savedParameterCount = compatibleSavedConfig?.let { saved ->
                 ArgusArchitectureParameterEstimator.estimate(
                     ArgusArchitectureConfig(
                         layerCount = saved.layerCount,
@@ -544,13 +550,13 @@ class ArgusNeuralEngine private constructor(
                 ).totalTrainableParameters
             }
             val accumulatedTrainingIsSafe = deviceConfig != null &&
-                (savedConfig == null ||
+                (compatibleSavedConfig == null ||
                     (
                         savedParameterCount != null &&
                             currentDeviceParameterCapacity != null &&
                             savedParameterCount <= currentDeviceParameterCapacity &&
                             runCatching {
-                                savedConfig.copy(gradientAccumulationEnabled = true)
+                                compatibleSavedConfig.copy(gradientAccumulationEnabled = true)
                             }.isSuccess
                     ))
             val selectedTier = deviceConfig?.modelTier ?: resolvedConfig.modelTier
@@ -828,8 +834,7 @@ class ArgusNeuralEngine private constructor(
     fun trainTokenizerFromCorpus(corpus: List<String>): TokenizerTrainingResult {
         val result = synchronized(modelLock) {
             val previousVocabularySize = tokenizer.vocabSize
-            val usesLearnedBpe =
-                config.tokenizerConfig.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1
+            val usesLearnedBpe = config.tokenizerConfig.algorithm.usesBpeMerges
             val previousMergeCount = if (usesLearnedBpe) tokenizer.mergeCount else 0
             val mergeBudget = when {
                 dModel < 64 -> 32
@@ -3067,7 +3072,7 @@ class ArgusNeuralEngine private constructor(
         val target = File(context.filesDir, "argus_model_weights.bin")
         val temporary = File(context.filesDir, "argus_model_weights.bin.tmp")
         val vocabEntries = tokenizer.exportVocab()
-        val isLearnedBpe = config.tokenizerConfig.algorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1
+        val isLearnedBpe = config.tokenizerConfig.algorithm.usesBpeMerges
         val merges = if (isLearnedBpe) tokenizer.exportMerges() else emptyList()
         val tensors = checkpointTensors()
         val architecture = architectureConfig
@@ -3461,7 +3466,7 @@ class ArgusNeuralEngine private constructor(
                     )
                 }
 
-                val isLearnedBpe = savedTokenizerAlgorithm == ArgusTokenizerAlgorithm.LEARNED_BPE_V1.checkpointId
+                val isLearnedBpe = config.tokenizerConfig.algorithm.usesBpeMerges
                 val loadedMerges = if (isLearnedBpe) {
                     val mergeCount = readIntLittleEndian(input)
                     require(mergeCount in 0..config.tokenizerConfig.maxVocabularySize) {
