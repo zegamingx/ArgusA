@@ -92,7 +92,6 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         const val CURRENT_SNAPSHOT_FORMAT_VERSION = 1
         private const val SNAPSHOT_DIGEST_BYTES = 32
         private const val MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
-        private val BYTE_LEVEL_PRETOKENIZER = Regex("(?U)\\s+|[^\\s]+")
 
         const val MAX_TOKEN_LEN = TokenizerConfig.DEFAULT_MAX_TOKEN_LENGTH
         const val MAX_VOCAB_SIZE = TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE
@@ -568,8 +567,8 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 // Byte-Level BPE is intentionally lossless: no typography
                 // normalization, trimming, or Unicode code-point splitting.
                 forEachNormalTextSegment(document) { segment ->
-                    for (match in BYTE_LEVEL_PRETOKENIZER.findAll(segment)) {
-                        addWordFrequency(match.value)
+                    forEachByteLevelPreToken(segment) { preToken ->
+                        addWordFrequency(preToken)
                     }
                 }
             } else {
@@ -785,6 +784,55 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
     }
 
     /**
+     * Splits text into alternating Unicode White_Space and non-whitespace runs.
+     *
+     * This deliberately avoids java.util.regex inline Unicode flags: Android's
+     * ICU-backed Pattern implementation does not accept the JVM (?U) flag.
+     * Training and inference share this scanner so BPE merge boundaries remain
+     * identical across runtimes.
+     */
+    private fun forEachByteLevelPreToken(
+        text: String,
+        action: (String) -> Unit
+    ) {
+        if (text.isEmpty()) return
+
+        var tokenStart = 0
+        var cursor = 0
+        var firstCodePoint = Character.codePointAt(text, cursor)
+        var previousIsWhitespace = isUnicodeWhiteSpace(firstCodePoint)
+        cursor += Character.charCount(firstCodePoint)
+
+        while (cursor < text.length) {
+            val codePoint = Character.codePointAt(text, cursor)
+            val isWhitespace = isUnicodeWhiteSpace(codePoint)
+            if (isWhitespace != previousIsWhitespace) {
+                action(text.substring(tokenStart, cursor))
+                tokenStart = cursor
+                previousIsWhitespace = isWhitespace
+            }
+            cursor += Character.charCount(codePoint)
+        }
+
+        action(text.substring(tokenStart))
+    }
+
+    /**
+     * Unicode White_Space property, independent of the device regex engine.
+     */
+    private fun isUnicodeWhiteSpace(codePoint: Int): Boolean =
+        codePoint in 0x0009..0x000D ||
+            codePoint == 0x0020 ||
+            codePoint == 0x0085 ||
+            codePoint == 0x00A0 ||
+            codePoint == 0x1680 ||
+            codePoint in 0x2000..0x200A ||
+            codePoint in 0x2028..0x2029 ||
+            codePoint == 0x202F ||
+            codePoint == 0x205F ||
+            codePoint == 0x3000
+
+    /**
      * Applies the learned merge ranks with a min-heap and a linked token sequence.
      * Stale candidates are rejected by node generations, so each local neighborhood
      * is reconsidered only when one of its nodes changes.
@@ -897,8 +945,8 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         segment: String,
         destination: MutableList<Int>
     ) {
-        for (match in BYTE_LEVEL_PRETOKENIZER.findAll(segment)) {
-            val bytes = encodeUtf8Strict(match.value)
+        forEachByteLevelPreToken(segment) { preToken ->
+            val bytes = encodeUtf8Strict(preToken)
             val initialSymbols = ArrayList<String>(bytes.size)
             for (byte in bytes) {
                 initialSymbols += byteSymbol(byte.toInt() and 0xFF)
