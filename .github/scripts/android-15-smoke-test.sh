@@ -18,7 +18,7 @@ log() {
 
 dump_diagnostics() {
     printf '\n===== Recent Android logcat =====\n' >&2
-    adb_cmd logcat -d -v time -t 100 2>/dev/null | tail -n 350 >&2 || true
+    adb_cmd logcat -d -v time -t 1000 2>/dev/null | tail -n 350 >&2 || true
     printf '===== End Android logcat =====\n' >&2
 }
 
@@ -99,7 +99,7 @@ for (( elapsed = 0; elapsed < CORE_INIT_TIMEOUT_SECONDS; elapsed += 1 )); do
     sleep 1
 done
 
-MicZTy] "${CORE_READY}" == "true" ]] || \
+[[ "${CORE_READY}" == "true" ]] || \
     fail "Argus did not complete core initialization within ${CORE_INIT_TIMEOUT_SECONDS}s."
 
 PROCESS_ID="$(adb_cmd shell pidof "${PACKAGE_NAME}" 2>/dev/null | tr -d '\r' || true)"
