@@ -14,6 +14,7 @@ on:
       - "version.properties"
       - "README.md"
       - ".github/workflows/build.yml"
+      - ".github/scripts/**"
   workflow_dispatch:
     inputs:
       publish_release:
@@ -146,6 +147,10 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew --version
+      - name: Validate Android 15 smoke-test script
+        shell: bash
+        run: bash -n .github/scripts/android-15-smoke-test.sh
+
 
       - name: Run release lint, unit tests and APK build
         run: |
@@ -277,56 +282,7 @@ jobs:
           disable-animations: true
           emulator-boot-timeout: 600
           script: |
-            set -euo pipefail
-            apk_path="app/build/outputs/apk/release/app-release.apk"
-            test -s "\${apk_path}"
-            adb wait-for-device
-            adb logcat -c
-            adb install -r "\${apk_path}"
-            adb shell am start -W -n com.argus.agi/.MainActivity
-
-            core_ready=false
-            for attempt in $(seq 1 120); do
-              crash_log="$(adb logcat -d -b crash)"
-              if grep -Eq "FATAL EXCEPTION|Fatal signal|Process: com.argus.agi" <<< "\${crash_log}"; then
-                echo "::error::Argus crashed during Android 15 startup."
-                adb logcat -d -v time -t 800 | tail -n 300
-                exit 1
-              fi
-              process_id="$(adb shell pidof com.argus.agi 2>/dev/null | tr -d '\r')"
-              if [[ -n "\${process_id}" ]] && adb logcat -d -s ArgusApp:I | grep -Fq "Core runtime initialization completed."; then
-                core_ready=true
-                break
-              fi
-              sleep 1
-            done
-
-            if [[ "\${core_ready}" != "true" ]]; then
-              echo "::error::Argus did not complete core initialization within 120 seconds."
-              adb logcat -d -v time -t 1000 | tail -n 350
-              exit 1
-            fi
-
-            sleep 15
-            process_id="$(adb shell pidof com.argus.agi 2>/dev/null | tr -d '\r')"
-            if [[ -z "\${process_id}" ]]; then
-              echo "::error::Argus process exited after core initialization."
-              adb logcat -d -v time -t 1000 | tail -n 350
-              exit 1
-            fi
-            service_dump="$(adb shell dumpsys activity services com.argus.agi)"
-            if ! grep -Fq "ArgusForegroundService" <<< "\${service_dump}"; then
-              echo "::error::ArgusForegroundService was not running after MainActivity startup."
-              adb logcat -d -v time -t 1000 | tail -n 350
-              exit 1
-            fi
-            crash_log="$(adb logcat -d -b crash)"
-            if grep -Eq "FATAL EXCEPTION|Fatal signal|Process: com.argus.agi" <<< "\${crash_log}"; then
-              echo "::error::Argus crashed after startup."
-              adb logcat -d -v time -t 1000 | tail -n 350
-              exit 1
-            fi
-            echo "Android 15 release startup smoke test passed; core runtime and foreground service stayed active."
+            bash .github/scripts/android-15-smoke-test.sh
 
       - name: Publish latest signed APK to GitHub Release tag
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
