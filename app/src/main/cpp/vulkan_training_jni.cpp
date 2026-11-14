@@ -1003,15 +1003,15 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         const jsize firstMomentCount = env->GetArrayLength(group.firstMoments);
         const jsize secondMomentCount = env->GetArrayLength(group.secondMoments);
 
-        group.elementCount = std::min(
-            std::min(parameterCount, gradientCount),
-            std::min(firstMomentCount, secondMomentCount)
-        );
-
-        if (group.elementCount <= 0) {
+        if (parameterCount <= 0 ||
+            gradientCount != parameterCount ||
+            firstMomentCount != parameterCount ||
+            secondMomentCount != parameterCount) {
+            logError("Vulkan AdamW parameter, gradient, and moment group sizes must match.");
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
         }
+        group.elementCount = parameterCount;
 
         group.packedOffset = totalElements;
         const size_t count = static_cast<size_t>(group.elementCount);
@@ -1030,15 +1030,31 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
     }
 
     const size_t packedFloatCount = totalElements * 5u;
-    std::vector<float> packed;
-    try {
-        packed.resize(packedFloatCount);
-    } catch (const std::bad_alloc&) {
+    const size_t byteCount = packedFloatCount * sizeof(float);
+    if (byteCount > static_cast<size_t>(
+            gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange
+        )) {
         releaseGroupReferences(env, groups);
         return JNI_FALSE;
     }
 
-    float* parameterValues = packed.data();
+    const uint64_t workGroupCount =
+        (static_cast<uint64_t>(totalElements) + kLocalWorkGroupSize - 1u) /
+        kLocalWorkGroupSize;
+    if (workGroupCount == 0 ||
+        workGroupCount > gRuntime.maxComputeWorkGroupCountX) {
+        releaseGroupReferences(env, groups);
+        return JNI_FALSE;
+    }
+
+    if (!ensureStorageBuffer(static_cast<VkDeviceSize>(byteCount))) {
+        releaseGroupReferences(env, groups);
+        return JNI_FALSE;
+    }
+
+    // The mapped Vulkan allocation is the final staging destination. Avoid
+    // allocating a second native tensor vector and copying it into the buffer.
+    float* parameterValues = static_cast<float*>(gRuntime.mappedStorage);
     float* gradientValues = parameterValues + totalElements;
     float* firstMomentValues = gradientValues + totalElements;
     float* secondMomentValues = firstMomentValues + totalElements;
@@ -1089,21 +1105,6 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         );
     }
 
-    const size_t byteCount = packedFloatCount * sizeof(float);
-    if (byteCount > static_cast<size_t>(
-            gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange
-        )) {
-        releaseGroupReferences(env, groups);
-        return JNI_FALSE;
-    }
-
-    if (!ensureStorageBuffer(static_cast<VkDeviceSize>(byteCount))) {
-        releaseGroupReferences(env, groups);
-        return JNI_FALSE;
-    }
-
-    std::memcpy(gRuntime.mappedStorage, packed.data(), byteCount);
-
     if (!gRuntime.hostCoherent) {
         VkMappedMemoryRange flushRange{};
         flushRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
@@ -1121,16 +1122,6 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
         }
-    }
-
-    const uint64_t workGroupCount =
-        (static_cast<uint64_t>(totalElements) + kLocalWorkGroupSize - 1u) /
-        kLocalWorkGroupSize;
-
-    if (workGroupCount == 0 ||
-        workGroupCount > gRuntime.maxComputeWorkGroupCountX) {
-        releaseGroupReferences(env, groups);
-        return JNI_FALSE;
     }
 
     VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0);
@@ -1285,6 +1276,17 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         static_cast<const float*>(gRuntime.mappedStorage);
     const float* outputFirstMoments = outputParameters + totalElements * 2u;
     const float* outputSecondMoments = outputParameters + totalElements * 3u;
+
+    // Validate every result before changing any Java-side model or optimizer tensor.
+    for (size_t index = 0; index < totalElements; ++index) {
+        if (!std::isfinite(outputParameters[index]) ||
+            !std::isfinite(outputFirstMoments[index]) ||
+            !std::isfinite(outputSecondMoments[index])) {
+            logError("Vulkan AdamW produced a non-finite parameter or optimizer-state value.");
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
+    }
 
     for (const GroupArrays& group : groups) {
         const size_t offset = group.packedOffset;

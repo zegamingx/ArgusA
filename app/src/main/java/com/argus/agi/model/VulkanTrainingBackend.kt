@@ -679,6 +679,179 @@ internal object VulkanTrainingBackend {
         return true
     }
 
+    /**
+     * Adapts binary16 model parameters to the FP32 Vulkan AdamW kernel.
+     *
+     * Gradient accumulation and AdamW state remain FP32. Only the active
+     * parameter prefix is staged; successful results are quantized back to
+     * binary16 once. Returning false leaves the complete update to the CPU path.
+     */
+    @Synchronized
+    fun tryApplyFp16AdamWUpdate(
+        parameters: Array<Float16ParameterArray>,
+        gradients: Array<FloatArray>,
+        firstMoments: Array<FloatArray>,
+        secondMoments: Array<FloatArray>,
+        weightDecayByGroup: FloatArray,
+        learningRate: Float,
+        beta1: Float,
+        beta2: Float,
+        biasCorrection1: Float,
+        biasCorrection2: Float,
+        epsilon: Float,
+        gradientClipFactor: Float
+    ): Boolean {
+        require(parameters.isNotEmpty()) {
+            "AdamW requires at least one parameter group."
+        }
+        require(
+            parameters.size == gradients.size &&
+                parameters.size == firstMoments.size &&
+                parameters.size == secondMoments.size &&
+                parameters.size == weightDecayByGroup.size
+        ) {
+            "AdamW tensor and weight-decay group counts must match."
+        }
+        require(learningRate.isFinite() && learningRate >= 0f) {
+            "AdamW learning rate must be finite and non-negative."
+        }
+        require(beta1.isFinite() && beta1 >= 0f && beta1 < 1f &&
+            beta2.isFinite() && beta2 >= 0f && beta2 < 1f) {
+            "AdamW beta values must be finite and in [0, 1)."
+        }
+        require(biasCorrection1.isFinite() && biasCorrection1 > 0f &&
+            biasCorrection2.isFinite() && biasCorrection2 > 0f) {
+            "AdamW bias corrections must be finite and positive."
+        }
+        require(epsilon.isFinite() && epsilon > 0f) {
+            "AdamW epsilon must be finite and positive."
+        }
+        require(gradientClipFactor.isFinite() &&
+            gradientClipFactor >= 0f && gradientClipFactor <= 1f) {
+            "AdamW gradient clipping factor must be in [0, 1]."
+        }
+
+        var totalElements = 0L
+        var stagingElements = 0L
+        for (index in parameters.indices) {
+            val parameterSize = parameters[index].size
+            val activeSize = gradients[index].size
+            require(parameterSize > 0 && activeSize > 0 && activeSize <= parameterSize) {
+                "AdamW active gradient prefix is invalid for parameter group $index."
+            }
+            require(
+                firstMoments[index].size == parameterSize &&
+                    secondMoments[index].size == parameterSize
+            ) {
+                "FP32 AdamW moments must match parameter capacity for group $index."
+            }
+            require(weightDecayByGroup[index].isFinite() &&
+                weightDecayByGroup[index] >= 0f) {
+                "AdamW weight decay must be finite and non-negative for group $index."
+            }
+            totalElements = Math.addExact(totalElements, activeSize.toLong())
+            stagingElements = Math.addExact(stagingElements, activeSize.toLong())
+            if (activeSize < parameterSize) {
+                stagingElements = Math.addExact(
+                    stagingElements,
+                    Math.multiplyExact(activeSize.toLong(), 2L)
+                )
+            }
+        }
+
+        if (!isRuntimeAvailable || disabledAfterRuntimeFailure ||
+            totalElements < MIN_GPU_UPDATE_ELEMENTS) {
+            _currentBackend = "Kotlin CPU"
+            return false
+        }
+
+        val runtime = Runtime.getRuntime()
+        val availableHeapBytes = runtime.freeMemory() +
+            (runtime.maxMemory() - runtime.totalMemory()).coerceAtLeast(0L)
+        val stagingBytes = Math.multiplyExact(stagingElements, Float.SIZE_BYTES.toLong())
+        if (stagingBytes > availableHeapBytes / 2L) {
+            Log.d(TAG, "Vulkan AdamW staging exceeds the safe available heap budget; retaining CPU fallback.")
+            return false
+        }
+
+        return try {
+            val stagedParameters = Array(parameters.size) { index ->
+                FloatArray(gradients[index].size) { element ->
+                    parameters[index][element]
+                }
+            }
+            val stagedFirstMoments = Array(firstMoments.size) { index ->
+                if (firstMoments[index].size == gradients[index].size) {
+                    firstMoments[index]
+                } else {
+                    firstMoments[index].copyOf(gradients[index].size)
+                }
+            }
+            val stagedSecondMoments = Array(secondMoments.size) { index ->
+                if (secondMoments[index].size == gradients[index].size) {
+                    secondMoments[index]
+                } else {
+                    secondMoments[index].copyOf(gradients[index].size)
+                }
+            }
+
+            val updated = tryApplyAdamWUpdate(
+                parameters = stagedParameters,
+                gradients = gradients,
+                firstMoments = stagedFirstMoments,
+                secondMoments = stagedSecondMoments,
+                weightDecayByGroup = weightDecayByGroup,
+                learningRate = learningRate,
+                beta1 = beta1,
+                beta2 = beta2,
+                biasCorrection1 = biasCorrection1,
+                biasCorrection2 = biasCorrection2,
+                epsilon = epsilon,
+                gradientClipFactor = gradientClipFactor
+            )
+            if (!updated) return false
+
+            // Validate the complete device result before committing FP16 weights.
+            for (group in stagedParameters.indices) {
+                require(stagedParameters[group].all(Float::isFinite)) {
+                    "Vulkan AdamW produced non-finite parameters in group $group."
+                }
+                require(stagedFirstMoments[group].all(Float::isFinite) &&
+                    stagedSecondMoments[group].all(Float::isFinite)) {
+                    "Vulkan AdamW produced non-finite optimizer state in group $group."
+                }
+            }
+
+            for (index in parameters.indices) {
+                val activeSize = stagedParameters[index].size
+                for (element in 0 until activeSize) {
+                    parameters[index][element] = stagedParameters[index][element]
+                }
+                if (stagedFirstMoments[index] !== firstMoments[index]) {
+                    System.arraycopy(
+                        stagedFirstMoments[index], 0,
+                        firstMoments[index], 0,
+                        activeSize
+                    )
+                }
+                if (stagedSecondMoments[index] !== secondMoments[index]) {
+                    System.arraycopy(
+                        stagedSecondMoments[index], 0,
+                        secondMoments[index], 0,
+                        activeSize
+                    )
+                }
+            }
+            true
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Not enough heap memory to stage FP16 parameters for Vulkan AdamW; retaining CPU fallback.", error)
+            false
+        } catch (error: IllegalArgumentException) {
+            Log.e(TAG, "Vulkan AdamW returned invalid staged tensors; retaining CPU fallback.", error)
+            false
+        }
+    }
+
     @Synchronized
     fun tryApplyAdamWUpdate(
         parameters: Array<FloatArray>,
@@ -710,13 +883,18 @@ internal object VulkanTrainingBackend {
 
         var totalElements = 0L
         for (index in parameters.indices) {
-            val groupSize = minOf(
-                parameters[index].size,
-                gradients[index].size,
-                firstMoments[index].size,
-                secondMoments[index].size
-            )
-            totalElements += groupSize.toLong()
+            val groupSize = parameters[index].size
+            require(groupSize > 0) {
+                "AdamW parameter groups must not be empty."
+            }
+            require(
+                gradients[index].size == groupSize &&
+                    firstMoments[index].size == groupSize &&
+                    secondMoments[index].size == groupSize
+            ) {
+                "AdamW tensor sizes must match exactly for parameter group $index."
+            }
+            totalElements = Math.addExact(totalElements, groupSize.toLong())
         }
 
         if (!isRuntimeAvailable ||
