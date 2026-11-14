@@ -1,6 +1,8 @@
 package com.argus.agi
 
+import android.app.ActivityManager
 import android.app.Application
+import android.app.ApplicationExitInfo
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
@@ -18,7 +20,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -34,6 +41,8 @@ class ArgusApp : Application() {
     companion object {
         private const val TAG = "ArgusApp"
         const val CHANNEL_ID = "argus_core_service_channel"
+        private const val DIAGNOSTICS_FILE_NAME = "argus_runtime_diagnostics.txt"
+        private const val MAX_DIAGNOSTICS_CHARS = 12_000
 
         @Volatile
         private var _instance: ArgusApp? = null
@@ -111,14 +120,100 @@ class ArgusApp : Application() {
     val coreInitializationState: StateFlow<ArgusCoreInitializationState> =
         _coreInitializationState.asStateFlow()
 
+    private val _runtimeDiagnostics = MutableStateFlow<String?>(null)
+    val runtimeDiagnostics: StateFlow<String?> = _runtimeDiagnostics.asStateFlow()
+
+    private val diagnosticsLock = Any()
+    private val diagnosticsFile: File by lazy(LazyThreadSafetyMode.NONE) {
+        File(noBackupFilesDir, DIAGNOSTICS_FILE_NAME)
+    }
+
+    @Volatile
+    private var initializationStage: String = "Application startup"
+
     @Volatile
     private var coreInitializationJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
         _instance = this
+        capturePreviousProcessExit()
+        installUncaughtExceptionHandler()
         createNotificationChannel()
         initializeCoreRuntime()
+    }
+
+    fun recordRuntimeDiagnostic(message: String) {
+        val timestamp = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date())
+        synchronized(diagnosticsLock) {
+            val updated = (_runtimeDiagnostics.value.orEmpty() + "\n[" + timestamp + "] " + message)
+                .trim()
+                .takeLast(MAX_DIAGNOSTICS_CHARS)
+            runCatching { diagnosticsFile.writeText(updated) }
+            _runtimeDiagnostics.value = updated
+        }
+    }
+
+    private fun capturePreviousProcessExit() {
+        val savedReport = runCatching {
+            if (diagnosticsFile.isFile) diagnosticsFile.readText() else ""
+        }.getOrDefault("")
+        _runtimeDiagnostics.value = savedReport.takeIf { it.isNotBlank() }
+
+        val activityManager = getSystemService(ActivityManager::class.java) ?: return
+        val previousExit = runCatching {
+            activityManager.getHistoricalProcessExitReasons(packageName, 0, 5).firstOrNull()
+        }.getOrNull() ?: return
+
+        val exitReport = buildString {
+            appendLine("Previous process exit")
+            appendLine("Reason: " + exitReasonLabel(previousExit.reason) + " (#" + previousExit.reason + ")")
+            appendLine("Timestamp: " + SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date(previousExit.timestamp)))
+            appendLine("Exit status: " + previousExit.status)
+            appendLine("Process importance: " + previousExit.importance)
+            appendLine("PSS: " + previousExit.pss)
+            appendLine("RSS: " + previousExit.rss)
+            append("System description: " + (previousExit.description ?: "Not provided"))
+        }
+        recordRuntimeDiagnostic(exitReport)
+    }
+
+    private fun exitReasonLabel(reason: Int): String = when (reason) {
+        ApplicationExitInfo.REASON_EXIT_SELF -> "App exited itself"
+        ApplicationExitInfo.REASON_SIGNALED -> "Process terminated by signal"
+        ApplicationExitInfo.REASON_LOW_MEMORY -> "System killed process for low memory"
+        ApplicationExitInfo.REASON_CRASH -> "Java/Kotlin crash"
+        ApplicationExitInfo.REASON_CRASH_NATIVE -> "Native crash"
+        ApplicationExitInfo.REASON_ANR -> "Application not responding"
+        ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "Process initialization failure"
+        ApplicationExitInfo.REASON_PERMISSION_CHANGE -> "Permission change"
+        ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "Excessive resource usage"
+        ApplicationExitInfo.REASON_USER_REQUESTED -> "User-requested process stop"
+        ApplicationExitInfo.REASON_USER_STOPPED -> "App stopped by system user action"
+        ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "Dependency process died"
+        ApplicationExitInfo.REASON_OTHER -> "Other process exit"
+        else -> "Unknown process exit"
+    }
+
+    private fun installUncaughtExceptionHandler() {
+        val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            runCatching {
+                recordRuntimeDiagnostic(
+                    "Uncaught exception on thread '" + thread.name + "': " +
+                        error.javaClass.name + ": " + (error.message ?: "No message") +
+                        "\n" + Log.getStackTraceString(error)
+                )
+            }.onFailure { reportingError ->
+                Log.e(TAG, "Could not persist the uncaught exception report.", reportingError)
+            }
+            if (previousHandler != null) {
+                previousHandler.uncaughtException(thread, error)
+            } else {
+                android.os.Process.killProcess(android.os.Process.myPid())
+                kotlin.system.exitProcess(10)
+            }
+        }
     }
 
     /**
@@ -132,20 +227,42 @@ class ArgusApp : Application() {
             _coreInitializationState.value = ArgusCoreInitializationState.Initializing
             coreInitializationJob = applicationScope.launch {
                 try {
+                    initializationStage = "Reading hardware profile"
                     hardwareProfile
+                    initializationStage = "Registering device safety monitor"
                     deviceGuard
+                    initializationStage = "Opening local database"
                     repository
+                    initializationStage = "Allocating neural engine and model tensors"
                     neuralEngine
+                    initializationStage = "Restoring world model"
                     worldModel
+                    initializationStage = "Preparing Genesis manager"
                     genesisModelManager
+                    initializationStage = "Starting training manager"
                     trainingManager
+                    initializationStage = "Ready"
                     _coreInitializationState.value = ArgusCoreInitializationState.Ready
                     Log.i(TAG, "Core runtime initialization completed.")
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: OutOfMemoryError) {
+                    val message = "Insufficient memory while initializing Argus at: " +
+                        initializationStage + ". The model was not started."
+                    _coreInitializationState.value = ArgusCoreInitializationState.Failed(message)
+                    runCatching { recordRuntimeDiagnostic(message) }
+                } catch (error: LinkageError) {
+                    val message = "Core initialization failed at " + initializationStage +
+                        ": " + error.javaClass.simpleName + ": " + (error.message ?: "No message")
+                    Log.e(TAG, message, error)
+                    recordRuntimeDiagnostic(message + "\n" + Log.getStackTraceString(error))
+                    _coreInitializationState.value = ArgusCoreInitializationState.Failed(message)
                 } catch (error: Exception) {
-                    Log.e(TAG, "Core runtime initialization failed.", error)
-                    _coreInitializationState.value = ArgusCoreInitializationState.Failed(
-                        error.message ?: error.javaClass.simpleName
-                    )
+                    val message = "Core initialization failed at " + initializationStage +
+                        ": " + error.javaClass.simpleName + ": " + (error.message ?: "No message")
+                    Log.e(TAG, message, error)
+                    recordRuntimeDiagnostic(message + "\n" + Log.getStackTraceString(error))
+                    _coreInitializationState.value = ArgusCoreInitializationState.Failed(message)
                 }
             }
         }

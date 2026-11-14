@@ -32,7 +32,7 @@ concurrency:
 jobs:
   build-release:
     name: Lint, test, sign and package APK
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     steps:
@@ -57,7 +57,6 @@ jobs:
           echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
 
           test -s "${sdk_root}/platforms/android-37.0/android.jar"
-          test -x "${sdk_root}/build-tools/36.0.0/apksigner"
           test -x "${sdk_root}/platform-tools/adb"
 
           platform_alias="${sdk_root}/platforms/android-37.0"
@@ -70,7 +69,7 @@ jobs:
           fi
 
           test -s "${platform_alias}/android.jar"
-          echo "Android SDK ready: minSdk 34, compileSdk 37, targetSdk 37, Build Tools 36.0.0."
+          echo "Android SDK platform ready: minSdk 34, compileSdk 37, targetSdk 37."
 
       - name: Install Android NDK r30 and CMake 3.31.6
         shell: bash
@@ -86,7 +85,8 @@ jobs:
           set +o pipefail
           yes | "${sdkmanager_path}" --licenses >/dev/null
           set -o pipefail
-          "${sdkmanager_path}" --install "ndk;30.0.16248370"
+          "${sdkmanager_path}" --install "build-tools;37.0.0" "ndk;30.0.16248370"
+          test -x "${ANDROID_HOME}/build-tools/37.0.0/apksigner"
 
           cmake_version="3.31.6"
           cmake_archive="cmake-${cmake_version}-linux-x86_64.tar.gz"
@@ -163,7 +163,7 @@ jobs:
             unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
           done
 
-          "${ANDROID_HOME}/build-tools/36.0.0/apksigner" verify --verbose --print-certs "${apk_path}" > /tmp/apksigner-report.txt
+          "${ANDROID_HOME}/build-tools/37.0.0/apksigner" verify --verbose --print-certs "${apk_path}" > /tmp/apksigner-report.txt
 
           expected_fingerprint="$(
             keytool -list -v -storetype PKCS12 -keystore "${KEYSTORE_PATH}" -storepass "" -alias upload 2>/dev/null |
@@ -188,6 +188,77 @@ jobs:
           echo "APK signature verified against the persistent Argus upload certificate."
 
 # Publish the validated main build automatically; dispatch runs still require explicit approval.
+      - name: Enable KVM for Android emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Smoke test signed release APK on Android 15
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7_pro
+          cores: 4
+          ram-size: 4096M
+          heap-size: 512M
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          emulator-boot-timeout: 600
+          script: |
+            set -euo pipefail
+            apk_path="app/build/outputs/apk/release/app-release.apk"
+            test -s "\${apk_path}"
+            adb wait-for-device
+            adb logcat -c
+            adb install -r "\${apk_path}"
+            adb shell am start -W -n com.argus.agi/.MainActivity
+
+            core_ready=false
+            for attempt in $(seq 1 120); do
+              crash_log="$(adb logcat -d -b crash)"
+              if grep -Eq "FATAL EXCEPTION|Fatal signal|Process: com.argus.agi" <<< "\${crash_log}"; then
+                echo "::error::Argus crashed during Android 15 startup."
+                adb logcat -d -v time -t 800 | tail -n 300
+                exit 1
+              fi
+              process_id="$(adb shell pidof com.argus.agi 2>/dev/null | tr -d '\r')"
+              if [[ -n "\${process_id}" ]] && adb logcat -d -s ArgusApp:I | grep -Fq "Core runtime initialization completed."; then
+                core_ready=true
+                break
+              fi
+              sleep 1
+            done
+
+            if [[ "\${core_ready}" != "true" ]]; then
+              echo "::error::Argus did not complete core initialization within 120 seconds."
+              adb logcat -d -v time -t 1000 | tail -n 350
+              exit 1
+            fi
+
+            sleep 15
+            process_id="$(adb shell pidof com.argus.agi 2>/dev/null | tr -d '\r')"
+            if [[ -z "\${process_id}" ]]; then
+              echo "::error::Argus process exited after core initialization."
+              adb logcat -d -v time -t 1000 | tail -n 350
+              exit 1
+            fi
+            service_dump="$(adb shell dumpsys activity services com.argus.agi)"
+            if ! grep -Fq "ArgusForegroundService" <<< "\${service_dump}"; then
+              echo "::error::ArgusForegroundService was not running after MainActivity startup."
+              adb logcat -d -v time -t 1000 | tail -n 350
+              exit 1
+            fi
+            crash_log="$(adb logcat -d -b crash)"
+            if grep -Eq "FATAL EXCEPTION|Fatal signal|Process: com.argus.agi" <<< "\${crash_log}"; then
+              echo "::error::Argus crashed after startup."
+              adb logcat -d -v time -t 1000 | tail -n 350
+              exit 1
+            fi
+            echo "Android 15 release startup smoke test passed; core runtime and foreground service stayed active."
+
       - name: Publish latest signed APK to GitHub Release tag
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
         env:
@@ -210,4 +281,15 @@ jobs:
               --title "Argus Latest Release" \
               --notes "Latest signed release APK for Argus (v${VERSION_NAME}). Automatically published from main build."
           fi
+
+          # Keep exactly one versioned APK plus the stable ARGUS.apk alias.
+          # The signing-key backup is stored in a separate release and is untouched.
+          stale_assets="$(gh release view "Release" --json assets --jq '.assets[].name' |
+            grep -E '^ARGUS-v[0-9]+\.[0-9]+\.[0-9]+\.apk$' || true)"
+          while IFS= read -r stale_asset; do
+            [[ -z "${stale_asset}" || "${stale_asset}" == "${release_apk}" ]] && continue
+            echo "Removing superseded release asset: ${stale_asset}"
+            gh release delete-asset "Release" "${stale_asset}" --yes
+          done <<< "${stale_assets}"
+
           echo "Successfully published APK to https://github.com/${{ github.repository }}/releases/tag/Release"

@@ -60,7 +60,16 @@ class ArgusForegroundService : Service() {
             else -> {
                 // Android requires immediate foreground promotion after startForegroundService().
                 // This notification does not access model singletons, Room, JNI, or GPU drivers.
-                startForegroundCompat()
+                try {
+                    startForegroundCompat()
+                } catch (error: Exception) {
+                    val message = "Foreground service promotion failed: " +
+                        error.javaClass.simpleName + ": " + (error.message ?: "No message")
+                    Log.e(TAG, message, error)
+                    (application as? ArgusApp)?.recordRuntimeDiagnostic(message)
+                    stopSelfResult(startId)
+                    return START_NOT_STICKY
+                }
 
                 if (intent?.action == ACTION_TOGGLE_PAUSE) {
                     val app = application as? ArgusApp

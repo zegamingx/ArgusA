@@ -1,6 +1,9 @@
 package com.argus.agi
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -20,8 +23,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.weight
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.systemBars
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
@@ -46,6 +52,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -100,21 +107,56 @@ class MainActivity : ComponentActivity() {
         setContent {
             ArgusTheme {
                 val initializationState by argusApp.coreInitializationState.collectAsState()
-                when (val state = initializationState) {
-                    ArgusCoreInitializationState.Initializing ->
-                        com.argus.agi.ui.components.ArgusModernLoadingScreen(
-                            title = "A . R . G . U . S",
-                            subtitle = "INITIALIZING THE LOCAL MODEL & TRAINING RUNTIME..."
-                        )
-
-                    ArgusCoreInitializationState.Ready ->
-                        MainScreen(viewModel = viewModel)
-
-                    is ArgusCoreInitializationState.Failed ->
-                        CoreInitializationFailureScreen(
-                            message = state.message,
-                            onRetry = argusApp::retryCoreInitialization
-                        )
+                val runtimeDiagnostics by argusApp.runtimeDiagnostics.collectAsState()
+                val context = LocalContext.current
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                        when (val state = initializationState) {
+                            ArgusCoreInitializationState.Initializing ->
+                                com.argus.agi.ui.components.ArgusModernLoadingScreen(
+                                    title = "A . R . G . U . S",
+                                    subtitle = "INITIALIZING THE LOCAL MODEL & TRAINING RUNTIME..."
+                                )
+                            ArgusCoreInitializationState.Ready -> MainScreen(viewModel = viewModel)
+                            is ArgusCoreInitializationState.Failed ->
+                                CoreInitializationFailureScreen(
+                                    message = state.message,
+                                    onRetry = argusApp::retryCoreInitialization
+                                )
+                        }
+                    }
+                    val report = runtimeDiagnostics
+                    if (!report.isNullOrBlank()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().background(ArgusSurface)
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Previous process exit captured",
+                                    color = Color.White,
+                                    style = androidx.compose.material3.MaterialTheme.typography.labelLarge
+                                )
+                                Text(
+                                    text = report.takeLast(180),
+                                    color = ArgusTextMuted,
+                                    style = androidx.compose.material3.MaterialTheme.typography.labelSmall,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Button(onClick = {
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                clipboard?.setPrimaryClip(
+                                    ClipData.newPlainText("Argus runtime diagnostics", report)
+                                )
+                            }) {
+                                Text("Copy diagnostics")
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -240,7 +240,14 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         runCatching { ArgusForegroundService.startService(application) }
-            .onFailure { Log.e(TAG, "Failed to start foreground service", it) }
+            .onFailure { error ->
+                Log.e(TAG, "Failed to start foreground service", error)
+                ArgusApp.instance.recordRuntimeDiagnostic(
+                    "Foreground service request failed: " +
+                        error.javaClass.simpleName + ": " + (error.message ?: "No message") +
+                        "\n" + Log.getStackTraceString(error)
+                )
+            }
 
         // Muat riwayat percakapan dari Room database on-device
         viewModelScope.launch(Dispatchers.IO) {

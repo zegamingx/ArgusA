@@ -62,7 +62,6 @@ jobs:
           echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
           echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
           test -s "${sdk_root}/platforms/android-37.0/android.jar"
-          test -x "${sdk_root}/build-tools/36.0.0/apksigner"
           platform_alias="${sdk_root}/platforms/android-37"
           if [[ ! -s "${platform_alias}/android.jar" ]]; then
             if [[ -e "${platform_alias}" && ! -L "${platform_alias}" ]]; then
@@ -87,7 +86,8 @@ jobs:
           set +o pipefail
           yes | "${sdkmanager_path}" --licenses >/dev/null
           set -o pipefail
-          "${sdkmanager_path}" --install "ndk;30.0.16248370"
+          "${sdkmanager_path}" --install "build-tools;37.0.0" "ndk;30.0.16248370"
+          test -x "${ANDROID_HOME}/build-tools/37.0.0/apksigner"
 
           cmake_version="3.31.6"
           cmake_archive="cmake-${cmake_version}-linux-x86_64.tar.gz"

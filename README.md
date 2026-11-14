@@ -14,7 +14,7 @@ Argus is a native Android application built with Kotlin and Jetpack Compose.
 | Java source/bytecode target | 21 | Language and bytecode compatibility for app sources |
 | Android SDK Platform | 37 | Compile SDK and target SDK |
 | Android minimum SDK | 34 | Minimum supported Android API |
-| Android SDK Build Tools | 36.0.0 | APK packaging and signing tools |
+| Android SDK Build Tools | 37.0.0 | APK packaging and signing tools |
 | Android NDK | 30.0.16248370 | Native C/C++ toolchain |
 | C++ language standard | C++23 | Vulkan JNI native library |
 | JUnit | 6.1.3 | Host-side unit-test platform and Jupiter API |
@@ -63,9 +63,18 @@ A release build requires the Argus release signing key at `signing/argus-release
 
 ## GitHub releases
 
-Publishing a versioned GitHub Release (for example, `v1.0.7`) runs release lint, Robolectric unit tests, a signed release build, certificate verification, and APK publication. The legacy `v1.0.6` tag is intentionally excluded; update `version.properties` before publishing the next versioned tag.
+Every push to `main` runs release lint, JUnit/Robolectric unit tests, a signed release build, certificate verification, and an Android 15 (API 35) emulator startup smoke test. The smoke test installs the signed release APK, waits for `ArgusApp` core initialization, and verifies that the process and foreground service remain active. After a successful smoke test, the workflow publishes `ARGUS-v<version>.apk` and the stable `ARGUS.apk` alias to the `Release` tag, then removes superseded versioned APK assets.
 
-The private repository keeps the CI signing-key backup in the private GitHub Release named `argus-signing-key`. Repository access therefore also grants access to the app-signing identity. Keep this repository private and restrict collaborator access. Never redistribute the signing-key asset.
+The private repository keeps the CI signing-key backup in the private GitHub Release named `argus-signing-key`. Repository access therefore also grants access to the app-signing identity. Keep this repository private and restrict collaborator access. Never redistribute the signing-key asset. The asset-pruning step only targets old `ARGUS-v*.apk` files in the `Release` tag and does not touch this signing-key backup.
+
+## Runtime crash diagnostics
+
+On startup, Argus reads Android's historical process-exit record and keeps a bounded
+local diagnostic report containing the exit reason, status, description, PSS, and RSS.
+Uncaught Java/Kotlin exceptions and foreground-service promotion failures are also
+recorded locally. When a report exists, the app displays a **Copy diagnostics**
+control so the user can share the exact startup failure for investigation. Reports
+are not uploaded automatically.
 
 ## Vulkan training backend
 
