@@ -26,13 +26,11 @@ class Float16ParameterArray(size: Int) {
     operator fun get(index: Int): Float = Float16Codec.toFloat(storage[index])
 
     operator fun set(index: Int, value: Float) {
-        require(value.isFinite()) { "FP16 parameter values must remain finite." }
-        storage[index] = Float16Codec.fromFloat(value)
+        storage[index] = Float16Codec.fromFiniteFloat(value)
     }
 
     fun fill(value: Float) {
-        require(value.isFinite()) { "FP16 parameter values must remain finite." }
-        storage.fill(Float16Codec.fromFloat(value))
+        storage.fill(Float16Codec.fromFiniteFloat(value))
     }
 
     fun copyFrom(source: Float16ParameterArray) {
@@ -75,6 +73,20 @@ class Float16ParameterArray(size: Int) {
 
 /** Correctly rounded IEEE-754 binary32/binary16 conversion helpers. */
 internal object Float16Codec {
+
+    /**
+     * Encodes a finite FP32 model value only when the rounded binary16 result
+     * remains finite. Finite FP32 magnitudes above the binary16 rounding range
+     * can otherwise silently become positive or negative infinity.
+     */
+    fun fromFiniteFloat(value: Float): Short {
+        require(value.isFinite()) { "FP16 parameter values must remain finite." }
+        val encoded = fromFloat(value)
+        require(toFloat(encoded).isFinite()) {
+            "FP32 parameter value exceeds the finite IEEE-754 binary16 range."
+        }
+        return encoded
+    }
 
     fun fromFloat(value: Float): Short {
         val bits = value.toRawBits()

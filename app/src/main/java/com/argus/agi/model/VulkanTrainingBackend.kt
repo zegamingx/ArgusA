@@ -750,13 +750,12 @@ internal object VulkanTrainingBackend {
                 "AdamW weight decay must be finite and non-negative for group $index."
             }
             totalElements = Math.addExact(totalElements, activeSize.toLong())
-            stagingElements = Math.addExact(stagingElements, activeSize.toLong())
-            if (activeSize < parameterSize) {
-                stagingElements = Math.addExact(
-                    stagingElements,
-                    Math.multiplyExact(activeSize.toLong(), 2L)
-                )
-            }
+            // Parameter, first-moment, and second-moment staging must all be
+            // isolated from model state until every GPU result is validated.
+            stagingElements = Math.addExact(
+                stagingElements,
+                Math.multiplyExact(activeSize.toLong(), 3L)
+            )
         }
 
         if (!isRuntimeAvailable || disabledAfterRuntimeFailure ||
@@ -781,18 +780,10 @@ internal object VulkanTrainingBackend {
                 }
             }
             val stagedFirstMoments = Array(firstMoments.size) { index ->
-                if (firstMoments[index].size == gradients[index].size) {
-                    firstMoments[index]
-                } else {
-                    firstMoments[index].copyOf(gradients[index].size)
-                }
+                firstMoments[index].copyOf(gradients[index].size)
             }
             val stagedSecondMoments = Array(secondMoments.size) { index ->
-                if (secondMoments[index].size == gradients[index].size) {
-                    secondMoments[index]
-                } else {
-                    secondMoments[index].copyOf(gradients[index].size)
-                }
+                secondMoments[index].copyOf(gradients[index].size)
             }
 
             val updated = tryApplyAdamWUpdate(
@@ -819,6 +810,9 @@ internal object VulkanTrainingBackend {
                 require(stagedFirstMoments[group].all(Float::isFinite) &&
                     stagedSecondMoments[group].all(Float::isFinite)) {
                     "Vulkan AdamW produced non-finite optimizer state in group $group."
+                }
+                for (value in stagedParameters[group]) {
+                    Float16Codec.fromFiniteFloat(value)
                 }
             }
 
