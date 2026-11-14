@@ -23,11 +23,9 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
-import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
@@ -91,13 +89,6 @@ import com.argus.agi.ui.theme.ArgusTextPrimary
 import com.argus.agi.ui.theme.ArgusTextSecondary
 import com.argus.agi.ui.theme.ArgusWarning
 import kotlinx.coroutines.launch
-
-private val DEFAULT_SUGGESTION_CHIPS = listOf(
-    "Calculate 125 * 34",
-    "What is the A.R.G.U.S. architecture?",
-    "Explore recent AGI developments",
-    "How does LoRA work?"
-)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -177,47 +168,25 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                 Column {
                     Text("Choose the type of content to send to ARGUS.", color = ArgusTextSecondary, fontSize = 13.sp)
                     Spacer(modifier = Modifier.height(12.dp))
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .defaultMinSize(minHeight = 48.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(ArgusSurfaceVariant)
-                            .clickable {
-                                showAttachDialog = false
-                                filePickerLauncher.launch("*/*")
-                            }
-                            .padding(horizontal = 12.dp, vertical = 14.dp)
-                            .testTag("attach_document_option"),
-                        contentAlignment = Alignment.CenterStart
-                    ) {
-                        Text(
-                            text = "Document / ZIP",
-                            color = ArgusCyanPrimary,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
+                    Text(
+                        text = "Document / ZIP",
+                        color = ArgusCyanPrimary,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(ArgusSurfaceVariant).clickable {
+                            showAttachDialog = false
+                            filePickerLauncher.launch("*/*")
+                        }.padding(12.dp)
+                    )
                     Spacer(modifier = Modifier.height(8.dp))
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .defaultMinSize(minHeight = 48.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(ArgusSurfaceVariant)
-                            .clickable {
-                                showAttachDialog = false
-                                mediaPickerLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
-                            }
-                            .padding(horizontal = 12.dp, vertical = 14.dp)
-                            .testTag("attach_media_option"),
-                        contentAlignment = Alignment.CenterStart
-                    ) {
-                        Text(
-                            text = "Image / Video",
-                            color = ArgusCyanPrimary,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
+                    Text(
+                        text = "Image / Video",
+                        color = ArgusCyanPrimary,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(ArgusSurfaceVariant).clickable {
+                            showAttachDialog = false
+                            mediaPickerLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+                        }.padding(12.dp)
+                    )
                 }
             },
             confirmButton = {},
@@ -244,10 +213,8 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(min = 48.dp)
                         .clickable { isHeaderExpanded = !isHeaderExpanded }
-                        .padding(horizontal = 14.dp, vertical = 10.dp)
-                        .testTag("chat_header_toggle"),
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Image(
@@ -295,51 +262,33 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                     exit = shrinkVertically() + fadeOut()
                 ) {
                     Row(
-                        modifier = Modifier.fillMaxWidth().background(ArgusDarkBg.copy(alpha = 0.5f)).padding(horizontal = 14.dp, vertical = 4.dp),
+                        modifier = Modifier.fillMaxWidth().background(ArgusDarkBg.copy(alpha = 0.5f)).padding(horizontal = 14.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
-                                .clip(RoundedCornerShape(20.dp))
-                                .clickable { viewModel.toggleAutoSpeak() }
-                                .testTag("auto_speak_toggle"),
-                            contentAlignment = Alignment.Center
+                        Row(
+                            modifier = Modifier.clip(RoundedCornerShape(20.dp)).clickable { viewModel.toggleAutoSpeak() }.background(ArgusSurfaceVariant).padding(horizontal = 10.dp, vertical = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(
-                                modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(ArgusSurfaceVariant).padding(horizontal = 10.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    painter = if (isAutoSpeak) painterResource(R.drawable.ic_symbol_volume_up) else painterResource(R.drawable.ic_symbol_volume_off),
-                                    contentDescription = "Auto Speak",
-                                    tint = if (isAutoSpeak) ArgusCyanPrimary else ArgusTextMuted,
-                                    modifier = Modifier.size(14.dp)
-                                )
-                                Spacer(modifier = Modifier.width(5.dp))
-                                Text(text = if (isAutoSpeak) "Voice on" else "Voice off", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = if (isAutoSpeak) ArgusCyanPrimary else ArgusTextMuted)
-                            }
-                        }
-                        Box(
-                            modifier = Modifier
-                                .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
-                                .clip(RoundedCornerShape(20.dp))
-                                .clickable {
-                                    viewModel.clearChat()
-                                    Toast.makeText(context, "Chat cleared", Toast.LENGTH_SHORT).show()
-                                }
-                                .testTag("clear_chat_button"),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = "Clear chat",
-                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
-                                color = ArgusCyanPrimary,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(ArgusSurfaceVariant).padding(horizontal = 10.dp, vertical = 6.dp)
+                            Icon(
+                                painter = if (isAutoSpeak) painterResource(R.drawable.ic_symbol_volume_up) else painterResource(R.drawable.ic_symbol_volume_off),
+                                contentDescription = "Auto Speak",
+                                tint = if (isAutoSpeak) ArgusCyanPrimary else ArgusTextMuted,
+                                modifier = Modifier.size(14.dp)
                             )
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text(text = if (isAutoSpeak) "Voice on" else "Voice off", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = if (isAutoSpeak) ArgusCyanPrimary else ArgusTextMuted)
                         }
+                        Text(
+                            text = "Clear chat",
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                            color = ArgusCyanPrimary,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.clip(RoundedCornerShape(20.dp)).clickable {
+                                viewModel.clearChat()
+                                Toast.makeText(context, "Chat cleared", Toast.LENGTH_SHORT).show()
+                            }.background(ArgusSurfaceVariant).padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
                     }
                 }
             }
@@ -369,21 +318,15 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                 )
                 Spacer(modifier = Modifier.height(18.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(DEFAULT_SUGGESTION_CHIPS) { chip ->
-                        Box(
-                            modifier = Modifier
-                                .defaultMinSize(minHeight = 48.dp)
-                                .clip(RoundedCornerShape(20.dp))
-                                .clickable { viewModel.sendMessage(chip) },
-                            contentAlignment = Alignment.Center
+                    val chips = listOf("Calculate 125 * 34", "What is the A.R.G.U.S. architecture?", "How does LoRA work?")
+                    items(chips) { chip ->
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = ArgusSurfaceVariant,
+                            border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder),
+                            modifier = Modifier.clickable { viewModel.sendMessage(chip) }
                         ) {
-                            Surface(
-                                shape = RoundedCornerShape(20.dp),
-                                color = ArgusSurfaceVariant,
-                                border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder)
-                            ) {
-                                Text(text = chip, style = MaterialTheme.typography.labelSmall, color = ArgusTextPrimary, modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp))
-                            }
+                            Text(text = chip, style = MaterialTheme.typography.labelSmall, color = ArgusTextPrimary, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
                         }
                     }
                 }
@@ -420,24 +363,12 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                 if (isGenerating) {
                     item {
                         Row(
-                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(ArgusSurfaceVariant.copy(alpha = 0.6f)).padding(horizontal = 12.dp, vertical = 8.dp),
+                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(ArgusSurfaceVariant.copy(alpha = 0.6f)).padding(12.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             CircularProgressIndicator(modifier = Modifier.size(16.dp), color = ArgusCyanPrimary, strokeWidth = 2.dp)
                             Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = "ARGUS is thinking...",
-                                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp),
-                                color = ArgusCyanGlow,
-                                fontFamily = FontFamily.Monospace,
-                                modifier = Modifier.weight(1f)
-                            )
-                            TextButton(
-                                onClick = { viewModel.stopGeneration() },
-                                modifier = Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp).testTag("stop_generation_button")
-                            ) {
-                                Text("Stop", color = ArgusWarning, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            }
+                            Text(text = "ARGUS is thinking...", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp), color = ArgusCyanGlow, fontFamily = FontFamily.Monospace)
                         }
                     }
                 }
@@ -477,24 +408,18 @@ fun ChatScreen(viewModel: ArgusViewModel) {
         if (messages.isNotEmpty()) {
             AnimatedVisibility(visible = !isKeyboardOpen) {
                 LazyRow(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(DEFAULT_SUGGESTION_CHIPS) { chip ->
-                        Box(
-                            modifier = Modifier
-                                .defaultMinSize(minHeight = 48.dp)
-                                .clip(RoundedCornerShape(20.dp))
-                                .clickable { viewModel.sendMessage(chip) },
-                            contentAlignment = Alignment.Center
+                    val chips = listOf("Calculate 125 * 34", "What is the A.R.G.U.S architecture?", "Explore recent AGI developments", "How does LoRA work?")
+                    items(chips) { chip ->
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = ArgusSurfaceVariant,
+                            border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder),
+                            modifier = Modifier.clickable { viewModel.sendMessage(chip) }
                         ) {
-                            Surface(
-                                shape = RoundedCornerShape(20.dp),
-                                color = ArgusSurfaceVariant,
-                                border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder)
-                            ) {
-                                Text(text = chip, style = MaterialTheme.typography.labelSmall, color = ArgusTextPrimary, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
-                            }
+                            Text(text = chip, style = MaterialTheme.typography.labelSmall, color = ArgusTextPrimary, modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp))
                         }
                     }
                 }
@@ -506,46 +431,35 @@ fun ChatScreen(viewModel: ArgusViewModel) {
             Column(modifier = Modifier.fillMaxWidth()) {
                 AnimatedVisibility(visible = isListening) {
                     Row(
-                        modifier = Modifier.fillMaxWidth().background(ArgusWarning.copy(alpha = 0.18f)).padding(horizontal = 12.dp, vertical = 2.dp),
+                        modifier = Modifier.fillMaxWidth().background(ArgusWarning.copy(alpha = 0.18f)).padding(horizontal = 12.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(painter = painterResource(R.drawable.ic_symbol_mic), contentDescription = null, tint = ArgusWarning, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(text = if (partialSpeech.isNotBlank()) "Heard: \"$partialSpeech\"" else "Listening...", style = MaterialTheme.typography.bodySmall, color = ArgusWarning, modifier = Modifier.weight(1f))
-                        TextButton(
-                            onClick = { viewModel.stopVoiceInput() },
-                            modifier = Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp).testTag("stop_listening_button")
-                        ) {
-                            Text(text = "Done", style = MaterialTheme.typography.labelSmall, color = ArgusWarning, fontWeight = FontWeight.Bold)
-                        }
+                        Text(text = "Done", style = MaterialTheme.typography.labelSmall, color = ArgusWarning, fontWeight = FontWeight.Bold, modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable { viewModel.stopVoiceInput() }.padding(horizontal = 6.dp, vertical = 2.dp))
                     }
                 }
 
                 AnimatedVisibility(visible = isSpeaking) {
                     Row(
-                        modifier = Modifier.fillMaxWidth().background(ArgusCyanPrimary.copy(alpha = 0.15f)).padding(horizontal = 12.dp, vertical = 2.dp),
+                        modifier = Modifier.fillMaxWidth().background(ArgusCyanPrimary.copy(alpha = 0.15f)).padding(horizontal = 12.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(painter = painterResource(R.drawable.ic_symbol_volume_up), contentDescription = null, tint = ArgusCyanPrimary, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(text = "Argus is speaking...", style = MaterialTheme.typography.bodySmall, color = ArgusCyanPrimary, modifier = Modifier.weight(1f))
-                        IconButton(
-                            onClick = { viewModel.stopSpeaking() },
-                            modifier = Modifier.size(48.dp).testTag("stop_speaking_button")
-                        ) {
-                            Icon(painter = painterResource(R.drawable.ic_symbol_stop), contentDescription = "Stop speaking", tint = ArgusCyanPrimary, modifier = Modifier.size(18.dp))
+                        IconButton(onClick = { viewModel.stopSpeaking() }, modifier = Modifier.size(26.dp)) {
+                            Icon(painter = painterResource(R.drawable.ic_symbol_stop), contentDescription = "Stop", tint = ArgusCyanPrimary, modifier = Modifier.size(16.dp))
                         }
                     }
                 }
 
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(
-                        onClick = { showAttachDialog = true },
-                        modifier = Modifier.size(48.dp).testTag("attach_button")
-                    ) {
+                    IconButton(onClick = { showAttachDialog = true }, modifier = Modifier.size(40.dp)) {
                         Icon(painter = painterResource(R.drawable.ic_symbol_attach_file), contentDescription = "Attach", tint = ArgusCyanPrimary)
                     }
 
@@ -567,13 +481,13 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                             }
                                         }
                                     },
-                                    modifier = Modifier.size(48.dp).testTag("paste_button")
+                                    modifier = Modifier.size(30.dp)
                                 ) {
-                                    Icon(painter = painterResource(R.drawable.ic_symbol_content_paste), contentDescription = "Paste", tint = ArgusTextMuted, modifier = Modifier.size(18.dp))
+                                    Icon(painter = painterResource(R.drawable.ic_symbol_content_paste), contentDescription = "Paste", tint = ArgusTextMuted, modifier = Modifier.size(16.dp))
                                 }
                             }
                         },
-                        modifier = Modifier.weight(1f).padding(horizontal = 2.dp).testTag("chat_input_field"),
+                        modifier = Modifier.weight(1f).padding(horizontal = 4.dp).testTag("chat_input_field"),
                         shape = RoundedCornerShape(22.dp),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = ArgusCyanPrimary,
@@ -602,15 +516,12 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                 }
                             }
                         },
-                        modifier = Modifier.size(48.dp).testTag("voice_input_button")
+                        modifier = Modifier.size(40.dp).clip(CircleShape).background(if (isListening) ArgusWarning else ArgusSurfaceVariant)
                     ) {
-                        Box(
-                            modifier = Modifier.size(40.dp).clip(CircleShape).background(if (isListening) ArgusWarning else ArgusSurfaceVariant),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(painter = if (isListening) painterResource(R.drawable.ic_symbol_mic_off) else painterResource(R.drawable.ic_symbol_mic), contentDescription = "Voice", tint = if (isListening) ArgusDarkBg else ArgusCyanPrimary, modifier = Modifier.size(18.dp))
-                        }
+                        Icon(painter = if (isListening) painterResource(R.drawable.ic_symbol_mic_off) else painterResource(R.drawable.ic_symbol_mic), contentDescription = "Voice", tint = if (isListening) ArgusDarkBg else ArgusCyanPrimary, modifier = Modifier.size(18.dp))
                     }
+
+                    Spacer(modifier = Modifier.width(6.dp))
 
                     IconButton(
                         onClick = {
@@ -620,14 +531,9 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                 inputText = ""
                             }
                         },
-                        modifier = Modifier.size(48.dp).testTag("send_button")
+                        modifier = Modifier.size(44.dp).clip(CircleShape).background(ArgusCyanPrimary).testTag("send_button")
                     ) {
-                        Box(
-                            modifier = Modifier.size(44.dp).clip(CircleShape).background(ArgusCyanPrimary),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(painter = painterResource(R.drawable.ic_symbol_send), contentDescription = "Send", tint = ArgusDarkBg, modifier = Modifier.size(20.dp))
-                        }
+                        Icon(painter = painterResource(R.drawable.ic_symbol_send), contentDescription = "Send", tint = ArgusDarkBg, modifier = Modifier.size(20.dp))
                     }
                 }
             }
@@ -696,14 +602,7 @@ fun ChatMessageItem(
 
                 if (!msg.isUser && !msg.thinkReasoning.isNullOrBlank()) {
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .defaultMinSize(minHeight = 48.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(ArgusDarkBg.copy(alpha = 0.6f))
-                            .clickable { isThinkingExpanded = !isThinkingExpanded }
-                            .padding(horizontal = 8.dp, vertical = 6.dp)
-                            .testTag("reasoning_toggle_button"),
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(ArgusDarkBg.copy(alpha = 0.6f)).clickable { isThinkingExpanded = !isThinkingExpanded }.padding(horizontal = 8.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(painter = painterResource(R.drawable.ic_symbol_psychology), contentDescription = "Reasoning", tint = ArgusCyanGlow, modifier = Modifier.size(16.dp))
@@ -723,23 +622,16 @@ fun ChatMessageItem(
 
                 if (isLongMessage) {
                     Spacer(modifier = Modifier.height(4.dp))
-                    Box(
-                        modifier = Modifier
-                            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
-                            .clip(RoundedCornerShape(4.dp))
-                            .clickable { isLongTextExpanded = !isLongTextExpanded },
-                        contentAlignment = Alignment.CenterStart
-                    ) {
-                        Text(
-                            text = if (isLongTextExpanded) "Collapse" else "Read more",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (msg.isUser) androidx.compose.ui.graphics.Color.White else ArgusCyanPrimary,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
+                    Text(
+                        text = if (isLongTextExpanded) "Collapse" else "Read more",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (msg.isUser) androidx.compose.ui.graphics.Color.White else ArgusCyanPrimary,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable { isLongTextExpanded = !isLongTextExpanded }.padding(vertical = 2.dp)
+                    )
                 }
 
-                Spacer(modifier = Modifier.height(4.dp))
+                Spacer(modifier = Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
                     if (!msg.isUser) {
                         val trainCallback = onTrain
@@ -761,8 +653,7 @@ fun ChatMessageItem(
                                             Toast.makeText(context, feedback, Toast.LENGTH_SHORT).show()
                                         }
                                     }
-                                },
-                                modifier = Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp).testTag("train_exchange_button")
+                                }
                             ) {
                                 val label = when {
                                     isTrainingRequestPending -> "Adding…"
@@ -777,47 +668,29 @@ fun ChatMessageItem(
                             }
                             Spacer(modifier = Modifier.width(4.dp))
                         }
-                        Box(
-                            modifier = Modifier
-                                .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
-                                .clip(RoundedCornerShape(20.dp))
-                                .clickable { onSpeak?.invoke(msg.text) }
-                                .testTag("speak_message_button"),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Row(
-                                modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(ArgusDarkBg.copy(alpha = 0.45f)).padding(horizontal = 8.dp, vertical = 5.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(painter = painterResource(R.drawable.ic_symbol_volume_up), contentDescription = "Speak", tint = ArgusCyanPrimary, modifier = Modifier.size(13.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(text = "Speak", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = ArgusCyanPrimary)
-                            }
-                        }
-                        Spacer(modifier = Modifier.width(4.dp))
-                    }
-                    Box(
-                        modifier = Modifier
-                            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
-                            .clip(RoundedCornerShape(20.dp))
-                            .clickable {
-                                clipboardScope.launch {
-                                    clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("Argus message", msg.text)))
-                                }
-                                isCopied = true
-                                Toast.makeText(context, "Message copied", Toast.LENGTH_SHORT).show()
-                            }
-                            .testTag("copy_message_button"),
-                        contentAlignment = Alignment.Center
-                    ) {
                         Row(
-                            modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(ArgusDarkBg.copy(alpha = 0.4f)).padding(horizontal = 8.dp, vertical = 5.dp),
+                            modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(ArgusDarkBg.copy(alpha = 0.45f)).clickable { onSpeak?.invoke(msg.text) }.padding(horizontal = 8.dp, vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(painter = if (isCopied) painterResource(R.drawable.ic_symbol_check) else painterResource(R.drawable.ic_symbol_content_copy), contentDescription = "Copy", tint = if (isCopied) ArgusSuccess else ArgusTextMuted, modifier = Modifier.size(13.dp))
+                            Icon(painter = painterResource(R.drawable.ic_symbol_volume_up), contentDescription = "Speak", tint = ArgusCyanPrimary, modifier = Modifier.size(13.dp))
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text(text = if (isCopied) "Copied" else "Copy", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = if (isCopied) ArgusSuccess else ArgusTextMuted)
+                            Text(text = "Speak", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = ArgusCyanPrimary)
                         }
+                        Spacer(modifier = Modifier.width(6.dp))
+                    }
+                    Row(
+                        modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(ArgusDarkBg.copy(alpha = 0.4f)).clickable {
+                            clipboardScope.launch {
+                                clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("Argus message", msg.text)))
+                            }
+                            isCopied = true
+                            Toast.makeText(context, "Message copied", Toast.LENGTH_SHORT).show()
+                        }.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(painter = if (isCopied) painterResource(R.drawable.ic_symbol_check) else painterResource(R.drawable.ic_symbol_content_copy), contentDescription = "Copy", tint = if (isCopied) ArgusSuccess else ArgusTextMuted, modifier = Modifier.size(13.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(text = if (isCopied) "Copied" else "Copy", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = if (isCopied) ArgusSuccess else ArgusTextMuted)
                     }
                 }
             }
