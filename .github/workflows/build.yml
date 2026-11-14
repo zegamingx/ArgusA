@@ -224,9 +224,9 @@ jobs:
           fi
           rmdir signing 2>/dev/null || true
 
-      # Publish the validated main build automatically; dispatch runs still require explicit approval.
+      # Release publication is an explicit workflow-dispatch action; ordinary main pushes only validate and build.
       - name: Publish latest signed APK to GitHub Release tag
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_release == true
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash

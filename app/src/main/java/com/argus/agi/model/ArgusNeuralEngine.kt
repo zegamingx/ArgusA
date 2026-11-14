@@ -2413,21 +2413,17 @@ class ArgusNeuralEngine private constructor(
             parameterList.add(b.loraVb); gradientList.add(lg.gradLoraVb); firstMomentList.add(b.mLoraVb); secondMomentList.add(b.vLoraVb); weightDecayList.add(0f)
         }
 
-        // FP16 parameters are updated on CPU with FP32 AdamW state. The current
-        // Vulkan optimizer accepts FloatArray parameters only.
-        for (index in parameterList.indices) {
-            applyClip(gradientList[index], clipFactor)
-            adamUpdate(
-                param = parameterList[index],
-                grad = gradientList[index],
-                m = firstMomentList[index],
-                v = secondMomentList[index],
-                lr = lr,
-                biasCorr1 = biasCorr1,
-                biasCorr2 = biasCorr2,
-                wd = weightDecayList[index]
-            )
-        }
+        applyAdamWUpdate(
+            parameters = parameterList.toTypedArray(),
+            gradients = gradientList.toTypedArray(),
+            firstMoments = firstMomentList.toTypedArray(),
+            secondMoments = secondMomentList.toTypedArray(),
+            weightDecayByGroup = weightDecayList.toFloatArray(),
+            learningRate = lr,
+            biasCorrection1 = biasCorr1,
+            biasCorrection2 = biasCorr2,
+            gradientClipFactor = clipFactor
+        )
 
         return if (validSteps > 0) totalLoss / validSteps else Float.NaN
     }
@@ -2548,10 +2544,72 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
-        // Accumulation buffers and AdamW moments stay FP32. Quantize the
-        // parameter only once, after the optimizer update.
+        applyAdamWUpdate(
+            parameters = parameters,
+            gradients = gradients,
+            firstMoments = firstMoments,
+            secondMoments = secondMoments,
+            weightDecayByGroup = weightDecayByGroup,
+            learningRate = learningRate,
+            biasCorrection1 = biasCorrection1,
+            biasCorrection2 = biasCorrection2,
+            gradientClipFactor = clipFactor
+        )
+    }
+
+    /**
+     * Executes one logical AdamW update. Vulkan stages FP16 weights through the
+     * existing FP32 optimizer kernel; Kotlin remains the authoritative fallback.
+     */
+    private fun applyAdamWUpdate(
+        parameters: Array<Float16ParameterArray>,
+        gradients: Array<FloatArray>,
+        firstMoments: Array<FloatArray>,
+        secondMoments: Array<FloatArray>,
+        weightDecayByGroup: FloatArray,
+        learningRate: Float,
+        biasCorrection1: Float,
+        biasCorrection2: Float,
+        gradientClipFactor: Float
+    ) {
+        require(parameters.isNotEmpty()) {
+            "AdamW requires at least one parameter group."
+        }
+        require(
+            parameters.size == gradients.size &&
+                parameters.size == firstMoments.size &&
+                parameters.size == secondMoments.size &&
+                parameters.size == weightDecayByGroup.size
+        ) {
+            "AdamW tensor and weight-decay group counts must match."
+        }
+
+        if (VulkanTrainingBackend.tryApplyFp16AdamWUpdate(
+                parameters = parameters,
+                gradients = gradients,
+                firstMoments = firstMoments,
+                secondMoments = secondMoments,
+                weightDecayByGroup = weightDecayByGroup,
+                learningRate = learningRate,
+                beta1 = beta1,
+                beta2 = beta2,
+                biasCorrection1 = biasCorrection1,
+                biasCorrection2 = biasCorrection2,
+                epsilon = epsilon,
+                gradientClipFactor = gradientClipFactor
+            )) {
+            return
+        }
+
         for (index in parameters.indices) {
-            applyClip(gradients[index], clipFactor)
+            require(
+                gradients[index].size <= parameters[index].size &&
+                    parameters[index].size == firstMoments[index].size &&
+                    parameters[index].size == secondMoments[index].size
+            ) {
+                "AdamW tensor shape mismatch at parameter group $index."
+            }
+            applyClip(gradients[index], gradientClipFactor)
             adamUpdate(
                 param = parameters[index],
                 grad = gradients[index],
