@@ -3,6 +3,7 @@ package com.argus.agi.model
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -39,6 +40,24 @@ class Float16ParameterArrayTest {
         // A one-element operation stays on the CPU/FP32 fallback, but validating
         // the active 1x1 matrix must not reject the larger backing capacity.
         assertFalse(dispatched)
+    }
+
+    @Test
+    fun rejectsFiniteFp32ValuesThatRoundToBinary16Infinity() {
+        val parameters = Float16ParameterArray(1)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            parameters[0] = 65_520f
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            parameters.fill(-65_520f)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            Float16ParameterArray.fromFloatArray(floatArrayOf(65_520f))
+        }
+
+        parameters[0] = 65_504f
+        assertEquals(65_504f, parameters[0], 0f)
     }
 
     @Test
