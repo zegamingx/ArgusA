@@ -166,16 +166,36 @@ jobs:
           "${ANDROID_HOME}/build-tools/37.0.0/apksigner" verify --verbose --print-certs "${apk_path}" > /tmp/apksigner-report.txt
 
           expected_fingerprint="$(
-            keytool -list -v -storetype PKCS12 -keystore "${KEYSTORE_PATH}" -storepass "" -alias upload 2>/dev/null |
-              awk -F': ' '/SHA256:/{print $2; exit}' |
-              tr -d '[:space:]:' | tr '[:upper:]' '[:lower:]'
+            keytool -exportcert \
+              -storetype PKCS12 \
+              -keystore "${KEYSTORE_PATH}" \
+              -storepass "" \
+              -alias upload |
+              sha256sum |
+              awk '{print $1}' |
+              tr '[:upper:]' '[:lower:]'
           )"
           actual_fingerprint="$(
-            awk -F': ' '/Signer #1 certificate SHA-256 digest:/{print $2; exit}' /tmp/apksigner-report.txt |
-              tr -d '[:space:]:' | tr '[:upper:]' '[:lower:]'
+            sed -nE 's/^Signer #1 certificate SHA-256 digest:[[:space:]]*//p' /tmp/apksigner-report.txt |
+              head -n 1 |
+              tr -d '[:space:]:' |
+              tr '[:upper:]' '[:lower:]'
           )"
 
-          if [[ -z "${expected_fingerprint}" || "${expected_fingerprint}" != "${actual_fingerprint}" ]]; then
+          echo "Expected upload certificate SHA-256: ${expected_fingerprint}"
+          echo "Actual APK signer SHA-256: ${actual_fingerprint}"
+
+          if [[ ! "${expected_fingerprint}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not extract the persistent upload certificate fingerprint."
+            exit 1
+          fi
+
+          if [[ ! "${actual_fingerprint}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not extract the APK signer certificate fingerprint."
+            exit 1
+          fi
+
+          if [[ "${expected_fingerprint}" != "${actual_fingerprint}" ]]; then
             echo "::error::APK certificate does not match the persistent Argus signing identity."
             exit 1
           fi
