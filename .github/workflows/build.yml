@@ -163,7 +163,7 @@ jobs:
             unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
           done
 
-          "${ANDROID_HOME}/build-tools/37.0.0/apksigner" verify --verbose --print-certs "${apk_path}" > /tmp/apksigner-report.txt
+          "${ANDROID_HOME}/build-tools/37.0.0/apksigner" verify --verbose --print-certs "${apk_path}" | tee /tmp/apksigner-report.txt
 
           expected_fingerprint="$(
             keytool -exportcert \
@@ -176,10 +176,15 @@ jobs:
               tr '[:upper:]' '[:lower:]'
           )"
           actual_fingerprint="$(
-            sed -nE 's/^Signer #1 certificate SHA-256 digest:[[:space:]]*//p' /tmp/apksigner-report.txt |
-              head -n 1 |
-              tr -d '[:space:]:' |
-              tr '[:upper:]' '[:lower:]'
+            awk '
+              tolower($0) ~ /certificate sha-256 digest:/ {
+                line = $0
+                sub(/^.*digest:[[:space:]]*/, "", line)
+                gsub(/[^[:xdigit:]]/, "", line)
+                print tolower(line)
+                exit
+              }
+            ' /tmp/apksigner-report.txt
           )"
 
           echo "Expected upload certificate SHA-256: ${expected_fingerprint}"
