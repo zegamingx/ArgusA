@@ -18,7 +18,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -375,7 +374,7 @@ fun NeuronBrain3DCard(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = "VISUALIZATION • ${brainNodes.size} NODES • ${synapses.size} CONNECTIONS",
+                            text = "VISUALIZATION • 56 NODES • 108 CONNECTIONS",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusCyanPrimary.copy(alpha = 0.8f),
                             fontFamily = FontFamily.Monospace,
@@ -430,7 +429,7 @@ fun NeuronBrain3DCard(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                    Column {
                         Text(
                             text = "DEVICE RAM: ${hardwareInfo.totalRamGb} GB (${String.format(java.util.Locale.US, "%.1f", hardwareInfo.availRamGb)} GB available)",
                             style = MaterialTheme.typography.bodyMedium,
@@ -460,10 +459,7 @@ fun NeuronBrain3DCard(
                     Spacer(modifier = Modifier.height(10.dp))
                     OutlinedButton(
                         onClick = onReplayBootSequence,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 48.dp)
-                            .testTag("replay_genesis_boot_button"),
+                        modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(8.dp),
                         colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
                             contentColor = ArgusCyanPrimary
