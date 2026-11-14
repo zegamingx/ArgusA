@@ -89,7 +89,13 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
     val worldEntities by viewModel.worldEntities.collectAsState()
     val modelConfig = viewModel.engineConfig
     val backendState = viewModel.activeComputeBackend
-    val isVulkanRuntimeReady = viewModel.isVulkanRuntimeReady
+    val computeBackendStatus by viewModel.computeBackendStatus.collectAsState()
+    val isVulkanEnabledForCurrentSession by
+        viewModel.isVulkanEnabledForCurrentSession.collectAsState()
+    val isVulkanInitializationInProgress by
+        viewModel.isVulkanInitializationInProgress.collectAsState()
+    val canInitializeVulkanForCurrentSession by
+        viewModel.canInitializeVulkanForCurrentSession.collectAsState()
     val activeDocument = activeDoc
     val activeTrainingItem = currentItem
 
@@ -459,10 +465,45 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             fontSize = 10.sp
                         )
                         Text(
-                            text = "Optimizer backend: $backendState • Vulkan: ${if (isVulkanRuntimeReady) "SELF-CHECKED" else "CPU FALLBACK"}",
+                            text = "Optimizer backend: $backendState",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted,
                             fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp
+                        )
+                        Text(
+                            text = computeBackendStatus,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = ArgusTextSecondary,
+                            fontSize = 10.sp
+                        )
+                        Button(
+                            onClick = viewModel::toggleVulkanForCurrentSession,
+                            enabled = !isVulkanInitializationInProgress &&
+                                (isVulkanEnabledForCurrentSession || canInitializeVulkanForCurrentSession),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isVulkanEnabledForCurrentSession) ArgusWarning else ArgusCyanPrimary,
+                                contentColor = ArgusDarkBg,
+                                disabledContainerColor = ArgusDarkBg,
+                                disabledContentColor = ArgusTextMuted
+                            ),
+                            modifier = Modifier.testTag("vulkan_session_toggle_button")
+                        ) {
+                            Text(
+                                text = when {
+                                    isVulkanInitializationInProgress -> "Checking Vulkan…"
+                                    isVulkanEnabledForCurrentSession -> "Disable Vulkan for this session"
+                                    canInitializeVulkanForCurrentSession -> "Enable Vulkan (advanced)"
+                                    else -> "Vulkan unavailable — CPU fallback"
+                                },
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Text(
+                            text = "Vulkan stays off by default. Enabling it is optional and applies only until the app restarts.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = ArgusTextMuted,
                             fontSize = 10.sp
                         )
                     }

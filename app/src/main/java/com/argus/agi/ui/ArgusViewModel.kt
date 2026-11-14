@@ -126,7 +126,29 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     val engineConfig get() = neuralEngine.config
     val activeComputeBackend get() = neuralEngine.optimizerBackend
     val isVulkanRuntimeReady get() = neuralEngine.isVulkanRuntimeReady
+    val computeBackendStatus = neuralEngine.computeBackendStatus
+    val isVulkanEnabledForCurrentSession = neuralEngine.isVulkanEnabledForCurrentSession
+    val isVulkanInitializationInProgress = neuralEngine.isVulkanInitializationInProgress
+    val canInitializeVulkanForCurrentSession = neuralEngine.canInitializeVulkanForCurrentSession
     val checkpointInterval get() = neuralEngine.checkpointInterval
+
+    fun toggleVulkanForCurrentSession() {
+        if (neuralEngine.isVulkanInitializationInProgress.value) return
+
+        if (neuralEngine.isVulkanEnabledForCurrentSession.value) {
+            neuralEngine.disableVulkanForCurrentSession()
+            return
+        }
+
+        if (!neuralEngine.canInitializeVulkanForCurrentSession.value) return
+
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { neuralEngine.enableVulkanForCurrentSession() }
+                .onFailure { error ->
+                    Log.e(TAG, "Optional Vulkan initialization failed; Kotlin CPU remains active.", error)
+                }
+        }
+    }
     val worldEntities: StateFlow<List<WorldEntity>> = worldModel.entitiesFlow
     val currentContextSummary: StateFlow<String> = worldModel.currentContextSummary
     val genesisState: StateFlow<com.argus.agi.model.GenesisLifecycleState> = genesisModelManager.lifecycleState

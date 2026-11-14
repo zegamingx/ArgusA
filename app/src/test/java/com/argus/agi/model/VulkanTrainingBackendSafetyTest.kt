@@ -1,0 +1,41 @@
+package com.argus.agi.model
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
+class VulkanTrainingBackendSafetyTest {
+
+    @Test
+    fun readingBackendStatusDoesNotLoadNativeRuntime() {
+        assertFalse(VulkanTrainingBackend.hasAttemptedInitialization)
+        assertFalse(VulkanTrainingBackend.isRuntimeAvailable)
+        assertFalse(VulkanTrainingBackend.isFp16ComputeAvailable)
+        assertEquals("Kotlin CPU", VulkanTrainingBackend.currentBackend)
+        assertFalse(VulkanTrainingBackend.hasAttemptedInitialization)
+    }
+
+    @Test
+    fun denseOperationUsesCpuFallbackUntilVulkanIsExplicitlyEnabled() {
+        val input = Array(64) { FloatArray(64) }
+        val weights = FloatArray(64 * 64)
+        val output = Array(64) { FloatArray(64) }
+
+        val updated = VulkanTrainingBackend.tryApplyLinear(
+            inputRows = input,
+            weights = weights,
+            outputRows = output,
+            inputColumns = 64,
+            outputColumns = 64
+        )
+
+        assertFalse("Vulkan must remain opt-in for a new app process.", updated)
+        assertFalse("CPU fallback must not attempt to load JNI.", VulkanTrainingBackend.hasAttemptedInitialization)
+        assertFalse(VulkanTrainingBackend.isRuntimeAvailable)
+    }
+}

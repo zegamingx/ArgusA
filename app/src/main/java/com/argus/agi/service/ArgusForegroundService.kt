@@ -8,17 +8,12 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.argus.agi.ArgusApp
+import com.argus.agi.ArgusCoreInitializationState
 import com.argus.agi.MainActivity
 import com.argus.agi.R
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import java.util.Locale
 
 class ArgusForegroundService : Service() {
 
@@ -27,6 +22,8 @@ class ArgusForegroundService : Service() {
         const val ACTION_START = "com.argus.agi.START_SERVICE"
         const val ACTION_STOP = "com.argus.agi.STOP_SERVICE"
         const val ACTION_TOGGLE_PAUSE = "com.argus.agi.TOGGLE_PAUSE"
+
+        private const val TAG = "ArgusForegroundService"
 
         fun startService(context: Context) {
             val intent = Intent(context, ArgusForegroundService::class.java).apply {
@@ -50,9 +47,6 @@ class ArgusForegroundService : Service() {
             }
     }
 
-    private val serviceScope = CoroutineScope(Dispatchers.Default + Job())
-    private var updateJob: Job? = null
-
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -62,13 +56,24 @@ class ArgusForegroundService : Service() {
                 stopSelf()
                 return START_NOT_STICKY
             }
-            ACTION_TOGGLE_PAUSE -> {
-                ArgusApp.trainingManager.togglePauseTraining()
-                updateNotification()
-            }
+
             else -> {
+                // Android requires immediate foreground promotion after startForegroundService().
+                // This notification does not access model singletons, Room, JNI, or GPU drivers.
                 startForegroundCompat()
-                startNotificationLoop()
+
+                if (intent?.action == ACTION_TOGGLE_PAUSE) {
+                    val app = application as? ArgusApp
+                    if (app?.coreInitializationState?.value is ArgusCoreInitializationState.Ready) {
+                        runCatching {
+                            ArgusApp.trainingManager.togglePauseTraining()
+                        }.onFailure { error ->
+                            Log.e(TAG, "Could not toggle training from the foreground notification.", error)
+                        }
+                    } else {
+                        Log.w(TAG, "Ignored notification training action while the core runtime is not ready.")
+                    }
+                }
             }
         }
         return START_STICKY
@@ -77,8 +82,6 @@ class ArgusForegroundService : Service() {
     private fun startForegroundCompat() {
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // API 34+ activates specialUse only. API 29-33 uses the legacy
-            // dataSync compatibility type because specialUse did not yet exist.
             startForeground(
                 NOTIFICATION_ID,
                 notification,
@@ -89,57 +92,18 @@ class ArgusForegroundService : Service() {
         }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        updateJob?.cancel()
-    }
-
-    private fun startNotificationLoop() {
-        updateJob?.cancel()
-        updateJob = serviceScope.launch {
-            while (isActive) {
-                delay(4000)
-                updateNotification()
-            }
-        }
-    }
-
-    private fun updateNotification() {
-        val notification = buildNotification()
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-        manager.notify(NOTIFICATION_ID, notification)
-    }
-
+    /**
+     * Keep this notification lightweight. The Android foreground-service deadline must not
+     * depend on model allocation, Room restoration, native-library loading, or a GPU driver.
+     */
     private fun buildNotification(): Notification {
-        val trainingManager = ArgusApp.trainingManager
-        val deviceGuard = ArgusApp.deviceGuard
-        val neuralEngine = ArgusApp.neuralEngine
-
-        val isPaused = trainingManager.isTrainingPaused.value
-        val safety = deviceGuard.safetyState.value
-        val currentItem = trainingManager.currentTrainingItem.value
-        val latestLoss = trainingManager.lossHistory.value.lastOrNull()
-
-        val title = "A.R.G.U.S Core: " + when {
-            isPaused -> "Training paused"
-            !safety.isSafeToTrain -> "Device safety hold active"
-            currentItem != null -> "Training: ${currentItem.source}"
-            else -> "Monitoring local activity"
-        }
-
-        val lossText = if (latestLoss != null) "Loss: ${String.format(Locale.US, "%.4f", latestLoss)}" else "Loss: not available"
-        val computeStatus = if (neuralEngine.isVulkanRuntimeReady) {
-            "Vulkan runtime verified"
-        } else {
-            "Kotlin CPU fallback"
-        }
-        val content = "$lossText | ${safety.batteryPct}% (${String.format(Locale.US, "%.1f", safety.temperatureCelsius)}°C) | $computeStatus"
-
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         val openAppPendingIntent = PendingIntent.getActivity(
-            this, 0, openAppIntent,
+            this,
+            0,
+            openAppIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
@@ -147,19 +111,19 @@ class ArgusForegroundService : Service() {
             action = ACTION_TOGGLE_PAUSE
         }
         val togglePendingIntent = PendingIntent.getService(
-            this, 1, toggleIntent,
+            this,
+            1,
+            toggleIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val pauseResumeLabel = if (isPaused) "Resume training" else "Pause training"
-
         return NotificationCompat.Builder(this, ArgusApp.CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(content)
+            .setContentTitle("A.R.G.U.S Neural Core")
+            .setContentText("On-device compute service is active")
             .setSmallIcon(R.drawable.ic_argus_logo)
             .setContentIntent(openAppPendingIntent)
             .setOngoing(true)
-            .addAction(0, pauseResumeLabel, togglePendingIntent)
+            .addAction(0, "Pause / resume training", togglePendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
