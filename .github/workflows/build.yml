@@ -212,6 +212,49 @@ jobs:
           (cd dist && sha256sum "ARGUS.apk" > "ARGUS.apk.sha256")
           echo "APK signature verified against the persistent Argus upload certificate."
 
+      - name: Reclaim build-only disk space before emulator startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_path="app/build/outputs/apk/release/app-release.apk"
+          test -s "${apk_path}"
+
+          echo "Disk space before cleanup:"
+          df -h "${HOME}"
+
+          # Native compilation and signing are complete. These build tools and
+          # intermediates are not needed by the Android emulator smoke test.
+          rm -rf "${ANDROID_HOME}/ndk/30.0.16248370"
+          rm -rf "${RUNNER_TEMP}/cmake-3.31.6"
+          rm -f "${RUNNER_TEMP}/cmake-3.31.6-linux-x86_64.tar.gz"
+
+          gradle_user_home="${GRADLE_USER_HOME:-${HOME}/.gradle}"
+          rm -rf "${gradle_user_home}/caches"
+          rm -rf "${gradle_user_home}/wrapper/dists"
+
+          # Keep the signed release APK; remove only disposable build outputs.
+          find app/build -mindepth 1 -maxdepth 1 ! -name outputs -exec rm -rf {} +
+          find app/build/outputs -mindepth 1 -maxdepth 1 ! -name apk -exec rm -rf {} +
+          find app/build/outputs/apk -mindepth 1 -maxdepth 1 ! -name release -exec rm -rf {} +
+
+          # The keystore was downloaded only to sign this APK. It must not
+          # remain in the workspace while the emulator or later steps run.
+          if [[ -n "${KEYSTORE_PATH:-}" ]]; then
+            rm -f -- "${KEYSTORE_PATH}"
+          fi
+          rmdir signing 2>/dev/null || true
+
+          test -s "${apk_path}"
+          echo "Disk space after cleanup:"
+          df -h "${HOME}"
+
+          available_kb="$(df -Pk "${HOME}" | awk 'NR == 2 {print $4}')"
+          minimum_kb="$((7 * 1024 * 1024))"
+          if [[ "${available_kb}" -lt "${minimum_kb}" ]]; then
+            echo "::error::Less than 7 GiB remains for Android emulator creation after cleanup."
+            exit 1
+          fi
+
 # Publish the validated main build automatically; dispatch runs still require explicit approval.
       - name: Enable KVM for Android emulator
         run: |
@@ -229,6 +272,7 @@ jobs:
           cores: 4
           ram-size: 4096M
           heap-size: 512M
+          disk-size: 4096M
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           emulator-boot-timeout: 600
