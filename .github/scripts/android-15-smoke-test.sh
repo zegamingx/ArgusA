@@ -7,7 +7,7 @@ readonly PACKAGE_NAME="com.argus.agi"
 readonly ACTIVITY_COMPONENT="${PACKAGE_NAME}/.MainActivity"
 readonly EXPECTED_API_LEVEL="35"
 readonly CORE_INIT_TIMEOUT_SECONDS="${ARGUS_CORE_INIT_TIMEOUT_SECONDS:-180}"
-readonlly SERVICE_START_TIMEOUT_SECONDS="${ARGUS_SERVICE_START_TIMEOUT_SECONDS:-30}"
+readonly SERVICE_START_TIMEOUT_SECONDS="${ARGUS_SERVICE_START_TIMEOUT_SECONDS:-30}"
 readonly STABILITY_SECONDS="${ARGUS_STABILITY_SECONDS:-15}"
 
 cd "${REPOSITORY_ROOT}"
@@ -77,7 +77,7 @@ if ! START_OUTPUT="$(adb_cmd shell am start -W -n "${ACTIVITY_COMPONENT}" 2>&1)"
     fail "Android rejected the Argus launcher activity."
 fi
 printf '%s\n' "${START_OUTPUT}"
-grep -Fq 'Status: ok' <<< "${START_OUTPUUT}" || \
+grep -Fq 'Status: ok' <<< "${START_OUTPUT}" || \
     fail "The Argus launcher activity did not report a successful start."
 
 log "Waiting up to ${CORE_INIT_TIMEOUT_SECONDS}s for core initialization."
