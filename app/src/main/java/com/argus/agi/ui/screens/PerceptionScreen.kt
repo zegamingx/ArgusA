@@ -29,7 +29,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -213,13 +212,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 48.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { isCameraExpanded = !isCameraExpanded }
-                            .padding(vertical = 2.dp)
-                            .testTag("perception_camera_header"),
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { isCameraExpanded = !isCameraExpanded }.padding(vertical = 2.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -323,13 +316,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
             Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 48.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { isScreenExpanded = !isScreenExpanded }
-                            .padding(vertical = 2.dp)
-                            .testTag("perception_screen_header"),
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { isScreenExpanded = !isScreenExpanded }.padding(vertical = 2.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -384,13 +371,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
             Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 48.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { isHardwareExpanded = !isHardwareExpanded }
-                            .padding(vertical = 2.dp)
-                            .testTag("perception_hardware_header"),
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { isHardwareExpanded = !isHardwareExpanded }.padding(vertical = 2.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -427,13 +408,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
             Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 48.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { isAudioExpanded = !isAudioExpanded }
-                            .padding(vertical = 2.dp)
-                            .testTag("perception_audio_header"),
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { isAudioExpanded = !isAudioExpanded }.padding(vertical = 2.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Box(modifier = Modifier.size(34.dp).clip(CircleShape).background(ArgusCyanPrimary.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
@@ -475,8 +450,7 @@ fun PerceptionScreen(viewModel: ArgusViewModel) {
                                     viewModel.toggleAcousticMonitoring()
                                 }
                             },
-                            colors = SwitchDefaults.colors(checkedThumbColor = ArgusDarkBg, checkedTrackColor = ArgusCyanPrimary, uncheckedThumbColor = ArgusTextMuted, uncheckedTrackColor = ArgusSurfaceVariant),
-                            modifier = Modifier.testTag("acoustic_monitoring_switch")
+                            colors = SwitchDefaults.colors(checkedThumbColor = ArgusDarkBg, checkedTrackColor = ArgusCyanPrimary, uncheckedThumbColor = ArgusTextMuted, uncheckedTrackColor = ArgusSurfaceVariant)
                         )
                         Icon(painter = if (isAudioExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down), contentDescription = "Expand", tint = ArgusTextMuted, modifier = Modifier.size(20.dp))
                     }
@@ -588,7 +562,6 @@ fun CameraViewfinder(
                         contentColor = ArgusDarkBg,
                     ),
                     shape = RoundedCornerShape(20.dp),
-                    modifier = Modifier.testTag("grant_camera_permission_button")
                 ) {
                     Text("Grant camera permission", fontWeight = FontWeight.Bold, fontSize = 11.sp)
                 }
