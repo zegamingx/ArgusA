@@ -783,9 +783,9 @@ bool copyBufferSync(
 
     VkBufferMemoryBarrier before[2]{};
     before[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    before[0].srcAccessMask = sourceHostWritten
-        ? VK_ACCESS_HOST_WRITE_BIT
-        : (VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    before[0].srcAccessMask =
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+        (sourceHostWritten ? VK_ACCESS_HOST_WRITE_BIT : 0u);
     before[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     before[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     before[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -796,7 +796,8 @@ bool copyBufferSync(
     // The destination range may have been read or written by an earlier GPU dispatch.
     before[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     before[1].srcAccessMask =
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     before[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     before[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     before[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -806,10 +807,8 @@ bool copyBufferSync(
 
     vkCmdPipelineBarrier(
         gRuntime.commandBuffer,
-        sourceHostWritten
-            ? (VK_PIPELINE_STAGE_HOST_BIT |
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT)
-            : (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT),
+        VK_PIPELINE_STAGE_HOST_BIT |
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 0, nullptr, 2, before, 0, nullptr
     );
@@ -977,13 +976,18 @@ bool growTensorArena(VkDeviceSize additionalBytes) {
 
     if (gRuntime.tensorArenaBuffer != VK_NULL_HANDLE) {
         const VkResult idle = vkDeviceWaitIdle(gRuntime.device);
-        if (idle != VK_SUCCESS ||
-            !copyBufferSync(
+        if (idle != VK_SUCCESS) {
+            vkDestroyBuffer(gRuntime.device, nextBuffer, nullptr);
+            vkFreeMemory(gRuntime.device, nextMemory, nullptr);
+            logError("Vulkan device did not become idle before preserving tensor data.", idle);
+            return false;
+        }
+        if (!copyBufferSync(
                 gRuntime.tensorArenaBuffer, nextBuffer, 0u, 0u, oldCapacity, false, false
             )) {
             vkDestroyBuffer(gRuntime.device, nextBuffer, nullptr);
             vkFreeMemory(gRuntime.device, nextMemory, nullptr);
-            logError("Could not preserve live tensors while growing the Vulkan arena.", idle);
+            logError("Could not preserve live tensors while growing the Vulkan arena.");
             return false;
         }
         vkDestroyBuffer(gRuntime.device, gRuntime.tensorArenaBuffer, nullptr);
