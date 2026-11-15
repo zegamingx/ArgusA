@@ -85,6 +85,10 @@ data class VulkanDeviceCapabilities(
     val driverName: String,
     val driverInfo: String,
     val driverVersionRaw: Long,
+    val deviceIdentityPropertiesAvailable: Boolean,
+    val deviceUuid: String,
+    val driverUuid: String,
+    val pipelineCacheUuid: String,
     val maxComputeWorkGroupInvocations: Int,
     val maxComputeWorkGroupSizeX: Int,
     val maxComputeWorkGroupSizeY: Int,
@@ -119,6 +123,26 @@ data class VulkanDeviceCapabilities(
     val cooperativeMatrixRobustBufferAccess: Boolean,
     val cooperativeMatrixSupportedStages: Int,
     val cooperativeMatrixTypes: List<VulkanCooperativeMatrixType>,
+    val armTensorsExtensionSupported: Boolean,
+    val armTensorsFeatureQueryAvailable: Boolean,
+    val armTensorsFeatureSupported: Boolean,
+    val armTensorNonPackedSupported: Boolean,
+    val armTensorShaderAccessSupported: Boolean,
+    val armTensorDynamicIndexingSupported: Boolean,
+    val armTensorNonUniformIndexingSupported: Boolean,
+    val armTensorUpdateAfterBindSupported: Boolean,
+    val armTensorDeviceFeaturesEnabled: Boolean,
+    val shaderTensorSupportedStages: Int,
+    val armTensorMaxDimensionCount: Int,
+    val armTensorMaxElements: Long,
+    val armTensorMaxPerDimensionElements: Long,
+    val armTensorMaxStride: Long,
+    val armTensorMaxSizeBytes: Long,
+    val armTensorMaxShaderAccessArrayLength: Int,
+    val armTensorMaxShaderAccessSizeBytes: Int,
+    val armTensorMaxDescriptorSetStorageTensors: Int,
+    val armTensorMaxPerStageDescriptorSetStorageTensors: Int,
+    val armTensorNonUniformIndexingNative: Boolean,
     val effectiveApiVersionMajor: Int,
     val effectiveApiVersionMinor: Int,
     val effectiveApiVersionPatch: Int,
@@ -194,6 +218,16 @@ data class VulkanDeviceCapabilities(
     val hasUsableCooperativeMatrixConfiguration: Boolean
         get() = cooperativeMatrixEnabled && hasSupportedCooperativeMatrixConfiguration
 
+    val supportsComputeArmTensors: Boolean
+        get() = armTensorsExtensionSupported &&
+            armTensorsFeatureQueryAvailable &&
+            armTensorsFeatureSupported &&
+            armTensorShaderAccessSupported &&
+            (shaderTensorSupportedStages and COMPUTE_SHADER_STAGE_BIT) != 0
+
+    val canUseArmTensorCompute: Boolean
+        get() = supportsComputeArmTensors && armTensorDeviceFeaturesEnabled
+
     companion object {
         private const val COMPUTE_SHADER_STAGE_BIT = 0x00000020
         private const val SUBGROUP_FEATURE_ARITHMETIC_BIT = 0x00000004
@@ -235,6 +269,10 @@ data class VulkanDeviceCapabilities(
                 driverName = json.optString("driverName"),
                 driverInfo = json.optString("driverInfo"),
                 driverVersionRaw = json.optLong("driverVersionRaw"),
+                deviceIdentityPropertiesAvailable = json.optBoolean("deviceIdentityPropertiesAvailable"),
+                deviceUuid = json.optString("deviceUUID"),
+                driverUuid = json.optString("driverUUID"),
+                pipelineCacheUuid = json.optString("pipelineCacheUUID"),
                 maxComputeWorkGroupInvocations = json.optInt("maxComputeWorkGroupInvocations"),
                 maxComputeWorkGroupSizeX = json.optInt("maxComputeWorkGroupSizeX"),
                 maxComputeWorkGroupSizeY = json.optInt("maxComputeWorkGroupSizeY"),
@@ -276,6 +314,33 @@ data class VulkanDeviceCapabilities(
                     json.optBoolean("cooperativeMatrixRobustBufferAccess"),
                 cooperativeMatrixSupportedStages = json.optInt("cooperativeMatrixSupportedStages"),
                 cooperativeMatrixTypes = matrixTypes,
+                armTensorsExtensionSupported = json.optBoolean("armTensorsExtensionSupported"),
+                armTensorsFeatureQueryAvailable = json.optBoolean("armTensorsFeatureQueryAvailable"),
+                armTensorsFeatureSupported = json.optBoolean("armTensorsFeatureSupported"),
+                armTensorNonPackedSupported = json.optBoolean("armTensorNonPackedSupported"),
+                armTensorShaderAccessSupported = json.optBoolean("armTensorShaderAccessSupported"),
+                armTensorDynamicIndexingSupported = json.optBoolean("armTensorDynamicIndexingSupported"),
+                armTensorNonUniformIndexingSupported =
+                    json.optBoolean("armTensorNonUniformIndexingSupported"),
+                armTensorUpdateAfterBindSupported =
+                    json.optBoolean("armTensorUpdateAfterBindSupported"),
+                armTensorDeviceFeaturesEnabled = json.optBoolean("armTensorDeviceFeaturesEnabled"),
+                shaderTensorSupportedStages = json.optInt("shaderTensorSupportedStages"),
+                armTensorMaxDimensionCount = json.optInt("armTensorMaxDimensionCount"),
+                armTensorMaxElements = json.optLong("armTensorMaxElements"),
+                armTensorMaxPerDimensionElements = json.optLong("armTensorMaxPerDimensionElements"),
+                armTensorMaxStride = json.optLong("armTensorMaxStride"),
+                armTensorMaxSizeBytes = json.optLong("armTensorMaxSizeBytes"),
+                armTensorMaxShaderAccessArrayLength =
+                    json.optInt("armTensorMaxShaderAccessArrayLength"),
+                armTensorMaxShaderAccessSizeBytes =
+                    json.optInt("armTensorMaxShaderAccessSizeBytes"),
+                armTensorMaxDescriptorSetStorageTensors =
+                    json.optInt("armTensorMaxDescriptorSetStorageTensors"),
+                armTensorMaxPerStageDescriptorSetStorageTensors =
+                    json.optInt("armTensorMaxPerStageDescriptorSetStorageTensors"),
+                armTensorNonUniformIndexingNative =
+                    json.optBoolean("armTensorNonUniformIndexingNative"),
                 effectiveApiVersionMajor = json.optInt(
                     "effectiveApiVersionMajor",
                     json.optInt("apiVersionMajor")
