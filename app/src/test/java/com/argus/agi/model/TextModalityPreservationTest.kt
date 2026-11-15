@@ -384,11 +384,12 @@ class TextModalityPreservationTest {
         assertEquals(2, Regex(Regex.escape(Tokenizer.EOS_TOKEN)).findAll(sample).count())
         assertEquals(2, Tokenizer().encode(sample).count { it == Tokenizer.EOS_ID })
     }
+
     @Test
     fun conversationEndingWithUserDoesNotReceiveSyntheticEos() {
-        val raw = "\${Tokenizer.USER_TOKEN} first question\n" +
-            "\${Tokenizer.ASSISTANT_TOKEN} first answer\n" +
-            "\${Tokenizer.USER_TOKEN} follow-up without an answer"
+        val raw = Tokenizer.USER_TOKEN + " first question\n" +
+            Tokenizer.ASSISTANT_TOKEN + " first answer\n" +
+            Tokenizer.USER_TOKEN + " follow-up without an answer"
 
         val sample = TextModalityProcessor.process(
             rawText = raw,
