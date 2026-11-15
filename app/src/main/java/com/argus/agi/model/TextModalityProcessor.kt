@@ -661,7 +661,7 @@ object TextModalityProcessor {
         val records = parseTrainingDatasetObjects(source)
         if (records != null) return processTrainingRecords(records, documentTitle)
 
-        return when (val modality = detectModality(source)) {
+        return when (detectModality(source)) {
             TextModality.CONVERSATION -> processConversation(source, documentTitle, chunkSize)
             TextModality.QA_PAIR -> processQAPairs(source, documentTitle, chunkSize)
             TextModality.REASONING -> processReasoningDataset(source, documentTitle, chunkSize)
@@ -696,8 +696,8 @@ object TextModalityProcessor {
     /**
      * Memproses teks percakapan:
      * Menyusun giliran bicara dengan token kanonikal <USER> dan <ASSISTANT>.
-     * Turn tunggal yang melebihi chunkSize dipecah di batas kalimat dengan
-     * mempertahankan prefix role pada setiap potongan.
+     * The complete conversation remains one sample; context windowing is delegated
+     * to the training engine so neither user nor assistant turns are split here.
      */
     private fun processConversation(
         text: String,
@@ -1011,9 +1011,8 @@ object TextModalityProcessor {
     }
 
     /**
-     * Keeps each reasoning record intact while batching records into bounded chunks.
-     * A single long record may exceed chunkSize because the neural engine trains it
-     * through overlapping context windows.
+     * Keeps one complete reasoning record intact. The neural engine owns context
+     * windowing; this formatter must not split THINK from its final answer.
      */
     private fun processReasoningDataset(
         text: String,

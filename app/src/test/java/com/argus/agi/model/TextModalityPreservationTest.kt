@@ -385,6 +385,42 @@ class TextModalityPreservationTest {
         assertEquals(2, Tokenizer().encode(sample).count { it == Tokenizer.EOS_ID })
     }
     @Test
+    fun conversationEndingWithUserDoesNotReceiveSyntheticEos() {
+        val raw = "\${Tokenizer.USER_TOKEN} first question\n" +
+            "\${Tokenizer.ASSISTANT_TOKEN} first answer\n" +
+            "\${Tokenizer.USER_TOKEN} follow-up without an answer"
+
+        val sample = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Open conversation",
+            chunkSize = 12,
+            overlap = 0
+        ).single().content
+
+        assertEquals(1, Regex(Regex.escape(Tokenizer.EOS_TOKEN)).findAll(sample).count())
+        assertFalse(sample.endsWith(Tokenizer.EOS_TOKEN))
+    }
+
+    @Test
+    fun structuredRecordsArePackedOnlyAtCompleteLineBoundaries() {
+        val first = "- first complete record with a long payload"
+        val second = "- second complete record with another long payload"
+        val raw = "$first\n$second"
+
+        val chunks = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Structured line records",
+            chunkSize = 12,
+            overlap = 0
+        )
+
+        assertEquals(2, chunks.size)
+        assertEquals(first, chunks[0].content)
+        assertEquals(second, chunks[1].content)
+        assertTrue(chunks.all { it.modality == TextModality.STRUCTURED_DATA })
+    }
+
+    @Test
     fun structuredPlainTextFormattingPreservesCrLfLfAndCrSeparators() {
         val raw = "alpha  \r\nbeta\n  gamma\rdelta\r\n"
 
