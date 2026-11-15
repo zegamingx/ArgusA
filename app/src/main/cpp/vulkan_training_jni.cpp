@@ -16,6 +16,8 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -60,6 +62,18 @@ struct LinearPushConstants {
 static_assert(sizeof(LinearPushConstants) == 36);
 static_assert(offsetof(LinearPushConstants, transposeWeights) == 32);
 
+struct CooperativeMatrixCapability {
+    uint32_t mSize = 0;
+    uint32_t nSize = 0;
+    uint32_t kSize = 0;
+    uint32_t aType = 0;
+    uint32_t bType = 0;
+    uint32_t cType = 0;
+    uint32_t resultType = 0;
+    bool saturatingAccumulation = false;
+    uint32_t scope = 0;
+};
+
 struct VulkanRuntime {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -86,6 +100,33 @@ struct VulkanRuntime {
 
     uint32_t instanceApiVersion = VK_API_VERSION_1_0;
     bool supportsFp16Compute = false;
+    bool supportsShaderInt8 = false;
+    bool supportsStorageBuffer16BitAccess = false;
+
+    uint32_t subgroupSize = 0;
+    uint32_t subgroupSupportedStages = 0;
+    uint32_t subgroupSupportedOperations = 0;
+    bool subgroupQuadOperationsInAllStages = false;
+    bool supportsSubgroupSizeControl = false;
+    bool supportsComputeFullSubgroups = false;
+    uint32_t minSubgroupSize = 0;
+    uint32_t maxSubgroupSize = 0;
+    uint32_t maxComputeWorkgroupSubgroups = 0;
+    uint32_t requiredSubgroupSizeStages = 0;
+
+    bool supportsShaderIntegerDotProduct = false;
+    bool integerDotProduct8BitUnsignedAccelerated = false;
+    bool integerDotProduct8BitSignedAccelerated = false;
+    bool integerDotProduct8BitMixedSignednessAccelerated = false;
+    bool integerDotProduct4x8BitPackedUnsignedAccelerated = false;
+    bool integerDotProduct4x8BitPackedSignedAccelerated = false;
+    bool integerDotProduct4x8BitPackedMixedSignednessAccelerated = false;
+
+    bool hasCooperativeMatrixExtension = false;
+    bool supportsCooperativeMatrix = false;
+    bool supportsCooperativeMatrixRobustBufferAccess = false;
+    uint32_t cooperativeMatrixSupportedStages = 0;
+    std::vector<CooperativeMatrixCapability> cooperativeMatrixTypes;
 
     VkBuffer storageBuffer = VK_NULL_HANDLE;
     VkDeviceMemory storageMemory = VK_NULL_HANDLE;
@@ -125,6 +166,67 @@ void logError(const char* message, VkResult result = VK_SUCCESS) {
             static_cast<int>(result)
         );
     }
+}
+
+bool hasDeviceExtension(
+    const std::vector<VkExtensionProperties>& extensions,
+    const char* extensionName
+) {
+    return std::any_of(
+        extensions.begin(),
+        extensions.end(),
+        [extensionName](const VkExtensionProperties& extension) {
+            return std::strcmp(extension.extensionName, extensionName) == 0;
+        }
+    );
+}
+
+std::string escapeJsonString(const char* value) {
+    std::string escaped;
+    if (value == nullptr) {
+        return escaped;
+    }
+
+    for (const unsigned char character : std::string(value)) {
+        switch (character) {
+            case '"':
+                escaped += "\\\"";
+                break;
+            case '\\':
+                escaped += "\\\\";
+                break;
+            case '\b':
+                escaped += "\\b";
+                break;
+            case '\f':
+                escaped += "\\f";
+                break;
+            case '\n':
+                escaped += "\\n";
+                break;
+            case '\r':
+                escaped += "\\r";
+                break;
+            case '\t':
+                escaped += "\\t";
+                break;
+            default:
+                if (character < 0x20u) {
+                    char buffer[7]{};
+                    std::snprintf(
+                        buffer,
+                        sizeof(buffer),
+                        "\\u%04X",
+                        static_cast<unsigned int>(character)
+                    );
+                    escaped += buffer;
+                } else {
+                    escaped += static_cast<char>(character);
+                }
+                break;
+        }
+    }
+    return escaped;
 }
 
 uint32_t calculateDispatchGroupCount(uint64_t requiredGroupCount) {
@@ -468,7 +570,13 @@ bool initializeRuntime() {
             loaderApiVersion = reportedVersion;
         }
     }
+    #if defined(VK_VERSION_1_3)
+    gRuntime.instanceApiVersion = std::min(loaderApiVersion, VK_API_VERSION_1_3);
+#elif defined(VK_VERSION_1_2)
     gRuntime.instanceApiVersion = std::min(loaderApiVersion, VK_API_VERSION_1_2);
+#else
+    gRuntime.instanceApiVersion = loaderApiVersion;
+#endif
     applicationInfo.apiVersion = gRuntime.instanceApiVersion;
 
     VkInstanceCreateInfo instanceInfo{};
@@ -583,65 +691,434 @@ bool initializeRuntime() {
         return false;
     }
 
-    // VkPhysicalDeviceProperties::driverVersion is vendor-defined. Do not decode
-    // it with VK_VERSION_MAJOR/MINOR/PATCH; Vulkan 1.2 driver properties expose
-    // the driver's own name and descriptive version information.
-    if (gRuntime.instanceApiVersion >= VK_API_VERSION_1_2 &&
-        gRuntime.physicalDeviceProperties.apiVersion >= VK_API_VERSION_1_2) {
-        const auto getPhysicalDeviceProperties2 =
-            reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
-                vkGetInstanceProcAddr(gRuntime.instance, "vkGetPhysicalDeviceProperties2")
-            );
-        if (getPhysicalDeviceProperties2 != nullptr) {
+    uint32_t extensionCount = 0;
+    VkResult extensionResult = vkEnumerateDeviceExtensionProperties(
+        gRuntime.physicalDevice,
+        nullptr,
+        &extensionCount,
+        nullptr
+    );
+    std::vector<VkExtensionProperties> deviceExtensions;
+    if (extensionResult == VK_SUCCESS && extensionCount > 0u) {
+        try {
+            deviceExtensions.resize(extensionCount);
+        } catch (const std::bad_alloc&) {
+            logError("Not enough memory to enumerate Vulkan device extensions.");
+            return false;
+        }
+
+        extensionResult = vkEnumerateDeviceExtensionProperties(
+            gRuntime.physicalDevice,
+            nullptr,
+            &extensionCount,
+            deviceExtensions.data()
+        );
+        if (extensionResult != VK_SUCCESS && extensionResult != VK_INCOMPLETE) {
+            deviceExtensions.clear();
+            logError("Vulkan device-extension enumeration failed.", extensionResult);
+        } else {
+            deviceExtensions.resize(extensionCount);
+        }
+    } else if (extensionResult != VK_SUCCESS) {
+        logError("Vulkan device-extension count query failed.", extensionResult);
+    }
+
+    const uint32_t physicalApiVersion = gRuntime.physicalDeviceProperties.apiVersion;
+    const bool physicalSupportsVulkan11 = physicalApiVersion >= VK_API_VERSION_1_1;
+    const bool physicalSupportsVulkan12 = physicalApiVersion >= VK_API_VERSION_1_2;
+#if defined(VK_VERSION_1_3)
+    const bool physicalSupportsVulkan13 = physicalApiVersion >= VK_API_VERSION_1_3;
+#else
+    const bool physicalSupportsVulkan13 = false;
+#endif
+
+#if defined(VK_EXT_subgroup_size_control)
+    const bool hasSubgroupSizeControlExtension = hasDeviceExtension(
+        deviceExtensions,
+        VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME
+    );
+#else
+    const bool hasSubgroupSizeControlExtension = false;
+#endif
+
+#if defined(VK_KHR_shader_integer_dot_product)
+    const bool hasIntegerDotProductExtension = hasDeviceExtension(
+        deviceExtensions,
+        VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME
+    );
+#else
+    const bool hasIntegerDotProductExtension = false;
+#endif
+
+#if defined(VK_KHR_cooperative_matrix)
+    gRuntime.hasCooperativeMatrixExtension = hasDeviceExtension(
+        deviceExtensions,
+        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME
+    );
+#endif
+
+    // Query extension and promoted-core features before creating the logical device.
+    // Only the existing FP16 path is enabled today; other feature flags are recorded
+    // for later pipeline selection and are deliberately not enabled speculatively.
+    VkPhysicalDeviceFeatures2 supportedFeatures{};
+    supportedFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    void** featureChainTail = &supportedFeatures.pNext;
+
+    auto appendFeature = [&featureChainTail](auto& feature) {
+        feature.pNext = nullptr;
+        *featureChainTail = &feature;
+        featureChainTail = &feature.pNext;
+    };
+
+    VkPhysicalDeviceShaderFloat16Int8Features supportedShaderFloat16{};
+    const bool queryShaderFloat16 =
+        physicalSupportsVulkan12
+#if defined(VK_KHR_shader_float16_int8)
+        || hasDeviceExtension(
+            deviceExtensions,
+            VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME
+        )
+#endif
+        ;
+    if (queryShaderFloat16) {
+        supportedShaderFloat16.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+        appendFeature(supportedShaderFloat16);
+    }
+
+#if defined(VK_VERSION_1_1)
+    VkPhysicalDevice16BitStorageFeatures supportedStorage16{};
+    if (physicalSupportsVulkan11) {
+        supportedStorage16.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+        appendFeature(supportedStorage16);
+    }
+#endif
+
+#if defined(VK_VERSION_1_3)
+    VkPhysicalDeviceSubgroupSizeControlFeatures supportedSubgroupSizeControl{};
+    const bool querySubgroupSizeControl =
+        physicalSupportsVulkan13 || hasSubgroupSizeControlExtension;
+    if (querySubgroupSizeControl) {
+        supportedSubgroupSizeControl.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
+        appendFeature(supportedSubgroupSizeControl);
+    }
+
+    VkPhysicalDeviceShaderIntegerDotProductFeatures supportedIntegerDotProduct{};
+    const bool queryIntegerDotProduct =
+        physicalSupportsVulkan13 || hasIntegerDotProductExtension;
+    if (queryIntegerDotProduct) {
+        supportedIntegerDotProduct.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+        appendFeature(supportedIntegerDotProduct);
+    }
+#else
+    const bool querySubgroupSizeControl = hasSubgroupSizeControlExtension;
+    const bool queryIntegerDotProduct = hasIntegerDotProductExtension;
+#if defined(VK_EXT_subgroup_size_control)
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT supportedSubgroupSizeControl{};
+    if (querySubgroupSizeControl) {
+        supportedSubgroupSizeControl.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT;
+        appendFeature(supportedSubgroupSizeControl);
+    }
+#endif
+#if defined(VK_KHR_shader_integer_dot_product)
+    VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR supportedIntegerDotProduct{};
+    if (queryIntegerDotProduct) {
+        supportedIntegerDotProduct.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
+        appendFeature(supportedIntegerDotProduct);
+    }
+#endif
+#endif
+
+#if defined(VK_KHR_cooperative_matrix)
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR supportedCooperativeMatrix{};
+    if (gRuntime.hasCooperativeMatrixExtension) {
+        supportedCooperativeMatrix.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+        appendFeature(supportedCooperativeMatrix);
+    }
+#endif
+
+    const auto getPhysicalDeviceFeatures2 =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+            vkGetInstanceProcAddr(gRuntime.instance, "vkGetPhysicalDeviceFeatures2")
+        );
+    const bool features2Available =
+        gRuntime.instanceApiVersion >= VK_API_VERSION_1_1 &&
+        physicalSupportsVulkan11 &&
+        getPhysicalDeviceFeatures2 != nullptr;
+
+    if (features2Available) {
+        getPhysicalDeviceFeatures2(gRuntime.physicalDevice, &supportedFeatures);
+        gRuntime.supportsFp16Compute =
+            queryShaderFloat16 && supportedShaderFloat16.shaderFloat16 == VK_TRUE;
+        gRuntime.supportsShaderInt8 =
+            queryShaderFloat16 && supportedShaderFloat16.shaderInt8 == VK_TRUE;
+#if defined(VK_VERSION_1_1)
+        gRuntime.supportsStorageBuffer16BitAccess =
+            physicalSupportsVulkan11 &&
+            supportedStorage16.storageBuffer16BitAccess == VK_TRUE;
+#endif
+#if defined(VK_VERSION_1_3)
+        gRuntime.supportsSubgroupSizeControl =
+            querySubgroupSizeControl &&
+            supportedSubgroupSizeControl.subgroupSizeControl == VK_TRUE;
+        gRuntime.supportsComputeFullSubgroups =
+            querySubgroupSizeControl &&
+            supportedSubgroupSizeControl.computeFullSubgroups == VK_TRUE;
+        gRuntime.supportsShaderIntegerDotProduct =
+            queryIntegerDotProduct &&
+            supportedIntegerDotProduct.shaderIntegerDotProduct == VK_TRUE;
+#else
+#if defined(VK_EXT_subgroup_size_control)
+        gRuntime.supportsSubgroupSizeControl =
+            querySubgroupSizeControl &&
+            supportedSubgroupSizeControl.subgroupSizeControl == VK_TRUE;
+        gRuntime.supportsComputeFullSubgroups =
+            querySubgroupSizeControl &&
+            supportedSubgroupSizeControl.computeFullSubgroups == VK_TRUE;
+#endif
+#if defined(VK_KHR_shader_integer_dot_product)
+        gRuntime.supportsShaderIntegerDotProduct =
+            queryIntegerDotProduct &&
+            supportedIntegerDotProduct.shaderIntegerDotProduct == VK_TRUE;
+#endif
+#endif
+#if defined(VK_KHR_cooperative_matrix)
+        gRuntime.supportsCooperativeMatrix =
+            gRuntime.hasCooperativeMatrixExtension &&
+            supportedCooperativeMatrix.cooperativeMatrix == VK_TRUE;
+        gRuntime.supportsCooperativeMatrixRobustBufferAccess =
+            gRuntime.hasCooperativeMatrixExtension &&
+            supportedCooperativeMatrix.cooperativeMatrixRobustBufferAccess == VK_TRUE;
+#endif
+    } else {
+        VkPhysicalDeviceFeatures legacyFeatures{};
+        vkGetPhysicalDeviceFeatures(gRuntime.physicalDevice, &legacyFeatures);
+        gRuntime.supportsFp16Compute = false;
+        gRuntime.supportsShaderInt8 = false;
+    }
+
+    // Properties are queried separately from features. A supported bit is not
+    // treated as accelerated hardware unless the matching property says so.
+    const auto getPhysicalDeviceProperties2 =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            vkGetInstanceProcAddr(gRuntime.instance, "vkGetPhysicalDeviceProperties2")
+        );
+    const bool properties2Available =
+        gRuntime.instanceApiVersion >= VK_API_VERSION_1_1 &&
+        physicalSupportsVulkan11 &&
+        getPhysicalDeviceProperties2 != nullptr;
+
+    if (properties2Available) {
+        VkPhysicalDeviceProperties2 properties2{};
+        properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        void** propertyChainTail = &properties2.pNext;
+
+        auto appendProperty = [&propertyChainTail](auto& property) {
+            property.pNext = nullptr;
+            *propertyChainTail = &property;
+            propertyChainTail = &property.pNext;
+        };
+
+        VkPhysicalDeviceSubgroupProperties subgroupProperties{};
+        subgroupProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+        appendProperty(subgroupProperties);
+
+        if (physicalSupportsVulkan12) {
             VkPhysicalDeviceDriverProperties driverProperties{};
             driverProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+            appendProperty(driverProperties);
+        }
 
-            VkPhysicalDeviceProperties2 properties2{};
-            properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-            properties2.pNext = &driverProperties;
-            getPhysicalDeviceProperties2(gRuntime.physicalDevice, &properties2);
+#if defined(VK_VERSION_1_3)
+        VkPhysicalDeviceSubgroupSizeControlProperties subgroupSizeProperties{};
+        if (querySubgroupSizeControl) {
+            subgroupSizeProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+            appendProperty(subgroupSizeProperties);
+        }
 
+        VkPhysicalDeviceShaderIntegerDotProductProperties integerDotProductProperties{};
+        if (queryIntegerDotProduct) {
+            integerDotProductProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
+            appendProperty(integerDotProductProperties);
+        }
+#else
+#if defined(VK_EXT_subgroup_size_control)
+        VkPhysicalDeviceSubgroupSizeControlPropertiesEXT subgroupSizeProperties{};
+        if (querySubgroupSizeControl) {
+            subgroupSizeProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT;
+            appendProperty(subgroupSizeProperties);
+        }
+#endif
+#if defined(VK_KHR_shader_integer_dot_product)
+        VkPhysicalDeviceShaderIntegerDotProductPropertiesKHR integerDotProductProperties{};
+        if (queryIntegerDotProduct) {
+            integerDotProductProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES_KHR;
+            appendProperty(integerDotProductProperties);
+        }
+#endif
+#endif
+
+#if defined(VK_KHR_cooperative_matrix)
+        VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperativeMatrixProperties{};
+        if (gRuntime.hasCooperativeMatrixExtension) {
+            cooperativeMatrixProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+            appendProperty(cooperativeMatrixProperties);
+        }
+#endif
+
+        getPhysicalDeviceProperties2(gRuntime.physicalDevice, &properties2);
+        gRuntime.physicalDeviceProperties = properties2.properties;
+        gRuntime.subgroupSize = subgroupProperties.subgroupSize;
+        gRuntime.subgroupSupportedStages = subgroupProperties.supportedStages;
+        gRuntime.subgroupSupportedOperations = subgroupProperties.supportedOperations;
+        gRuntime.subgroupQuadOperationsInAllStages =
+            subgroupProperties.quadOperationsInAllStages == VK_TRUE;
+
+        if (physicalSupportsVulkan12) {
+            // The driver structure is queried separately below to keep it alive
+            // for the complete properties2 call.
+            VkPhysicalDeviceDriverProperties driverProperties{};
+            driverProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+            VkPhysicalDeviceProperties2 driverProperties2{};
+            driverProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            driverProperties2.pNext = &driverProperties;
+            getPhysicalDeviceProperties2(gRuntime.physicalDevice, &driverProperties2);
             gRuntime.driverProperties = driverProperties;
             gRuntime.hasDriverProperties =
                 driverProperties.driverName[0] != '\0' ||
                 driverProperties.driverInfo[0] != '\0';
         }
+
+#if defined(VK_VERSION_1_3)
+        if (querySubgroupSizeControl) {
+            gRuntime.minSubgroupSize = subgroupSizeProperties.minSubgroupSize;
+            gRuntime.maxSubgroupSize = subgroupSizeProperties.maxSubgroupSize;
+            gRuntime.maxComputeWorkgroupSubgroups =
+                subgroupSizeProperties.maxComputeWorkgroupSubgroups;
+            gRuntime.requiredSubgroupSizeStages =
+                subgroupSizeProperties.requiredSubgroupSizeStages;
+        }
+        if (queryIntegerDotProduct) {
+            gRuntime.integerDotProduct8BitUnsignedAccelerated =
+                integerDotProductProperties.integerDotProduct8BitUnsignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct8BitSignedAccelerated =
+                integerDotProductProperties.integerDotProduct8BitSignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct8BitMixedSignednessAccelerated =
+                integerDotProductProperties.integerDotProduct8BitMixedSignednessAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct4x8BitPackedUnsignedAccelerated =
+                integerDotProductProperties.integerDotProduct4x8BitPackedUnsignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct4x8BitPackedSignedAccelerated =
+                integerDotProductProperties.integerDotProduct4x8BitPackedSignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct4x8BitPackedMixedSignednessAccelerated =
+                integerDotProductProperties.integerDotProduct4x8BitPackedMixedSignednessAccelerated == VK_TRUE;
+        }
+#else
+#if defined(VK_EXT_subgroup_size_control)
+        if (querySubgroupSizeControl) {
+            gRuntime.minSubgroupSize = subgroupSizeProperties.minSubgroupSize;
+            gRuntime.maxSubgroupSize = subgroupSizeProperties.maxSubgroupSize;
+            gRuntime.maxComputeWorkgroupSubgroups =
+                subgroupSizeProperties.maxComputeWorkgroupSubgroups;
+            gRuntime.requiredSubgroupSizeStages =
+                subgroupSizeProperties.requiredSubgroupSizeStages;
+        }
+#endif
+#if defined(VK_KHR_shader_integer_dot_product)
+        if (queryIntegerDotProduct) {
+            gRuntime.integerDotProduct8BitUnsignedAccelerated =
+                integerDotProductProperties.integerDotProduct8BitUnsignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct8BitSignedAccelerated =
+                integerDotProductProperties.integerDotProduct8BitSignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct8BitMixedSignednessAccelerated =
+                integerDotProductProperties.integerDotProduct8BitMixedSignednessAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct4x8BitPackedUnsignedAccelerated =
+                integerDotProductProperties.integerDotProduct4x8BitPackedUnsignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct4x8BitPackedSignedAccelerated =
+                integerDotProductProperties.integerDotProduct4x8BitPackedSignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct4x8BitPackedMixedSignednessAccelerated =
+                integerDotProductProperties.integerDotProduct4x8BitPackedMixedSignednessAccelerated == VK_TRUE;
+        }
+#endif
+#endif
+
+#if defined(VK_KHR_cooperative_matrix)
+        if (gRuntime.hasCooperativeMatrixExtension) {
+            gRuntime.cooperativeMatrixSupportedStages =
+                cooperativeMatrixProperties.cooperativeMatrixSupportedStages;
+        }
+#endif
     }
 
-    vkGetPhysicalDeviceMemoryProperties(
-        gRuntime.physicalDevice,
-        &gRuntime.memoryProperties
-    );
-
-    const float queuePriority = 1.0f;
-    VkDeviceQueueCreateInfo queueInfo{};
-    queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queueInfo.queueFamilyIndex = gRuntime.queueFamilyIndex;
-    queueInfo.queueCount = 1;
-    queueInfo.pQueuePriorities = &queuePriority;
-
-    // The packed FP16 shader uses uint32 storage words and performs
-    // half-precision arithmetic only in function-local values. It requires
-    // shaderFloat16, not 16-bit storage-buffer access.
-    VkPhysicalDeviceShaderFloat16Int8Features supportedShaderFloat16{};
-    VkPhysicalDeviceFeatures2 supportedFeatures{};
-    if (gRuntime.instanceApiVersion >= VK_API_VERSION_1_1 &&
-        gRuntime.physicalDeviceProperties.apiVersion >= VK_API_VERSION_1_2) {
-        supportedShaderFloat16.sType =
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
-        supportedFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-        supportedFeatures.pNext = &supportedShaderFloat16;
-
-        const auto getPhysicalDeviceFeatures2 =
-            reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
-                vkGetInstanceProcAddr(gRuntime.instance, "vkGetPhysicalDeviceFeatures2")
+#if defined(VK_KHR_cooperative_matrix)
+    if (gRuntime.supportsCooperativeMatrix) {
+        const auto getCooperativeMatrixProperties =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+                vkGetInstanceProcAddr(
+                    gRuntime.instance,
+                    "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"
+                )
             );
-        if (getPhysicalDeviceFeatures2 != nullptr) {
-            getPhysicalDeviceFeatures2(gRuntime.physicalDevice, &supportedFeatures);
-            gRuntime.supportsFp16Compute =
-                supportedShaderFloat16.shaderFloat16 == VK_TRUE;
+        if (getCooperativeMatrixProperties != nullptr) {
+            uint32_t matrixPropertyCount = 0;
+            VkResult matrixResult = getCooperativeMatrixProperties(
+                gRuntime.physicalDevice,
+                &matrixPropertyCount,
+                nullptr
+            );
+            if (matrixResult == VK_SUCCESS && matrixPropertyCount > 0u) {
+                std::vector<VkCooperativeMatrixPropertiesKHR> matrixProperties;
+                try {
+                    matrixProperties.resize(matrixPropertyCount);
+                } catch (const std::bad_alloc&) {
+                    logError("Not enough memory to enumerate cooperative-matrix configurations.");
+                    return false;
+                }
+
+                for (auto& matrixProperty : matrixProperties) {
+                    matrixProperty.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                }
+
+                matrixResult = getCooperativeMatrixProperties(
+                    gRuntime.physicalDevice,
+                    &matrixPropertyCount,
+                    matrixProperties.data()
+                );
+                if (matrixResult == VK_SUCCESS || matrixResult == VK_INCOMPLETE) {
+                    matrixProperties.resize(matrixPropertyCount);
+                    gRuntime.cooperativeMatrixTypes.reserve(matrixProperties.size());
+                    for (const auto& matrixProperty : matrixProperties) {
+                        gRuntime.cooperativeMatrixTypes.push_back({
+                            matrixProperty.MSize,
+                            matrixProperty.NSize,
+                            matrixProperty.KSize,
+                            static_cast<uint32_t>(matrixProperty.AType),
+                            static_cast<uint32_t>(matrixProperty.BType),
+                            static_cast<uint32_t>(matrixProperty.CType),
+                            static_cast<uint32_t>(matrixProperty.ResultType),
+                            matrixProperty.saturatingAccumulation == VK_TRUE,
+                            static_cast<uint32_t>(matrixProperty.scope)
+                        });
+                    }
+                } else {
+                    logError("Cooperative-matrix configuration query failed.", matrixResult);
+                }
+            } else if (matrixResult != VK_SUCCESS) {
+                logError("Cooperative-matrix configuration count query failed.", matrixResult);
+            }
         }
     }
+#endif
 
     VkPhysicalDeviceFeatures deviceFeatures{};
     VkPhysicalDeviceShaderFloat16Int8Features enabledShaderFloat16{};
@@ -2331,6 +2808,117 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDriverInfo(
         );
     }
     return env->NewStringUTF(driverInfo);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
+    JNIEnv* env,
+    jobject
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.physicalDevice == VK_NULL_HANDLE) {
+        return env->NewStringUTF("{}");
+    }
+
+    const VkPhysicalDeviceProperties& properties = gRuntime.physicalDeviceProperties;
+    std::ostringstream json;
+    json << "{"
+         << "\"deviceName\":\"" << escapeJsonString(properties.deviceName) << "\","
+         << "\"vendorId\":" << properties.vendorID << ","
+         << "\"deviceId\":" << properties.deviceID << ","
+         << "\"deviceType\":" << static_cast<uint32_t>(properties.deviceType) << ","
+         << "\"apiVersionMajor\":" << VK_VERSION_MAJOR(properties.apiVersion) << ","
+         << "\"apiVersionMinor\":" << VK_VERSION_MINOR(properties.apiVersion) << ","
+         << "\"apiVersionPatch\":" << VK_VERSION_PATCH(properties.apiVersion) << ","
+         << "\"driverName\":\"" << escapeJsonString(
+                gRuntime.hasDriverProperties ? gRuntime.driverProperties.driverName : ""
+            ) << "\","
+         << "\"driverInfo\":\"" << escapeJsonString(
+                gRuntime.hasDriverProperties ? gRuntime.driverProperties.driverInfo : ""
+            ) << "\","
+         << "\"driverVersionRaw\":" << properties.driverVersion << ","
+         << "\"maxComputeWorkGroupInvocations\":"
+         << properties.limits.maxComputeWorkGroupInvocations << ","
+         << "\"maxComputeWorkGroupSizeX\":"
+         << properties.limits.maxComputeWorkGroupSize[0] << ","
+         << "\"maxComputeWorkGroupSizeY\":"
+         << properties.limits.maxComputeWorkGroupSize[1] << ","
+         << "\"maxComputeWorkGroupSizeZ\":"
+         << properties.limits.maxComputeWorkGroupSize[2] << ","
+         << "\"maxComputeWorkGroupCountX\":"
+         << properties.limits.maxComputeWorkGroupCount[0] << ","
+         << "\"maxComputeWorkGroupCountY\":"
+         << properties.limits.maxComputeWorkGroupCount[1] << ","
+         << "\"maxComputeWorkGroupCountZ\":"
+         << properties.limits.maxComputeWorkGroupCount[2] << ","
+         << "\"maxComputeSharedMemoryBytes\":"
+         << properties.limits.maxComputeSharedMemorySize << ","
+         << "\"maxStorageBufferRangeBytes\":"
+         << properties.limits.maxStorageBufferRange << ","
+         << "\"subgroupSize\":" << gRuntime.subgroupSize << ","
+         << "\"subgroupSupportedStages\":" << gRuntime.subgroupSupportedStages << ","
+         << "\"subgroupSupportedOperations\":" << gRuntime.subgroupSupportedOperations << ","
+         << "\"subgroupQuadOperationsInAllStages\":"
+         << (gRuntime.subgroupQuadOperationsInAllStages ? "true" : "false") << ","
+         << "\"subgroupSizeControl\":"
+         << (gRuntime.supportsSubgroupSizeControl ? "true" : "false") << ","
+         << "\"computeFullSubgroups\":"
+         << (gRuntime.supportsComputeFullSubgroups ? "true" : "false") << ","
+         << "\"minSubgroupSize\":" << gRuntime.minSubgroupSize << ","
+         << "\"maxSubgroupSize\":" << gRuntime.maxSubgroupSize << ","
+         << "\"maxComputeWorkgroupSubgroups\":"
+         << gRuntime.maxComputeWorkgroupSubgroups << ","
+         << "\"requiredSubgroupSizeStages\":" << gRuntime.requiredSubgroupSizeStages << ","
+         << "\"shaderFloat16\":" << (gRuntime.supportsFp16Compute ? "true" : "false") << ","
+         << "\"shaderInt8\":" << (gRuntime.supportsShaderInt8 ? "true" : "false") << ","
+         << "\"storageBuffer16BitAccess\":"
+         << (gRuntime.supportsStorageBuffer16BitAccess ? "true" : "false") << ","
+         << "\"shaderIntegerDotProduct\":"
+         << (gRuntime.supportsShaderIntegerDotProduct ? "true" : "false") << ","
+         << "\"integerDotProduct8BitUnsignedAccelerated\":"
+         << (gRuntime.integerDotProduct8BitUnsignedAccelerated ? "true" : "false") << ","
+         << "\"integerDotProduct8BitSignedAccelerated\":"
+         << (gRuntime.integerDotProduct8BitSignedAccelerated ? "true" : "false") << ","
+         << "\"integerDotProduct8BitMixedSignednessAccelerated\":"
+         << (gRuntime.integerDotProduct8BitMixedSignednessAccelerated ? "true" : "false") << ","
+         << "\"integerDotProduct4x8BitPackedUnsignedAccelerated\":"
+         << (gRuntime.integerDotProduct4x8BitPackedUnsignedAccelerated ? "true" : "false") << ","
+         << "\"integerDotProduct4x8BitPackedSignedAccelerated\":"
+         << (gRuntime.integerDotProduct4x8BitPackedSignedAccelerated ? "true" : "false") << ","
+         << "\"integerDotProduct4x8BitPackedMixedSignednessAccelerated\":"
+         << (gRuntime.integerDotProduct4x8BitPackedMixedSignednessAccelerated ? "true" : "false") << ","
+         << "\"cooperativeMatrixExtension\":"
+         << (gRuntime.hasCooperativeMatrixExtension ? "true" : "false") << ","
+         << "\"cooperativeMatrix\":"
+         << (gRuntime.supportsCooperativeMatrix ? "true" : "false") << ","
+         << "\"cooperativeMatrixRobustBufferAccess\":"
+         << (gRuntime.supportsCooperativeMatrixRobustBufferAccess ? "true" : "false") << ","
+         << "\"cooperativeMatrixSupportedStages\":"
+         << gRuntime.cooperativeMatrixSupportedStages << ","
+         << "\"cooperativeMatrixTypes\":[";
+
+    for (size_t index = 0; index < gRuntime.cooperativeMatrixTypes.size(); ++index) {
+        const auto& matrix = gRuntime.cooperativeMatrixTypes[index];
+        if (index > 0u) {
+            json << ",";
+        }
+        json << "{"
+             << "\"mSize\":" << matrix.mSize << ","
+             << "\"nSize\":" << matrix.nSize << ","
+             << "\"kSize\":" << matrix.kSize << ","
+             << "\"aType\":" << matrix.aType << ","
+             << "\"bType\":" << matrix.bType << ","
+             << "\"cType\":" << matrix.cType << ","
+             << "\"resultType\":" << matrix.resultType << ","
+             << "\"saturatingAccumulation\":"
+             << (matrix.saturatingAccumulation ? "true" : "false") << ","
+             << "\"scope\":" << matrix.scope
+             << "}";
+    }
+
+    json << "]}";
+    const std::string payload = json.str();
+    return env->NewStringUTF(payload.c_str());
 }
 
 extern "C" JNIEXPORT void JNICALL

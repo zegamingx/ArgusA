@@ -13,6 +13,166 @@ data class VulkanInitializationProgress(
     val isCpuFallback: Boolean = false
 )
 
+data class VulkanCooperativeMatrixType(
+    val mSize: Int,
+    val nSize: Int,
+    val kSize: Int,
+    val aType: Int,
+    val bType: Int,
+    val cType: Int,
+    val resultType: Int,
+    val saturatingAccumulation: Boolean,
+    val scope: Int
+)
+
+data class VulkanDeviceCapabilities(
+    val deviceName: String,
+    val vendorId: Int,
+    val deviceId: Int,
+    val deviceType: Int,
+    val apiVersionMajor: Int,
+    val apiVersionMinor: Int,
+    val apiVersionPatch: Int,
+    val driverName: String,
+    val driverInfo: String,
+    val driverVersionRaw: Long,
+    val maxComputeWorkGroupInvocations: Int,
+    val maxComputeWorkGroupSizeX: Int,
+    val maxComputeWorkGroupSizeY: Int,
+    val maxComputeWorkGroupSizeZ: Int,
+    val maxComputeWorkGroupCountX: Int,
+    val maxComputeWorkGroupCountY: Int,
+    val maxComputeWorkGroupCountZ: Int,
+    val maxComputeSharedMemoryBytes: Long,
+    val maxStorageBufferRangeBytes: Long,
+    val subgroupSize: Int,
+    val subgroupSupportedStages: Int,
+    val subgroupSupportedOperations: Int,
+    val subgroupQuadOperationsInAllStages: Boolean,
+    val subgroupSizeControl: Boolean,
+    val computeFullSubgroups: Boolean,
+    val minSubgroupSize: Int,
+    val maxSubgroupSize: Int,
+    val maxComputeWorkgroupSubgroups: Int,
+    val requiredSubgroupSizeStages: Int,
+    val shaderFloat16: Boolean,
+    val shaderInt8: Boolean,
+    val storageBuffer16BitAccess: Boolean,
+    val shaderIntegerDotProduct: Boolean,
+    val integerDotProduct8BitUnsignedAccelerated: Boolean,
+    val integerDotProduct8BitSignedAccelerated: Boolean,
+    val integerDotProduct8BitMixedSignednessAccelerated: Boolean,
+    val integerDotProduct4x8BitPackedUnsignedAccelerated: Boolean,
+    val integerDotProduct4x8BitPackedSignedAccelerated: Boolean,
+    val integerDotProduct4x8BitPackedMixedSignednessAccelerated: Boolean,
+    val cooperativeMatrixExtension: Boolean,
+    val cooperativeMatrix: Boolean,
+    val cooperativeMatrixRobustBufferAccess: Boolean,
+    val cooperativeMatrixSupportedStages: Int,
+    val cooperativeMatrixTypes: List<VulkanCooperativeMatrixType>
+) {
+    val apiVersion: String
+        get() = "$apiVersionMajor.$apiVersionMinor.$apiVersionPatch"
+
+    val supportsComputeSubgroups: Boolean
+        get() = subgroupSize > 0 && (subgroupSupportedStages and COMPUTE_SHADER_STAGE_BIT) != 0
+
+    val hasAcceleratedInt8DotProduct: Boolean
+        get() = shaderIntegerDotProduct &&
+            (integerDotProduct8BitSignedAccelerated ||
+                integerDotProduct8BitUnsignedAccelerated ||
+                integerDotProduct4x8BitPackedSignedAccelerated ||
+                integerDotProduct4x8BitPackedUnsignedAccelerated)
+
+    val hasUsableCooperativeMatrixConfiguration: Boolean
+        get() = cooperativeMatrix &&
+            (cooperativeMatrixSupportedStages and COMPUTE_SHADER_STAGE_BIT) != 0 &&
+            cooperativeMatrixTypes.isNotEmpty()
+
+    companion object {
+        private const val COMPUTE_SHADER_STAGE_BIT = 0x00000020
+
+        fun fromJson(payload: String): VulkanDeviceCapabilities {
+            val json = org.json.JSONObject(payload)
+            val matrixArray = json.optJSONArray("cooperativeMatrixTypes")
+            val matrixTypes = buildList {
+                if (matrixArray != null) {
+                    for (index in 0 until matrixArray.length()) {
+                        val matrix = matrixArray.optJSONObject(index) ?: continue
+                        add(
+                            VulkanCooperativeMatrixType(
+                                mSize = matrix.optInt("mSize"),
+                                nSize = matrix.optInt("nSize"),
+                                kSize = matrix.optInt("kSize"),
+                                aType = matrix.optInt("aType"),
+                                bType = matrix.optInt("bType"),
+                                cType = matrix.optInt("cType"),
+                                resultType = matrix.optInt("resultType"),
+                                saturatingAccumulation = matrix.optBoolean("saturatingAccumulation"),
+                                scope = matrix.optInt("scope")
+                            )
+                        )
+                    }
+                }
+            }
+
+            return VulkanDeviceCapabilities(
+                deviceName = json.optString("deviceName", "Unknown Vulkan GPU"),
+                vendorId = json.optInt("vendorId"),
+                deviceId = json.optInt("deviceId"),
+                deviceType = json.optInt("deviceType"),
+                apiVersionMajor = json.optInt("apiVersionMajor"),
+                apiVersionMinor = json.optInt("apiVersionMinor"),
+                apiVersionPatch = json.optInt("apiVersionPatch"),
+                driverName = json.optString("driverName"),
+                driverInfo = json.optString("driverInfo"),
+                driverVersionRaw = json.optLong("driverVersionRaw"),
+                maxComputeWorkGroupInvocations = json.optInt("maxComputeWorkGroupInvocations"),
+                maxComputeWorkGroupSizeX = json.optInt("maxComputeWorkGroupSizeX"),
+                maxComputeWorkGroupSizeY = json.optInt("maxComputeWorkGroupSizeY"),
+                maxComputeWorkGroupSizeZ = json.optInt("maxComputeWorkGroupSizeZ"),
+                maxComputeWorkGroupCountX = json.optInt("maxComputeWorkGroupCountX"),
+                maxComputeWorkGroupCountY = json.optInt("maxComputeWorkGroupCountY"),
+                maxComputeWorkGroupCountZ = json.optInt("maxComputeWorkGroupCountZ"),
+                maxComputeSharedMemoryBytes = json.optLong("maxComputeSharedMemoryBytes"),
+                maxStorageBufferRangeBytes = json.optLong("maxStorageBufferRangeBytes"),
+                subgroupSize = json.optInt("subgroupSize"),
+                subgroupSupportedStages = json.optInt("subgroupSupportedStages"),
+                subgroupSupportedOperations = json.optInt("subgroupSupportedOperations"),
+                subgroupQuadOperationsInAllStages = json.optBoolean("subgroupQuadOperationsInAllStages"),
+                subgroupSizeControl = json.optBoolean("subgroupSizeControl"),
+                computeFullSubgroups = json.optBoolean("computeFullSubgroups"),
+                minSubgroupSize = json.optInt("minSubgroupSize"),
+                maxSubgroupSize = json.optInt("maxSubgroupSize"),
+                maxComputeWorkgroupSubgroups = json.optInt("maxComputeWorkgroupSubgroups"),
+                requiredSubgroupSizeStages = json.optInt("requiredSubgroupSizeStages"),
+                shaderFloat16 = json.optBoolean("shaderFloat16"),
+                shaderInt8 = json.optBoolean("shaderInt8"),
+                storageBuffer16BitAccess = json.optBoolean("storageBuffer16BitAccess"),
+                shaderIntegerDotProduct = json.optBoolean("shaderIntegerDotProduct"),
+                integerDotProduct8BitUnsignedAccelerated =
+                    json.optBoolean("integerDotProduct8BitUnsignedAccelerated"),
+                integerDotProduct8BitSignedAccelerated =
+                    json.optBoolean("integerDotProduct8BitSignedAccelerated"),
+                integerDotProduct8BitMixedSignednessAccelerated =
+                    json.optBoolean("integerDotProduct8BitMixedSignednessAccelerated"),
+                integerDotProduct4x8BitPackedUnsignedAccelerated =
+                    json.optBoolean("integerDotProduct4x8BitPackedUnsignedAccelerated"),
+                integerDotProduct4x8BitPackedSignedAccelerated =
+                    json.optBoolean("integerDotProduct4x8BitPackedSignedAccelerated"),
+                integerDotProduct4x8BitPackedMixedSignednessAccelerated =
+                    json.optBoolean("integerDotProduct4x8BitPackedMixedSignednessAccelerated"),
+                cooperativeMatrixExtension = json.optBoolean("cooperativeMatrixExtension"),
+                cooperativeMatrix = json.optBoolean("cooperativeMatrix"),
+                cooperativeMatrixRobustBufferAccess =
+                    json.optBoolean("cooperativeMatrixRobustBufferAccess"),
+                cooperativeMatrixSupportedStages = json.optInt("cooperativeMatrixSupportedStages"),
+                cooperativeMatrixTypes = matrixTypes
+            )
+        }
+    }
+}
+
 /**
  * Optional Vulkan Compute backend for batched dense operations and AdamW updates.
  *
@@ -51,6 +211,10 @@ internal object VulkanTrainingBackend {
     private val _initializationProgress = MutableStateFlow(VulkanInitializationProgress())
     val initializationProgress: StateFlow<VulkanInitializationProgress> =
         _initializationProgress.asStateFlow()
+
+    private val _deviceCapabilities = MutableStateFlow<VulkanDeviceCapabilities?>(null)
+    val deviceCapabilities: StateFlow<VulkanDeviceCapabilities?> =
+        _deviceCapabilities.asStateFlow()
 
     internal val hasAttemptedInitialization: Boolean
         get() = initializationAttempted
@@ -113,6 +277,7 @@ internal object VulkanTrainingBackend {
         if (initializationAttempted) return false
 
         initializationAttempted = true
+        _deviceCapabilities.value = null
         _runtimeStatus.value = "Preparing Vulkan after model initialization…"
         publishInitializationProgress(
             status = "Initializing Vulkan",
@@ -129,6 +294,23 @@ internal object VulkanTrainingBackend {
             if (initialized) {
                 detectedDriverInfo = runCatching { nativeGetDriverInfo() }
                     .getOrDefault("Vulkan driver information unavailable")
+                val detectedCapabilities = runCatching {
+                    VulkanDeviceCapabilities.fromJson(nativeGetDeviceCapabilities())
+                }.onFailure { error ->
+                    Log.w(TAG, "Vulkan runtime started but capability metadata could not be parsed.", error)
+                }.getOrNull()
+                _deviceCapabilities.value = detectedCapabilities
+                if (detectedCapabilities != null) {
+                    Log.i(
+                        TAG,
+                        "GPU capabilities: ${detectedCapabilities.deviceName}; " +
+                            "Vulkan ${detectedCapabilities.apiVersion}; " +
+                            "subgroup ${detectedCapabilities.subgroupSize}; " +
+                            "FP16 ${detectedCapabilities.shaderFloat16}; " +
+                            "INT8 dot ${detectedCapabilities.hasAcceleratedInt8DotProduct}; " +
+                            "cooperative matrix ${detectedCapabilities.hasUsableCooperativeMatrixConfiguration}."
+                    )
+                }
                 publishInitializationProgress(
                     status = "Verifying Vulkan compute kernels",
                     driverInfo = detectedDriverInfo,
@@ -1150,6 +1332,8 @@ internal object VulkanTrainingBackend {
     private external fun nativeInitialize(): Boolean
 
     private external fun nativeGetDriverInfo(): String
+
+    private external fun nativeGetDeviceCapabilities(): String
 
     private external fun nativeSupportsFp16(): Boolean
 

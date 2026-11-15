@@ -314,6 +314,8 @@ class ArgusNeuralEngine private constructor(
         get() = VulkanTrainingBackend.runtimeStatus
     val vulkanInitializationProgress: StateFlow<VulkanInitializationProgress>
         get() = VulkanTrainingBackend.initializationProgress
+    val vulkanDeviceCapabilities: StateFlow<VulkanDeviceCapabilities?>
+        get() = VulkanTrainingBackend.deviceCapabilities
 
     fun initializeOptionalVulkanRuntime(): Boolean =
         VulkanTrainingBackend.initializeAfterModelReady()
