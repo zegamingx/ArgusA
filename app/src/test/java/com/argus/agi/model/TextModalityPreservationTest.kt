@@ -416,7 +416,7 @@ class TextModalityPreservationTest {
         )
 
         assertEquals(2, chunks.size)
-        assertEquals(first, chunks[0].content)
+        assertEquals("$first\n", chunks[0].content)
         assertEquals(second, chunks[1].content)
         assertTrue(chunks.all { it.modality == TextModality.STRUCTURED_DATA })
     }

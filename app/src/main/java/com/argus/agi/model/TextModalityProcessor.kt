@@ -548,7 +548,7 @@ object TextModalityProcessor {
         val safeResponse = Tokenizer.escapeLiteralControlTokens(response)
         val safeReasoning = reasoning
             ?.takeIf { it.isNotBlank() }
-            ?.let(Tokenizer::escapeLiteralControlTokens)
+            ?.let { value -> Tokenizer.escapeLiteralControlTokens(value) }
 
         return if (safeReasoning == null) {
             "${Tokenizer.USER_TOKEN} $safePrompt\n" +
