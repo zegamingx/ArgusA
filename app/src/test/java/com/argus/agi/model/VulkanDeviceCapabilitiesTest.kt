@@ -439,4 +439,126 @@ class VulkanDeviceCapabilitiesTest {
         assertFalse(maliG925.hasUsableCooperativeMatrixConfiguration)
     }
 
+
+    @Test
+    fun parsesMaliG2UltraArmTensorAndIdentityProfileWithoutEnablingIt() {
+        val capabilities = VulkanDeviceCapabilities.fromJson(
+            """
+            {
+              "deviceName": "Mali-G2-Ultra-NX MC12",
+              "vendorId": 5045,
+              "deviceId": 4042293250,
+              "deviceType": 1,
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 4,
+              "apiVersionPatch": 349,
+              "effectiveApiVersionMajor": 1,
+              "effectiveApiVersionMinor": 3,
+              "effectiveApiVersionPatch": 0,
+              "driverName": "Mali-G2-Ultra-NX MC12",
+              "driverInfo": "v1.r56p0-18eac0.99766b76a7d9937554caf805b4a9a6ca",
+              "deviceIdentityPropertiesAvailable": true,
+              "deviceUUID": "00080F00010000000000000000000000",
+              "driverUUID": "295140483411D0A9C450125E67D65489",
+              "pipelineCacheUUID": "16E03C7F6B12BD8DC035C2564FC780F1",
+              "maxComputeWorkGroupInvocations": 1024,
+              "maxComputeWorkGroupSizeX": 1024,
+              "maxComputeWorkGroupSizeY": 1024,
+              "maxComputeWorkGroupSizeZ": 1024,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 2147483648,
+              "subgroupSize": 16,
+              "subgroupSupportedStages": 49,
+              "subgroupSupportedOperations": 511,
+              "subgroupSizeControl": true,
+              "minSubgroupSize": 16,
+              "maxSubgroupSize": 16,
+              "maxComputeWorkgroupSubgroups": 64,
+              "timestampPeriodNanoseconds": 0.999001,
+              "timestampComputeAndGraphics": true,
+              "computeQueueTimestampValidBits": 64,
+              "computeTimestampQueriesSupported": true,
+              "shaderIntegerDotProduct": true,
+              "integerDotProduct8BitUnsignedAccelerated": true,
+              "integerDotProduct8BitSignedAccelerated": true,
+              "integerDotProduct4x8BitPackedUnsignedAccelerated": true,
+              "integerDotProduct4x8BitPackedSignedAccelerated": true,
+              "cooperativeMatrixExtension": true,
+              "cooperativeMatrix": true,
+              "cooperativeMatrixSupportedStages": 32,
+              "cooperativeMatrixTypes": [],
+              "armTensorsExtensionSupported": true,
+              "armTensorsFeatureQueryAvailable": true,
+              "armTensorsFeatureSupported": true,
+              "armTensorNonPackedSupported": true,
+              "armTensorShaderAccessSupported": true,
+              "armTensorDynamicIndexingSupported": true,
+              "armTensorNonUniformIndexingSupported": false,
+              "armTensorUpdateAfterBindSupported": false,
+              "armTensorDeviceFeaturesEnabled": false,
+              "shaderTensorSupportedStages": 49,
+              "armTensorMaxDimensionCount": 4,
+              "armTensorMaxElements": 4294967295,
+              "armTensorMaxPerDimensionElements": 4294967294,
+              "armTensorMaxStride": 4294967295,
+              "armTensorMaxSizeBytes": 4294967294,
+              "armTensorMaxShaderAccessArrayLength": 16,
+              "armTensorMaxShaderAccessSizeBytes": 16,
+              "armTensorMaxDescriptorSetStorageTensors": 500000,
+              "armTensorMaxPerStageDescriptorSetStorageTensors": 500000,
+              "armTensorNonUniformIndexingNative": false
+            }
+            """
+        )
+
+        assertEquals("Mali-G2-Ultra-NX MC12", capabilities.deviceName)
+        assertEquals(5045, capabilities.vendorId)
+        assertEquals("f0f08002", capabilities.deviceId.toUInt().toString(16))
+        assertEquals("1.4.349", capabilities.apiVersion)
+        assertEquals(1, capabilities.effectiveApiVersionMajor)
+        assertEquals(3, capabilities.effectiveApiVersionMinor)
+        assertEquals("00080F00010000000000000000000000", capabilities.deviceUuid)
+        assertEquals("295140483411D0A9C450125E67D65489", capabilities.driverUuid)
+        assertEquals("16E03C7F6B12BD8DC035C2564FC780F1", capabilities.pipelineCacheUuid)
+        assertTrue(capabilities.deviceIdentityPropertiesAvailable)
+
+        assertEquals(1024, capabilities.maxComputeWorkGroupInvocations)
+        assertEquals(32768L, capabilities.maxComputeSharedMemoryBytes)
+        assertEquals(2147483648L, capabilities.maxStorageBufferRangeBytes)
+        assertEquals(16, capabilities.subgroupSize)
+        assertEquals(16, capabilities.minSubgroupSize)
+        assertEquals(16, capabilities.maxSubgroupSize)
+        assertTrue(capabilities.supportsComputeSubgroups)
+        assertTrue(capabilities.supportsComputeTimestampQueries)
+        assertEquals(0.999001, capabilities.timestampPeriodNanoseconds, 0.000001)
+
+        assertTrue(capabilities.hasAcceleratedInt8DotProduct)
+        assertFalse(capabilities.canUseIntegerDotProductKernel)
+        assertTrue(capabilities.cooperativeMatrix)
+        assertFalse(capabilities.hasUsableCooperativeMatrixConfiguration)
+
+        assertTrue(capabilities.armTensorsExtensionSupported)
+        assertTrue(capabilities.armTensorsFeatureQueryAvailable)
+        assertTrue(capabilities.armTensorsFeatureSupported)
+        assertTrue(capabilities.armTensorNonPackedSupported)
+        assertTrue(capabilities.armTensorShaderAccessSupported)
+        assertTrue(capabilities.armTensorDynamicIndexingSupported)
+        assertFalse(capabilities.armTensorNonUniformIndexingSupported)
+        assertFalse(capabilities.armTensorUpdateAfterBindSupported)
+        assertEquals(49, capabilities.shaderTensorSupportedStages)
+        assertEquals(4, capabilities.armTensorMaxDimensionCount)
+        assertEquals(4294967295L, capabilities.armTensorMaxElements)
+        assertEquals(4294967294L, capabilities.armTensorMaxPerDimensionElements)
+        assertEquals(4294967295L, capabilities.armTensorMaxStride)
+        assertEquals(4294967294L, capabilities.armTensorMaxSizeBytes)
+        assertEquals(16, capabilities.armTensorMaxShaderAccessArrayLength)
+        assertEquals(16, capabilities.armTensorMaxShaderAccessSizeBytes)
+        assertEquals(500000, capabilities.armTensorMaxDescriptorSetStorageTensors)
+        assertEquals(500000, capabilities.armTensorMaxPerStageDescriptorSetStorageTensors)
+        assertFalse(capabilities.armTensorNonUniformIndexingNative)
+        assertTrue(capabilities.supportsComputeArmTensors)
+        assertFalse(capabilities.armTensorDeviceFeaturesEnabled)
+        assertFalse(capabilities.canUseArmTensorCompute)
+    }
+
 }
