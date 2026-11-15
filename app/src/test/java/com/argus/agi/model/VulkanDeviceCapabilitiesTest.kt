@@ -276,6 +276,9 @@ class VulkanDeviceCapabilitiesTest {
         assertFalse(capabilities.supportsComputeTimestampQueries)
         assertFalse(capabilities.shaderIntegerDotProductEnabled)
         assertFalse(capabilities.cooperativeMatrixEnabled)
+        assertFalse(capabilities.synchronization2ExtensionSupported)
+        assertFalse(capabilities.synchronization2Supported)
+        assertFalse(capabilities.synchronization2Enabled)
     }
 
     @Test
@@ -493,6 +496,9 @@ class VulkanDeviceCapabilitiesTest {
               "storageBuffer8BitAccessEnabled": false,
               "shaderIntegerDotProductEnabled": false,
               "cooperativeMatrixExtension": false,
+              "synchronization2ExtensionSupported": false,
+              "synchronization2Supported": true,
+              "synchronization2Enabled": true,
               "armTensorsExtensionSupported": false,
               "armShaderCorePropertiesExtensionSupported": true,
               "armShaderCoreBuiltinsExtensionSupported": true,
@@ -536,6 +542,9 @@ class VulkanDeviceCapabilitiesTest {
         assertTrue(capabilities.hasAcceleratedInt8DotProduct)
         assertFalse(capabilities.canUseIntegerDotProductKernel)
         assertFalse(capabilities.hasUsableCooperativeMatrixConfiguration)
+        assertFalse(capabilities.synchronization2ExtensionSupported)
+        assertTrue(capabilities.synchronization2Supported)
+        assertTrue(capabilities.synchronization2Enabled)
         assertFalse(capabilities.armTensorsExtensionSupported)
 
         assertTrue(capabilities.hasArmShaderCoreTopology)
@@ -561,7 +570,7 @@ class VulkanDeviceCapabilitiesTest {
               "apiVersionMinor": 4,
               "apiVersionPatch": 349,
               "effectiveApiVersionMajor": 1,
-              "effectiveApiVersionMinor": 3,
+              "effectiveApiVersionMinor": 4,
               "effectiveApiVersionPatch": 0,
               "driverName": "Mali-G2-Ultra-NX MC12",
               "driverInfo": "v1.r56p0-18eac0.99766b76a7d9937554caf805b4a9a6ca",
@@ -595,6 +604,9 @@ class VulkanDeviceCapabilitiesTest {
               "cooperativeMatrix": true,
               "cooperativeMatrixSupportedStages": 32,
               "cooperativeMatrixTypes": [],
+              "synchronization2ExtensionSupported": false,
+              "synchronization2Supported": true,
+              "synchronization2Enabled": true,
               "armTensorsExtensionSupported": true,
               "armTensorsFeatureQueryAvailable": true,
               "armTensorsFeatureSupported": true,
@@ -624,7 +636,9 @@ class VulkanDeviceCapabilitiesTest {
         assertEquals("f0f08002", capabilities.deviceId.toUInt().toString(16))
         assertEquals("1.4.349", capabilities.apiVersion)
         assertEquals(1, capabilities.effectiveApiVersionMajor)
-        assertEquals(3, capabilities.effectiveApiVersionMinor)
+        assertEquals(4, capabilities.effectiveApiVersionMinor)
+        assertTrue(capabilities.synchronization2Supported)
+        assertTrue(capabilities.synchronization2Enabled)
         assertEquals("00080F00010000000000000000000000", capabilities.deviceUuid)
         assertEquals("295140483411D0A9C450125E67D65489", capabilities.driverUuid)
         assertEquals("16E03C7F6B12BD8DC035C2564FC780F1", capabilities.pipelineCacheUuid)

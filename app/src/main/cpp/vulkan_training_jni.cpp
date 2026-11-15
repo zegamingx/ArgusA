@@ -2,6 +2,10 @@
 #include <android/log.h>
 #include <vulkan/vulkan.h>
 
+#if !defined(VK_KHR_synchronization2)
+#error "Argus requires Vulkan headers with VK_KHR_synchronization2 support."
+#endif
+
 #include "adamw_shader_spv.h"
 #include "linear_shader_spv.h"
 #include "linear_fp16_shader_spv.h"
@@ -115,6 +119,12 @@ struct VulkanRuntime {
     uint32_t computeQueueTimestampValidBits = 0;
     uint32_t effectiveApiVersion = VK_API_VERSION_1_0;
     uint32_t maxComputeWorkGroupCountX = 0;
+    bool synchronization2ExtensionSupported = false;
+    bool synchronization2Supported = false;
+    bool synchronization2Enabled = false;
+    PFN_vkQueueSubmit2KHR queueSubmit2 = nullptr;
+    PFN_vkCmdPipelineBarrier2KHR cmdPipelineBarrier2 = nullptr;
+    PFN_vkCmdWriteTimestamp2KHR cmdWriteTimestamp2 = nullptr;
 
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
@@ -706,10 +716,11 @@ bool ensureStorageBuffer(VkDeviceSize requiredBytes) {
     return createStorageBuffer(requiredBytes);
 }
 
-bool submitAndWait(const VkSubmitInfo& submitInfo, const char* operation) {
+bool submitAndWait(const char* operation) {
     if (gRuntime.device == VK_NULL_HANDLE ||
         gRuntime.computeQueue == VK_NULL_HANDLE ||
-        gRuntime.submissionFence == VK_NULL_HANDLE) {
+        gRuntime.submissionFence == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr) {
         logError(operation);
         return false;
     }
@@ -724,9 +735,19 @@ bool submitAndWait(const VkSubmitInfo& submitInfo, const char* operation) {
         return false;
     }
 
-    result = vkQueueSubmit(
+    VkCommandBufferSubmitInfoKHR commandBufferInfo{};
+    commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO_KHR;
+    commandBufferInfo.commandBuffer = gRuntime.commandBuffer;
+    commandBufferInfo.deviceMask = 0u;
+
+    VkSubmitInfo2KHR submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2_KHR;
+    submitInfo.commandBufferInfoCount = 1u;
+    submitInfo.pCommandBufferInfos = &commandBufferInfo;
+
+    result = gRuntime.queueSubmit2(
         gRuntime.computeQueue,
-        1,
+        1u,
         &submitInfo,
         gRuntime.submissionFence
     );
@@ -840,12 +861,17 @@ bool copyBufferSync(
     result = vkBeginCommandBuffer(gRuntime.commandBuffer, &begin);
     if (result != VK_SUCCESS) return false;
 
-    VkBufferMemoryBarrier before[2]{};
-    before[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    VkBufferMemoryBarrier2KHR before[2]{};
+    before[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    before[0].srcStageMask =
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR |
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR |
+        (sourceHostWritten ? VK_PIPELINE_STAGE_2_HOST_BIT_KHR : 0u);
     before[0].srcAccessMask =
-        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
-        (sourceHostWritten ? VK_ACCESS_HOST_WRITE_BIT : 0u);
-    before[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        VK_ACCESS_2_SHADER_WRITE_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        (sourceHostWritten ? VK_ACCESS_2_HOST_WRITE_BIT_KHR : 0u);
+    before[0].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR;
+    before[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
     before[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     before[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     before[0].buffer = source;
@@ -853,24 +879,27 @@ bool copyBufferSync(
     before[0].size = size;
 
     // The destination range may have been read or written by an earlier GPU dispatch.
-    before[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    before[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    before[1].srcStageMask =
+        VK_PIPELINE_STAGE_2_HOST_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR |
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR;
     before[1].srcAccessMask =
-        VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
-        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    before[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        VK_ACCESS_2_HOST_WRITE_BIT_KHR | VK_ACCESS_2_SHADER_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_WRITE_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    before[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR;
+    before[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
     before[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     before[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     before[1].buffer = destination;
     before[1].offset = destinationOffset;
     before[1].size = size;
 
-    vkCmdPipelineBarrier(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_STAGE_HOST_BIT |
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 2, before, 0, nullptr
-    );
+    VkDependencyInfoKHR beforeDependency{};
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeDependency.bufferMemoryBarrierCount = 2u;
+    beforeDependency.pBufferMemoryBarriers = before;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
 
     VkBufferCopy region{};
     region.srcOffset = sourceOffset;
@@ -878,32 +907,31 @@ bool copyBufferSync(
     region.size = size;
     vkCmdCopyBuffer(gRuntime.commandBuffer, source, destination, 1, &region);
 
-    VkBufferMemoryBarrier after{};
-    after.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    VkBufferMemoryBarrier2KHR after{};
+    after.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    after.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR;
+    after.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    after.dstStageMask = destinationHostReadable
+        ? VK_PIPELINE_STAGE_2_HOST_BIT_KHR
+        : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
     after.dstAccessMask = destinationHostReadable
-        ? VK_ACCESS_HOST_READ_BIT
-        : (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        ? VK_ACCESS_2_HOST_READ_BIT_KHR
+        : (VK_ACCESS_2_SHADER_READ_BIT_KHR | VK_ACCESS_2_SHADER_WRITE_BIT_KHR);
     after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     after.buffer = destination;
     after.offset = destinationOffset;
     after.size = size;
-    vkCmdPipelineBarrier(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        destinationHostReadable ? VK_PIPELINE_STAGE_HOST_BIT
-                                : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 1, &after, 0, nullptr
-    );
+
+    VkDependencyInfoKHR afterDependency{};
+    afterDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    afterDependency.bufferMemoryBarrierCount = 1u;
+    afterDependency.pBufferMemoryBarriers = &after;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &afterDependency);
 
     result = vkEndCommandBuffer(gRuntime.commandBuffer);
     if (result != VK_SUCCESS) return false;
-    VkSubmitInfo submit{};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1u;
-    submit.pCommandBuffers = &gRuntime.commandBuffer;
-    return submitAndWait(submit, "Vulkan tensor-arena transfer failed.");
+    return submitAndWait("Vulkan tensor-arena transfer failed.");
 }
 
 bool createArenaBacking(
@@ -1267,9 +1295,9 @@ bool beginGpuTimestampCapture(VkCommandBuffer commandBuffer) {
         0,
         2
     );
-    vkCmdWriteTimestamp(
+    gRuntime.cmdWriteTimestamp2(
         commandBuffer,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR,
         gRuntime.timestampQueryPool,
         0
     );
@@ -1281,9 +1309,9 @@ void endGpuTimestampCapture(VkCommandBuffer commandBuffer, bool captureStarted) 
         return;
     }
 
-    vkCmdWriteTimestamp(
+    gRuntime.cmdWriteTimestamp2(
         commandBuffer,
-        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT_KHR,
         gRuntime.timestampQueryPool,
         1
     );
@@ -1350,9 +1378,9 @@ bool initializeRuntime() {
     VkApplicationInfo applicationInfo{};
     applicationInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     applicationInfo.pApplicationName = "Argus";
-    applicationInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+    applicationInfo.applicationVersion = VK_MAKE_API_VERSION(0, 1, 0, 0);
     applicationInfo.pEngineName = "Argus On-Device Trainer";
-    applicationInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+    applicationInfo.engineVersion = VK_MAKE_API_VERSION(0, 1, 0, 0);
     uint32_t loaderApiVersion = VK_API_VERSION_1_0;
     const auto enumerateInstanceVersion =
         reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
@@ -1364,7 +1392,9 @@ bool initializeRuntime() {
             loaderApiVersion = reportedVersion;
         }
     }
-    #if defined(VK_VERSION_1_3)
+#if defined(VK_VERSION_1_4)
+    gRuntime.instanceApiVersion = std::min(loaderApiVersion, VK_API_VERSION_1_4);
+#elif defined(VK_VERSION_1_3)
     gRuntime.instanceApiVersion = std::min(loaderApiVersion, VK_API_VERSION_1_3);
 #elif defined(VK_VERSION_1_2)
     gRuntime.instanceApiVersion = std::min(loaderApiVersion, VK_API_VERSION_1_2);
@@ -1592,6 +1622,14 @@ bool initializeRuntime() {
     const bool hasIntegerDotProductExtension = false;
 #endif
 
+    gRuntime.synchronization2ExtensionSupported = hasDeviceExtension(
+        deviceExtensions,
+        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME
+    );
+    const bool querySynchronization2 =
+        physicalSupportsVulkan13 ||
+        (physicalSupportsVulkan11 && gRuntime.synchronization2ExtensionSupported);
+
 #if defined(VK_KHR_cooperative_matrix)
     gRuntime.hasCooperativeMatrixExtension = hasDeviceExtension(
         deviceExtensions,
@@ -1670,6 +1708,13 @@ bool initializeRuntime() {
     }
 #endif
 
+    VkPhysicalDeviceSynchronization2FeaturesKHR supportedSynchronization2{};
+    if (querySynchronization2) {
+        supportedSynchronization2.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
+        appendFeature(supportedSynchronization2);
+    }
+
 #if defined(VK_VERSION_1_3)
     VkPhysicalDeviceSubgroupSizeControlFeatures supportedSubgroupSizeControl{};
     const bool querySubgroupSizeControl =
@@ -1747,6 +1792,9 @@ bool initializeRuntime() {
 
     if (features2Available) {
         getPhysicalDeviceFeatures2(gRuntime.physicalDevice, &supportedFeatures);
+        gRuntime.synchronization2Supported =
+            querySynchronization2 &&
+            supportedSynchronization2.synchronization2 == VK_TRUE;
         gRuntime.supportsShaderFloat16Feature =
             queryShaderFloat16 && supportedShaderFloat16.shaderFloat16 == VK_TRUE;
         gRuntime.supportsFp16Compute = gRuntime.supportsShaderFloat16Feature;
@@ -2109,6 +2157,13 @@ bool initializeRuntime() {
     }
 #endif
 
+    if (!gRuntime.synchronization2Supported) {
+        logError(
+            "The Vulkan device does not support Synchronization2; using the Kotlin compute fallback."
+        );
+        return false;
+    }
+
     const float queuePriority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo{};
     queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -2116,15 +2171,19 @@ bool initializeRuntime() {
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &queuePriority;
 
-    VkPhysicalDeviceFeatures deviceFeatures{};
-    VkPhysicalDeviceShaderFloat16Int8Features enabledShaderFloat16{};
     VkPhysicalDeviceFeatures2 enabledFeatures{};
+    VkPhysicalDeviceShaderFloat16Int8Features enabledShaderFloat16{};
+    VkPhysicalDeviceSynchronization2FeaturesKHR enabledSynchronization2{};
     std::vector<const char*> enabledDeviceExtensions;
 #if defined(VK_EXT_memory_budget)
     if (gRuntime.memoryBudgetExtensionSupported) {
         enabledDeviceExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     }
 #endif
+    if (gRuntime.effectiveApiVersion < VK_API_VERSION_1_3 &&
+        gRuntime.synchronization2ExtensionSupported) {
+        enabledDeviceExtensions.push_back(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+    }
 
     VkDeviceCreateInfo deviceInfo{};
     deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -2135,17 +2194,23 @@ bool initializeRuntime() {
     deviceInfo.ppEnabledExtensionNames = enabledDeviceExtensions.empty()
         ? nullptr
         : enabledDeviceExtensions.data();
+    enabledFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    enabledSynchronization2.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
+    enabledSynchronization2.synchronization2 = VK_TRUE;
+    void** enabledFeatureChainTail = &enabledFeatures.pNext;
     if (gRuntime.supportsFp16Compute) {
         enabledShaderFloat16.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
         enabledShaderFloat16.shaderFloat16 = VK_TRUE;
-        enabledFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-        enabledFeatures.pNext = &enabledShaderFloat16;
-        deviceInfo.pNext = &enabledFeatures;
-        deviceInfo.pEnabledFeatures = nullptr;
-    } else {
-        deviceInfo.pEnabledFeatures = &deviceFeatures;
+        enabledShaderFloat16.pNext = nullptr;
+        *enabledFeatureChainTail = &enabledShaderFloat16;
+        enabledFeatureChainTail = &enabledShaderFloat16.pNext;
     }
+    *enabledFeatureChainTail = &enabledSynchronization2;
+    enabledSynchronization2.pNext = nullptr;
+    deviceInfo.pNext = &enabledFeatures;
+    deviceInfo.pEnabledFeatures = nullptr;
 
     result = vkCreateDevice(
         gRuntime.physicalDevice,
@@ -2162,6 +2227,31 @@ bool initializeRuntime() {
         enabledShaderFloat16.shaderFloat16 == VK_TRUE;
     gRuntime.shaderInt8FeatureEnabled =
         enabledShaderFloat16.shaderInt8 == VK_TRUE;
+    gRuntime.synchronization2Enabled =
+        enabledSynchronization2.synchronization2 == VK_TRUE;
+
+    const bool useCoreSynchronization2 =
+        gRuntime.effectiveApiVersion >= VK_API_VERSION_1_3;
+    const char* queueSubmit2Name = useCoreSynchronization2 ? "vkQueueSubmit2" : "vkQueueSubmit2KHR";
+    const char* pipelineBarrier2Name = useCoreSynchronization2 ? "vkCmdPipelineBarrier2" : "vkCmdPipelineBarrier2KHR";
+    const char* writeTimestamp2Name = useCoreSynchronization2 ? "vkCmdWriteTimestamp2" : "vkCmdWriteTimestamp2KHR";
+    gRuntime.queueSubmit2 = reinterpret_cast<PFN_vkQueueSubmit2KHR>(
+        vkGetDeviceProcAddr(gRuntime.device, queueSubmit2Name)
+    );
+    gRuntime.cmdPipelineBarrier2 = reinterpret_cast<PFN_vkCmdPipelineBarrier2KHR>(
+        vkGetDeviceProcAddr(gRuntime.device, pipelineBarrier2Name)
+    );
+    gRuntime.cmdWriteTimestamp2 = reinterpret_cast<PFN_vkCmdWriteTimestamp2KHR>(
+        vkGetDeviceProcAddr(gRuntime.device, writeTimestamp2Name)
+    );
+    if (!gRuntime.synchronization2Enabled ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        gRuntime.cmdWriteTimestamp2 == nullptr) {
+        logError("Vulkan Synchronization2 was enabled but one or more required device entry points are unavailable.");
+        return false;
+    }
+
 #if defined(VK_EXT_memory_budget) && defined(VK_VERSION_1_1)
     gRuntime.memoryBudgetExtensionEnabled = gRuntime.memoryBudgetExtensionSupported;
     if (gRuntime.memoryBudgetExtensionEnabled) {
@@ -2487,9 +2577,9 @@ bool initializeRuntime() {
         kLogTag,
         "Initialized Vulkan optimizer on %s (API %u.%u.%u).",
         gRuntime.physicalDeviceProperties.deviceName,
-        VK_VERSION_MAJOR(gRuntime.physicalDeviceProperties.apiVersion),
-        VK_VERSION_MINOR(gRuntime.physicalDeviceProperties.apiVersion),
-        VK_VERSION_PATCH(gRuntime.physicalDeviceProperties.apiVersion)
+        VK_API_VERSION_MAJOR(gRuntime.physicalDeviceProperties.apiVersion),
+        VK_API_VERSION_MINOR(gRuntime.physicalDeviceProperties.apiVersion),
+        VK_API_VERSION_PATCH(gRuntime.physicalDeviceProperties.apiVersion)
     );
 
     return true;
@@ -2931,23 +3021,18 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         }
         const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
 
-        VkMemoryBarrier hostToComputeBarrier{};
-        hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        hostToComputeBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        VkMemoryBarrier2KHR hostToComputeBarrier{};
+        hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+        hostToComputeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+        hostToComputeBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
+        hostToComputeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
         hostToComputeBarrier.dstAccessMask =
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(
-            gRuntime.commandBuffer,
-            VK_PIPELINE_STAGE_HOST_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0,
-            1,
-            &hostToComputeBarrier,
-            0,
-            nullptr,
-            0,
-            nullptr
-        );
+            VK_ACCESS_2_SHADER_READ_BIT_KHR | VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+        VkDependencyInfoKHR hostToComputeDependency{};
+        hostToComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+        hostToComputeDependency.memoryBarrierCount = 1u;
+        hostToComputeDependency.pMemoryBarriers = &hostToComputeBarrier;
+        gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &hostToComputeDependency);
 
         vkCmdBindPipeline(
             gRuntime.commandBuffer,
@@ -3030,22 +3115,17 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             return JNI_FALSE;
         }
 
-        VkMemoryBarrier computeToHostBarrier{};
-        computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        computeToHostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        computeToHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        vkCmdPipelineBarrier(
-            gRuntime.commandBuffer,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_HOST_BIT,
-            0,
-            1,
-            &computeToHostBarrier,
-            0,
-            nullptr,
-            0,
-            nullptr
-        );
+        VkMemoryBarrier2KHR computeToHostBarrier{};
+        computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+        computeToHostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        computeToHostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+        computeToHostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+        computeToHostBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR;
+        VkDependencyInfoKHR computeToHostDependency{};
+        computeToHostDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+        computeToHostDependency.memoryBarrierCount = 1u;
+        computeToHostDependency.pMemoryBarriers = &computeToHostBarrier;
+        gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &computeToHostDependency);
 
         endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
 
@@ -3056,16 +3136,9 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             return JNI_FALSE;
         }
 
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
         // The mapped page is read back before reuse, so completion remains synchronous.
         // A fence targets this dispatch instead of idling the entire queue.
-        if (!submitAndWait(
-                submitInfo,
-                "Vulkan AdamW page submission or fence wait failed."
-            )) {
+        if (!submitAndWait("Vulkan AdamW page submission or fence wait failed.")) {
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
         }
@@ -3373,24 +3446,18 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
     }
     const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
 
-    VkMemoryBarrier hostToComputeBarrier{};
-    hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    hostToComputeBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    VkMemoryBarrier2KHR hostToComputeBarrier{};
+    hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    hostToComputeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    hostToComputeBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
+    hostToComputeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
     hostToComputeBarrier.dstAccessMask =
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-
-    vkCmdPipelineBarrier(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0,
-        1,
-        &hostToComputeBarrier,
-        0,
-        nullptr,
-        0,
-        nullptr
-    );
+        VK_ACCESS_2_SHADER_READ_BIT_KHR | VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+    VkDependencyInfoKHR hostToComputeDependency{};
+    hostToComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    hostToComputeDependency.memoryBarrierCount = 1u;
+    hostToComputeDependency.pMemoryBarriers = &hostToComputeBarrier;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &hostToComputeDependency);
 
     vkCmdBindPipeline(
         gRuntime.commandBuffer,
@@ -3436,23 +3503,17 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         1
     );
 
-    VkMemoryBarrier computeToHostBarrier{};
-    computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    computeToHostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    computeToHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-
-    vkCmdPipelineBarrier(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        0,
-        1,
-        &computeToHostBarrier,
-        0,
-        nullptr,
-        0,
-        nullptr
-    );
+    VkMemoryBarrier2KHR computeToHostBarrier{};
+    computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    computeToHostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    computeToHostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+    computeToHostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    computeToHostBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR;
+    VkDependencyInfoKHR computeToHostDependency{};
+    computeToHostDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    computeToHostDependency.memoryBarrierCount = 1u;
+    computeToHostDependency.pMemoryBarriers = &computeToHostBarrier;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &computeToHostDependency);
 
     endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
 
@@ -3462,15 +3523,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         return JNI_FALSE;
     }
 
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
-
-    if (!submitAndWait(
-            submitInfo,
-            "Vulkan linear submission or fence wait failed."
-        )) {
+    if (!submitAndWait("Vulkan linear submission or fence wait failed.")) {
         return JNI_FALSE;
     }
     if (timestampCapture) {
@@ -3728,23 +3781,18 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
     }
     const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
 
-    VkMemoryBarrier hostToComputeBarrier{};
-    hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    hostToComputeBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    VkMemoryBarrier2KHR hostToComputeBarrier{};
+    hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    hostToComputeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    hostToComputeBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
+    hostToComputeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
     hostToComputeBarrier.dstAccessMask =
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0,
-        1,
-        &hostToComputeBarrier,
-        0,
-        nullptr,
-        0,
-        nullptr
-    );
+        VK_ACCESS_2_SHADER_READ_BIT_KHR | VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+    VkDependencyInfoKHR hostToComputeDependency{};
+    hostToComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    hostToComputeDependency.memoryBarrierCount = 1u;
+    hostToComputeDependency.pMemoryBarriers = &hostToComputeBarrier;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &hostToComputeDependency);
 
     vkCmdBindPipeline(
         gRuntime.commandBuffer,
@@ -3788,22 +3836,17 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         1
     );
 
-    VkMemoryBarrier computeToHostBarrier{};
-    computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    computeToHostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    computeToHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        0,
-        1,
-        &computeToHostBarrier,
-        0,
-        nullptr,
-        0,
-        nullptr
-    );
+    VkMemoryBarrier2KHR computeToHostBarrier{};
+    computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    computeToHostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    computeToHostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+    computeToHostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    computeToHostBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR;
+    VkDependencyInfoKHR computeToHostDependency{};
+    computeToHostDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    computeToHostDependency.memoryBarrierCount = 1u;
+    computeToHostDependency.pMemoryBarriers = &computeToHostBarrier;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &computeToHostDependency);
 
     endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
 
@@ -3813,14 +3856,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         return JNI_FALSE;
     }
 
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
-    if (!submitAndWait(
-            submitInfo,
-            "Vulkan FP16 linear submission or fence wait failed."
-        )) {
+    if (!submitAndWait("Vulkan FP16 linear submission or fence wait failed.")) {
         return JNI_FALSE;
     }
     if (timestampCapture) {
@@ -3957,12 +3993,18 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
         json << gRuntime.memoryHeapUsage[heapIndex];
     }
     json << "],"
-         << "\"apiVersionMajor\":" << VK_VERSION_MAJOR(properties.apiVersion) << ","
-         << "\"apiVersionMinor\":" << VK_VERSION_MINOR(properties.apiVersion) << ","
-         << "\"apiVersionPatch\":" << VK_VERSION_PATCH(properties.apiVersion) << ","
-         << "\"effectiveApiVersionMajor\":" << VK_VERSION_MAJOR(gRuntime.effectiveApiVersion) << ","
-         << "\"effectiveApiVersionMinor\":" << VK_VERSION_MINOR(gRuntime.effectiveApiVersion) << ","
-         << "\"effectiveApiVersionPatch\":" << VK_VERSION_PATCH(gRuntime.effectiveApiVersion) << ","
+         << "\"apiVersionMajor\":" << VK_API_VERSION_MAJOR(properties.apiVersion) << ","
+         << "\"apiVersionMinor\":" << VK_API_VERSION_MINOR(properties.apiVersion) << ","
+         << "\"apiVersionPatch\":" << VK_API_VERSION_PATCH(properties.apiVersion) << ","
+         << "\"effectiveApiVersionMajor\":" << VK_API_VERSION_MAJOR(gRuntime.effectiveApiVersion) << ","
+         << "\"effectiveApiVersionMinor\":" << VK_API_VERSION_MINOR(gRuntime.effectiveApiVersion) << ","
+         << "\"effectiveApiVersionPatch\":" << VK_API_VERSION_PATCH(gRuntime.effectiveApiVersion) << ","
+         << "\"synchronization2ExtensionSupported\":"
+         << (gRuntime.synchronization2ExtensionSupported ? "true" : "false") << ","
+         << "\"synchronization2Supported\":"
+         << (gRuntime.synchronization2Supported ? "true" : "false") << ","
+         << "\"synchronization2Enabled\":"
+         << (gRuntime.synchronization2Enabled ? "true" : "false") << ","
          << "\"driverName\":\"" << escapeJsonString(
                 gRuntime.hasDriverProperties ? gRuntime.driverProperties.driverName : ""
             ) << "\","

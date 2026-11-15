@@ -80,6 +80,12 @@ are not uploaded automatically.
 
 The native training module is built with Android NDK r30, CMake 4.5.0
 (project minimum 3.28), and C++23 for arm64-v8a, armeabi-v7a, and x86_64.
+It negotiates up to the highest Vulkan API version supported by the pinned
+headers, Android loader, and physical device (including 1.4 when available).
+GPU execution uses Vulkan Synchronization 2 (Vulkan 1.3 core or
+`VK_KHR_synchronization2`); devices without that feature remain on the Kotlin
+CPU fallback. The backend does not issue legacy Synchronization 1 queue-submit,
+pipeline-barrier, or timestamp commands.
 It uses the NDK-bundled glslc compiler to
 compile the AdamW (`adamw.comp`), batched-linear (`linear.comp`), and Vulkan 1.2 FP16-weight linear (`linear_fp16.comp`) compute shaders to SPIR-V during the native build.
 
