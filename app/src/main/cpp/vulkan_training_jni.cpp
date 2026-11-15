@@ -771,15 +771,10 @@ bool initializeRuntime() {
     };
 
     VkPhysicalDeviceShaderFloat16Int8Features supportedShaderFloat16{};
-    const bool queryShaderFloat16 =
-        physicalSupportsVulkan12
-#if defined(VK_KHR_shader_float16_int8)
-        || hasDeviceExtension(
-            deviceExtensions,
-            VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME
-        )
-#endif
-        ;
+    // The current FP16 kernel is compiled for the Vulkan 1.2 core path.
+    // Do not activate the extension-only feature on Vulkan 1.1 devices until
+    // the extension is explicitly enabled in VkDeviceCreateInfo.
+    const bool queryShaderFloat16 = physicalSupportsVulkan12;
     if (queryShaderFloat16) {
         supportedShaderFloat16.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
