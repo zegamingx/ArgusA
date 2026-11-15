@@ -897,8 +897,6 @@ bool initializeRuntime() {
             supportedCooperativeMatrix.cooperativeMatrixRobustBufferAccess == VK_TRUE;
 #endif
     } else {
-        VkPhysicalDeviceFeatures legacyFeatures{};
-        vkGetPhysicalDeviceFeatures(gRuntime.physicalDevice, &legacyFeatures);
         gRuntime.supportsFp16Compute = false;
         gRuntime.supportsShaderInt8 = false;
     }
@@ -929,8 +927,8 @@ bool initializeRuntime() {
         subgroupProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
         appendProperty(subgroupProperties);
 
+        VkPhysicalDeviceDriverProperties driverProperties{};
         if (physicalSupportsVulkan12) {
-            VkPhysicalDeviceDriverProperties driverProperties{};
             driverProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
             appendProperty(driverProperties);
         }
@@ -986,14 +984,6 @@ bool initializeRuntime() {
             subgroupProperties.quadOperationsInAllStages == VK_TRUE;
 
         if (physicalSupportsVulkan12) {
-            // The driver structure is queried separately below to keep it alive
-            // for the complete properties2 call.
-            VkPhysicalDeviceDriverProperties driverProperties{};
-            driverProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
-            VkPhysicalDeviceProperties2 driverProperties2{};
-            driverProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-            driverProperties2.pNext = &driverProperties;
-            getPhysicalDeviceProperties2(gRuntime.physicalDevice, &driverProperties2);
             gRuntime.driverProperties = driverProperties;
             gRuntime.hasDriverProperties =
                 driverProperties.driverName[0] != '\0' ||

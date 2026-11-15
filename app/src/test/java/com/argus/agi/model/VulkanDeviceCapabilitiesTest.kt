@@ -51,7 +51,7 @@ class VulkanDeviceCapabilitiesTest {
               "cooperativeMatrix": false,
               "cooperativeMatrixTypes": []
             }
-            """.replace("ARM_PLACEHOLDER", "0")
+            """
         )
 
         assertEquals("Mali-G57", capabilities.deviceName)
