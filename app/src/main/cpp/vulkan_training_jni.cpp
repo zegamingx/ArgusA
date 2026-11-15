@@ -74,6 +74,19 @@ struct CooperativeMatrixCapability {
     uint32_t scope = 0;
 };
 
+struct TensorArenaAllocation {
+    VkDeviceSize offset = 0;
+    VkDeviceSize allocatedSize = 0;
+    VkDeviceSize logicalSize = 0;
+    uint32_t generation = 0u;
+    bool active = false;
+};
+
+struct TensorArenaFreeBlock {
+    VkDeviceSize offset = 0;
+    VkDeviceSize size = 0;
+};
+
 struct VulkanRuntime {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -183,19 +196,6 @@ struct GroupArrays {
 };
 
 
-struct TensorArenaAllocation {
-    VkDeviceSize offset = 0;
-    VkDeviceSize allocatedSize = 0;
-    VkDeviceSize logicalSize = 0;
-    uint32_t generation = 1;
-    bool active = false;
-};
-
-struct TensorArenaFreeBlock {
-    VkDeviceSize offset = 0;
-    VkDeviceSize size = 0;
-};
-
 struct AdamwSegment {
     uint32_t elementOffset = 0;
     uint32_t elementCount = 0;
@@ -204,6 +204,11 @@ struct AdamwSegment {
 
 std::mutex gRuntimeMutex;
 VulkanRuntime gRuntime{};
+
+// Process-lifetime token generation prevents handles from becoming valid again
+// after a Vulkan runtime is destroyed and initialized with a fresh allocation table.
+// All accesses are serialized by gRuntimeMutex.
+uint32_t gNextTensorArenaHandleGeneration = 1u;
 
 void logError(const char* message, VkResult result = VK_SUCCESS) {
     if (result == VK_SUCCESS) {
@@ -888,19 +893,28 @@ bool createArenaBacking(
         buffer = VK_NULL_HANDLE;
         return false;
     }
-    std::sort(candidates.begin(), candidates.end(), [](uint32_t a, uint32_t b) {
-        const VkMemoryPropertyFlags af = gRuntime.memoryProperties.memoryTypes[a].propertyFlags;
-        const VkMemoryPropertyFlags bf = gRuntime.memoryProperties.memoryTypes[b].propertyFlags;
-        const int as =
-            ((af & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0u ? 100 : 0) +
-            ((af & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u ? 20 : 0) +
-            ((af & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u ? 5 : 0);
-        const int bs =
-            ((bf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0u ? 100 : 0) +
-            ((bf & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u ? 20 : 0) +
-            ((bf & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u ? 5 : 0);
-        return as > bs;
-    });
+    // Vulkan exposes at most VK_MAX_MEMORY_TYPES (32) candidates. A small
+    // stable insertion sort avoids comparator-template edge cases in older
+    // Android NDK libc++ while keeping the preferred memory types first.
+    const auto memoryTypeScore = [](uint32_t index) noexcept -> uint32_t {
+        const VkMemoryPropertyFlags flags =
+            gRuntime.memoryProperties.memoryTypes[index].propertyFlags;
+        return
+            ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0u ? 100u : 0u) +
+            ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u ? 20u : 0u) +
+            ((flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u ? 5u : 0u);
+    };
+    for (size_t index = 1u; index < candidates.size(); ++index) {
+        const uint32_t candidate = candidates[index];
+        const uint32_t candidateScore = memoryTypeScore(candidate);
+        size_t insertionIndex = index;
+        while (insertionIndex > 0u &&
+               candidateScore > memoryTypeScore(candidates[insertionIndex - 1u])) {
+            candidates[insertionIndex] = candidates[insertionIndex - 1u];
+            --insertionIndex;
+        }
+        candidates[insertionIndex] = candidate;
+    }
 
     for (uint32_t index : candidates) {
         if (!hasMemoryBudgetHeadroom(index, requirements.size)) continue;
@@ -1056,13 +1070,18 @@ jlong allocateArenaTensor(VkDeviceSize logicalSize) {
         logicalSize > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange) {
         return 0;
     }
+    if (gNextTensorArenaHandleGeneration == 0u) {
+        logError("Vulkan tensor-arena handle generation space is exhausted.");
+        return 0;
+    }
+
     VkDeviceSize allocatedSize = 0u;
     if (!alignArenaSize(logicalSize, 4u, allocatedSize)) return 0;
 
     size_t index = gRuntime.tensorArenaAllocations.size();
     for (size_t candidate = 0u; candidate < index; ++candidate) {
         const TensorArenaAllocation& item = gRuntime.tensorArenaAllocations[candidate];
-        if (!item.active && item.generation != 0u) {
+        if (!item.active) {
             index = candidate;
             break;
         }
@@ -1089,7 +1108,16 @@ jlong allocateArenaTensor(VkDeviceSize logicalSize) {
     allocation.offset = offset;
     allocation.allocatedSize = allocatedSize;
     allocation.logicalSize = logicalSize;
+    allocation.generation = gNextTensorArenaHandleGeneration;
     allocation.active = true;
+
+    if (gNextTensorArenaHandleGeneration ==
+        std::numeric_limits<uint32_t>::max()) {
+        gNextTensorArenaHandleGeneration = 0u;
+    } else {
+        ++gNextTensorArenaHandleGeneration;
+    }
+
     gRuntime.tensorArenaAllocatedBytes += allocatedSize;
     const uint64_t token =
         (static_cast<uint64_t>(allocation.generation) << 32u) |
@@ -3916,9 +3944,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeReleaseTensor(
     allocation->offset = 0u;
     allocation->allocatedSize = 0u;
     allocation->logicalSize = 0u;
-    allocation->generation =
-        allocation->generation == std::numeric_limits<uint32_t>::max()
-            ? 0u : allocation->generation + 1u;
+    allocation->generation = 0u;
     return JNI_TRUE;
 }
 
