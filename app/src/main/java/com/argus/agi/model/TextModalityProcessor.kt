@@ -585,24 +585,42 @@ object TextModalityProcessor {
                         isTrainingRecord(record) && !extractReasoningText(record).isNullOrBlank()
                     } == true
         }
-        if (containsReasoningMarkers || containsReasoningRecords) {
-            return TextModality.REASONING
-        }
+        if (containsReasoningRecords) return TextModality.REASONING
 
-        // 1. Percakapan
+        // Determine conversation framing before treating literal THINK text as a
+        // reasoning instruction. Genuine serialized reasoning records use the
+        // assistant/THINK prefix and return to an assistant final-answer turn.
         var userTurnCount = 0
         var assistantTurnCount = 0
         for (line in lines) {
             if (USER_TURN_PATTERN.matcher(line).find()) userTurnCount++
             if (ASSISTANT_TURN_PATTERN.matcher(line).find()) assistantTurnCount++
         }
-        // Deteksi literal token harus menyertakan KEDUANYA untuk menghindari
-        // false-positive pada dokumentasi yang hanya menyebut salah satunya.
         val hasBothTokens = trimmed.contains(Tokenizer.USER_TOKEN) &&
-                trimmed.contains(Tokenizer.ASSISTANT_TOKEN)
-        if ((userTurnCount >= 1 && assistantTurnCount >= 1) || hasBothTokens) {
-            return TextModality.CONVERSATION
+            trimmed.contains(Tokenizer.ASSISTANT_TOKEN)
+        val hasConversationStructure =
+            (userTurnCount >= 1 && assistantTurnCount >= 1) || hasBothTokens
+
+        val thinkStartIndex = trimmed.indexOf(Tokenizer.THINK_START)
+        val thinkEndIndex = trimmed.indexOf(
+            Tokenizer.THINK_END,
+            thinkStartIndex.coerceAtLeast(0) + Tokenizer.THINK_START.length
+        )
+        val hasAssistantThinkFraming =
+            trimmed.contains(Tokenizer.ASSISTANT_TOKEN + Tokenizer.THINK_START) &&
+                thinkEndIndex >= 0 &&
+                trimmed.indexOf(
+                    Tokenizer.ASSISTANT_TOKEN,
+                    thinkEndIndex + Tokenizer.THINK_END.length
+                ) >= 0
+
+        if (
+            containsReasoningMarkers &&
+            (!hasConversationStructure || hasAssistantThinkFraming)
+        ) {
+            return TextModality.REASONING
         }
+        if (hasConversationStructure) return TextModality.CONVERSATION
 
         // 2. Tanya Jawab
         var qCount = 0

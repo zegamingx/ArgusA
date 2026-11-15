@@ -275,7 +275,7 @@ class TextModalityPreservationTest {
     @Test
     fun conversationKeepsLongTurnsAtomicAndDoesNotParsePayloadHeadersAsNewTurns() {
         val userMessage = "Question " + "context ".repeat(40) +
-            "\nAssistant: this line is quoted content.\n<EOS>"
+            "\nAssistant: this line is quoted content.\n<EOS>\nLiteral <THINK> and </THINK>"
         val assistantMessage = "Answer " + "detail ".repeat(40) +
             "\nUser: this is still answer content.\n<ASSISTANT>"
         val serialized = requireNotNull(
@@ -298,6 +298,10 @@ class TextModalityPreservationTest {
         assertEquals(1, tokenIds.count { it == Tokenizer.USER_ID })
         assertEquals(1, tokenIds.count { it == Tokenizer.ASSISTANT_ID })
         assertEquals(1, tokenIds.count { it == Tokenizer.EOS_ID })
+        assertEquals(
+            0,
+            tokenIds.count { it == Tokenizer.THINK_START_ID || it == Tokenizer.THINK_END_ID }
+        )
 
         val expected = "${Tokenizer.USER_TOKEN} $userMessage\n" +
             "${Tokenizer.ASSISTANT_TOKEN} $assistantMessage ${Tokenizer.EOS_TOKEN}"
