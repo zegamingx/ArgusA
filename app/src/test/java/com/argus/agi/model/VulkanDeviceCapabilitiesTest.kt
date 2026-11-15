@@ -304,7 +304,7 @@ class VulkanDeviceCapabilitiesTest {
             {
               "deviceName": "Mali-G57",
               "vendorId": 5045,
-              "deviceId": 2425415696,
+              "deviceId": 2425421840,
               "apiVersionMajor": 1,
               "apiVersionMinor": 3,
               "apiVersionPatch": 278,
@@ -330,7 +330,7 @@ class VulkanDeviceCapabilitiesTest {
             {
               "deviceName": "Adreno 830",
               "vendorId": 20803,
-              "deviceId": 1145378817,
+              "deviceId": 1141178369,
               "apiVersionMajor": 1,
               "apiVersionMinor": 3,
               "apiVersionPatch": 284,
@@ -382,7 +382,7 @@ class VulkanDeviceCapabilitiesTest {
             {
               "deviceName": "Mali-G925-Immortalis MC12",
               "vendorId": 5045,
-              "deviceId": 3627028496,
+              "deviceId": 3627024400,
               "apiVersionMajor": 1,
               "apiVersionMinor": 3,
               "apiVersionPatch": 278,
