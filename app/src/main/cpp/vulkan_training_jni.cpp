@@ -84,6 +84,8 @@ struct VulkanRuntime {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue computeQueue = VK_NULL_HANDLE;
     uint32_t queueFamilyIndex = 0;
+    uint32_t computeQueueTimestampValidBits = 0;
+    uint32_t effectiveApiVersion = VK_API_VERSION_1_0;
     uint32_t maxComputeWorkGroupCountX = 0;
 
     VkCommandPool commandPool = VK_NULL_HANDLE;
@@ -100,14 +102,19 @@ struct VulkanRuntime {
 
     uint32_t instanceApiVersion = VK_API_VERSION_1_0;
     bool supportsFp16Compute = false;
+    bool supportsShaderFloat16Feature = false;
     bool supportsShaderInt8 = false;
     bool supportsStorageBuffer16BitAccess = false;
+    bool shaderFloat16FeatureEnabled = false;
+    bool shaderInt8FeatureEnabled = false;
+    bool storageBuffer16BitAccessEnabled = false;
 
     uint32_t subgroupSize = 0;
     uint32_t subgroupSupportedStages = 0;
     uint32_t subgroupSupportedOperations = 0;
     bool subgroupQuadOperationsInAllStages = false;
     bool supportsSubgroupSizeControl = false;
+    bool subgroupSizeControlEnabled = false;
     bool supportsComputeFullSubgroups = false;
     uint32_t minSubgroupSize = 0;
     uint32_t maxSubgroupSize = 0;
@@ -115,6 +122,7 @@ struct VulkanRuntime {
     uint32_t requiredSubgroupSizeStages = 0;
 
     bool supportsShaderIntegerDotProduct = false;
+    bool shaderIntegerDotProductEnabled = false;
     bool integerDotProduct8BitUnsignedAccelerated = false;
     bool integerDotProduct8BitSignedAccelerated = false;
     bool integerDotProduct8BitMixedSignednessAccelerated = false;
@@ -124,6 +132,7 @@ struct VulkanRuntime {
 
     bool hasCooperativeMatrixExtension = false;
     bool supportsCooperativeMatrix = false;
+    bool cooperativeMatrixEnabled = false;
     bool supportsCooperativeMatrixRobustBufferAccess = false;
     uint32_t cooperativeMatrixSupportedStages = 0;
     std::vector<CooperativeMatrixCapability> cooperativeMatrixTypes;
@@ -681,6 +690,7 @@ bool initializeRuntime() {
                 bestScore = score;
                 gRuntime.physicalDevice = candidate;
                 gRuntime.queueFamilyIndex = familyIndex;
+                gRuntime.computeQueueTimestampValidBits = family.timestampValidBits;
                 gRuntime.physicalDeviceProperties = properties;
             }
         }
@@ -724,10 +734,15 @@ bool initializeRuntime() {
     }
 
     const uint32_t physicalApiVersion = gRuntime.physicalDeviceProperties.apiVersion;
-    const bool physicalSupportsVulkan11 = physicalApiVersion >= VK_API_VERSION_1_1;
-    const bool physicalSupportsVulkan12 = physicalApiVersion >= VK_API_VERSION_1_2;
+    const uint32_t effectiveApiVersion = std::min(
+        gRuntime.instanceApiVersion,
+        physicalApiVersion
+    );
+    gRuntime.effectiveApiVersion = effectiveApiVersion;
+    const bool physicalSupportsVulkan11 = effectiveApiVersion >= VK_API_VERSION_1_1;
+    const bool physicalSupportsVulkan12 = effectiveApiVersion >= VK_API_VERSION_1_2;
 #if defined(VK_VERSION_1_3)
-    const bool physicalSupportsVulkan13 = physicalApiVersion >= VK_API_VERSION_1_3;
+    const bool physicalSupportsVulkan13 = effectiveApiVersion >= VK_API_VERSION_1_3;
 #else
     const bool physicalSupportsVulkan13 = false;
 #endif
@@ -849,8 +864,9 @@ bool initializeRuntime() {
 
     if (features2Available) {
         getPhysicalDeviceFeatures2(gRuntime.physicalDevice, &supportedFeatures);
-        gRuntime.supportsFp16Compute =
+        gRuntime.supportsShaderFloat16Feature =
             queryShaderFloat16 && supportedShaderFloat16.shaderFloat16 == VK_TRUE;
+        gRuntime.supportsFp16Compute = gRuntime.supportsShaderFloat16Feature;
         gRuntime.supportsShaderInt8 =
             queryShaderFloat16 && supportedShaderFloat16.shaderInt8 == VK_TRUE;
 #if defined(VK_VERSION_1_1)
@@ -1142,6 +1158,11 @@ bool initializeRuntime() {
         logError("Vulkan logical-device creation failed.", result);
         return false;
     }
+
+    gRuntime.shaderFloat16FeatureEnabled =
+        enabledShaderFloat16.shaderFloat16 == VK_TRUE;
+    gRuntime.shaderInt8FeatureEnabled =
+        enabledShaderFloat16.shaderInt8 == VK_TRUE;
 
     vkGetDeviceQueue(
         gRuntime.device,
@@ -2822,6 +2843,9 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
          << "\"apiVersionMajor\":" << VK_VERSION_MAJOR(properties.apiVersion) << ","
          << "\"apiVersionMinor\":" << VK_VERSION_MINOR(properties.apiVersion) << ","
          << "\"apiVersionPatch\":" << VK_VERSION_PATCH(properties.apiVersion) << ","
+         << "\"effectiveApiVersionMajor\":" << VK_VERSION_MAJOR(gRuntime.effectiveApiVersion) << ","
+         << "\"effectiveApiVersionMinor\":" << VK_VERSION_MINOR(gRuntime.effectiveApiVersion) << ","
+         << "\"effectiveApiVersionPatch\":" << VK_VERSION_PATCH(gRuntime.effectiveApiVersion) << ","
          << "\"driverName\":\"" << escapeJsonString(
                 gRuntime.hasDriverProperties ? gRuntime.driverProperties.driverName : ""
             ) << "\","
@@ -2847,6 +2871,14 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
          << properties.limits.maxComputeSharedMemorySize << ","
          << "\"maxStorageBufferRangeBytes\":"
          << properties.limits.maxStorageBufferRange << ","
+         << "\"timestampPeriodNanoseconds\":"
+         << properties.limits.timestampPeriod << ","
+         << "\"timestampComputeAndGraphics\":"
+         << (properties.limits.timestampComputeAndGraphics == VK_TRUE ? "true" : "false") << ","
+         << "\"computeQueueTimestampValidBits\":"
+         << gRuntime.computeQueueTimestampValidBits << ","
+         << "\"computeTimestampQueriesSupported\":"
+         << (gRuntime.computeQueueTimestampValidBits > 0u ? "true" : "false") << ","
          << "\"subgroupSize\":" << gRuntime.subgroupSize << ","
          << "\"subgroupSupportedStages\":" << gRuntime.subgroupSupportedStages << ","
          << "\"subgroupSupportedOperations\":" << gRuntime.subgroupSupportedOperations << ","
@@ -2854,6 +2886,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
          << (gRuntime.subgroupQuadOperationsInAllStages ? "true" : "false") << ","
          << "\"subgroupSizeControl\":"
          << (gRuntime.supportsSubgroupSizeControl ? "true" : "false") << ","
+         << "\"subgroupSizeControlEnabled\":"
+         << (gRuntime.subgroupSizeControlEnabled ? "true" : "false") << ","
          << "\"computeFullSubgroups\":"
          << (gRuntime.supportsComputeFullSubgroups ? "true" : "false") << ","
          << "\"minSubgroupSize\":" << gRuntime.minSubgroupSize << ","
@@ -2862,11 +2896,21 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
          << gRuntime.maxComputeWorkgroupSubgroups << ","
          << "\"requiredSubgroupSizeStages\":" << gRuntime.requiredSubgroupSizeStages << ","
          << "\"shaderFloat16\":" << (gRuntime.supportsFp16Compute ? "true" : "false") << ","
+         << "\"shaderFloat16FeatureSupported\":"
+         << (gRuntime.supportsShaderFloat16Feature ? "true" : "false") << ","
+         << "\"shaderFloat16FeatureEnabled\":"
+         << (gRuntime.shaderFloat16FeatureEnabled ? "true" : "false") << ","
          << "\"shaderInt8\":" << (gRuntime.supportsShaderInt8 ? "true" : "false") << ","
+         << "\"shaderInt8FeatureEnabled\":"
+         << (gRuntime.shaderInt8FeatureEnabled ? "true" : "false") << ","
          << "\"storageBuffer16BitAccess\":"
          << (gRuntime.supportsStorageBuffer16BitAccess ? "true" : "false") << ","
+         << "\"storageBuffer16BitAccessEnabled\":"
+         << (gRuntime.storageBuffer16BitAccessEnabled ? "true" : "false") << ","
          << "\"shaderIntegerDotProduct\":"
          << (gRuntime.supportsShaderIntegerDotProduct ? "true" : "false") << ","
+         << "\"shaderIntegerDotProductEnabled\":"
+         << (gRuntime.shaderIntegerDotProductEnabled ? "true" : "false") << ","
          << "\"integerDotProduct8BitUnsignedAccelerated\":"
          << (gRuntime.integerDotProduct8BitUnsignedAccelerated ? "true" : "false") << ","
          << "\"integerDotProduct8BitSignedAccelerated\":"
@@ -2883,6 +2927,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
          << (gRuntime.hasCooperativeMatrixExtension ? "true" : "false") << ","
          << "\"cooperativeMatrix\":"
          << (gRuntime.supportsCooperativeMatrix ? "true" : "false") << ","
+         << "\"cooperativeMatrixEnabled\":"
+         << (gRuntime.cooperativeMatrixEnabled ? "true" : "false") << ","
          << "\"cooperativeMatrixRobustBufferAccess\":"
          << (gRuntime.supportsCooperativeMatrixRobustBufferAccess ? "true" : "false") << ","
          << "\"cooperativeMatrixSupportedStages\":"

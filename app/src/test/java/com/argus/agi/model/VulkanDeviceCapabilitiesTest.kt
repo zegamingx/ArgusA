@@ -37,11 +37,20 @@ class VulkanDeviceCapabilitiesTest {
               "subgroupSize": 16,
               "subgroupSupportedStages": 32,
               "subgroupSupportedOperations": 511,
+              "computeQueueTimestampValidBits": 64,
+              "timestampPeriodNanoseconds": 1.0,
+              "timestampComputeAndGraphics": true,
+              "computeTimestampQueriesSupported": true,
+              "effectiveApiVersionMajor": 1,
+              "effectiveApiVersionMinor": 3,
+              "effectiveApiVersionPatch": 278,
               "subgroupSizeControl": true,
               "computeFullSubgroups": true,
               "minSubgroupSize": 4,
               "maxSubgroupSize": 32,
               "shaderFloat16": true,
+              "shaderFloat16FeatureSupported": true,
+              "shaderFloat16FeatureEnabled": true,
               "shaderInt8": true,
               "storageBuffer16BitAccess": true,
               "shaderIntegerDotProduct": true,
@@ -58,7 +67,17 @@ class VulkanDeviceCapabilitiesTest {
         assertEquals("1.3.278", capabilities.apiVersion)
         assertEquals(16, capabilities.subgroupSize)
         assertTrue(capabilities.supportsComputeSubgroups)
+        assertTrue(capabilities.supportsComputeSubgroupArithmetic)
+        assertTrue(capabilities.supportsComputeSubgroupReduction)
+        assertTrue(capabilities.supportsComputeSubgroupShuffle)
+        assertTrue(capabilities.supportsComputeSubgroupShuffleRelative)
+        assertTrue(capabilities.supportsComputeTimestampQueries)
+        assertEquals(64, capabilities.computeQueueTimestampValidBits)
+        assertEquals(1.3, capabilities.effectiveApiVersionMajor +
+            capabilities.effectiveApiVersionMinor / 10.0, 0.0001)
         assertTrue(capabilities.shaderFloat16)
+        assertTrue(capabilities.shaderFloat16FeatureSupported)
+        assertTrue(capabilities.shaderFloat16FeatureEnabled)
         assertTrue(capabilities.shaderInt8)
         assertTrue(capabilities.hasAcceleratedInt8DotProduct)
         assertFalse(capabilities.hasUsableCooperativeMatrixConfiguration)
@@ -76,6 +95,7 @@ class VulkanDeviceCapabilitiesTest {
               "cooperativeMatrixExtension": true,
               "cooperativeMatrix": true,
               "cooperativeMatrixSupportedStages": 32,
+              "cooperativeMatrixEnabled": true,
               "cooperativeMatrixTypes": [
                 {
                   "mSize": 16,
@@ -93,6 +113,7 @@ class VulkanDeviceCapabilitiesTest {
             """
         )
 
+        assertTrue(capabilities.hasSupportedCooperativeMatrixConfiguration)
         assertTrue(capabilities.hasUsableCooperativeMatrixConfiguration)
         assertEquals(16, capabilities.cooperativeMatrixTypes.single().mSize)
     }
@@ -124,4 +145,70 @@ class VulkanDeviceCapabilitiesTest {
 
         assertFalse(capabilities.hasUsableCooperativeMatrixConfiguration)
     }
+    @Test
+    fun reportedCapabilitiesDoNotImplyLogicalDeviceFeaturesAreEnabled() {
+        val capabilities = VulkanDeviceCapabilities.fromJson(
+            """
+            {
+              "deviceName": "Mali-G57",
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 2,
+              "effectiveApiVersionMajor": 1,
+              "effectiveApiVersionMinor": 2,
+              "subgroupSize": 16,
+              "subgroupSupportedStages": 32,
+              "subgroupSupportedOperations": 20,
+              "shaderIntegerDotProduct": true,
+              "integerDotProduct8BitSignedAccelerated": true,
+              "cooperativeMatrix": true,
+              "cooperativeMatrixSupportedStages": 32,
+              "cooperativeMatrixTypes": [
+                {
+                  "mSize": 16,
+                  "nSize": 16,
+                  "kSize": 16,
+                  "aType": 1,
+                  "bType": 1,
+                  "cType": 1,
+                  "resultType": 1,
+                  "saturatingAccumulation": false,
+                  "scope": 3
+                }
+              ],
+              "computeQueueTimestampValidBits": 0,
+              "timestampPeriodNanoseconds": 1.0
+            }
+            """
+        )
+
+        assertTrue(capabilities.supportsComputeSubgroupArithmetic)
+        assertTrue(capabilities.supportsComputeSubgroupReduction)
+        assertTrue(capabilities.supportsComputeSubgroupShuffle)
+        assertFalse(capabilities.canUseIntegerDotProductKernel)
+        assertTrue(capabilities.hasAcceleratedInt8DotProduct)
+        assertTrue(capabilities.hasSupportedCooperativeMatrixConfiguration)
+        assertFalse(capabilities.hasUsableCooperativeMatrixConfiguration)
+        assertFalse(capabilities.supportsComputeTimestampQueries)
+        assertFalse(capabilities.shaderIntegerDotProductEnabled)
+        assertFalse(capabilities.cooperativeMatrixEnabled)
+    }
+
+    @Test
+    fun timestampProfilingRequiresValidBitsOnTheSelectedComputeQueue() {
+        val capabilities = VulkanDeviceCapabilities.fromJson(
+            """
+            {
+              "deviceName": "Unknown",
+              "subgroupSize": 16,
+              "subgroupSupportedStages": 32,
+              "computeQueueTimestampValidBits": 0,
+              "computeTimestampQueriesSupported": false,
+              "timestampPeriodNanoseconds": 1.0
+            }
+            """
+        )
+
+        assertFalse(capabilities.supportsComputeTimestampQueries)
+    }
+
 }

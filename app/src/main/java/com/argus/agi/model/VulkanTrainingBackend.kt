@@ -69,13 +69,46 @@ data class VulkanDeviceCapabilities(
     val cooperativeMatrix: Boolean,
     val cooperativeMatrixRobustBufferAccess: Boolean,
     val cooperativeMatrixSupportedStages: Int,
-    val cooperativeMatrixTypes: List<VulkanCooperativeMatrixType>
+    val cooperativeMatrixTypes: List<VulkanCooperativeMatrixType>,
+    val effectiveApiVersionMajor: Int,
+    val effectiveApiVersionMinor: Int,
+    val effectiveApiVersionPatch: Int,
+    val timestampPeriodNanoseconds: Double,
+    val timestampComputeAndGraphics: Boolean,
+    val computeQueueTimestampValidBits: Int,
+    val computeTimestampQueriesSupported: Boolean,
+    val shaderFloat16FeatureSupported: Boolean,
+    val shaderFloat16FeatureEnabled: Boolean,
+    val shaderInt8FeatureEnabled: Boolean,
+    val storageBuffer16BitAccessEnabled: Boolean,
+    val subgroupSizeControlEnabled: Boolean,
+    val shaderIntegerDotProductEnabled: Boolean,
+    val cooperativeMatrixEnabled: Boolean
 ) {
     val apiVersion: String
         get() = "$apiVersionMajor.$apiVersionMinor.$apiVersionPatch"
 
     val supportsComputeSubgroups: Boolean
         get() = subgroupSize > 0 && (subgroupSupportedStages and COMPUTE_SHADER_STAGE_BIT) != 0
+
+    val supportsComputeSubgroupArithmetic: Boolean
+        get() = supportsComputeSubgroups &&
+            (subgroupSupportedOperations and SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0
+
+    val supportsComputeSubgroupReduction: Boolean
+        get() = supportsComputeSubgroupArithmetic
+
+    val supportsComputeSubgroupShuffle: Boolean
+        get() = supportsComputeSubgroups &&
+            (subgroupSupportedOperations and SUBGROUP_FEATURE_SHUFFLE_BIT) != 0
+
+    val supportsComputeSubgroupShuffleRelative: Boolean
+        get() = supportsComputeSubgroups &&
+            (subgroupSupportedOperations and SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT) != 0
+
+    val supportsComputeTimestampQueries: Boolean
+        get() = computeTimestampQueriesSupported &&
+            computeQueueTimestampValidBits > 0 && timestampPeriodNanoseconds > 0.0
 
     val hasAcceleratedInt8DotProduct: Boolean
         get() = shaderIntegerDotProduct &&
@@ -84,13 +117,23 @@ data class VulkanDeviceCapabilities(
                 integerDotProduct4x8BitPackedSignedAccelerated ||
                 integerDotProduct4x8BitPackedUnsignedAccelerated)
 
-    val hasUsableCooperativeMatrixConfiguration: Boolean
+    val canUseIntegerDotProductKernel: Boolean
+        get() = shaderIntegerDotProduct && shaderIntegerDotProductEnabled &&
+            hasAcceleratedInt8DotProduct
+
+    val hasSupportedCooperativeMatrixConfiguration: Boolean
         get() = cooperativeMatrix &&
             (cooperativeMatrixSupportedStages and COMPUTE_SHADER_STAGE_BIT) != 0 &&
             cooperativeMatrixTypes.isNotEmpty()
 
+    val hasUsableCooperativeMatrixConfiguration: Boolean
+        get() = cooperativeMatrixEnabled && hasSupportedCooperativeMatrixConfiguration
+
     companion object {
         private const val COMPUTE_SHADER_STAGE_BIT = 0x00000020
+        private const val SUBGROUP_FEATURE_ARITHMETIC_BIT = 0x00000004
+        private const val SUBGROUP_FEATURE_SHUFFLE_BIT = 0x00000010
+        private const val SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT = 0x00000020
 
         fun fromJson(payload: String): VulkanDeviceCapabilities {
             val json = org.json.JSONObject(payload)
@@ -167,7 +210,33 @@ data class VulkanDeviceCapabilities(
                 cooperativeMatrixRobustBufferAccess =
                     json.optBoolean("cooperativeMatrixRobustBufferAccess"),
                 cooperativeMatrixSupportedStages = json.optInt("cooperativeMatrixSupportedStages"),
-                cooperativeMatrixTypes = matrixTypes
+                cooperativeMatrixTypes = matrixTypes,
+                effectiveApiVersionMajor = json.optInt(
+                    "effectiveApiVersionMajor",
+                    json.optInt("apiVersionMajor")
+                ),
+                effectiveApiVersionMinor = json.optInt(
+                    "effectiveApiVersionMinor",
+                    json.optInt("apiVersionMinor")
+                ),
+                effectiveApiVersionPatch = json.optInt(
+                    "effectiveApiVersionPatch",
+                    json.optInt("apiVersionPatch")
+                ),
+                timestampPeriodNanoseconds = json.optDouble("timestampPeriodNanoseconds"),
+                timestampComputeAndGraphics = json.optBoolean("timestampComputeAndGraphics"),
+                computeQueueTimestampValidBits = json.optInt("computeQueueTimestampValidBits"),
+                computeTimestampQueriesSupported = json.optBoolean(
+                    "computeTimestampQueriesSupported",
+                    json.optInt("computeQueueTimestampValidBits") > 0
+                ),
+                shaderFloat16FeatureSupported = json.optBoolean("shaderFloat16FeatureSupported"),
+                shaderFloat16FeatureEnabled = json.optBoolean("shaderFloat16FeatureEnabled"),
+                shaderInt8FeatureEnabled = json.optBoolean("shaderInt8FeatureEnabled"),
+                storageBuffer16BitAccessEnabled = json.optBoolean("storageBuffer16BitAccessEnabled"),
+                subgroupSizeControlEnabled = json.optBoolean("subgroupSizeControlEnabled"),
+                shaderIntegerDotProductEnabled = json.optBoolean("shaderIntegerDotProductEnabled"),
+                cooperativeMatrixEnabled = json.optBoolean("cooperativeMatrixEnabled")
             )
         }
     }
