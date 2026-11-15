@@ -447,6 +447,31 @@ class TextModalityPreservationTest {
     }
 
     @Test
+    fun structuredJsonPayloadControlTokensAreEscapedExactlyOnce() {
+        val raw = JSONObject()
+            .put("note", "Literal <EOS> and <ASSISTANT>.")
+            .toString()
+
+        val chunk = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Structured literal controls",
+            chunkSize = 256,
+            overlap = 0
+        ).single()
+
+        assertEquals(TextModality.STRUCTURED_DATA, chunk.modality)
+
+        val tokenizer = Tokenizer()
+        val ids = tokenizer.encode(chunk.content)
+        assertFalse(ids.contains(Tokenizer.EOS_ID))
+        assertFalse(ids.contains(Tokenizer.ASSISTANT_ID))
+        assertEquals(
+            "note: Literal <EOS> and <ASSISTANT>.",
+            tokenizer.decode(ids, keepControlTokens = true)
+        )
+    }
+
+    @Test
     fun structuredPlainTextFormattingPreservesCrLfLfAndCrSeparators() {
         val raw = "alpha  \r\nbeta\n  gamma\rdelta\r\n"
 

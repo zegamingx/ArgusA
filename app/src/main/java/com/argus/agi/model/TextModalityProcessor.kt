@@ -997,7 +997,10 @@ object TextModalityProcessor {
      * Formats recognized structured records line-by-line while retaining every original
      * CR, LF, and CRLF separator. Unrecognized plain-text lines remain unchanged.
      */
-    internal fun formatStructuredTextPreservingLineEndings(text: String): String {
+    internal fun formatStructuredTextPreservingLineEndings(
+        text: String,
+        escapePlainText: Boolean = false
+    ): String {
         if (text.isEmpty()) return text
 
         val result = StringBuilder(text.length)
@@ -1007,7 +1010,15 @@ object TextModalityProcessor {
         while (cursor < text.length) {
             val character = text[cursor]
             if (character == '\r' || character == '\n') {
-                result.append(formatStructuredLineIfJson(text.substring(lineStart, cursor)))
+                val line = text.substring(lineStart, cursor)
+                val formatted = formatStructuredLineIfJson(line)
+                result.append(
+                    if (escapePlainText && formatted == line) {
+                        Tokenizer.escapeLiteralControlTokens(line)
+                    } else {
+                        formatted
+                    }
+                )
                 if (character == '\r' && cursor + 1 < text.length && text[cursor + 1] == '\n') {
                     result.append("\r\n")
                     cursor += 2
@@ -1022,7 +1033,15 @@ object TextModalityProcessor {
         }
 
         if (lineStart < text.length) {
-            result.append(formatStructuredLineIfJson(text.substring(lineStart)))
+            val line = text.substring(lineStart)
+            val formatted = formatStructuredLineIfJson(line)
+            result.append(
+                if (escapePlainText && formatted == line) {
+                    Tokenizer.escapeLiteralControlTokens(line)
+                } else {
+                    formatted
+                }
+            )
         }
         return result.toString()
     }
@@ -1058,8 +1077,9 @@ object TextModalityProcessor {
         documentTitle: String,
         chunkSize: Int
     ): List<ProcessedChunk> {
-        val formattedText = Tokenizer.escapeLiteralControlTokens(
-            formatStructuredTextPreservingLineEndings(text)
+        val formattedText = formatStructuredTextPreservingLineEndings(
+            text,
+            escapePlainText = true
         )
         if (formattedText.isBlank()) return emptyList()
 
