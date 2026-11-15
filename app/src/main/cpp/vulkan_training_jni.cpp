@@ -22,7 +22,9 @@ constexpr char kLogTag[] = "ArgusVulkan";
 constexpr uint32_t kLocalWorkGroupSize = 64;
 
 struct AdamwPushConstants {
-    uint32_t elementCount;
+    uint32_t totalElementCount;
+    uint32_t segmentOffset;
+    uint32_t segmentElementCount;
     float learningRate;
     float beta1;
     float beta2;
@@ -30,11 +32,16 @@ struct AdamwPushConstants {
     float biasCorrection2;
     float epsilon;
     float gradientClipFactor;
+    float weightDecay;
 };
 
-// Both layouts must match their GLSL push-constant blocks exactly.
-static_assert(sizeof(AdamwPushConstants) == 32);
-static_assert(offsetof(AdamwPushConstants, gradientClipFactor) == 28);
+// The push-constant layout must match the GLSL block exactly.
+static_assert(sizeof(AdamwPushConstants) == 44);
+static_assert(offsetof(AdamwPushConstants, segmentOffset) == 4);
+static_assert(offsetof(AdamwPushConstants, segmentElementCount) == 8);
+static_assert(offsetof(AdamwPushConstants, learningRate) == 12);
+static_assert(offsetof(AdamwPushConstants, gradientClipFactor) == 36);
+static_assert(offsetof(AdamwPushConstants, weightDecay) == 40);
 
 struct LinearPushConstants {
     uint32_t rowCount;
@@ -89,6 +96,13 @@ struct GroupArrays {
     jfloatArray secondMoments = nullptr;
     jsize elementCount = 0;
     size_t packedOffset = 0;
+    float weightDecay = 0.0f;
+};
+
+struct AdamwSegment {
+    uint32_t elementOffset = 0;
+    uint32_t elementCount = 0;
+    float weightDecay = 0.0f;
 };
 
 std::mutex gRuntimeMutex;
@@ -620,7 +634,9 @@ bool initializeRuntime() {
     VkPushConstantRange pushConstantRange{};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(LinearPushConstants);
+    pushConstantRange.size = static_cast<uint32_t>(
+        std::max(sizeof(AdamwPushConstants), sizeof(LinearPushConstants))
+    );
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -961,7 +977,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
     }
 
     const jsize groupCount = env->GetArrayLength(parameterGroups);
-    if (groupCount <= 0 ||
+    if (env->ExceptionCheck() || groupCount <= 0 ||
         env->GetArrayLength(gradientGroups) != groupCount ||
         env->GetArrayLength(firstMomentGroups) != groupCount ||
         env->GetArrayLength(secondMomentGroups) != groupCount ||
@@ -970,8 +986,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
     }
 
     std::vector<GroupArrays> groups;
+    std::vector<AdamwSegment> segments;
     try {
         groups.resize(static_cast<size_t>(groupCount));
+        segments.reserve(static_cast<size_t>(groupCount));
     } catch (const std::bad_alloc&) {
         return JNI_FALSE;
     }
@@ -1007,7 +1025,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         const jsize firstMomentCount = env->GetArrayLength(group.firstMoments);
         const jsize secondMomentCount = env->GetArrayLength(group.secondMoments);
 
-        if (parameterCount <= 0 ||
+        if (env->ExceptionCheck() ||
+            parameterCount <= 0 ||
             gradientCount != parameterCount ||
             firstMomentCount != parameterCount ||
             secondMomentCount != parameterCount) {
@@ -1017,7 +1036,18 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         }
         group.elementCount = parameterCount;
 
-        group.packedOffset = totalElements;
+        env->GetFloatArrayRegion(weightDecayByGroup, index, 1, &group.weightDecay);
+        if (env->ExceptionCheck() ||
+            !std::isfinite(group.weightDecay) ||
+            group.weightDecay < 0.0f) {
+            logError("Vulkan AdamW weight decay must be finite and non-negative.");
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
+        if (group.weightDecay == 0.0f) {
+            group.weightDecay = 0.0f;
+        }
+
         const size_t count = static_cast<size_t>(group.elementCount);
         if (totalElements > std::numeric_limits<size_t>::max() - count) {
             releaseGroupReferences(env, groups);
@@ -1028,23 +1058,65 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
 
     if (totalElements == 0 ||
         totalElements > std::numeric_limits<uint32_t>::max() ||
-        totalElements > std::numeric_limits<size_t>::max() / (5u * sizeof(float))) {
+        totalElements > std::numeric_limits<size_t>::max() / (4u * sizeof(float))) {
         releaseGroupReferences(env, groups);
         return JNI_FALSE;
     }
 
-    const size_t packedFloatCount = totalElements * 5u;
+    // Sort tensors by decay rate so all tensors sharing the same scalar
+    // weight decay occupy one contiguous range. This removes the per-element
+    // decay array while preserving the original Java array references.
+    std::sort(
+        groups.begin(),
+        groups.end(),
+        [](const GroupArrays& left, const GroupArrays& right) {
+            return left.weightDecay < right.weightDecay;
+        }
+    );
+
+    size_t packedOffset = 0;
+    for (GroupArrays& group : groups) {
+        group.packedOffset = packedOffset;
+        const uint32_t groupElementCount =
+            static_cast<uint32_t>(group.elementCount);
+
+        if (segments.empty() ||
+            segments.back().weightDecay != group.weightDecay) {
+            segments.push_back(AdamwSegment{
+                static_cast<uint32_t>(packedOffset),
+                groupElementCount,
+                group.weightDecay
+            });
+        } else {
+            AdamwSegment& segment = segments.back();
+            if (groupElementCount >
+                std::numeric_limits<uint32_t>::max() - segment.elementCount) {
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+            segment.elementCount += groupElementCount;
+        }
+
+        packedOffset += static_cast<size_t>(groupElementCount);
+    }
+
+    if (packedOffset != totalElements || segments.empty()) {
+        releaseGroupReferences(env, groups);
+        return JNI_FALSE;
+    }
+
+    for (const AdamwSegment& segment : segments) {
+        if (calculateDispatchWorkGroupCount(segment.elementCount) == 0u) {
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
+    }
+
+    const size_t packedFloatCount = totalElements * 4u;
     const size_t byteCount = packedFloatCount * sizeof(float);
     if (byteCount > static_cast<size_t>(
             gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange
         )) {
-        releaseGroupReferences(env, groups);
-        return JNI_FALSE;
-    }
-
-    const uint32_t workGroupCount =
-        calculateDispatchWorkGroupCount(static_cast<uint64_t>(totalElements));
-    if (workGroupCount == 0u) {
         releaseGroupReferences(env, groups);
         return JNI_FALSE;
     }
@@ -1054,16 +1126,14 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         return JNI_FALSE;
     }
 
-    // The mapped Vulkan allocation is the final staging destination. Avoid
-    // allocating a second native tensor vector and copying it into the buffer.
+    // One mapped allocation stages four tensor arrays. Weight decay is now a
+    // scalar per contiguous segment, not a fifth full-size tensor.
     float* parameterValues = static_cast<float*>(gRuntime.mappedStorage);
     float* gradientValues = parameterValues + totalElements;
     float* firstMomentValues = gradientValues + totalElements;
     float* secondMomentValues = firstMomentValues + totalElements;
-    float* decayValues = secondMomentValues + totalElements;
 
-    for (jsize index = 0; index < groupCount; ++index) {
-        GroupArrays& group = groups[static_cast<size_t>(index)];
+    for (const GroupArrays& group : groups) {
         const size_t offset = group.packedOffset;
         const jsize count = group.elementCount;
 
@@ -1073,38 +1143,43 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             count,
             parameterValues + offset
         );
+        if (env->ExceptionCheck()) {
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
+
         env->GetFloatArrayRegion(
             group.gradients,
             0,
             count,
             gradientValues + offset
         );
+        if (env->ExceptionCheck()) {
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
+
         env->GetFloatArrayRegion(
             group.firstMoments,
             0,
             count,
             firstMomentValues + offset
         );
+        if (env->ExceptionCheck()) {
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
+
         env->GetFloatArrayRegion(
             group.secondMoments,
             0,
             count,
             secondMomentValues + offset
         );
-
-        jfloat decay = 0.0f;
-        env->GetFloatArrayRegion(weightDecayByGroup, index, 1, &decay);
-
         if (env->ExceptionCheck()) {
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
         }
-
-        std::fill(
-            decayValues + offset,
-            decayValues + offset + static_cast<size_t>(count),
-            decay
-        );
     }
 
     if (!gRuntime.hostCoherent) {
@@ -1179,32 +1254,39 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         nullptr
     );
 
-    const AdamwPushConstants pushConstants{
-        static_cast<uint32_t>(totalElements),
-        learningRate,
-        beta1,
-        beta2,
-        biasCorrection1,
-        biasCorrection2,
-        epsilon,
-        gradientClipFactor
-    };
+    for (const AdamwSegment& segment : segments) {
+        const AdamwPushConstants pushConstants{
+            static_cast<uint32_t>(totalElements),
+            segment.elementOffset,
+            segment.elementCount,
+            learningRate,
+            beta1,
+            beta2,
+            biasCorrection1,
+            biasCorrection2,
+            epsilon,
+            gradientClipFactor,
+            segment.weightDecay
+        };
 
-    vkCmdPushConstants(
-        gRuntime.commandBuffer,
-        gRuntime.pipelineLayout,
-        VK_SHADER_STAGE_COMPUTE_BIT,
-        0,
-        sizeof(AdamwPushConstants),
-        &pushConstants
-    );
+        vkCmdPushConstants(
+            gRuntime.commandBuffer,
+            gRuntime.pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            sizeof(AdamwPushConstants),
+            &pushConstants
+        );
 
-    vkCmdDispatch(
-        gRuntime.commandBuffer,
-        static_cast<uint32_t>(workGroupCount),
-        1,
-        1
-    );
+        const uint32_t workGroupCount =
+            calculateDispatchWorkGroupCount(segment.elementCount);
+        vkCmdDispatch(
+            gRuntime.commandBuffer,
+            workGroupCount,
+            1,
+            1
+        );
+    }
 
     VkMemoryBarrier computeToHostBarrier{};
     computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;

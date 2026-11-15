@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.28...4.5)
 
+# Argus uses C++23 headers, not C++ standard-library modules. Keep the
+# optional import-std path disabled for Android cross-compilation: CMake may
+# otherwise discover host GCC module metadata instead of Android NDK libc++.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+set(CMAKE_CXX_MODULE_STD OFF)
+
 project(argus_training LANGUAGES CXX)
 
 # Export a compile database for native diagnostics and static-analysis tooling.
@@ -45,71 +51,50 @@ if(NOT ARGUS_GLSLC)
     )
 endif()
 
+set(ARGUS_SPIRV_EMBED_SCRIPT
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv_header.cmake"
+)
+
 function(argus_compile_shader source_file binary_name header_name array_symbol size_symbol)
     set(shader_target_environment "vulkan1.0")
     if(ARGC GREATER 5)
         set(shader_target_environment "${ARGV5}")
     endif()
+
     set(shader_binary "${CMAKE_CURRENT_BINARY_DIR}/${binary_name}")
     set(shader_header "${CMAKE_CURRENT_BINARY_DIR}/${header_name}")
 
-    set_property(
-        DIRECTORY APPEND
-        PROPERTY CMAKE_CONFIGURE_DEPENDS "${source_file}"
-    )
-
-    execute_process(
+    # Model shader compilation as a proper build rule. Unchanged shaders are
+    # not recompiled on every CMake configure, and incremental builds only
+    # regenerate the SPIR-V/header pair whose inputs actually changed.
+    add_custom_command(
+        OUTPUT
+            "${shader_binary}"
+            "${shader_header}"
         COMMAND
             "${ARGUS_GLSLC}"
-            --target-env=${shader_target_environment}
+            "--target-env=${shader_target_environment}"
             -O
             "${source_file}"
             -o "${shader_binary}"
-        RESULT_VARIABLE shader_result
-        OUTPUT_VARIABLE shader_stdout
-        ERROR_VARIABLE shader_stderr
+        COMMAND
+            "${CMAKE_COMMAND}"
+            "-DINPUT_FILE=${shader_binary}"
+            "-DOUTPUT_FILE=${shader_header}"
+            "-DARRAY_SYMBOL=${array_symbol}"
+            "-DSIZE_SYMBOL=${size_symbol}"
+            -P "${ARGUS_SPIRV_EMBED_SCRIPT}"
+        DEPENDS
+            "${source_file}"
+            "${ARGUS_SPIRV_EMBED_SCRIPT}"
+        COMMENT "Compiling Vulkan shader ${binary_name}"
+        VERBATIM
     )
 
-    if(NOT shader_result EQUAL 0)
-        message(FATAL_ERROR
-            "Vulkan shader compilation failed for ${source_file}.\n"
-            "stdout: ${shader_stdout}\n"
-            "stderr: ${shader_stderr}"
-        )
-    endif()
-
-    file(READ "${shader_binary}" shader_hex HEX)
-    string(LENGTH "${shader_hex}" shader_hex_length)
-    math(EXPR shader_byte_count "${shader_hex_length} / 2")
-    math(EXPR shader_word_remainder "${shader_byte_count} % 4")
-
-    if(shader_byte_count LESS 20 OR NOT shader_word_remainder EQUAL 0)
-        message(FATAL_ERROR "Compiled SPIR-V is incomplete or not word-aligned: ${source_file}")
-    endif()
-
-    file(
-        WRITE "${shader_header}"
-        "#pragma once\n"
-        "#include <cstddef>\n"
-        "#include <cstdint>\n"
-        "alignas(4) static const unsigned char ${array_symbol}[] = {\n"
-    )
-
-    set(shader_offset 0)
-    while(shader_offset LESS shader_hex_length)
-        string(SUBSTRING "${shader_hex}" ${shader_offset} 2 shader_byte)
-        file(APPEND "${shader_header}" "0x${shader_byte},")
-        math(EXPR shader_offset "${shader_offset} + 2")
-        math(EXPR shader_column "${shader_offset} % 32")
-        if(shader_column EQUAL 0)
-            file(APPEND "${shader_header}" "\n")
-        endif()
-    endwhile()
-
-    file(
-        APPEND "${shader_header}"
-        "\n};\n"
-        "static constexpr std::size_t ${size_symbol} = ${shader_byte_count};\n"
+    set_property(
+        GLOBAL
+        APPEND
+        PROPERTY ARGUS_SHADER_HEADERS "${shader_header}"
     )
 endfunction()
 
@@ -138,7 +123,29 @@ argus_compile_shader(
     "vulkan1.2"
 )
 
+get_property(
+    ARGUS_SHADER_HEADERS
+    GLOBAL
+    PROPERTY ARGUS_SHADER_HEADERS
+)
+
+add_custom_target(
+    argus_shader_headers
+    DEPENDS ${ARGUS_SHADER_HEADERS}
+)
+
 add_library(argus_training SHARED vulkan_training_jni.cpp)
+add_dependencies(argus_training argus_shader_headers)
+
+# Be explicit at target scope as well as directory scope. The backend does not
+# use C++ named modules, and Android NDK r30's cross-toolchain must use libc++
+# headers rather than host libstdc++ module interfaces.
+set_target_properties(
+    argus_training
+    PROPERTIES
+        CXX_SCAN_FOR_MODULES OFF
+        CXX_MODULE_STD OFF
+)
 
 target_compile_features(argus_training PRIVATE cxx_std_23)
 target_compile_options(argus_training PRIVATE -Wall -Wextra -Wpedantic)

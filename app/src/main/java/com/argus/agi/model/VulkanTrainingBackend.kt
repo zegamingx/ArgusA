@@ -250,10 +250,75 @@ internal object VulkanTrainingBackend {
             gradientClipFactor = 1f
         )
 
-        return adamwUpdated &&
-            approximatelyEqual(parameters, floatArrayOf(0.99f, 2.01f), 1e-4f) &&
-            approximatelyEqual(firstMoments, floatArrayOf(0.01f, -0.02f), 1e-5f) &&
-            approximatelyEqual(secondMoments, floatArrayOf(0.00001f, 0.00004f), 1e-7f)
+        if (!adamwUpdated ||
+            !approximatelyEqual(parameters, floatArrayOf(0.99f, 2.01f), 1e-4f) ||
+            !approximatelyEqual(firstMoments, floatArrayOf(0.01f, -0.02f), 1e-5f) ||
+            !approximatelyEqual(secondMoments, floatArrayOf(0.00001f, 0.00004f), 1e-7f)) {
+            return false
+        }
+
+        // Weight-decay groups are intentionally interleaved. The native
+        // optimizer sorts them into contiguous GPU segments and must still
+        // commit every result to its original Java tensor reference.
+        val groupedParameterReference = arrayOf(
+            floatArrayOf(1.0f, 2.0f),
+            floatArrayOf(3.0f, 4.0f),
+            floatArrayOf(-1.0f, 0.5f)
+        )
+        val groupedParameters = Array(groupedParameterReference.size) {
+            groupedParameterReference[it].copyOf()
+        }
+        val groupedGradients = arrayOf(
+            floatArrayOf(0.1f, -0.2f),
+            floatArrayOf(0.3f, -0.4f),
+            floatArrayOf(0.5f, -0.6f)
+        )
+        val groupedFirstMoments = Array(groupedParameters.size) { FloatArray(2) }
+        val groupedSecondMoments = Array(groupedParameters.size) { FloatArray(2) }
+        val groupedDecay = floatArrayOf(0.01f, 0.0f, 0.01f)
+        val groupedUpdated = nativeApplyAdamWUpdate(
+            parameterGroups = groupedParameters,
+            gradientGroups = groupedGradients,
+            firstMomentGroups = groupedFirstMoments,
+            secondMomentGroups = groupedSecondMoments,
+            weightDecayByGroup = groupedDecay,
+            learningRate = 0.01f,
+            beta1 = 0.9f,
+            beta2 = 0.999f,
+            biasCorrection1 = 0.1f,
+            biasCorrection2 = 0.001f,
+            epsilon = 1e-8f,
+            gradientClipFactor = 1f
+        )
+        if (!groupedUpdated) return false
+
+        for (groupIndex in groupedParameters.indices) {
+            val expectedParameters = FloatArray(2)
+            val expectedFirstMoments = FloatArray(2)
+            val expectedSecondMoments = FloatArray(2)
+            for (elementIndex in 0 until 2) {
+                val gradient = groupedGradients[groupIndex][elementIndex]
+                val firstMoment = 0.1f * gradient
+                val secondMoment = 0.001f * gradient * gradient
+                val correctedFirst = firstMoment / 0.1f
+                val correctedSecond = secondMoment / 0.001f
+                val parameter = groupedParameterReference[groupIndex][elementIndex]
+                val update = correctedFirst /
+                    (kotlin.math.sqrt(correctedSecond) + 1e-8f) +
+                    groupedDecay[groupIndex] * parameter
+
+                expectedParameters[elementIndex] = parameter - 0.01f * update
+                expectedFirstMoments[elementIndex] = firstMoment
+                expectedSecondMoments[elementIndex] = secondMoment
+            }
+
+            if (!approximatelyEqual(groupedParameters[groupIndex], expectedParameters, 1e-4f) ||
+                !approximatelyEqual(groupedFirstMoments[groupIndex], expectedFirstMoments, 1e-5f) ||
+                !approximatelyEqual(groupedSecondMoments[groupIndex], expectedSecondMoments, 1e-7f)) {
+                return false
+            }
+        }
+        return true
     }
 
     /**
