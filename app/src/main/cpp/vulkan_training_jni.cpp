@@ -1820,11 +1820,13 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         }
     }
 
-    const uint64_t workGroupCount =
-        (outputElements + kLocalWorkGroupSize - 1u) / kLocalWorkGroupSize;
-    if (workGroupCount == 0 ||
-        workGroupCount > gRuntime.maxComputeWorkGroupCountX) {
-        logError("Vulkan FP16 linear dispatch exceeds the device work-group limit.");
+    // The FP16 shader uses a grid-stride loop, so clamp the physical
+    // dispatch to the device X limit and let each invocation cover its
+    // additional output elements through the shader stride.
+    const uint32_t workGroupCount =
+        calculateDispatchWorkGroupCount(outputElements);
+    if (workGroupCount == 0u) {
+        logError("Vulkan FP16 linear dispatch has no available compute work-groups.");
         return JNI_FALSE;
     }
 
