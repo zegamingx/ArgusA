@@ -37,6 +37,31 @@ data class VulkanGpuPerformanceMetrics(
     }
 }
 
+
+internal data class VulkanTensorAllocation internal constructor(
+    internal val nativeHandle: Long,
+    val byteCount: Long
+)
+
+internal data class VulkanTensorArenaMetrics(
+    val capacityBytes: Long = 0L,
+    val allocatedBytes: Long = 0L,
+    val activeAllocationCount: Int = 0,
+    val deviceLocalMemory: Boolean = false
+) {
+    companion object {
+        fun fromJson(payload: String): VulkanTensorArenaMetrics {
+            val json = org.json.JSONObject(payload)
+            return VulkanTensorArenaMetrics(
+                capacityBytes = json.optLong("capacityBytes"),
+                allocatedBytes = json.optLong("allocatedBytes"),
+                activeAllocationCount = json.optInt("activeAllocationCount"),
+                deviceLocalMemory = json.optBoolean("deviceLocalMemory")
+            )
+        }
+    }
+}
+
 data class VulkanCooperativeMatrixType(
     val mSize: Int,
     val nSize: Int,
@@ -348,6 +373,10 @@ internal object VulkanTrainingBackend {
     val gpuPerformanceMetrics: StateFlow<VulkanGpuPerformanceMetrics> =
         _gpuPerformanceMetrics.asStateFlow()
 
+    private val _tensorArenaMetrics = MutableStateFlow(VulkanTensorArenaMetrics())
+    val tensorArenaMetrics: StateFlow<VulkanTensorArenaMetrics> =
+        _tensorArenaMetrics.asStateFlow()
+
     internal val hasAttemptedInitialization: Boolean
         get() = initializationAttempted
 
@@ -404,6 +433,87 @@ internal object VulkanTrainingBackend {
                     Log.w(TAG, "Failed to release a partially initialized Vulkan runtime.", error)
                 }
         }
+    }
+
+
+    private fun refreshTensorArenaMetrics() {
+        if (!nativeReady) return
+        runCatching {
+            VulkanTensorArenaMetrics.fromJson(nativeGetTensorArenaMetrics())
+        }.onSuccess { metrics ->
+            _tensorArenaMetrics.value = metrics
+        }.onFailure { error ->
+            Log.d(TAG, "Vulkan tensor-arena metrics could not be read.", error)
+        }
+    }
+
+    /**
+     * Allocates persistent Vulkan storage. New contents are undefined until uploaded
+     * or initialized by a future GPU operation; this API does not change model ownership.
+     */
+    @Synchronized
+    fun allocateGpuTensor(byteCount: Long): VulkanTensorAllocation? {
+        if (!isRuntimeAvailable || byteCount <= 0L) return null
+        val handle = try {
+            nativeAllocateTensor(byteCount)
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Vulkan tensor allocation entry point is unavailable.", error)
+            return null
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Vulkan tensor allocation failed.", error)
+            return null
+        }
+        if (handle == 0L) return null
+        refreshTensorArenaMetrics()
+        return VulkanTensorAllocation(handle, byteCount)
+    }
+
+    @Synchronized
+    fun uploadGpuTensor(allocation: VulkanTensorAllocation, bytes: ByteArray): Boolean {
+        if (!isRuntimeAvailable || bytes.size.toLong() != allocation.byteCount) return false
+        val uploaded = try {
+            nativeUploadTensor(allocation.nativeHandle, bytes)
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Vulkan tensor upload entry point is unavailable.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Vulkan tensor upload failed.", error)
+            false
+        }
+        if (uploaded) refreshTensorArenaMetrics()
+        return uploaded
+    }
+
+    @Synchronized
+    fun downloadGpuTensor(allocation: VulkanTensorAllocation, destination: ByteArray): Boolean {
+        if (!isRuntimeAvailable || destination.size.toLong() != allocation.byteCount) return false
+        val downloaded = try {
+            nativeDownloadTensor(allocation.nativeHandle, destination)
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Vulkan tensor readback entry point is unavailable.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Vulkan tensor readback failed.", error)
+            false
+        }
+        if (downloaded) refreshTensorArenaMetrics()
+        return downloaded
+    }
+
+    @Synchronized
+    fun releaseGpuTensor(allocation: VulkanTensorAllocation): Boolean {
+        if (!isRuntimeAvailable) return false
+        val released = try {
+            nativeReleaseTensor(allocation.nativeHandle)
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Vulkan tensor release entry point is unavailable.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Vulkan tensor release failed.", error)
+            false
+        }
+        if (released) refreshTensorArenaMetrics()
+        return released
     }
 
     @Synchronized
@@ -1524,6 +1634,19 @@ internal object VulkanTrainingBackend {
         epsilon: Float,
         gradientClipFactor: Float
     ): Boolean
+
+    private external fun nativeAllocateTensor(byteCount: Long): Long
+
+    private external fun nativeUploadTensor(tensorHandle: Long, source: ByteArray): Boolean
+
+    private external fun nativeDownloadTensor(
+        tensorHandle: Long,
+        destination: ByteArray
+    ): Boolean
+
+    private external fun nativeReleaseTensor(tensorHandle: Long): Boolean
+
+    private external fun nativeGetTensorArenaMetrics(): String
 
     private external fun nativeDestroy()
 }
