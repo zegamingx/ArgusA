@@ -1437,10 +1437,22 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
 
     const uint64_t inputElements =
         static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(inputColumns);
-    const uint64_t weightElements =
-        static_cast<uint64_t>(batchCount) *
-        static_cast<uint64_t>(inputColumns) *
-        static_cast<uint64_t>(outputColumns);
+    // Bound the intermediate product before multiplying by outputColumns.
+    // The JNI array length must fit jsize, so rejecting earlier also prevents
+    // uint64_t wraparound in the three-dimensional weight count.
+    const uint64_t maximumArrayElements =
+        static_cast<uint64_t>(std::numeric_limits<jsize>::max());
+    const uint64_t batchInputWidth = static_cast<uint64_t>(batchCount);
+    const uint64_t inputColumnCount = static_cast<uint64_t>(inputColumns);
+    const uint64_t outputColumnCount = static_cast<uint64_t>(outputColumns);
+    if (batchInputWidth > maximumArrayElements / inputColumnCount) {
+        return JNI_FALSE;
+    }
+    const uint64_t batchInputElements = batchInputWidth * inputColumnCount;
+    if (batchInputElements > maximumArrayElements / outputColumnCount) {
+        return JNI_FALSE;
+    }
+    const uint64_t weightElements = batchInputElements * outputColumnCount;
     const uint64_t outputElements =
         static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(outputColumns);
     const uint64_t totalElements = inputElements + weightElements + outputElements;
@@ -1708,10 +1720,22 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
 
     const uint64_t inputElements =
         static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(inputColumns);
-    const uint64_t weightElements =
-        static_cast<uint64_t>(batchCount) *
-        static_cast<uint64_t>(inputColumns) *
-        static_cast<uint64_t>(outputColumns);
+    // Bound the intermediate product before multiplying by outputColumns.
+    // The JNI array length must fit jsize, so rejecting earlier also prevents
+    // uint64_t wraparound in the three-dimensional weight count.
+    const uint64_t maximumArrayElements =
+        static_cast<uint64_t>(std::numeric_limits<jsize>::max());
+    const uint64_t batchInputWidth = static_cast<uint64_t>(batchCount);
+    const uint64_t inputColumnCount = static_cast<uint64_t>(inputColumns);
+    const uint64_t outputColumnCount = static_cast<uint64_t>(outputColumns);
+    if (batchInputWidth > maximumArrayElements / inputColumnCount) {
+        return JNI_FALSE;
+    }
+    const uint64_t batchInputElements = batchInputWidth * inputColumnCount;
+    if (batchInputElements > maximumArrayElements / outputColumnCount) {
+        return JNI_FALSE;
+    }
+    const uint64_t weightElements = batchInputElements * outputColumnCount;
     const uint64_t outputElements =
         static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(outputColumns);
 
