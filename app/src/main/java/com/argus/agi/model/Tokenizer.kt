@@ -1220,7 +1220,14 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             var matchedSubword = false
             var len = minOf(localMaxLen, n - i)
             while (len >= 2) {
-                val id = tokenToId[cleanText.substring(i, i + len)]
+                val candidate = cleanText.substring(i, i + len)
+                // Reserved control IDs must never be selected through the ordinary
+                // subword path. This is essential when a literal token is escaped.
+                val id = if (candidate in CONTROL_TOKENS) {
+                    null
+                } else {
+                    tokenToId[candidate]
+                }
                 if (id != null) {
                     result.add(id)
                     i += len
