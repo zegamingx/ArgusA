@@ -122,17 +122,25 @@ void logError(const char* message, VkResult result = VK_SUCCESS) {
     }
 }
 
-uint32_t calculateDispatchWorkGroupCount(uint64_t invocationCount) {
+uint32_t calculateDispatchGroupCount(uint64_t requiredGroupCount) {
     const uint32_t deviceGroupLimit = gRuntime.maxComputeWorkGroupCountX;
-    if (invocationCount == 0u || deviceGroupLimit == 0u) {
+    if (requiredGroupCount == 0u || deviceGroupLimit == 0u) {
+        return 0u;
+    }
+
+    return static_cast<uint32_t>(
+        std::min<uint64_t>(requiredGroupCount, deviceGroupLimit)
+    );
+}
+
+uint32_t calculateDispatchWorkGroupCount(uint64_t invocationCount) {
+    if (invocationCount == 0u) {
         return 0u;
     }
 
     const uint64_t requiredGroups =
         1u + (invocationCount - 1u) / kLocalWorkGroupSize;
-    return static_cast<uint32_t>(
-        std::min<uint64_t>(requiredGroups, deviceGroupLimit)
-    );
+    return calculateDispatchGroupCount(requiredGroups);
 }
 
 void destroyStorageBuffer() {
@@ -1521,10 +1529,23 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         }
     }
 
+    // Each 8x16 workgroup computes one output tile. The shader advances
+    // over additional tiles by gl_NumWorkGroups.x, so dispatch remains within
+    // the device X limit without rejecting large, otherwise valid matrices.
+    constexpr uint64_t kLinearTileRows = 8u;
+    constexpr uint64_t kLinearTileColumns = 16u;
+    const uint64_t tileRowsPerBatch =
+        1u + (static_cast<uint64_t>(rowsPerBatch) - 1u) / kLinearTileRows;
+    const uint64_t tileColumnsPerBatch =
+        1u + (static_cast<uint64_t>(outputColumns) - 1u) / kLinearTileColumns;
+    const uint64_t totalTileCount =
+        static_cast<uint64_t>(batchCount) *
+        tileRowsPerBatch *
+        tileColumnsPerBatch;
     const uint32_t workGroupCount =
-        calculateDispatchWorkGroupCount(outputElements);
+        calculateDispatchGroupCount(totalTileCount);
     if (workGroupCount == 0u) {
-        logError("Vulkan linear dispatch exceeds the device work-group limit.");
+        logError("Vulkan linear dispatch has no available output tile groups.");
         return JNI_FALSE;
     }
 

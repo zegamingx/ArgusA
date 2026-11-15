@@ -326,10 +326,12 @@ internal object VulkanTrainingBackend {
      * 72 outputs deliberately cross the 64-invocation workgroup boundary.
      */
     private fun verifyBatchedLinearKernel(): Boolean {
+        // Exercise partial 8x16 output tiles, multiple batches, and a K
+        // dimension that requires a second 16-wide shared-memory tile.
         val batchCount = 3
-        val rowsPerBatch = 3
-        val inputColumns = 5
-        val outputColumns = 8
+        val rowsPerBatch = 9
+        val inputColumns = 19
+        val outputColumns = 19
         val rowCount = batchCount * rowsPerBatch
         val input = FloatArray(rowCount * inputColumns) { index ->
             ((index % 17) - 8) * 0.125f
@@ -338,40 +340,57 @@ internal object VulkanTrainingBackend {
         val weights = FloatArray(batchCount * weightsPerBatch) { index ->
             ((index % 13) - 6) * 0.0625f
         }
-        val expected = FloatArray(rowCount * outputColumns)
-
+        val transposedWeights = FloatArray(weights.size)
         for (batchIndex in 0 until batchCount) {
-            val batchInputOffset = batchIndex * rowsPerBatch * inputColumns
-            val batchWeightOffset = batchIndex * weightsPerBatch
-            for (row in 0 until rowsPerBatch) {
-                val inputRowOffset = batchInputOffset + row * inputColumns
-                val outputRowOffset = (batchIndex * rowsPerBatch + row) * outputColumns
+            val batchOffset = batchIndex * weightsPerBatch
+            for (inner in 0 until inputColumns) {
                 for (column in 0 until outputColumns) {
-                    var sum = 0f
-                    for (inner in 0 until inputColumns) {
-                        val inputValue = input[inputRowOffset + inner]
-                        val weightValue = weights[
-                            batchWeightOffset + inner * outputColumns + column
-                        ]
-                        sum += inputValue * weightValue
-                    }
-                    expected[outputRowOffset + column] = sum
+                    transposedWeights[batchOffset + column * inputColumns + inner] =
+                        weights[batchOffset + inner * outputColumns + column]
                 }
             }
         }
 
-        val actual = FloatArray(expected.size)
-        return nativeApplyLinear(
-            input,
-            weights,
-            actual,
-            rows = rowCount,
-            batchCount = batchCount,
-            rowsPerBatch = rowsPerBatch,
-            inputColumns = inputColumns,
-            outputColumns = outputColumns,
-            transposeWeights = false
-        ) && approximatelyEqual(actual, expected, 1e-4f)
+        fun verify(weightValues: FloatArray, transposeWeights: Boolean): Boolean {
+            val expected = FloatArray(rowCount * outputColumns)
+            for (batchIndex in 0 until batchCount) {
+                val batchInputOffset = batchIndex * rowsPerBatch * inputColumns
+                val batchWeightOffset = batchIndex * weightsPerBatch
+                for (row in 0 until rowsPerBatch) {
+                    val inputRowOffset = batchInputOffset + row * inputColumns
+                    val outputRowOffset =
+                        (batchIndex * rowsPerBatch + row) * outputColumns
+                    for (column in 0 until outputColumns) {
+                        var sum = 0f
+                        for (inner in 0 until inputColumns) {
+                            val weightIndex = if (transposeWeights) {
+                                batchWeightOffset + column * inputColumns + inner
+                            } else {
+                                batchWeightOffset + inner * outputColumns + column
+                            }
+                            sum += input[inputRowOffset + inner] * weightValues[weightIndex]
+                        }
+                        expected[outputRowOffset + column] = sum
+                    }
+                }
+            }
+
+            val actual = FloatArray(expected.size)
+            return nativeApplyLinear(
+                input,
+                weightValues,
+                actual,
+                rows = rowCount,
+                batchCount = batchCount,
+                rowsPerBatch = rowsPerBatch,
+                inputColumns = inputColumns,
+                outputColumns = outputColumns,
+                transposeWeights = transposeWeights
+            ) && approximatelyEqual(actual, expected, 1e-4f)
+        }
+
+        return verify(weights, transposeWeights = false) &&
+            verify(transposedWeights, transposeWeights = true)
     }
 
     private fun approximatelyEqual(
