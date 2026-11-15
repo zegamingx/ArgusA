@@ -63,7 +63,7 @@ A release build requires the Argus release signing key at `signing/argus-release
 
 ## GitHub releases
 
-Every push to `main` runs release lint, JUnit/Robolectric unit tests, a signed release build, certificate verification, and an Android 15 (API 35) emulator startup smoke test. The smoke test installs the signed release APK, waits for `ArgusApp` core initialization, and verifies that the process and foreground service remain active. After a successful smoke test, the workflow publishes `ARGUS-v<version>.apk` and the stable `ARGUS.apk` alias to the `Release` tag, then removes superseded versioned APK assets.
+Every push to `main` runs release lint, JUnit/Robolectric unit tests, a signed release build, and APK signature/native-ABI verification. It does not run an Android emulator smoke test. Publishing the signed APK to the `Release` tag is a separate, explicit `workflow_dispatch` operation with `publish_release=true`; ordinary pushes only validate and build.
 
 The private repository keeps the CI signing-key backup in the private GitHub Release named `argus-signing-key`. Repository access therefore also grants access to the app-signing identity. Keep this repository private and restrict collaborator access. Never redistribute the signing-key asset. The asset-pruning step only targets old `ARGUS-v*.apk` files in the `Release` tag and does not touch this signing-key backup.
 
