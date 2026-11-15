@@ -116,7 +116,6 @@ class MainActivity : ComponentActivity() {
                                 com.argus.agi.ui.components.ArgusModernLoadingScreen(
                                     title = "ARGUS",
                                     subtitle = initializationProgress.status,
-                                    progressPercent = initializationProgress.percent,
                                     driverInfo = initializationProgress.driverInfo
                                 )
                             ArgusCoreInitializationState.Ready -> MainScreen(viewModel = viewModel)

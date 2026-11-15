@@ -6,17 +6,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 data class VulkanInitializationProgress(
-    val percent: Int = 0,
     val status: String = "Waiting for model readiness",
     val driverInfo: String = "Vulkan driver detection pending",
     val isInitializing: Boolean = false,
     val isVerified: Boolean = false,
     val isCpuFallback: Boolean = false
-) {
-    init {
-        require(percent in 0..100)
-    }
-}
+)
 
 /**
  * Optional Vulkan Compute backend for batched dense operations and AdamW updates.
@@ -78,7 +73,6 @@ internal object VulkanTrainingBackend {
      * Driver verification is isolated from application cold-start; failure keeps Kotlin CPU active.
      */
     private fun publishInitializationProgress(
-        percent: Int,
         status: String,
         driverInfo: String,
         isInitializing: Boolean,
@@ -86,7 +80,6 @@ internal object VulkanTrainingBackend {
         isCpuFallback: Boolean = false
     ) {
         _initializationProgress.value = VulkanInitializationProgress(
-            percent = percent.coerceIn(0, 100),
             status = status,
             driverInfo = driverInfo,
             isInitializing = isInitializing,
@@ -110,7 +103,6 @@ internal object VulkanTrainingBackend {
     fun initializeAfterModelReady(): Boolean {
         if (isRuntimeAvailable) {
             publishInitializationProgress(
-                percent = 92,
                 status = "Vulkan runtime verified",
                 driverInfo = _initializationProgress.value.driverInfo,
                 isInitializing = false,
@@ -123,7 +115,6 @@ internal object VulkanTrainingBackend {
         initializationAttempted = true
         _runtimeStatus.value = "Preparing Vulkan after model initialization…"
         publishInitializationProgress(
-            percent = 72,
             status = "Initializing Vulkan",
             driverInfo = "Detecting Vulkan compute driver...",
             isInitializing = true
@@ -139,7 +130,6 @@ internal object VulkanTrainingBackend {
                 detectedDriverInfo = runCatching { nativeGetDriverInfo() }
                     .getOrDefault("Vulkan driver information unavailable")
                 publishInitializationProgress(
-                    percent = 84,
                     status = "Verifying Vulkan compute kernels",
                     driverInfo = detectedDriverInfo,
                     isInitializing = true
@@ -152,7 +142,6 @@ internal object VulkanTrainingBackend {
 
             if (verified && runCatching { nativeSupportsFp16() }.getOrDefault(false)) {
                 publishInitializationProgress(
-                    percent = 91,
                     status = "Verifying FP16 acceleration",
                     driverInfo = detectedDriverInfo,
                     isInitializing = true
@@ -178,7 +167,6 @@ internal object VulkanTrainingBackend {
                 _runtimeStatus.value =
                     "Vulkan runtime verified — eligible operations can use the GPU"
                 publishInitializationProgress(
-                    percent = 92,
                     status = "Vulkan runtime verified",
                     driverInfo = detectedDriverInfo,
                     isInitializing = false,
@@ -193,7 +181,6 @@ internal object VulkanTrainingBackend {
                 _currentBackend = "Kotlin CPU"
                 _runtimeStatus.value = "Kotlin CPU fallback — Vulkan self-check was unsuccessful"
                 publishInitializationProgress(
-                    percent = 88,
                     status = "Vulkan unavailable — CPU fallback",
                     driverInfo = detectedDriverInfo,
                     isInitializing = false,
@@ -208,7 +195,6 @@ internal object VulkanTrainingBackend {
             _currentBackend = "Kotlin CPU"
             _runtimeStatus.value = "Kotlin CPU fallback — native Vulkan library unavailable"
             publishInitializationProgress(
-                percent = 88,
                 status = "Vulkan loader unavailable — CPU fallback",
                 driverInfo = "Vulkan driver unavailable",
                 isInitializing = false,
@@ -222,7 +208,6 @@ internal object VulkanTrainingBackend {
             _currentBackend = "Kotlin CPU"
             _runtimeStatus.value = "Kotlin CPU fallback — native Vulkan access was blocked"
             publishInitializationProgress(
-                percent = 88,
                 status = "Vulkan access blocked — CPU fallback",
                 driverInfo = detectedDriverInfo,
                 isInitializing = false,
@@ -236,7 +221,6 @@ internal object VulkanTrainingBackend {
             _currentBackend = "Kotlin CPU"
             _runtimeStatus.value = "Kotlin CPU fallback — insufficient memory for Vulkan initialization"
             publishInitializationProgress(
-                percent = 88,
                 status = "Vulkan memory allocation failed — CPU fallback",
                 driverInfo = detectedDriverInfo,
                 isInitializing = false,
@@ -250,7 +234,6 @@ internal object VulkanTrainingBackend {
             _currentBackend = "Kotlin CPU"
             _runtimeStatus.value = "Kotlin CPU fallback — Vulkan initialization failed"
             publishInitializationProgress(
-                percent = 88,
                 status = "Vulkan initialization failed — CPU fallback",
                 driverInfo = detectedDriverInfo,
                 isInitializing = false,

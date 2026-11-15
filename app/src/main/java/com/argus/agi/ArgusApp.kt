@@ -39,7 +39,6 @@ sealed interface ArgusCoreInitializationState {
 }
 
 data class ArgusCoreInitializationProgress(
-    val percent: Int = 0,
     val status: String = "Assessing device",
     val driverInfo: String = "System Vulkan capability profile pending"
 )
@@ -167,13 +166,11 @@ class ArgusApp : Application() {
     }
 
     private fun publishCoreProgress(
-        percent: Int,
         status: String,
         driverInfo: String? = null
     ) {
         val current = _coreInitializationProgress.value
         _coreInitializationProgress.value = ArgusCoreInitializationProgress(
-            percent = percent.coerceIn(0, 100),
             status = status,
             driverInfo = driverInfo ?: current.driverInfo
         )
@@ -265,30 +262,28 @@ class ArgusApp : Application() {
             coreInitializationJob = applicationScope.launch {
                 try {
                     initializationStage = "Reading system device profile"
-                    publishCoreProgress(8, "Reading device specifications")
+                    publishCoreProgress("Reading device specifications")
                     val profile = hardwareInfo
                     val advertisedVulkan = if (profile.vulkanSupported) {
                         "Vulkan API ${profile.vulkanVersionName} advertised"
                     } else {
                         "Vulkan is not advertised by the system"
                     }
-                    publishCoreProgress(
-                        14,
-                        "System device profile captured",
+                    publishCoreProgress("System device profile captured",
                         "${profile.socManufacturer} ${profile.socModel} · $advertisedVulkan"
                     )
 
                     initializationStage = "Registering device safety monitor"
-                    publishCoreProgress(18, "Assessing device safety")
+                    publishCoreProgress("Assessing device safety")
                     deviceGuard.refreshState()
                     val safety = deviceGuard.safetyState.value
 
                     initializationStage = "Opening local database"
-                    publishCoreProgress(24, "Opening local database")
+                    publishCoreProgress("Opening local database")
                     repository
 
                     initializationStage = "Assessing device compute and memory capacity"
-                    publishCoreProgress(30, "Assessing device compute and memory budget")
+                    publishCoreProgress("Assessing device compute and memory budget")
                     val modelConfig = neuralEngineConfig
                     Log.i(
                         TAG,
@@ -296,39 +291,34 @@ class ArgusApp : Application() {
                             "available RAM ${profile.availRamGb} GB; " +
                             "training safety: ${safety.statusMessage}"
                     )
-                    publishCoreProgress(
-                        36,
-                        "Device assessment complete",
+                    publishCoreProgress("Device assessment complete",
                         "${modelConfig.modelTier.displayName} · ${modelConfig.layerCount} layers · " +
                             "batch ${modelConfig.trainingBatchSize}"
                     )
 
                     initializationStage = "Constructing model and restoring checkpoint"
-                    publishCoreProgress(48, "Constructing or restoring model tensors")
+                    publishCoreProgress("Constructing or restoring model tensors")
                     val engine = neuralEngine
 
                     initializationStage = "Restoring world model"
-                    publishCoreProgress(58, "Restoring local world memory")
+                    publishCoreProgress("Restoring local world memory")
                     worldModel
 
                     initializationStage = "Preparing Genesis manager"
-                    publishCoreProgress(66, "Preparing model lifecycle")
+                    publishCoreProgress("Preparing model lifecycle")
                     genesisModelManager
 
                     // The model constructor has initialized its tensors and loaded any
                     // compatible checkpoint. Vulkan now runs on this IO worker, while
                     // the activity keeps rendering the startup progress screen.
                     initializationStage = "Initializing Vulkan after model readiness"
-                    publishCoreProgress(
-                        72,
-                        "Initializing Vulkan",
+                    publishCoreProgress("Initializing Vulkan",
                         "Detecting Vulkan compute driver..."
                     )
                     val progressObserver = launch {
                         engine.vulkanInitializationProgress.collect { progress ->
                             if (progress.isInitializing || progress.isVerified || progress.isCpuFallback) {
                                 publishCoreProgress(
-                                    percent = progress.percent,
                                     status = progress.status,
                                     driverInfo = progress.driverInfo
                                 )
@@ -342,7 +332,6 @@ class ArgusApp : Application() {
                     }
                     val vulkanProgress = engine.vulkanInitializationProgress.value
                     publishCoreProgress(
-                        percent = if (vulkanReady) 92 else 88,
                         status = if (vulkanReady) {
                             "Vulkan runtime verified"
                         } else {
@@ -352,11 +341,11 @@ class ArgusApp : Application() {
                     )
 
                     initializationStage = "Starting training manager"
-                    publishCoreProgress(96, "Preparing background training runtime")
+                    publishCoreProgress("Preparing background training runtime")
                     trainingManager
 
                     initializationStage = "Ready"
-                    publishCoreProgress(100, "ARGUS READY", vulkanProgress.driverInfo)
+                    publishCoreProgress("ARGUS READY", vulkanProgress.driverInfo)
                     _coreInitializationState.value = ArgusCoreInitializationState.Ready
                     Log.i(TAG, "Core runtime initialization completed.")
                 } catch (cancelled: CancellationException) {
