@@ -29,12 +29,19 @@ import java.util.Locale
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 
 sealed interface ArgusCoreInitializationState {
     data object Initializing : ArgusCoreInitializationState
     data object Ready : ArgusCoreInitializationState
     data class Failed(val message: String) : ArgusCoreInitializationState
 }
+
+data class ArgusCoreInitializationProgress(
+    val percent: Int = 0,
+    val status: String = "Assessing device",
+    val driverInfo: String = "Vulkan driver detection pending"
+)
 
 class ArgusApp : Application() {
 
@@ -120,6 +127,11 @@ class ArgusApp : Application() {
     val coreInitializationState: StateFlow<ArgusCoreInitializationState> =
         _coreInitializationState.asStateFlow()
 
+    private val _coreInitializationProgress =
+        MutableStateFlow(ArgusCoreInitializationProgress())
+    val coreInitializationProgress: StateFlow<ArgusCoreInitializationProgress> =
+        _coreInitializationProgress.asStateFlow()
+
     private val _runtimeDiagnostics = MutableStateFlow<String?>(null)
     val runtimeDiagnostics: StateFlow<String?> = _runtimeDiagnostics.asStateFlow()
 
@@ -141,6 +153,19 @@ class ArgusApp : Application() {
         installUncaughtExceptionHandler()
         createNotificationChannel()
         initializeCoreRuntime()
+    }
+
+    private fun publishCoreProgress(
+        percent: Int,
+        status: String,
+        driverInfo: String? = null
+    ) {
+        val current = _coreInitializationProgress.value
+        _coreInitializationProgress.value = ArgusCoreInitializationProgress(
+            percent = percent.coerceIn(0, 100),
+            status = status,
+            driverInfo = driverInfo ?: current.driverInfo
+        )
     }
 
     fun recordRuntimeDiagnostic(message: String) {
@@ -225,23 +250,75 @@ class ArgusApp : Application() {
             if (coreInitializationJob?.isActive == true) return
 
             _coreInitializationState.value = ArgusCoreInitializationState.Initializing
+            _coreInitializationProgress.value = ArgusCoreInitializationProgress()
             coreInitializationJob = applicationScope.launch {
                 try {
                     initializationStage = "Reading hardware profile"
+                    publishCoreProgress(8, "Assessing device")
                     hardwareProfile
+
                     initializationStage = "Registering device safety monitor"
+                    publishCoreProgress(16, "Preparing device safety")
                     deviceGuard
+
                     initializationStage = "Opening local database"
+                    publishCoreProgress(24, "Opening local database")
                     repository
-                    initializationStage = "Allocating neural engine and model tensors"
-                    neuralEngine
+
+                    initializationStage = "Allocating neural engine and restoring model tensors"
+                    publishCoreProgress(42, "Constructing and restoring the local model")
+                    val engine = neuralEngine
+
                     initializationStage = "Restoring world model"
+                    publishCoreProgress(58, "Restoring local world memory")
                     worldModel
+
                     initializationStage = "Preparing Genesis manager"
+                    publishCoreProgress(66, "Preparing model lifecycle")
                     genesisModelManager
+
+                    // The model constructor has initialized its tensors and loaded any
+                    // compatible checkpoint. Vulkan now runs on this IO worker, while
+                    // the activity keeps rendering the startup progress screen.
+                    initializationStage = "Initializing Vulkan after model readiness"
+                    publishCoreProgress(
+                        72,
+                        "Initializing Vulkan",
+                        "Detecting Vulkan compute driver..."
+                    )
+                    val progressObserver = launch {
+                        engine.vulkanInitializationProgress.collect { progress ->
+                            if (progress.isInitializing || progress.isVerified || progress.isCpuFallback) {
+                                publishCoreProgress(
+                                    percent = progress.percent,
+                                    status = progress.status,
+                                    driverInfo = progress.driverInfo
+                                )
+                            }
+                        }
+                    }
+                    val vulkanReady = try {
+                        engine.initializeOptionalVulkanRuntime()
+                    } finally {
+                        progressObserver.cancel()
+                    }
+                    val vulkanProgress = engine.vulkanInitializationProgress.value
+                    publishCoreProgress(
+                        percent = if (vulkanReady) 92 else 88,
+                        status = if (vulkanReady) {
+                            "Vulkan runtime verified"
+                        } else {
+                            "Vulkan unavailable — CPU fallback"
+                        },
+                        driverInfo = vulkanProgress.driverInfo
+                    )
+
                     initializationStage = "Starting training manager"
+                    publishCoreProgress(96, "Preparing background training runtime")
                     trainingManager
+
                     initializationStage = "Ready"
+                    publishCoreProgress(100, "ARGUS READY", vulkanProgress.driverInfo)
                     _coreInitializationState.value = ArgusCoreInitializationState.Ready
                     Log.i(TAG, "Core runtime initialization completed.")
                 } catch (cancelled: CancellationException) {

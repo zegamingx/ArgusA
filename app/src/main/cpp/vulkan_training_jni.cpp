@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -2258,6 +2259,40 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         return JNI_FALSE;
     }
     return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDriverInfo(
+    JNIEnv* env,
+    jobject
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.physicalDevice == VK_NULL_HANDLE) {
+        return env->NewStringUTF("Vulkan driver unavailable");
+    }
+
+    const VkPhysicalDeviceProperties& properties =
+        gRuntime.physicalDeviceProperties;
+    char driverInfo[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE + 96]{};
+    if (properties.driverVersion == 0u) {
+        std::snprintf(
+            driverInfo,
+            sizeof(driverInfo),
+            "%s | Vulkan driver version unavailable",
+            properties.deviceName
+        );
+    } else {
+        std::snprintf(
+            driverInfo,
+            sizeof(driverInfo),
+            "%s | Vulkan driver %u.%u.%u",
+            properties.deviceName,
+            VK_VERSION_MAJOR(properties.driverVersion),
+            VK_VERSION_MINOR(properties.driverVersion),
+            VK_VERSION_PATCH(properties.driverVersion)
+        );
+    }
+    return env->NewStringUTF(driverInfo);
 }
 
 extern "C" JNIEXPORT void JNICALL
