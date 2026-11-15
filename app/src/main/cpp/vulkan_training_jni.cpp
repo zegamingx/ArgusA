@@ -3205,7 +3205,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
         if (heapIndex > 0u) json << ",";
         json << gRuntime.memoryHeapBudget[heapIndex];
     }
-    json << "],"memoryHeapUsageBytes":[";
+    json << "],\"memoryHeapUsageBytes\":[";
     for (uint32_t heapIndex = 0; heapIndex < gRuntime.memoryBudgetHeapCount; ++heapIndex) {
         if (heapIndex > 0u) json << ",";
         json << gRuntime.memoryHeapUsage[heapIndex];
