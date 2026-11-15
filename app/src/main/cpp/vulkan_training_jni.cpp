@@ -884,15 +884,6 @@ uint16_t floatToHalf(float value) {
     );
 }
 
-void storePackedHalf(uint32_t* words, size_t halfIndex, uint16_t value) {
-    const size_t wordIndex = halfIndex >> 1u;
-    const uint32_t shift = (halfIndex & 1u) == 0u ? 0u : 16u;
-    const uint32_t mask = 0xFFFFu << shift;
-    words[wordIndex] =
-        (words[wordIndex] & ~mask) |
-        (static_cast<uint32_t>(value) << shift);
-}
-
 void releaseGroupReferences(JNIEnv* env, std::vector<GroupArrays>& groups) {
     for (GroupArrays& group : groups) {
         if (group.parameters != nullptr) {
@@ -1674,15 +1665,16 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         return JNI_FALSE;
     }
 
+    if (!ensureStorageBuffer(static_cast<VkDeviceSize>(totalByteCount))) {
+        logError("Vulkan FP16 linear storage-buffer allocation failed.");
+        return JNI_FALSE;
+    }
+
     std::vector<jfloat> inputValues;
-    std::vector<jshort> weightValues;
-    std::vector<uint32_t> packedWords;
     try {
         inputValues.resize(static_cast<size_t>(inputElements));
-        weightValues.resize(static_cast<size_t>(weightElements));
-        packedWords.assign(static_cast<size_t>(totalWords), 0u);
     } catch (const std::bad_alloc&) {
-        logError("Not enough host memory to prepare a Vulkan FP16 linear operation.");
+        logError("Not enough host memory to prepare Vulkan FP16 linear input.");
         return JNI_FALSE;
     }
 
@@ -1692,39 +1684,42 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         static_cast<jsize>(inputElements),
         inputValues.data()
     );
-    env->GetShortArrayRegion(
-        weightArray,
-        0,
-        static_cast<jsize>(weightElements),
-        weightValues.data()
-    );
     if (env->ExceptionCheck()) {
         return JNI_FALSE;
     }
 
-    for (size_t index = 0; index < inputValues.size(); ++index) {
-        if (!std::isfinite(inputValues[index])) {
+    auto* packedWords = static_cast<uint32_t*>(gRuntime.mappedStorage);
+    for (size_t index = 0; index < inputValues.size(); index += 2u) {
+        const float firstValue = inputValues[index];
+        if (!std::isfinite(firstValue)) {
             return JNI_FALSE;
         }
-        storePackedHalf(
-            packedWords.data(),
-            index,
-            floatToHalf(inputValues[index])
-        );
-    }
-    for (size_t index = 0; index < weightValues.size(); ++index) {
-        storePackedHalf(
-            packedWords.data(),
-            static_cast<size_t>(weightOffsetHalf) + index,
-            static_cast<uint16_t>(weightValues[index])
-        );
+
+        const uint32_t lowHalf = floatToHalf(firstValue);
+        uint32_t highHalf = 0u;
+        if (index + 1u < inputValues.size()) {
+            const float secondValue = inputValues[index + 1u];
+            if (!std::isfinite(secondValue)) {
+                return JNI_FALSE;
+            }
+            highHalf = static_cast<uint32_t>(floatToHalf(secondValue)) << 16u;
+        }
+        packedWords[index >> 1u] = lowHalf | highHalf;
     }
 
-    if (!ensureStorageBuffer(static_cast<VkDeviceSize>(totalByteCount))) {
-        logError("Vulkan FP16 linear storage-buffer allocation failed.");
+    // Weight arrays already contain IEEE-754 binary16 payloads. Copy them
+    // directly into mapped storage instead of allocating and repacking a
+    // second native vector.
+    auto* packedWeights = reinterpret_cast<jshort*>(packedWords) + weightOffsetHalf;
+    env->GetShortArrayRegion(
+        weightArray,
+        0,
+        static_cast<jsize>(weightElements),
+        packedWeights
+    );
+    if (env->ExceptionCheck()) {
         return JNI_FALSE;
     }
-    std::memcpy(gRuntime.mappedStorage, packedWords.data(), totalByteCount);
 
     if (!gRuntime.hostCoherent) {
         VkMappedMemoryRange flushRange{};
@@ -1883,23 +1878,13 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
     }
 
     const auto* mappedWords = static_cast<const uint32_t*>(gRuntime.mappedStorage);
-    std::vector<jfloat> outputValues;
-    try {
-        outputValues.resize(static_cast<size_t>(outputElements));
-    } catch (const std::bad_alloc&) {
-        logError("Not enough host memory to collect Vulkan FP16 linear output.");
-        return JNI_FALSE;
-    }
-    std::memcpy(
-        outputValues.data(),
-        mappedWords + outputOffsetWords,
-        static_cast<size_t>(outputElements) * sizeof(jfloat)
-    );
+    const auto* outputValues =
+        reinterpret_cast<const jfloat*>(mappedWords + outputOffsetWords);
     env->SetFloatArrayRegion(
         outputArray,
         0,
         static_cast<jsize>(outputElements),
-        outputValues.data()
+        outputValues
     );
     if (env->ExceptionCheck()) {
         return JNI_FALSE;

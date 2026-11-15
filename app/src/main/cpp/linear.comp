@@ -22,14 +22,13 @@ void main() {
     const uint outputElementCount = parameters.rowCount * parameters.outputColumns;
     const uint invocationStride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
 
-    for (uint outputIndex = gl_GlobalInvocationID.x;
-         outputIndex < outputElementCount;
-         outputIndex += invocationStride) {
+    uint outputIndex = gl_GlobalInvocationID.x;
+    while (outputIndex < outputElementCount) {
         const uint row = outputIndex / parameters.outputColumns;
         const uint column = outputIndex - row * parameters.outputColumns;
         const uint batchIndex = row / parameters.rowsPerBatch;
         if (batchIndex >= parameters.batchCount) {
-            continue;
+            break;
         }
 
         const uint rowInBatch = row - batchIndex * parameters.rowsPerBatch;
@@ -53,5 +52,10 @@ void main() {
         }
 
         values[parameters.outputOffset + outputIndex] = sum;
+
+        if (outputElementCount - outputIndex <= invocationStride) {
+            break;
+        }
+        outputIndex += invocationStride;
     }
 }

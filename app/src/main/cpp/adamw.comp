@@ -24,9 +24,8 @@ void main() {
     const uint secondMomentOffset = parameters.elementCount * 3u;
     const uint weightDecayOffset = parameters.elementCount * 4u;
 
-    for (uint index = gl_GlobalInvocationID.x;
-         index < parameters.elementCount;
-         index += invocationStride) {
+    uint index = gl_GlobalInvocationID.x;
+    while (index < parameters.elementCount) {
         const float parameter = values[index];
         const float gradient =
             values[gradientOffset + index] * parameters.gradientClipFactor;
@@ -53,5 +52,12 @@ void main() {
 
         values[firstMomentOffset + index] = firstMoment;
         values[secondMomentOffset + index] = secondMoment;
+
+        // Subtract before adding to avoid unsigned wraparound at the upper
+        // end of the supported uint index range.
+        if (parameters.elementCount - index <= invocationStride) {
+            break;
+        }
+        index += invocationStride;
     }
 }
