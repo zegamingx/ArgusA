@@ -501,18 +501,17 @@ bool initializeRuntime() {
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &queuePriority;
 
-    VkPhysicalDevice16BitStorageFeatures supportedStorage16{};
+    // The packed FP16 shader uses uint32 storage words and performs
+    // half-precision arithmetic only in function-local values. It requires
+    // shaderFloat16, not 16-bit storage-buffer access.
     VkPhysicalDeviceShaderFloat16Int8Features supportedShaderFloat16{};
     VkPhysicalDeviceFeatures2 supportedFeatures{};
     if (gRuntime.instanceApiVersion >= VK_API_VERSION_1_1 &&
         gRuntime.physicalDeviceProperties.apiVersion >= VK_API_VERSION_1_2) {
-        supportedStorage16.sType =
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
-        supportedStorage16.pNext = &supportedShaderFloat16;
         supportedShaderFloat16.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
         supportedFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-        supportedFeatures.pNext = &supportedStorage16;
+        supportedFeatures.pNext = &supportedShaderFloat16;
 
         const auto getPhysicalDeviceFeatures2 =
             reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
@@ -521,13 +520,11 @@ bool initializeRuntime() {
         if (getPhysicalDeviceFeatures2 != nullptr) {
             getPhysicalDeviceFeatures2(gRuntime.physicalDevice, &supportedFeatures);
             gRuntime.supportsFp16Compute =
-                supportedStorage16.storageBuffer16BitAccess == VK_TRUE &&
                 supportedShaderFloat16.shaderFloat16 == VK_TRUE;
         }
     }
 
     VkPhysicalDeviceFeatures deviceFeatures{};
-    VkPhysicalDevice16BitStorageFeatures enabledStorage16{};
     VkPhysicalDeviceShaderFloat16Int8Features enabledShaderFloat16{};
     VkPhysicalDeviceFeatures2 enabledFeatures{};
 
@@ -536,15 +533,11 @@ bool initializeRuntime() {
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
     if (gRuntime.supportsFp16Compute) {
-        enabledStorage16.sType =
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
-        enabledStorage16.storageBuffer16BitAccess = VK_TRUE;
-        enabledStorage16.pNext = &enabledShaderFloat16;
         enabledShaderFloat16.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
         enabledShaderFloat16.shaderFloat16 = VK_TRUE;
         enabledFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-        enabledFeatures.pNext = &enabledStorage16;
+        enabledFeatures.pNext = &enabledShaderFloat16;
         deviceInfo.pNext = &enabledFeatures;
         deviceInfo.pEnabledFeatures = nullptr;
     } else {

@@ -453,7 +453,10 @@ internal object VulkanTrainingBackend {
         }
         val rowsPerBatch = inputBatches[0].size
         require(rowsPerBatch > 0) { "Every FP16 batched linear input must contain at least one row." }
-        val requiredWeightElements = Math.multiplyExact(inputColumns, outputColumns)
+        val requiredWeightElementsLong =
+            inputColumns.toLong() * outputColumns.toLong()
+        if (requiredWeightElementsLong > Int.MAX_VALUE.toLong()) return false
+        val requiredWeightElements = requiredWeightElementsLong.toInt()
 
         for (batchIndex in 0 until batchCount) {
             require(inputBatches[batchIndex].size == rowsPerBatch) {
@@ -480,11 +483,12 @@ internal object VulkanTrainingBackend {
         }
 
         val totalRowsLong = batchCount.toLong() * rowsPerBatch.toLong()
+        if (totalRowsLong > Int.MAX_VALUE.toLong()) return false
+
         val inputElementsLong = totalRowsLong * inputColumns.toLong()
         val weightElementsLong = batchCount.toLong() * requiredWeightElements.toLong()
         val outputElementsLong = totalRowsLong * outputColumns.toLong()
-        if (totalRowsLong > Int.MAX_VALUE.toLong() ||
-            inputElementsLong > Int.MAX_VALUE.toLong() ||
+        if (inputElementsLong > Int.MAX_VALUE.toLong() ||
             weightElementsLong > Int.MAX_VALUE.toLong() ||
             outputElementsLong > Int.MAX_VALUE.toLong()) {
             return false
@@ -642,11 +646,12 @@ internal object VulkanTrainingBackend {
         }
 
         val totalRowsLong = batchCount.toLong() * rowsPerBatch.toLong()
+        if (totalRowsLong > Int.MAX_VALUE.toLong()) return false
+
         val inputElementCountLong = totalRowsLong * inputColumns.toLong()
         val weightElementCountLong = batchCount.toLong() * requiredWeightElements
         val outputElementCountLong = totalRowsLong * outputColumns.toLong()
-        if (totalRowsLong > Int.MAX_VALUE.toLong() ||
-            inputElementCountLong > Int.MAX_VALUE.toLong() ||
+        if (inputElementCountLong > Int.MAX_VALUE.toLong() ||
             weightElementCountLong > Int.MAX_VALUE.toLong() ||
             outputElementCountLong > Int.MAX_VALUE.toLong()) {
             return false
