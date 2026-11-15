@@ -471,7 +471,7 @@ class TextModalityPreservationTest {
         val flattenedLines = chunks.flatMap { it.content.lines().filter(String::isNotEmpty) }
         assertEquals(raw.lines(), flattenedLines)
         chunks.forEach { chunk ->
-            val singleAtomicLine = chunk.lines().filter(String::isNotEmpty).size == 1
+            val singleAtomicLine = chunk.content.lines().filter(String::isNotEmpty).size == 1
             assertTrue(
                 "Packed structured chunks must fit the token target unless a single line is oversized.",
                 tokenizer.encode(chunk.content, autoRegister = false).size <= 24 ||
