@@ -13,6 +13,7 @@ on:
       - "settings.gradle.kts"
       - "gradle.properties"
       - "version.properties"
+      - "tools/cmake-compat/**"
       - ".github/workflows/validate-native.yml"
   pull_request:
     branches:
@@ -25,6 +26,7 @@ on:
       - "settings.gradle.kts"
       - "gradle.properties"
       - "version.properties"
+      - "tools/cmake-compat/**"
       - ".github/workflows/validate-native.yml"
   workflow_dispatch:
 
@@ -62,17 +64,13 @@ jobs:
           echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
           echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
           test -s "${sdk_root}/platforms/android-37.0/android.jar"
-          platform_alias="${sdk_root}/platforms/android-37.0"
-          if [[ ! -s "${platform_alias}/android.jar" ]]; then
-            if [[ -e "${platform_alias}" && ! -L "${platform_alias}" ]]; then
-              echo "::error::Unexpected existing SDK directory: ${platform_alias}"
-              exit 1
-            fi
-            ln -sfn android-37.0 "${platform_alias}"
+          sdk_platform="${sdk_root}/platforms/android-37.0"
+          if [[ ! -s "${sdk_platform}/android.jar" ]]; then
+            echo "::error::Android SDK platform android-37.0 is not installed."
+            exit 1
           fi
-          test -s "${platform_alias}/android.jar"
 
-      - name: Install Android NDK r30 and CMake 3.31.6
+      - name: Install Android NDK r30 and CMake 4.5.0
         shell: bash
         run: |
           set -euo pipefail
@@ -89,7 +87,7 @@ jobs:
           "${sdkmanager_path}" --install "build-tools;37.0.0" "ndk;30.0.16248370"
           test -x "${ANDROID_HOME}/build-tools/37.0.0/apksigner"
 
-          cmake_version="3.31.6"
+          cmake_version="4.5.0"
           cmake_archive="cmake-${cmake_version}-linux-x86_64.tar.gz"
           cmake_archive_path="${RUNNER_TEMP}/${cmake_archive}"
           cmake_root="${RUNNER_TEMP}/cmake-${cmake_version}"
@@ -97,11 +95,11 @@ jobs:
           curl --fail --location --retry 3 --silent --show-error \
             "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/${cmake_archive}" \
             --output "${cmake_archive_path}"
-          printf '%s  %s\n' "5a1133ff103c71eb5120e2cc3de922733e7d8a26a98ae716397e8676adb367bf" "${cmake_archive_path}" | sha256sum --check --status
+          printf '%s  %s\n' "81f0d5b0960fb6adc8197030ffc827fba937640d51e73e39e0e9e40d88c66f6f" "${cmake_archive_path}" | sha256sum --check --status
           mkdir -p "${cmake_root}"
           tar -xzf "${cmake_archive_path}" --strip-components=1 -C "${cmake_root}"
-          echo "${cmake_root}/bin" >> "${GITHUB_PATH}"
-          "${cmake_root}/bin/cmake" --version | grep -Fx "cmake version ${cmake_version}"
+          tools/cmake-compat/install-wrapper.sh "${cmake_root}/bin/cmake" "${RUNNER_TEMP}/argus-cmake-compat"
+          "${RUNNER_TEMP}/argus-cmake-compat/bin/cmake" --version | grep -Fx "cmake version ${cmake_version}"
 
           glslc_path="$(find "${ANDROID_HOME}/ndk/30.0.16248370/shader-tools" -type f -name glslc -print -quit)"
           test -n "${glslc_path}"

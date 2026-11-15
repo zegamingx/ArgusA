@@ -7,6 +7,7 @@
 #include "linear_fp16_shader_spv.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -22,7 +23,9 @@ constexpr char kLogTag[] = "ArgusVulkan";
 constexpr uint32_t kLocalWorkGroupSize = 64;
 
 struct AdamwPushConstants {
-    uint32_t elementCount;
+    uint32_t totalElementCount;
+    uint32_t segmentOffset;
+    uint32_t segmentElementCount;
     float learningRate;
     float beta1;
     float beta2;
@@ -30,11 +33,16 @@ struct AdamwPushConstants {
     float biasCorrection2;
     float epsilon;
     float gradientClipFactor;
+    float weightDecay;
 };
 
-// Both layouts must match their GLSL push-constant blocks exactly.
-static_assert(sizeof(AdamwPushConstants) == 32);
-static_assert(offsetof(AdamwPushConstants, gradientClipFactor) == 28);
+// The push-constant layout must match the GLSL block exactly.
+static_assert(sizeof(AdamwPushConstants) == 44);
+static_assert(offsetof(AdamwPushConstants, segmentOffset) == 4);
+static_assert(offsetof(AdamwPushConstants, segmentElementCount) == 8);
+static_assert(offsetof(AdamwPushConstants, learningRate) == 12);
+static_assert(offsetof(AdamwPushConstants, gradientClipFactor) == 36);
+static_assert(offsetof(AdamwPushConstants, weightDecay) == 40);
 
 struct LinearPushConstants {
     uint32_t rowCount;
@@ -89,6 +97,13 @@ struct GroupArrays {
     jfloatArray secondMoments = nullptr;
     jsize elementCount = 0;
     size_t packedOffset = 0;
+    float weightDecay = 0.0f;
+};
+
+struct AdamwSegment {
+    uint32_t elementOffset = 0;
+    uint32_t elementCount = 0;
+    float weightDecay = 0.0f;
 };
 
 std::mutex gRuntimeMutex;
@@ -106,6 +121,27 @@ void logError(const char* message, VkResult result = VK_SUCCESS) {
             static_cast<int>(result)
         );
     }
+}
+
+uint32_t calculateDispatchGroupCount(uint64_t requiredGroupCount) {
+    const uint32_t deviceGroupLimit = gRuntime.maxComputeWorkGroupCountX;
+    if (requiredGroupCount == 0u || deviceGroupLimit == 0u) {
+        return 0u;
+    }
+
+    return static_cast<uint32_t>(
+        std::min<uint64_t>(requiredGroupCount, deviceGroupLimit)
+    );
+}
+
+uint32_t calculateDispatchWorkGroupCount(uint64_t invocationCount) {
+    if (invocationCount == 0u) {
+        return 0u;
+    }
+
+    const uint64_t requiredGroups =
+        1u + (invocationCount - 1u) / kLocalWorkGroupSize;
+    return calculateDispatchGroupCount(requiredGroups);
 }
 
 void destroyStorageBuffer() {
@@ -474,18 +510,17 @@ bool initializeRuntime() {
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &queuePriority;
 
-    VkPhysicalDevice16BitStorageFeatures supportedStorage16{};
+    // The packed FP16 shader uses uint32 storage words and performs
+    // half-precision arithmetic only in function-local values. It requires
+    // shaderFloat16, not 16-bit storage-buffer access.
     VkPhysicalDeviceShaderFloat16Int8Features supportedShaderFloat16{};
     VkPhysicalDeviceFeatures2 supportedFeatures{};
     if (gRuntime.instanceApiVersion >= VK_API_VERSION_1_1 &&
         gRuntime.physicalDeviceProperties.apiVersion >= VK_API_VERSION_1_2) {
-        supportedStorage16.sType =
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
-        supportedStorage16.pNext = &supportedShaderFloat16;
         supportedShaderFloat16.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
         supportedFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-        supportedFeatures.pNext = &supportedStorage16;
+        supportedFeatures.pNext = &supportedShaderFloat16;
 
         const auto getPhysicalDeviceFeatures2 =
             reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
@@ -494,13 +529,11 @@ bool initializeRuntime() {
         if (getPhysicalDeviceFeatures2 != nullptr) {
             getPhysicalDeviceFeatures2(gRuntime.physicalDevice, &supportedFeatures);
             gRuntime.supportsFp16Compute =
-                supportedStorage16.storageBuffer16BitAccess == VK_TRUE &&
                 supportedShaderFloat16.shaderFloat16 == VK_TRUE;
         }
     }
 
     VkPhysicalDeviceFeatures deviceFeatures{};
-    VkPhysicalDevice16BitStorageFeatures enabledStorage16{};
     VkPhysicalDeviceShaderFloat16Int8Features enabledShaderFloat16{};
     VkPhysicalDeviceFeatures2 enabledFeatures{};
 
@@ -509,15 +542,11 @@ bool initializeRuntime() {
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
     if (gRuntime.supportsFp16Compute) {
-        enabledStorage16.sType =
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
-        enabledStorage16.storageBuffer16BitAccess = VK_TRUE;
-        enabledStorage16.pNext = &enabledShaderFloat16;
         enabledShaderFloat16.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
         enabledShaderFloat16.shaderFloat16 = VK_TRUE;
         enabledFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-        enabledFeatures.pNext = &enabledStorage16;
+        enabledFeatures.pNext = &enabledShaderFloat16;
         deviceInfo.pNext = &enabledFeatures;
         deviceInfo.pEnabledFeatures = nullptr;
     } else {
@@ -607,7 +636,9 @@ bool initializeRuntime() {
     VkPushConstantRange pushConstantRange{};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(LinearPushConstants);
+    pushConstantRange.size = static_cast<uint32_t>(
+        std::max(sizeof(AdamwPushConstants), sizeof(LinearPushConstants))
+    );
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -871,15 +902,6 @@ uint16_t floatToHalf(float value) {
     );
 }
 
-void storePackedHalf(uint32_t* words, size_t halfIndex, uint16_t value) {
-    const size_t wordIndex = halfIndex >> 1u;
-    const uint32_t shift = (halfIndex & 1u) == 0u ? 0u : 16u;
-    const uint32_t mask = 0xFFFFu << shift;
-    words[wordIndex] =
-        (words[wordIndex] & ~mask) |
-        (static_cast<uint32_t>(value) << shift);
-}
-
 void releaseGroupReferences(JNIEnv* env, std::vector<GroupArrays>& groups) {
     for (GroupArrays& group : groups) {
         if (group.parameters != nullptr) {
@@ -957,7 +979,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
     }
 
     const jsize groupCount = env->GetArrayLength(parameterGroups);
-    if (groupCount <= 0 ||
+    if (env->ExceptionCheck() || groupCount <= 0 ||
         env->GetArrayLength(gradientGroups) != groupCount ||
         env->GetArrayLength(firstMomentGroups) != groupCount ||
         env->GetArrayLength(secondMomentGroups) != groupCount ||
@@ -966,8 +988,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
     }
 
     std::vector<GroupArrays> groups;
+    std::vector<AdamwSegment> segments;
     try {
         groups.resize(static_cast<size_t>(groupCount));
+        segments.reserve(static_cast<size_t>(groupCount));
     } catch (const std::bad_alloc&) {
         return JNI_FALSE;
     }
@@ -1003,7 +1027,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         const jsize firstMomentCount = env->GetArrayLength(group.firstMoments);
         const jsize secondMomentCount = env->GetArrayLength(group.secondMoments);
 
-        if (parameterCount <= 0 ||
+        if (env->ExceptionCheck() ||
+            parameterCount <= 0 ||
             gradientCount != parameterCount ||
             firstMomentCount != parameterCount ||
             secondMomentCount != parameterCount) {
@@ -1013,7 +1038,18 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         }
         group.elementCount = parameterCount;
 
-        group.packedOffset = totalElements;
+        env->GetFloatArrayRegion(weightDecayByGroup, index, 1, &group.weightDecay);
+        if (env->ExceptionCheck() ||
+            !std::isfinite(group.weightDecay) ||
+            group.weightDecay < 0.0f) {
+            logError("Vulkan AdamW weight decay must be finite and non-negative.");
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
+        if (group.weightDecay == 0.0f) {
+            group.weightDecay = 0.0f;
+        }
+
         const size_t count = static_cast<size_t>(group.elementCount);
         if (totalElements > std::numeric_limits<size_t>::max() - count) {
             releaseGroupReferences(env, groups);
@@ -1024,265 +1060,438 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
 
     if (totalElements == 0 ||
         totalElements > std::numeric_limits<uint32_t>::max() ||
-        totalElements > std::numeric_limits<size_t>::max() / (5u * sizeof(float))) {
+        totalElements > std::numeric_limits<size_t>::max() / (4u * sizeof(float))) {
         releaseGroupReferences(env, groups);
         return JNI_FALSE;
     }
 
-    const size_t packedFloatCount = totalElements * 5u;
-    const size_t byteCount = packedFloatCount * sizeof(float);
-    if (byteCount > static_cast<size_t>(
-            gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange
-        )) {
+    // Sort tensors by decay rate so all tensors sharing the same scalar
+    // weight decay occupy one contiguous range. This removes the per-element
+    // decay array while preserving the original Java array references.
+    std::sort(
+        groups.begin(),
+        groups.end(),
+        [](const GroupArrays& left, const GroupArrays& right) {
+            return left.weightDecay < right.weightDecay;
+        }
+    );
+
+    size_t packedOffset = 0;
+    for (GroupArrays& group : groups) {
+        group.packedOffset = packedOffset;
+        const uint32_t groupElementCount =
+            static_cast<uint32_t>(group.elementCount);
+
+        if (segments.empty() ||
+            segments.back().weightDecay != group.weightDecay) {
+            segments.push_back(AdamwSegment{
+                static_cast<uint32_t>(packedOffset),
+                groupElementCount,
+                group.weightDecay
+            });
+        } else {
+            AdamwSegment& segment = segments.back();
+            if (groupElementCount >
+                std::numeric_limits<uint32_t>::max() - segment.elementCount) {
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+            segment.elementCount += groupElementCount;
+        }
+
+        packedOffset += static_cast<size_t>(groupElementCount);
+    }
+
+    if (packedOffset != totalElements || segments.empty()) {
         releaseGroupReferences(env, groups);
         return JNI_FALSE;
     }
 
-    const uint64_t workGroupCount =
-        (static_cast<uint64_t>(totalElements) + kLocalWorkGroupSize - 1u) /
-        kLocalWorkGroupSize;
-    if (workGroupCount == 0 ||
-        workGroupCount > gRuntime.maxComputeWorkGroupCountX) {
+    const VkDeviceSize maxStorageBufferRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    constexpr size_t kAdamwTensorArrayCount = 4u;
+    constexpr size_t kAdamwValueSize = sizeof(float);
+    constexpr size_t kAdamwBytesPerElement =
+        kAdamwTensorArrayCount * kAdamwValueSize;
+    const VkDeviceSize maxPageElementsDevice =
+        maxStorageBufferRange / kAdamwBytesPerElement;
+    if (maxPageElementsDevice == 0u ||
+        maxPageElementsDevice > std::numeric_limits<size_t>::max()) {
+        logError("Vulkan storage-buffer range cannot hold one AdamW element page.");
+        releaseGroupReferences(env, groups);
+        return JNI_FALSE;
+    }
+    const size_t maxPageElements =
+        static_cast<size_t>(maxPageElementsDevice);
+
+    // Keep the transaction atomic with respect to model state. GPU work is
+    // performed one storage-buffer page at a time, but no Java tensor is
+    // changed until every page has completed and every result is finite.
+    std::vector<float> stagedParameters;
+    std::vector<float> stagedFirstMoments;
+    std::vector<float> stagedSecondMoments;
+    try {
+        stagedParameters.resize(totalElements);
+        stagedFirstMoments.resize(totalElements);
+        stagedSecondMoments.resize(totalElements);
+    } catch (const std::bad_alloc&) {
+        logError("Not enough host memory to retain the complete staged AdamW result.");
         releaseGroupReferences(env, groups);
         return JNI_FALSE;
     }
 
-    if (!ensureStorageBuffer(static_cast<VkDeviceSize>(byteCount))) {
-        releaseGroupReferences(env, groups);
-        return JNI_FALSE;
-    }
+    VkResult result = VK_SUCCESS;
+    size_t pageOffset = 0u;
+    size_t pageIndex = 0u;
+    const size_t pageCount =
+        1u + (totalElements - 1u) / maxPageElements;
 
-    // The mapped Vulkan allocation is the final staging destination. Avoid
-    // allocating a second native tensor vector and copying it into the buffer.
-    float* parameterValues = static_cast<float*>(gRuntime.mappedStorage);
-    float* gradientValues = parameterValues + totalElements;
-    float* firstMomentValues = gradientValues + totalElements;
-    float* secondMomentValues = firstMomentValues + totalElements;
-    float* decayValues = secondMomentValues + totalElements;
+    while (pageOffset < totalElements) {
+        const size_t pageElementCount =
+            std::min(maxPageElements, totalElements - pageOffset);
+        const size_t pageEnd = pageOffset + pageElementCount;
+        const VkDeviceSize pageByteCount =
+            static_cast<VkDeviceSize>(pageElementCount) *
+            static_cast<VkDeviceSize>(kAdamwBytesPerElement);
 
-    for (jsize index = 0; index < groupCount; ++index) {
-        GroupArrays& group = groups[static_cast<size_t>(index)];
-        const size_t offset = group.packedOffset;
-        const jsize count = group.elementCount;
-
-        env->GetFloatArrayRegion(
-            group.parameters,
-            0,
-            count,
-            parameterValues + offset
-        );
-        env->GetFloatArrayRegion(
-            group.gradients,
-            0,
-            count,
-            gradientValues + offset
-        );
-        env->GetFloatArrayRegion(
-            group.firstMoments,
-            0,
-            count,
-            firstMomentValues + offset
-        );
-        env->GetFloatArrayRegion(
-            group.secondMoments,
-            0,
-            count,
-            secondMomentValues + offset
-        );
-
-        jfloat decay = 0.0f;
-        env->GetFloatArrayRegion(weightDecayByGroup, index, 1, &decay);
-
-        if (env->ExceptionCheck()) {
+        if (pageElementCount == 0u ||
+            pageElementCount > std::numeric_limits<uint32_t>::max() ||
+            !ensureStorageBuffer(pageByteCount)) {
+            logError("Vulkan AdamW storage-buffer page allocation failed.");
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
         }
 
-        std::fill(
-            decayValues + offset,
-            decayValues + offset + static_cast<size_t>(count),
-            decay
-        );
-    }
+        // The page layout is [parameters | gradients | first moments |
+        // second moments]. Copy only each group's overlap with this page.
+        float* parameterValues = static_cast<float*>(gRuntime.mappedStorage);
+        float* gradientValues = parameterValues + pageElementCount;
+        float* firstMomentValues = gradientValues + pageElementCount;
+        float* secondMomentValues = firstMomentValues + pageElementCount;
 
-    if (!gRuntime.hostCoherent) {
-        VkMappedMemoryRange flushRange{};
-        flushRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-        flushRange.memory = gRuntime.storageMemory;
-        flushRange.offset = 0;
-        flushRange.size = VK_WHOLE_SIZE;
+        for (const GroupArrays& group : groups) {
+            const size_t groupStart = group.packedOffset;
+            const size_t groupEnd =
+                groupStart + static_cast<size_t>(group.elementCount);
+            const size_t overlapStart = std::max(groupStart, pageOffset);
+            const size_t overlapEnd = std::min(groupEnd, pageEnd);
+            if (overlapStart >= overlapEnd) {
+                continue;
+            }
 
-        const VkResult flushResult = vkFlushMappedMemoryRanges(
-            gRuntime.device,
-            1,
-            &flushRange
-        );
-        if (flushResult != VK_SUCCESS) {
-            logError("Failed to flush Vulkan host-visible memory.", flushResult);
+            const size_t sourceOffset = overlapStart - groupStart;
+            const size_t destinationOffset = overlapStart - pageOffset;
+            const size_t overlapCount = overlapEnd - overlapStart;
+            if (sourceOffset > static_cast<size_t>(group.elementCount) ||
+                overlapCount > static_cast<size_t>(group.elementCount) - sourceOffset ||
+                overlapCount > static_cast<size_t>(std::numeric_limits<jsize>::max())) {
+                logError("Vulkan AdamW page/group overlap is outside the source tensor.");
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+
+            const jsize sourceIndex = static_cast<jsize>(sourceOffset);
+            const jsize copyCount = static_cast<jsize>(overlapCount);
+            const size_t targetIndex = destinationOffset;
+
+            env->GetFloatArrayRegion(
+                group.parameters,
+                sourceIndex,
+                copyCount,
+                parameterValues + targetIndex
+            );
+            if (env->ExceptionCheck()) {
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+
+            env->GetFloatArrayRegion(
+                group.gradients,
+                sourceIndex,
+                copyCount,
+                gradientValues + targetIndex
+            );
+            if (env->ExceptionCheck()) {
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+
+            env->GetFloatArrayRegion(
+                group.firstMoments,
+                sourceIndex,
+                copyCount,
+                firstMomentValues + targetIndex
+            );
+            if (env->ExceptionCheck()) {
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+
+            env->GetFloatArrayRegion(
+                group.secondMoments,
+                sourceIndex,
+                copyCount,
+                secondMomentValues + targetIndex
+            );
+            if (env->ExceptionCheck()) {
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+        }
+
+        if (!gRuntime.hostCoherent) {
+            VkMappedMemoryRange flushRange{};
+            flushRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            flushRange.memory = gRuntime.storageMemory;
+            flushRange.offset = 0;
+            flushRange.size = VK_WHOLE_SIZE;
+
+            const VkResult flushResult = vkFlushMappedMemoryRanges(
+                gRuntime.device,
+                1,
+                &flushRange
+            );
+            if (flushResult != VK_SUCCESS) {
+                logError("Failed to flush Vulkan AdamW page input memory.", flushResult);
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+        }
+
+        result = vkResetCommandBuffer(gRuntime.commandBuffer, 0);
+        if (result != VK_SUCCESS) {
+            logError("Failed to reset the Vulkan AdamW page command buffer.", result);
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
         }
-    }
 
-    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0);
-    if (result != VK_SUCCESS) {
-        logError("Failed to reset the Vulkan command buffer.", result);
-        releaseGroupReferences(env, groups);
-        return JNI_FALSE;
-    }
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+        if (result != VK_SUCCESS) {
+            logError("Failed to begin the Vulkan AdamW page command buffer.", result);
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
 
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
-    if (result != VK_SUCCESS) {
-        logError("Failed to begin the Vulkan command buffer.", result);
-        releaseGroupReferences(env, groups);
-        return JNI_FALSE;
-    }
-
-    VkMemoryBarrier hostToComputeBarrier{};
-    hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    hostToComputeBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-    hostToComputeBarrier.dstAccessMask =
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-
-    vkCmdPipelineBarrier(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0,
-        1,
-        &hostToComputeBarrier,
-        0,
-        nullptr,
-        0,
-        nullptr
-    );
-
-    vkCmdBindPipeline(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_BIND_POINT_COMPUTE,
-        gRuntime.pipeline
-    );
-    vkCmdBindDescriptorSets(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_BIND_POINT_COMPUTE,
-        gRuntime.pipelineLayout,
-        0,
-        1,
-        &gRuntime.descriptorSet,
-        0,
-        nullptr
-    );
-
-    const AdamwPushConstants pushConstants{
-        static_cast<uint32_t>(totalElements),
-        learningRate,
-        beta1,
-        beta2,
-        biasCorrection1,
-        biasCorrection2,
-        epsilon,
-        gradientClipFactor
-    };
-
-    vkCmdPushConstants(
-        gRuntime.commandBuffer,
-        gRuntime.pipelineLayout,
-        VK_SHADER_STAGE_COMPUTE_BIT,
-        0,
-        sizeof(AdamwPushConstants),
-        &pushConstants
-    );
-
-    vkCmdDispatch(
-        gRuntime.commandBuffer,
-        static_cast<uint32_t>(workGroupCount),
-        1,
-        1
-    );
-
-    VkMemoryBarrier computeToHostBarrier{};
-    computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    computeToHostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    computeToHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-
-    vkCmdPipelineBarrier(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        0,
-        1,
-        &computeToHostBarrier,
-        0,
-        nullptr,
-        0,
-        nullptr
-    );
-
-    result = vkEndCommandBuffer(gRuntime.commandBuffer);
-    if (result != VK_SUCCESS) {
-        logError("Failed to finish the Vulkan command buffer.", result);
-        releaseGroupReferences(env, groups);
-        return JNI_FALSE;
-    }
-
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
-
-    result = vkQueueSubmit(
-        gRuntime.computeQueue,
-        1,
-        &submitInfo,
-        VK_NULL_HANDLE
-    );
-    if (result != VK_SUCCESS) {
-        logError("Vulkan optimizer queue submission failed.", result);
-        releaseGroupReferences(env, groups);
-        return JNI_FALSE;
-    }
-
-    result = vkQueueWaitIdle(gRuntime.computeQueue);
-    if (result != VK_SUCCESS) {
-        logError("Vulkan optimizer queue did not complete.", result);
-        releaseGroupReferences(env, groups);
-        return JNI_FALSE;
-    }
-
-    if (!gRuntime.hostCoherent) {
-        VkMappedMemoryRange invalidateRange{};
-        invalidateRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-        invalidateRange.memory = gRuntime.storageMemory;
-        invalidateRange.offset = 0;
-        invalidateRange.size = VK_WHOLE_SIZE;
-
-        result = vkInvalidateMappedMemoryRanges(
-            gRuntime.device,
+        VkMemoryBarrier hostToComputeBarrier{};
+        hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        hostToComputeBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        hostToComputeBarrier.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(
+            gRuntime.commandBuffer,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
             1,
-            &invalidateRange
+            &hostToComputeBarrier,
+            0,
+            nullptr,
+            0,
+            nullptr
+        );
+
+        vkCmdBindPipeline(
+            gRuntime.commandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            gRuntime.pipeline
+        );
+        vkCmdBindDescriptorSets(
+            gRuntime.commandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            gRuntime.pipelineLayout,
+            0,
+            1,
+            &gRuntime.descriptorSet,
+            0,
+            nullptr
+        );
+
+        size_t dispatchedSegmentCount = 0u;
+        for (const AdamwSegment& segment : segments) {
+            const size_t segmentStart = segment.elementOffset;
+            const size_t segmentEnd =
+                segmentStart + static_cast<size_t>(segment.elementCount);
+            const size_t overlapStart = std::max(segmentStart, pageOffset);
+            const size_t overlapEnd = std::min(segmentEnd, pageEnd);
+            if (overlapStart >= overlapEnd) {
+                continue;
+            }
+
+            const size_t localOffset = overlapStart - pageOffset;
+            const size_t localCount = overlapEnd - overlapStart;
+            if (localOffset > std::numeric_limits<uint32_t>::max() ||
+                localCount == 0u ||
+                localCount > std::numeric_limits<uint32_t>::max()) {
+                logError("Vulkan AdamW page segment exceeds the shader index range.");
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+
+            const uint32_t workGroupCount =
+                calculateDispatchWorkGroupCount(localCount);
+            if (workGroupCount == 0u) {
+                logError("Vulkan AdamW page segment has no available work-groups.");
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+
+            const AdamwPushConstants pushConstants{
+                static_cast<uint32_t>(pageElementCount),
+                static_cast<uint32_t>(localOffset),
+                static_cast<uint32_t>(localCount),
+                learningRate,
+                beta1,
+                beta2,
+                biasCorrection1,
+                biasCorrection2,
+                epsilon,
+                gradientClipFactor,
+                segment.weightDecay
+            };
+            vkCmdPushConstants(
+                gRuntime.commandBuffer,
+                gRuntime.pipelineLayout,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                sizeof(AdamwPushConstants),
+                &pushConstants
+            );
+            vkCmdDispatch(
+                gRuntime.commandBuffer,
+                workGroupCount,
+                1,
+                1
+            );
+            ++dispatchedSegmentCount;
+        }
+
+        if (dispatchedSegmentCount == 0u) {
+            logError("Vulkan AdamW page did not intersect an optimizer segment.");
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
+
+        VkMemoryBarrier computeToHostBarrier{};
+        computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        computeToHostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        computeToHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(
+            gRuntime.commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            0,
+            1,
+            &computeToHostBarrier,
+            0,
+            nullptr,
+            0,
+            nullptr
+        );
+
+        result = vkEndCommandBuffer(gRuntime.commandBuffer);
+        if (result != VK_SUCCESS) {
+            logError("Failed to finish the Vulkan AdamW page command buffer.", result);
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
+        result = vkQueueSubmit(
+            gRuntime.computeQueue,
+            1,
+            &submitInfo,
+            VK_NULL_HANDLE
         );
         if (result != VK_SUCCESS) {
-            logError("Failed to invalidate Vulkan host-visible memory.", result);
+            logError("Vulkan AdamW page queue submission failed.", result);
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
         }
+
+        // This is deliberately synchronous while the single mapped page is
+        // reused. Replacing it with fences alone would not remove the
+        // dependency on reading each page back before the next page overwrites it.
+        result = vkQueueWaitIdle(gRuntime.computeQueue);
+        if (result != VK_SUCCESS) {
+            logError("Vulkan AdamW page queue did not complete.", result);
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
+
+        if (!gRuntime.hostCoherent) {
+            VkMappedMemoryRange invalidateRange{};
+            invalidateRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            invalidateRange.memory = gRuntime.storageMemory;
+            invalidateRange.offset = 0;
+            invalidateRange.size = VK_WHOLE_SIZE;
+            result = vkInvalidateMappedMemoryRanges(
+                gRuntime.device,
+                1,
+                &invalidateRange
+            );
+            if (result != VK_SUCCESS) {
+                logError("Failed to invalidate Vulkan AdamW page output memory.", result);
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+        }
+
+        const float* pageOutputParameters =
+            static_cast<const float*>(gRuntime.mappedStorage);
+        const float* pageOutputFirstMoments =
+            pageOutputParameters + pageElementCount * 2u;
+        const float* pageOutputSecondMoments =
+            pageOutputParameters + pageElementCount * 3u;
+
+        for (size_t index = 0u; index < pageElementCount; ++index) {
+            if (!std::isfinite(pageOutputParameters[index]) ||
+                !std::isfinite(pageOutputFirstMoments[index]) ||
+                !std::isfinite(pageOutputSecondMoments[index])) {
+                logError("Vulkan AdamW produced a non-finite value in a storage-buffer page.");
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+        }
+
+        std::copy_n(
+            pageOutputParameters,
+            pageElementCount,
+            stagedParameters.data() + pageOffset
+        );
+        std::copy_n(
+            pageOutputFirstMoments,
+            pageElementCount,
+            stagedFirstMoments.data() + pageOffset
+        );
+        std::copy_n(
+            pageOutputSecondMoments,
+            pageElementCount,
+            stagedSecondMoments.data() + pageOffset
+        );
+
+        pageOffset = pageEnd;
+        ++pageIndex;
     }
 
-    const float* outputParameters =
-        static_cast<const float*>(gRuntime.mappedStorage);
-    const float* outputFirstMoments = outputParameters + totalElements * 2u;
-    const float* outputSecondMoments = outputParameters + totalElements * 3u;
+    if (pageIndex != pageCount) {
+        logError("Vulkan AdamW did not process every storage-buffer page.");
+        releaseGroupReferences(env, groups);
+        return JNI_FALSE;
+    }
 
-    // Validate every result before changing any Java-side model or optimizer tensor.
-    for (size_t index = 0; index < totalElements; ++index) {
-        if (!std::isfinite(outputParameters[index]) ||
-            !std::isfinite(outputFirstMoments[index]) ||
-            !std::isfinite(outputSecondMoments[index])) {
-            logError("Vulkan AdamW produced a non-finite parameter or optimizer-state value.");
+    // Validate the complete result before mutating any Java model/optimizer
+    // arrays. Earlier pages remain only in host staging if a later page fails.
+    for (size_t index = 0u; index < totalElements; ++index) {
+        if (!std::isfinite(stagedParameters[index]) ||
+            !std::isfinite(stagedFirstMoments[index]) ||
+            !std::isfinite(stagedSecondMoments[index])) {
+            logError("Vulkan AdamW staged output contains a non-finite value.");
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
         }
@@ -1296,21 +1505,30 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             group.parameters,
             0,
             count,
-            outputParameters + offset
+            stagedParameters.data() + offset
         );
+        if (env->ExceptionCheck()) {
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
+
         env->SetFloatArrayRegion(
             group.firstMoments,
             0,
             count,
-            outputFirstMoments + offset
+            stagedFirstMoments.data() + offset
         );
+        if (env->ExceptionCheck()) {
+            releaseGroupReferences(env, groups);
+            return JNI_FALSE;
+        }
+
         env->SetFloatArrayRegion(
             group.secondMoments,
             0,
             count,
-            outputSecondMoments + offset
+            stagedSecondMoments.data() + offset
         );
-
         if (env->ExceptionCheck()) {
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
@@ -1353,10 +1571,22 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
 
     const uint64_t inputElements =
         static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(inputColumns);
-    const uint64_t weightElements =
-        static_cast<uint64_t>(batchCount) *
-        static_cast<uint64_t>(inputColumns) *
-        static_cast<uint64_t>(outputColumns);
+    // Bound the intermediate product before multiplying by outputColumns.
+    // The JNI array length must fit jsize, so rejecting earlier also prevents
+    // uint64_t wraparound in the three-dimensional weight count.
+    const uint64_t maximumArrayElements =
+        static_cast<uint64_t>(std::numeric_limits<jsize>::max());
+    const uint64_t batchInputWidth = static_cast<uint64_t>(batchCount);
+    const uint64_t inputColumnCount = static_cast<uint64_t>(inputColumns);
+    const uint64_t outputColumnCount = static_cast<uint64_t>(outputColumns);
+    if (batchInputWidth > maximumArrayElements / inputColumnCount) {
+        return JNI_FALSE;
+    }
+    const uint64_t batchInputElements = batchInputWidth * inputColumnCount;
+    if (batchInputElements > maximumArrayElements / outputColumnCount) {
+        return JNI_FALSE;
+    }
+    const uint64_t weightElements = batchInputElements * outputColumnCount;
     const uint64_t outputElements =
         static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(outputColumns);
     const uint64_t totalElements = inputElements + weightElements + outputElements;
@@ -1386,36 +1616,33 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         return JNI_FALSE;
     }
 
-    std::vector<float> packed;
-    try {
-        packed.resize(static_cast<size_t>(totalElements));
-    } catch (const std::bad_alloc&) {
-        logError("Not enough host memory to prepare a Vulkan linear operation.");
-        return JNI_FALSE;
-    }
-
-    env->GetFloatArrayRegion(
-        inputArray,
-        0,
-        static_cast<jsize>(inputElements),
-        packed.data() + inputOffset
-    );
-    env->GetFloatArrayRegion(
-        weightArray,
-        0,
-        static_cast<jsize>(weightElements),
-        packed.data() + weightOffset
-    );
-    if (env->ExceptionCheck()) {
-        return JNI_FALSE;
-    }
-
     if (!ensureStorageBuffer(static_cast<VkDeviceSize>(totalByteCount))) {
         logError("Vulkan linear storage-buffer allocation failed.");
         return JNI_FALSE;
     }
 
-    std::memcpy(gRuntime.mappedStorage, packed.data(), totalByteCount);
+    // Copy JNI arrays directly into the mapped Vulkan staging allocation.
+    // This avoids a temporary tensor vector and a second full-buffer memcpy.
+    float* packedValues = static_cast<float*>(gRuntime.mappedStorage);
+    env->GetFloatArrayRegion(
+        inputArray,
+        0,
+        static_cast<jsize>(inputElements),
+        packedValues + inputOffset
+    );
+    if (env->ExceptionCheck()) {
+        return JNI_FALSE;
+    }
+
+    env->GetFloatArrayRegion(
+        weightArray,
+        0,
+        static_cast<jsize>(weightElements),
+        packedValues + weightOffset
+    );
+    if (env->ExceptionCheck()) {
+        return JNI_FALSE;
+    }
 
     if (!gRuntime.hostCoherent) {
         VkMappedMemoryRange flushRange{};
@@ -1435,11 +1662,23 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         }
     }
 
-    const uint64_t workGroupCount =
-        (outputElements + kLocalWorkGroupSize - 1u) / kLocalWorkGroupSize;
-    if (workGroupCount == 0 ||
-        workGroupCount > gRuntime.maxComputeWorkGroupCountX) {
-        logError("Vulkan linear dispatch exceeds the device work-group limit.");
+    // Each 8x16 workgroup computes one output tile. The shader advances
+    // over additional tiles by gl_NumWorkGroups.x, so dispatch remains within
+    // the device X limit without rejecting large, otherwise valid matrices.
+    constexpr uint64_t kLinearTileRows = 8u;
+    constexpr uint64_t kLinearTileColumns = 16u;
+    const uint64_t tileRowsPerBatch =
+        1u + (static_cast<uint64_t>(rowsPerBatch) - 1u) / kLinearTileRows;
+    const uint64_t tileColumnsPerBatch =
+        1u + (static_cast<uint64_t>(outputColumns) - 1u) / kLinearTileColumns;
+    const uint64_t totalTileCount =
+        static_cast<uint64_t>(batchCount) *
+        tileRowsPerBatch *
+        tileColumnsPerBatch;
+    const uint32_t workGroupCount =
+        calculateDispatchGroupCount(totalTileCount);
+    if (workGroupCount == 0u) {
+        logError("Vulkan linear dispatch has no available output tile groups.");
         return JNI_FALSE;
     }
 
@@ -1628,10 +1867,22 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
 
     const uint64_t inputElements =
         static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(inputColumns);
-    const uint64_t weightElements =
-        static_cast<uint64_t>(batchCount) *
-        static_cast<uint64_t>(inputColumns) *
-        static_cast<uint64_t>(outputColumns);
+    // Bound the intermediate product before multiplying by outputColumns.
+    // The JNI array length must fit jsize, so rejecting earlier also prevents
+    // uint64_t wraparound in the three-dimensional weight count.
+    const uint64_t maximumArrayElements =
+        static_cast<uint64_t>(std::numeric_limits<jsize>::max());
+    const uint64_t batchInputWidth = static_cast<uint64_t>(batchCount);
+    const uint64_t inputColumnCount = static_cast<uint64_t>(inputColumns);
+    const uint64_t outputColumnCount = static_cast<uint64_t>(outputColumns);
+    if (batchInputWidth > maximumArrayElements / inputColumnCount) {
+        return JNI_FALSE;
+    }
+    const uint64_t batchInputElements = batchInputWidth * inputColumnCount;
+    if (batchInputElements > maximumArrayElements / outputColumnCount) {
+        return JNI_FALSE;
+    }
+    const uint64_t weightElements = batchInputElements * outputColumnCount;
     const uint64_t outputElements =
         static_cast<uint64_t>(rowCount) * static_cast<uint64_t>(outputColumns);
 
@@ -1667,57 +1918,85 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         return JNI_FALSE;
     }
 
-    std::vector<jfloat> inputValues;
-    std::vector<jshort> weightValues;
-    std::vector<uint32_t> packedWords;
-    try {
-        inputValues.resize(static_cast<size_t>(inputElements));
-        weightValues.resize(static_cast<size_t>(weightElements));
-        packedWords.assign(static_cast<size_t>(totalWords), 0u);
-    } catch (const std::bad_alloc&) {
-        logError("Not enough host memory to prepare a Vulkan FP16 linear operation.");
-        return JNI_FALSE;
-    }
-
-    env->GetFloatArrayRegion(
-        inputArray,
-        0,
-        static_cast<jsize>(inputElements),
-        inputValues.data()
-    );
-    env->GetShortArrayRegion(
-        weightArray,
-        0,
-        static_cast<jsize>(weightElements),
-        weightValues.data()
-    );
-    if (env->ExceptionCheck()) {
-        return JNI_FALSE;
-    }
-
-    for (size_t index = 0; index < inputValues.size(); ++index) {
-        if (!std::isfinite(inputValues[index])) {
-            return JNI_FALSE;
-        }
-        storePackedHalf(
-            packedWords.data(),
-            index,
-            floatToHalf(inputValues[index])
-        );
-    }
-    for (size_t index = 0; index < weightValues.size(); ++index) {
-        storePackedHalf(
-            packedWords.data(),
-            static_cast<size_t>(weightOffsetHalf) + index,
-            static_cast<uint16_t>(weightValues[index])
-        );
-    }
-
     if (!ensureStorageBuffer(static_cast<VkDeviceSize>(totalByteCount))) {
         logError("Vulkan FP16 linear storage-buffer allocation failed.");
         return JNI_FALSE;
     }
-    std::memcpy(gRuntime.mappedStorage, packedWords.data(), totalByteCount);
+
+    // Convert FP32 activations directly into the mapped packed-half staging
+    // buffer in bounded chunks. This avoids a second full-size host tensor
+    // allocation while keeping JNI calls large enough to amortize call overhead.
+    constexpr size_t kInputConversionChunkElements = 8192u;
+    std::array<jfloat, kInputConversionChunkElements> inputChunk{};
+    auto* packedWords = static_cast<uint32_t*>(gRuntime.mappedStorage);
+
+    for (uint64_t chunkOffset = 0u;
+         chunkOffset < inputElements;
+         chunkOffset += kInputConversionChunkElements) {
+        const size_t chunkCount = static_cast<size_t>(
+            std::min<uint64_t>(
+                kInputConversionChunkElements,
+                inputElements - chunkOffset
+            )
+        );
+        env->GetFloatArrayRegion(
+            inputArray,
+            static_cast<jsize>(chunkOffset),
+            static_cast<jsize>(chunkCount),
+            inputChunk.data()
+        );
+        if (env->ExceptionCheck()) {
+            return JNI_FALSE;
+        }
+
+        // Chunk size and offsets are even, so only the final chunk can leave
+        // one high-half slot unused. That slot is explicitly zero-filled.
+        for (size_t localIndex = 0u; localIndex < chunkCount; localIndex += 2u) {
+            const size_t absoluteIndex =
+                static_cast<size_t>(chunkOffset) + localIndex;
+            const float firstValue = inputChunk[localIndex];
+            if (!std::isfinite(firstValue)) {
+                return JNI_FALSE;
+            }
+
+            const uint16_t lowHalf = floatToHalf(firstValue);
+            if ((lowHalf & 0x7C00u) == 0x7C00u) {
+                logError("FP16 input activation exceeds the finite binary16 range.");
+                return JNI_FALSE;
+            }
+
+            uint32_t highHalf = 0u;
+            if (localIndex + 1u < chunkCount) {
+                const float secondValue = inputChunk[localIndex + 1u];
+                if (!std::isfinite(secondValue)) {
+                    return JNI_FALSE;
+                }
+                const uint16_t encodedSecond = floatToHalf(secondValue);
+                if ((encodedSecond & 0x7C00u) == 0x7C00u) {
+                    logError("FP16 input activation exceeds the finite binary16 range.");
+                    return JNI_FALSE;
+                }
+                highHalf = static_cast<uint32_t>(encodedSecond) << 16u;
+            }
+
+            packedWords[absoluteIndex >> 1u] =
+                static_cast<uint32_t>(lowHalf) | highHalf;
+        }
+    }
+
+    // Weight arrays already contain IEEE-754 binary16 payloads. Copy them
+    // directly into mapped storage instead of allocating and repacking a
+    // second native vector.
+    auto* packedWeights = reinterpret_cast<jshort*>(packedWords) + weightOffsetHalf;
+    env->GetShortArrayRegion(
+        weightArray,
+        0,
+        static_cast<jsize>(weightElements),
+        packedWeights
+    );
+    if (env->ExceptionCheck()) {
+        return JNI_FALSE;
+    }
 
     if (!gRuntime.hostCoherent) {
         VkMappedMemoryRange flushRange{};
@@ -1736,11 +2015,22 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         }
     }
 
-    const uint64_t workGroupCount =
-        (outputElements + kLocalWorkGroupSize - 1u) / kLocalWorkGroupSize;
-    if (workGroupCount == 0 ||
-        workGroupCount > gRuntime.maxComputeWorkGroupCountX) {
-        logError("Vulkan FP16 linear dispatch exceeds the device work-group limit.");
+    // Each 8x16 workgroup computes one FP16 output tile. Additional tiles
+    // are covered by the shader's workgroup grid-stride loop.
+    constexpr uint64_t kFp16TileRows = 8u;
+    constexpr uint64_t kFp16TileColumns = 16u;
+    const uint64_t tileRowsPerBatch =
+        1u + (static_cast<uint64_t>(rowsPerBatch) - 1u) / kFp16TileRows;
+    const uint64_t tileColumnsPerBatch =
+        1u + (static_cast<uint64_t>(outputColumns) - 1u) / kFp16TileColumns;
+    const uint64_t totalTileCount =
+        static_cast<uint64_t>(batchCount) *
+        tileRowsPerBatch *
+        tileColumnsPerBatch;
+    const uint32_t workGroupCount =
+        calculateDispatchGroupCount(totalTileCount);
+    if (workGroupCount == 0u) {
+        logError("Vulkan FP16 linear dispatch has no available output tile groups.");
         return JNI_FALSE;
     }
 
@@ -1876,23 +2166,20 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
     }
 
     const auto* mappedWords = static_cast<const uint32_t*>(gRuntime.mappedStorage);
-    std::vector<jfloat> outputValues;
-    try {
-        outputValues.resize(static_cast<size_t>(outputElements));
-    } catch (const std::bad_alloc&) {
-        logError("Not enough host memory to collect Vulkan FP16 linear output.");
-        return JNI_FALSE;
+    for (uint64_t index = 0u; index < outputElements; ++index) {
+        const uint32_t valueBits = mappedWords[outputOffsetWords + index];
+        if ((valueBits & 0x7F800000u) == 0x7F800000u) {
+            logError("Vulkan FP16 linear kernel produced a non-finite output.");
+            return JNI_FALSE;
+        }
     }
-    std::memcpy(
-        outputValues.data(),
-        mappedWords + outputOffsetWords,
-        static_cast<size_t>(outputElements) * sizeof(jfloat)
-    );
+    const auto* outputValues =
+        reinterpret_cast<const jfloat*>(mappedWords + outputOffsetWords);
     env->SetFloatArrayRegion(
         outputArray,
         0,
         static_cast<jsize>(outputElements),
-        outputValues.data()
+        outputValues
     );
     if (env->ExceptionCheck()) {
         return JNI_FALSE;

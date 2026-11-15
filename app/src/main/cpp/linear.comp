@@ -1,6 +1,8 @@
 #version 450
 
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// 128 invocations per workgroup, within Vulkan's guaranteed minimum.
+// A tile reuses each loaded input and weight value across multiple outputs.
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) buffer TrainingBuffer {
     float values[];
@@ -18,39 +20,124 @@ layout(push_constant) uniform LinearParameters {
     uint transposeWeights;
 } parameters;
 
+const uint TILE_ROWS = 8u;
+const uint TILE_COLUMNS = 16u;
+const uint TILE_K = 16u;
+
+shared float inputTile[TILE_ROWS][TILE_K];
+shared float weightTile[TILE_K][TILE_COLUMNS];
+
 void main() {
-    const uint outputIndex = gl_GlobalInvocationID.x;
-    const uint outputElementCount = parameters.rowCount * parameters.outputColumns;
-    if (outputIndex >= outputElementCount) {
-        return;
-    }
+    const uint tilesPerRow =
+        1u + (parameters.outputColumns - 1u) / TILE_COLUMNS;
+    const uint tilesPerBatch =
+        (1u + (parameters.rowsPerBatch - 1u) / TILE_ROWS) * tilesPerRow;
+    const uint totalTileCount = parameters.batchCount * tilesPerBatch;
+    const uint tileStride = gl_NumWorkGroups.x;
 
-    const uint row = outputIndex / parameters.outputColumns;
-    const uint column = outputIndex - row * parameters.outputColumns;
-    const uint batchIndex = row / parameters.rowsPerBatch;
-    if (batchIndex >= parameters.batchCount) {
-        return;
-    }
+    const uint localColumn = gl_LocalInvocationID.x;
+    const uint localRow = gl_LocalInvocationID.y;
+    uint tileIndex = gl_WorkGroupID.x;
 
-    const uint rowInBatch = row - batchIndex * parameters.rowsPerBatch;
-    const uint inputRowOffset =
-        parameters.inputOffset +
-        batchIndex * parameters.rowsPerBatch * parameters.inputColumns +
-        rowInBatch * parameters.inputColumns;
-    const uint batchWeightOffset =
-        parameters.weightOffset +
-        batchIndex * parameters.inputColumns * parameters.outputColumns;
+    while (tileIndex < totalTileCount) {
+        const uint batchIndex = tileIndex / tilesPerBatch;
+        const uint tileInBatch = tileIndex - batchIndex * tilesPerBatch;
+        const uint tileRow = tileInBatch / tilesPerRow;
+        const uint tileColumn = tileInBatch - tileRow * tilesPerRow;
 
-    float sum = 0.0;
-    for (uint inner = 0u; inner < parameters.inputColumns; ++inner) {
-        uint weightIndex;
-        if (parameters.transposeWeights == 0u) {
-            weightIndex = batchWeightOffset + inner * parameters.outputColumns + column;
-        } else {
-            weightIndex = batchWeightOffset + column * parameters.inputColumns + inner;
+        const uint rowInBatch = tileRow * TILE_ROWS + localRow;
+        const uint outputColumn = tileColumn * TILE_COLUMNS + localColumn;
+        const bool validOutputRow = rowInBatch < parameters.rowsPerBatch;
+        const bool validOutputColumn = outputColumn < parameters.outputColumns;
+
+        const uint inputBatchOffset =
+            parameters.inputOffset +
+            batchIndex * parameters.rowsPerBatch * parameters.inputColumns;
+        const uint weightBatchOffset =
+            parameters.weightOffset +
+            batchIndex * parameters.inputColumns * parameters.outputColumns;
+
+        float accumulated = 0.0;
+        for (uint kBase = 0u; kBase < parameters.inputColumns; kBase += TILE_K) {
+            const uint inputColumn = kBase + localColumn;
+
+            if (validOutputRow && inputColumn < parameters.inputColumns) {
+                inputTile[localRow][localColumn] =
+                    values[inputBatchOffset +
+                        rowInBatch * parameters.inputColumns +
+                        inputColumn];
+            } else {
+                inputTile[localRow][localColumn] = 0.0;
+            }
+
+            // Each invocation loads two rows of the 16x16 weight tile.
+            const uint weightK0 = kBase + localRow;
+            const uint weightK1 = weightK0 + TILE_ROWS;
+            const bool validWeightColumn = validOutputColumn;
+            if (validWeightColumn && weightK0 < parameters.inputColumns) {
+                uint weightIndex0;
+                if (parameters.transposeWeights == 0u) {
+                    weightIndex0 =
+                        weightBatchOffset +
+                        weightK0 * parameters.outputColumns +
+                        outputColumn;
+                } else {
+                    weightIndex0 =
+                        weightBatchOffset +
+                        outputColumn * parameters.inputColumns +
+                        weightK0;
+                }
+                weightTile[localRow][localColumn] = values[weightIndex0];
+            } else {
+                weightTile[localRow][localColumn] = 0.0;
+            }
+
+            if (validWeightColumn && weightK1 < parameters.inputColumns) {
+                uint weightIndex1;
+                if (parameters.transposeWeights == 0u) {
+                    weightIndex1 =
+                        weightBatchOffset +
+                        weightK1 * parameters.outputColumns +
+                        outputColumn;
+                } else {
+                    weightIndex1 =
+                        weightBatchOffset +
+                        outputColumn * parameters.inputColumns +
+                        weightK1;
+                }
+                weightTile[weightK1 - kBase][localColumn] = values[weightIndex1];
+            } else {
+                weightTile[weightK1 - kBase][localColumn] = 0.0;
+            }
+
+            barrier();
+
+            for (uint k = 0u; k < TILE_K; ++k) {
+                accumulated = fma(
+                    inputTile[localRow][k],
+                    weightTile[k][localColumn],
+                    accumulated
+                );
+            }
+
+            // Do not overwrite shared values until all invocations have
+            // finished consuming the current K tile.
+            barrier();
         }
-        sum += values[inputRowOffset + inner] * values[weightIndex];
-    }
 
-    values[parameters.outputOffset + outputIndex] = sum;
+        if (validOutputRow && validOutputColumn) {
+            const uint globalRow =
+                batchIndex * parameters.rowsPerBatch + rowInBatch;
+            const uint outputIndex =
+                parameters.outputOffset +
+                globalRow * parameters.outputColumns +
+                outputColumn;
+            values[outputIndex] = accumulated;
+        }
+
+        if (totalTileCount - tileIndex <= tileStride) {
+            break;
+        }
+        tileIndex += tileStride;
+    }
 }

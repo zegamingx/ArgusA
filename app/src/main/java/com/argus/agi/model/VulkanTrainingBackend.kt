@@ -250,10 +250,75 @@ internal object VulkanTrainingBackend {
             gradientClipFactor = 1f
         )
 
-        return adamwUpdated &&
-            approximatelyEqual(parameters, floatArrayOf(0.99f, 2.01f), 1e-4f) &&
-            approximatelyEqual(firstMoments, floatArrayOf(0.01f, -0.02f), 1e-5f) &&
-            approximatelyEqual(secondMoments, floatArrayOf(0.00001f, 0.00004f), 1e-7f)
+        if (!adamwUpdated ||
+            !approximatelyEqual(parameters, floatArrayOf(0.99f, 2.01f), 1e-4f) ||
+            !approximatelyEqual(firstMoments, floatArrayOf(0.01f, -0.02f), 1e-5f) ||
+            !approximatelyEqual(secondMoments, floatArrayOf(0.00001f, 0.00004f), 1e-7f)) {
+            return false
+        }
+
+        // Weight-decay groups are intentionally interleaved. The native
+        // optimizer sorts them into contiguous GPU segments and must still
+        // commit every result to its original Java tensor reference.
+        val groupedParameterReference = arrayOf(
+            floatArrayOf(1.0f, 2.0f),
+            floatArrayOf(3.0f, 4.0f),
+            floatArrayOf(-1.0f, 0.5f)
+        )
+        val groupedParameters = Array(groupedParameterReference.size) {
+            groupedParameterReference[it].copyOf()
+        }
+        val groupedGradients = arrayOf(
+            floatArrayOf(0.1f, -0.2f),
+            floatArrayOf(0.3f, -0.4f),
+            floatArrayOf(0.5f, -0.6f)
+        )
+        val groupedFirstMoments = Array(groupedParameters.size) { FloatArray(2) }
+        val groupedSecondMoments = Array(groupedParameters.size) { FloatArray(2) }
+        val groupedDecay = floatArrayOf(0.01f, 0.0f, 0.01f)
+        val groupedUpdated = nativeApplyAdamWUpdate(
+            parameterGroups = groupedParameters,
+            gradientGroups = groupedGradients,
+            firstMomentGroups = groupedFirstMoments,
+            secondMomentGroups = groupedSecondMoments,
+            weightDecayByGroup = groupedDecay,
+            learningRate = 0.01f,
+            beta1 = 0.9f,
+            beta2 = 0.999f,
+            biasCorrection1 = 0.1f,
+            biasCorrection2 = 0.001f,
+            epsilon = 1e-8f,
+            gradientClipFactor = 1f
+        )
+        if (!groupedUpdated) return false
+
+        for (groupIndex in groupedParameters.indices) {
+            val expectedParameters = FloatArray(2)
+            val expectedFirstMoments = FloatArray(2)
+            val expectedSecondMoments = FloatArray(2)
+            for (elementIndex in 0 until 2) {
+                val gradient = groupedGradients[groupIndex][elementIndex]
+                val firstMoment = 0.1f * gradient
+                val secondMoment = 0.001f * gradient * gradient
+                val correctedFirst = firstMoment / 0.1f
+                val correctedSecond = secondMoment / 0.001f
+                val parameter = groupedParameterReference[groupIndex][elementIndex]
+                val update = correctedFirst /
+                    (kotlin.math.sqrt(correctedSecond) + 1e-8f) +
+                    groupedDecay[groupIndex] * parameter
+
+                expectedParameters[elementIndex] = parameter - 0.01f * update
+                expectedFirstMoments[elementIndex] = firstMoment
+                expectedSecondMoments[elementIndex] = secondMoment
+            }
+
+            if (!approximatelyEqual(groupedParameters[groupIndex], expectedParameters, 1e-4f) ||
+                !approximatelyEqual(groupedFirstMoments[groupIndex], expectedFirstMoments, 1e-5f) ||
+                !approximatelyEqual(groupedSecondMoments[groupIndex], expectedSecondMoments, 1e-7f)) {
+                return false
+            }
+        }
+        return true
     }
 
     /**
@@ -261,10 +326,12 @@ internal object VulkanTrainingBackend {
      * 72 outputs deliberately cross the 64-invocation workgroup boundary.
      */
     private fun verifyBatchedLinearKernel(): Boolean {
+        // Exercise partial 8x16 output tiles, multiple batches, and a K
+        // dimension that requires a second 16-wide shared-memory tile.
         val batchCount = 3
-        val rowsPerBatch = 3
-        val inputColumns = 5
-        val outputColumns = 8
+        val rowsPerBatch = 9
+        val inputColumns = 19
+        val outputColumns = 19
         val rowCount = batchCount * rowsPerBatch
         val input = FloatArray(rowCount * inputColumns) { index ->
             ((index % 17) - 8) * 0.125f
@@ -273,40 +340,57 @@ internal object VulkanTrainingBackend {
         val weights = FloatArray(batchCount * weightsPerBatch) { index ->
             ((index % 13) - 6) * 0.0625f
         }
-        val expected = FloatArray(rowCount * outputColumns)
-
+        val transposedWeights = FloatArray(weights.size)
         for (batchIndex in 0 until batchCount) {
-            val batchInputOffset = batchIndex * rowsPerBatch * inputColumns
-            val batchWeightOffset = batchIndex * weightsPerBatch
-            for (row in 0 until rowsPerBatch) {
-                val inputRowOffset = batchInputOffset + row * inputColumns
-                val outputRowOffset = (batchIndex * rowsPerBatch + row) * outputColumns
+            val batchOffset = batchIndex * weightsPerBatch
+            for (inner in 0 until inputColumns) {
                 for (column in 0 until outputColumns) {
-                    var sum = 0f
-                    for (inner in 0 until inputColumns) {
-                        val inputValue = input[inputRowOffset + inner]
-                        val weightValue = weights[
-                            batchWeightOffset + inner * outputColumns + column
-                        ]
-                        sum += inputValue * weightValue
-                    }
-                    expected[outputRowOffset + column] = sum
+                    transposedWeights[batchOffset + column * inputColumns + inner] =
+                        weights[batchOffset + inner * outputColumns + column]
                 }
             }
         }
 
-        val actual = FloatArray(expected.size)
-        return nativeApplyLinear(
-            input,
-            weights,
-            actual,
-            rows = rowCount,
-            batchCount = batchCount,
-            rowsPerBatch = rowsPerBatch,
-            inputColumns = inputColumns,
-            outputColumns = outputColumns,
-            transposeWeights = false
-        ) && approximatelyEqual(actual, expected, 1e-4f)
+        fun verify(weightValues: FloatArray, transposeWeights: Boolean): Boolean {
+            val expected = FloatArray(rowCount * outputColumns)
+            for (batchIndex in 0 until batchCount) {
+                val batchInputOffset = batchIndex * rowsPerBatch * inputColumns
+                val batchWeightOffset = batchIndex * weightsPerBatch
+                for (row in 0 until rowsPerBatch) {
+                    val inputRowOffset = batchInputOffset + row * inputColumns
+                    val outputRowOffset =
+                        (batchIndex * rowsPerBatch + row) * outputColumns
+                    for (column in 0 until outputColumns) {
+                        var sum = 0f
+                        for (inner in 0 until inputColumns) {
+                            val weightIndex = if (transposeWeights) {
+                                batchWeightOffset + column * inputColumns + inner
+                            } else {
+                                batchWeightOffset + inner * outputColumns + column
+                            }
+                            sum += input[inputRowOffset + inner] * weightValues[weightIndex]
+                        }
+                        expected[outputRowOffset + column] = sum
+                    }
+                }
+            }
+
+            val actual = FloatArray(expected.size)
+            return nativeApplyLinear(
+                input,
+                weightValues,
+                actual,
+                rows = rowCount,
+                batchCount = batchCount,
+                rowsPerBatch = rowsPerBatch,
+                inputColumns = inputColumns,
+                outputColumns = outputColumns,
+                transposeWeights = transposeWeights
+            ) && approximatelyEqual(actual, expected, 1e-4f)
+        }
+
+        return verify(weights, transposeWeights = false) &&
+            verify(transposedWeights, transposeWeights = true)
     }
 
     private fun approximatelyEqual(
@@ -325,31 +409,85 @@ internal object VulkanTrainingBackend {
     }
 
     private fun verifyNativeFp16Kernel(): Boolean {
-        val input = floatArrayOf(
-            0.5f, 1.0f, 1.5f,
-            2.0f, 2.5f, 3.0f
-        )
-        val weights = Float16ParameterArray.fromFloatArray(
-            floatArrayOf(
-                0.5f, 1.0f,
-                1.5f, 2.0f,
-                2.5f, 3.0f
-            )
-        ).toShortArray()
-        val output = FloatArray(4)
-        val succeeded = nativeApplyFp16Linear(
-            input = input,
-            weights = weights,
-            output = output,
-            rows = 2,
-            batchCount = 1,
-            rowsPerBatch = 2,
-            inputColumns = 3,
-            outputColumns = 2,
-            transposeWeights = false
-        )
-        return succeeded &&
-            approximatelyEqual(output, floatArrayOf(5.5f, 7.0f, 12.25f, 16.0f), 1e-3f)
+        // Cover partial 8x16 tiles, a second K tile, multiple independent
+        // batches, odd packed-input and weight lengths, and both weight layouts.
+        val batchCount = 3
+        val rowsPerBatch = 9
+        val inputColumns = 19
+        val outputColumns = 19
+        val rowCount = batchCount * rowsPerBatch
+        val input = FloatArray(rowCount * inputColumns) { index ->
+            ((index % 17) - 8) * 0.125f
+        }
+        val sourceWeights = FloatArray(
+            batchCount * inputColumns * outputColumns
+        ) { index ->
+            ((index % 13) - 6) * 0.0625f
+        }
+        val weights = Float16ParameterArray.fromFloatArray(sourceWeights).toShortArray()
+        val transposedWeights = ShortArray(weights.size)
+        val weightBatchSize = inputColumns * outputColumns
+
+        for (batchIndex in 0 until batchCount) {
+            val batchOffset = batchIndex * weightBatchSize
+            for (inner in 0 until inputColumns) {
+                for (column in 0 until outputColumns) {
+                    transposedWeights[batchOffset + column * inputColumns + inner] =
+                        weights[batchOffset + inner * outputColumns + column]
+                }
+            }
+        }
+
+        fun verify(weightValues: ShortArray, transposeWeights: Boolean): Boolean {
+            val expected = FloatArray(rowCount * outputColumns)
+            for (batchIndex in 0 until batchCount) {
+                val inputBatchOffset = batchIndex * rowsPerBatch * inputColumns
+                val weightBatchOffset = batchIndex * weightBatchSize
+                for (row in 0 until rowsPerBatch) {
+                    val inputRowOffset = inputBatchOffset + row * inputColumns
+                    val outputRowOffset =
+                        (batchIndex * rowsPerBatch + row) * outputColumns
+
+                    for (column in 0 until outputColumns) {
+                        var sum = 0f
+                        for (inner in 0 until inputColumns) {
+                            val inputValue = Float16Codec.toFloat(
+                                Float16Codec.fromFiniteFloat(
+                                    input[inputRowOffset + inner]
+                                )
+                            )
+                            val weightIndex = if (transposeWeights) {
+                                weightBatchOffset + column * inputColumns + inner
+                            } else {
+                                weightBatchOffset + inner * outputColumns + column
+                            }
+                            val weightValue = Float16Codec.toFloat(weightValues[weightIndex])
+                            val halfProduct = Float16Codec.toFloat(
+                                Float16Codec.fromFiniteFloat(inputValue * weightValue)
+                            )
+                            sum += halfProduct
+                        }
+                        expected[outputRowOffset + column] = sum
+                    }
+                }
+            }
+
+            val actual = FloatArray(expected.size)
+            return nativeApplyFp16Linear(
+                input = input,
+                weights = weightValues,
+                output = actual,
+                rows = rowCount,
+                batchCount = batchCount,
+                rowsPerBatch = rowsPerBatch,
+                inputColumns = inputColumns,
+                outputColumns = outputColumns,
+                transposeWeights = transposeWeights
+            ) && approximatelyEqual(actual, expected, 1e-3f)
+        }
+
+        return verify(weights, transposeWeights = false) &&
+            verify(transposedWeights, transposeWeights = true)
     }
 
     @Synchronized
@@ -388,7 +526,10 @@ internal object VulkanTrainingBackend {
         }
         val rowsPerBatch = inputBatches[0].size
         require(rowsPerBatch > 0) { "Every FP16 batched linear input must contain at least one row." }
-        val requiredWeightElements = Math.multiplyExact(inputColumns, outputColumns)
+        val requiredWeightElementsLong =
+            inputColumns.toLong() * outputColumns.toLong()
+        if (requiredWeightElementsLong > Int.MAX_VALUE.toLong()) return false
+        val requiredWeightElements = requiredWeightElementsLong.toInt()
 
         for (batchIndex in 0 until batchCount) {
             require(inputBatches[batchIndex].size == rowsPerBatch) {
@@ -415,11 +556,12 @@ internal object VulkanTrainingBackend {
         }
 
         val totalRowsLong = batchCount.toLong() * rowsPerBatch.toLong()
+        if (totalRowsLong > Int.MAX_VALUE.toLong()) return false
+
         val inputElementsLong = totalRowsLong * inputColumns.toLong()
         val weightElementsLong = batchCount.toLong() * requiredWeightElements.toLong()
         val outputElementsLong = totalRowsLong * outputColumns.toLong()
-        if (totalRowsLong > Int.MAX_VALUE.toLong() ||
-            inputElementsLong > Int.MAX_VALUE.toLong() ||
+        if (inputElementsLong > Int.MAX_VALUE.toLong() ||
             weightElementsLong > Int.MAX_VALUE.toLong() ||
             outputElementsLong > Int.MAX_VALUE.toLong()) {
             return false
@@ -577,11 +719,12 @@ internal object VulkanTrainingBackend {
         }
 
         val totalRowsLong = batchCount.toLong() * rowsPerBatch.toLong()
+        if (totalRowsLong > Int.MAX_VALUE.toLong()) return false
+
         val inputElementCountLong = totalRowsLong * inputColumns.toLong()
         val weightElementCountLong = batchCount.toLong() * requiredWeightElements
         val outputElementCountLong = totalRowsLong * outputColumns.toLong()
-        if (totalRowsLong > Int.MAX_VALUE.toLong() ||
-            inputElementCountLong > Int.MAX_VALUE.toLong() ||
+        if (inputElementCountLong > Int.MAX_VALUE.toLong() ||
             weightElementCountLong > Int.MAX_VALUE.toLong() ||
             outputElementCountLong > Int.MAX_VALUE.toLong()) {
             return false

@@ -1,7 +1,10 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// Match the FP32 8x16 output tile while retaining FP16 multiplication.
+// shaderFloat16 permits 16-bit values in Workgroup storage; the storage
+// buffer remains packed uint32 and does not require 16-bit SSBO support.
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) buffer PackedTrainingBuffer {
     uint values[];
@@ -19,47 +22,126 @@ layout(push_constant) uniform LinearParameters {
     uint transposeWeights;
 } parameters;
 
+const uint TILE_ROWS = 8u;
+const uint TILE_COLUMNS = 16u;
+const uint TILE_K = 16u;
+
+shared float16_t inputTile[TILE_ROWS][TILE_K];
+shared float16_t weightTile[TILE_K][TILE_COLUMNS];
+
 float16_t loadHalf(uint halfIndex) {
     const vec2 pair = unpackHalf2x16(values[halfIndex >> 1u]);
     return float16_t((halfIndex & 1u) == 0u ? pair.x : pair.y);
 }
 
 void main() {
-    const uint outputIndex = gl_GlobalInvocationID.x;
-    const uint outputElementCount = parameters.rowCount * parameters.outputColumns;
-    if (outputIndex >= outputElementCount) {
-        return;
-    }
+    const uint tilesPerRow =
+        1u + (parameters.outputColumns - 1u) / TILE_COLUMNS;
+    const uint tilesPerBatch =
+        (1u + (parameters.rowsPerBatch - 1u) / TILE_ROWS) * tilesPerRow;
+    const uint totalTileCount = parameters.batchCount * tilesPerBatch;
+    const uint tileStride = gl_NumWorkGroups.x;
 
-    const uint row = outputIndex / parameters.outputColumns;
-    const uint column = outputIndex - row * parameters.outputColumns;
-    const uint batchIndex = row / parameters.rowsPerBatch;
-    if (batchIndex >= parameters.batchCount) {
-        return;
-    }
+    const uint localColumn = gl_LocalInvocationID.x;
+    const uint localRow = gl_LocalInvocationID.y;
+    uint tileIndex = gl_WorkGroupID.x;
 
-    const uint rowInBatch = row - batchIndex * parameters.rowsPerBatch;
-    const uint inputRowOffset =
-        parameters.inputOffset +
-        batchIndex * parameters.rowsPerBatch * parameters.inputColumns +
-        rowInBatch * parameters.inputColumns;
-    const uint batchWeightOffset =
-        parameters.weightOffset +
-        batchIndex * parameters.inputColumns * parameters.outputColumns;
+    while (tileIndex < totalTileCount) {
+        const uint batchIndex = tileIndex / tilesPerBatch;
+        const uint tileInBatch = tileIndex - batchIndex * tilesPerBatch;
+        const uint tileRow = tileInBatch / tilesPerRow;
+        const uint tileColumn = tileInBatch - tileRow * tilesPerRow;
 
-    float sum = 0.0;
-    for (uint inner = 0u; inner < parameters.inputColumns; ++inner) {
-        uint weightIndex;
-        if (parameters.transposeWeights == 0u) {
-            weightIndex = batchWeightOffset + inner * parameters.outputColumns + column;
-        } else {
-            weightIndex = batchWeightOffset + column * parameters.inputColumns + inner;
+        const uint rowInBatch = tileRow * TILE_ROWS + localRow;
+        const uint outputColumn = tileColumn * TILE_COLUMNS + localColumn;
+        const bool validOutputRow = rowInBatch < parameters.rowsPerBatch;
+        const bool validOutputColumn = outputColumn < parameters.outputColumns;
+
+        const uint inputBatchOffset =
+            parameters.inputOffset +
+            batchIndex * parameters.rowsPerBatch * parameters.inputColumns;
+        const uint weightBatchOffset =
+            parameters.weightOffset +
+            batchIndex * parameters.inputColumns * parameters.outputColumns;
+
+        float accumulated = 0.0;
+        for (uint kBase = 0u; kBase < parameters.inputColumns; kBase += TILE_K) {
+            const uint inputColumn = kBase + localColumn;
+            if (validOutputRow && inputColumn < parameters.inputColumns) {
+                inputTile[localRow][localColumn] =
+                    loadHalf(
+                        inputBatchOffset +
+                        rowInBatch * parameters.inputColumns +
+                        inputColumn
+                    );
+            } else {
+                inputTile[localRow][localColumn] = float16_t(0.0);
+            }
+
+            // Each invocation loads two rows of the 16x16 weight tile.
+            const uint weightK0 = kBase + localRow;
+            const uint weightK1 = weightK0 + TILE_ROWS;
+            if (validOutputColumn && weightK0 < parameters.inputColumns) {
+                uint weightIndex0;
+                if (parameters.transposeWeights == 0u) {
+                    weightIndex0 =
+                        weightBatchOffset +
+                        weightK0 * parameters.outputColumns +
+                        outputColumn;
+                } else {
+                    weightIndex0 =
+                        weightBatchOffset +
+                        outputColumn * parameters.inputColumns +
+                        weightK0;
+                }
+                weightTile[localRow][localColumn] = loadHalf(weightIndex0);
+            } else {
+                weightTile[localRow][localColumn] = float16_t(0.0);
+            }
+
+            if (validOutputColumn && weightK1 < parameters.inputColumns) {
+                uint weightIndex1;
+                if (parameters.transposeWeights == 0u) {
+                    weightIndex1 =
+                        weightBatchOffset +
+                        weightK1 * parameters.outputColumns +
+                        outputColumn;
+                } else {
+                    weightIndex1 =
+                        weightBatchOffset +
+                        outputColumn * parameters.inputColumns +
+                        weightK1;
+                }
+                weightTile[weightK1 - kBase][localColumn] = loadHalf(weightIndex1);
+            } else {
+                weightTile[weightK1 - kBase][localColumn] = float16_t(0.0);
+            }
+
+            barrier();
+
+            for (uint k = 0u; k < TILE_K; ++k) {
+                // Keep the product in binary16, then accumulate in binary32.
+                accumulated += float(
+                    inputTile[localRow][k] * weightTile[k][localColumn]
+                );
+            }
+
+            barrier();
         }
 
-        const float16_t inputValue = loadHalf(inputRowOffset + inner);
-        const float16_t weightValue = loadHalf(weightIndex);
-        sum += float(inputValue * weightValue);
-    }
+        if (validOutputRow && validOutputColumn) {
+            const uint globalRow =
+                batchIndex * parameters.rowsPerBatch + rowInBatch;
+            const uint outputIndex =
+                parameters.outputOffset +
+                globalRow * parameters.outputColumns +
+                outputColumn;
+            values[outputIndex] = floatBitsToUint(accumulated);
+        }
 
-    values[parameters.outputOffset + outputIndex] = floatBitsToUint(sum);
+        if (totalTileCount - tileIndex <= tileStride) {
+            break;
+        }
+        tileIndex += tileStride;
+    }
 }

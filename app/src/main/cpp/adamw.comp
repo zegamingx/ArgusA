@@ -7,7 +7,9 @@ layout(set = 0, binding = 0, std430) buffer TrainingBuffer {
 };
 
 layout(push_constant) uniform AdamwParameters {
-    uint elementCount;
+    uint totalElementCount;
+    uint segmentOffset;
+    uint segmentElementCount;
     float learningRate;
     float beta1;
     float beta2;
@@ -15,43 +17,49 @@ layout(push_constant) uniform AdamwParameters {
     float biasCorrection2;
     float epsilon;
     float gradientClipFactor;
+    float weightDecay;
 } parameters;
 
 void main() {
-    const uint index = gl_GlobalInvocationID.x;
-    if (index >= parameters.elementCount) {
-        return;
+    const uint invocationStride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    const uint gradientOffset = parameters.totalElementCount;
+    const uint firstMomentOffset = parameters.totalElementCount * 2u;
+    const uint secondMomentOffset = parameters.totalElementCount * 3u;
+
+    uint localIndex = gl_GlobalInvocationID.x;
+    while (localIndex < parameters.segmentElementCount) {
+        const uint index = parameters.segmentOffset + localIndex;
+        const float parameter = values[index];
+        const float gradient =
+            values[gradientOffset + index] * parameters.gradientClipFactor;
+
+        const float firstMoment =
+            parameters.beta1 * values[firstMomentOffset + index] +
+            (1.0 - parameters.beta1) * gradient;
+
+        const float secondMoment =
+            parameters.beta2 * values[secondMomentOffset + index] +
+            (1.0 - parameters.beta2) * gradient * gradient;
+
+        const float correctedFirstMoment =
+            firstMoment / parameters.biasCorrection1;
+        const float correctedSecondMoment =
+            secondMoment / parameters.biasCorrection2;
+
+        values[index] = parameter - parameters.learningRate * (
+            correctedFirstMoment /
+                (sqrt(correctedSecondMoment) + parameters.epsilon) +
+            parameters.weightDecay * parameter
+        );
+
+        values[firstMomentOffset + index] = firstMoment;
+        values[secondMomentOffset + index] = secondMoment;
+
+        // Avoid unsigned wraparound when the final invocation reaches the
+        // end of this segment.
+        if (parameters.segmentElementCount - localIndex <= invocationStride) {
+            break;
+        }
+        localIndex += invocationStride;
     }
-
-    const uint gradientOffset = parameters.elementCount;
-    const uint firstMomentOffset = parameters.elementCount * 2u;
-    const uint secondMomentOffset = parameters.elementCount * 3u;
-    const uint weightDecayOffset = parameters.elementCount * 4u;
-
-    const float parameter = values[index];
-    const float gradient =
-        values[gradientOffset + index] * parameters.gradientClipFactor;
-
-    const float firstMoment =
-        parameters.beta1 * values[firstMomentOffset + index] +
-        (1.0 - parameters.beta1) * gradient;
-
-    const float secondMoment =
-        parameters.beta2 * values[secondMomentOffset + index] +
-        (1.0 - parameters.beta2) * gradient * gradient;
-
-    const float correctedFirstMoment =
-        firstMoment / parameters.biasCorrection1;
-    const float correctedSecondMoment =
-        secondMoment / parameters.biasCorrection2;
-    const float decay = values[weightDecayOffset + index];
-
-    values[index] = parameter - parameters.learningRate * (
-        correctedFirstMoment /
-            (sqrt(correctedSecondMoment) + parameters.epsilon) +
-        decay * parameter
-    );
-
-    values[firstMomentOffset + index] = firstMoment;
-    values[secondMomentOffset + index] = secondMoment;
 }
