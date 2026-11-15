@@ -108,6 +108,19 @@ void logError(const char* message, VkResult result = VK_SUCCESS) {
     }
 }
 
+uint32_t calculateDispatchWorkGroupCount(uint64_t invocationCount) {
+    const uint32_t deviceGroupLimit = gRuntime.maxComputeWorkGroupCountX;
+    if (invocationCount == 0u || deviceGroupLimit == 0u) {
+        return 0u;
+    }
+
+    const uint64_t requiredGroups =
+        1u + (invocationCount - 1u) / kLocalWorkGroupSize;
+    return static_cast<uint32_t>(
+        std::min<uint64_t>(requiredGroups, deviceGroupLimit)
+    );
+}
+
 void destroyStorageBuffer() {
     if (gRuntime.device == VK_NULL_HANDLE) {
         return;
@@ -1038,11 +1051,9 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         return JNI_FALSE;
     }
 
-    const uint64_t workGroupCount =
-        (static_cast<uint64_t>(totalElements) + kLocalWorkGroupSize - 1u) /
-        kLocalWorkGroupSize;
-    if (workGroupCount == 0 ||
-        workGroupCount > gRuntime.maxComputeWorkGroupCountX) {
+    const uint32_t workGroupCount =
+        calculateDispatchWorkGroupCount(static_cast<uint64_t>(totalElements));
+    if (workGroupCount == 0u) {
         releaseGroupReferences(env, groups);
         return JNI_FALSE;
     }
@@ -1386,36 +1397,33 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         return JNI_FALSE;
     }
 
-    std::vector<float> packed;
-    try {
-        packed.resize(static_cast<size_t>(totalElements));
-    } catch (const std::bad_alloc&) {
-        logError("Not enough host memory to prepare a Vulkan linear operation.");
-        return JNI_FALSE;
-    }
-
-    env->GetFloatArrayRegion(
-        inputArray,
-        0,
-        static_cast<jsize>(inputElements),
-        packed.data() + inputOffset
-    );
-    env->GetFloatArrayRegion(
-        weightArray,
-        0,
-        static_cast<jsize>(weightElements),
-        packed.data() + weightOffset
-    );
-    if (env->ExceptionCheck()) {
-        return JNI_FALSE;
-    }
-
     if (!ensureStorageBuffer(static_cast<VkDeviceSize>(totalByteCount))) {
         logError("Vulkan linear storage-buffer allocation failed.");
         return JNI_FALSE;
     }
 
-    std::memcpy(gRuntime.mappedStorage, packed.data(), totalByteCount);
+    // Copy JNI arrays directly into the mapped Vulkan staging allocation.
+    // This avoids a temporary tensor vector and a second full-buffer memcpy.
+    float* packedValues = static_cast<float*>(gRuntime.mappedStorage);
+    env->GetFloatArrayRegion(
+        inputArray,
+        0,
+        static_cast<jsize>(inputElements),
+        packedValues + inputOffset
+    );
+    if (env->ExceptionCheck()) {
+        return JNI_FALSE;
+    }
+
+    env->GetFloatArrayRegion(
+        weightArray,
+        0,
+        static_cast<jsize>(weightElements),
+        packedValues + weightOffset
+    );
+    if (env->ExceptionCheck()) {
+        return JNI_FALSE;
+    }
 
     if (!gRuntime.hostCoherent) {
         VkMappedMemoryRange flushRange{};
@@ -1435,10 +1443,9 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         }
     }
 
-    const uint64_t workGroupCount =
-        (outputElements + kLocalWorkGroupSize - 1u) / kLocalWorkGroupSize;
-    if (workGroupCount == 0 ||
-        workGroupCount > gRuntime.maxComputeWorkGroupCountX) {
+    const uint32_t workGroupCount =
+        calculateDispatchWorkGroupCount(outputElements);
+    if (workGroupCount == 0u) {
         logError("Vulkan linear dispatch exceeds the device work-group limit.");
         return JNI_FALSE;
     }

@@ -19,38 +19,39 @@ layout(push_constant) uniform LinearParameters {
 } parameters;
 
 void main() {
-    const uint outputIndex = gl_GlobalInvocationID.x;
     const uint outputElementCount = parameters.rowCount * parameters.outputColumns;
-    if (outputIndex >= outputElementCount) {
-        return;
-    }
+    const uint invocationStride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
 
-    const uint row = outputIndex / parameters.outputColumns;
-    const uint column = outputIndex - row * parameters.outputColumns;
-    const uint batchIndex = row / parameters.rowsPerBatch;
-    if (batchIndex >= parameters.batchCount) {
-        return;
-    }
-
-    const uint rowInBatch = row - batchIndex * parameters.rowsPerBatch;
-    const uint inputRowOffset =
-        parameters.inputOffset +
-        batchIndex * parameters.rowsPerBatch * parameters.inputColumns +
-        rowInBatch * parameters.inputColumns;
-    const uint batchWeightOffset =
-        parameters.weightOffset +
-        batchIndex * parameters.inputColumns * parameters.outputColumns;
-
-    float sum = 0.0;
-    for (uint inner = 0u; inner < parameters.inputColumns; ++inner) {
-        uint weightIndex;
-        if (parameters.transposeWeights == 0u) {
-            weightIndex = batchWeightOffset + inner * parameters.outputColumns + column;
-        } else {
-            weightIndex = batchWeightOffset + column * parameters.inputColumns + inner;
+    for (uint outputIndex = gl_GlobalInvocationID.x;
+         outputIndex < outputElementCount;
+         outputIndex += invocationStride) {
+        const uint row = outputIndex / parameters.outputColumns;
+        const uint column = outputIndex - row * parameters.outputColumns;
+        const uint batchIndex = row / parameters.rowsPerBatch;
+        if (batchIndex >= parameters.batchCount) {
+            continue;
         }
-        sum += values[inputRowOffset + inner] * values[weightIndex];
-    }
 
-    values[parameters.outputOffset + outputIndex] = sum;
+        const uint rowInBatch = row - batchIndex * parameters.rowsPerBatch;
+        const uint inputRowOffset =
+            parameters.inputOffset +
+            batchIndex * parameters.rowsPerBatch * parameters.inputColumns +
+            rowInBatch * parameters.inputColumns;
+        const uint batchWeightOffset =
+            parameters.weightOffset +
+            batchIndex * parameters.inputColumns * parameters.outputColumns;
+
+        float sum = 0.0;
+        for (uint inner = 0u; inner < parameters.inputColumns; ++inner) {
+            uint weightIndex;
+            if (parameters.transposeWeights == 0u) {
+                weightIndex = batchWeightOffset + inner * parameters.outputColumns + column;
+            } else {
+                weightIndex = batchWeightOffset + column * parameters.inputColumns + inner;
+            }
+            sum += values[inputRowOffset + inner] * values[weightIndex];
+        }
+
+        values[parameters.outputOffset + outputIndex] = sum;
+    }
 }

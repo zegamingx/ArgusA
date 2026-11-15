@@ -72,7 +72,7 @@ jobs:
           fi
           test -s "${platform_alias}/android.jar"
 
-      - name: Install Android NDK r30 and CMake 3.31.6
+      - name: Install Android NDK r30 and CMake 4.5.0
         shell: bash
         run: |
           set -euo pipefail
