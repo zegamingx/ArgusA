@@ -354,17 +354,16 @@ object TextModalityProcessor {
 
     /**
      * Serializes parsed turns without interpreting payload lines as role headers.
-     * EOS is appended only when the final complete turn belongs to the assistant.
+     * Every complete assistant turn ends with EOS; user/system turns never do.
      */
     private fun serializeConversationTurns(turns: List<ConversationTurn>): String {
-        if (turns.isEmpty()) return ""
-        val serialized = turns.joinToString("\n") { turn ->
-            "${turn.role.token} ${Tokenizer.escapeLiteralControlTokens(turn.content)}"
-        }
-        return if (turns.last().role == TurnRole.ASSISTANT) {
-            "$serialized ${Tokenizer.EOS_TOKEN}"
-        } else {
-            serialized
+        return turns.joinToString("\n") { turn ->
+            val payload = "${turn.role.token} ${Tokenizer.escapeLiteralControlTokens(turn.content)}"
+            if (turn.role == TurnRole.ASSISTANT) {
+                "$payload ${Tokenizer.EOS_TOKEN}"
+            } else {
+                payload
+            }
         }
     }
 
@@ -377,20 +376,20 @@ object TextModalityProcessor {
         return buildString(text.length + 8) {
             lines.forEachIndexed { index, sourceLine ->
                 val line = sourceLine.content
+                val startsWithEscapeMarker =
+                    line.isNotEmpty() && line[0] == LITERAL_LINE_ESCAPE
                 val looksLikeRoleHeader =
                     USER_TURN_PATTERN.matcher(line).find() ||
                     ASSISTANT_TURN_PATTERN.matcher(line).find() ||
                     SYSTEM_TURN_PATTERN.matcher(line).find()
-                if (
-                    index > 0 && looksLikeRoleHeader &&
-                    (line.isEmpty() || line[0] != LITERAL_LINE_ESCAPE)
-                ) append(LITERAL_LINE_ESCAPE)
+                if (startsWithEscapeMarker || (index > 0 && looksLikeRoleHeader)) {
+                    append(LITERAL_LINE_ESCAPE)
+                }
                 append(line)
                 append(sourceLine.separator)
             }
         }
     }
-
 
     /**
      * Reads text-only ChatML/OpenAI message content. Unsupported multimodal payloads
@@ -663,7 +662,7 @@ object TextModalityProcessor {
         if (records != null) return processTrainingRecords(records, documentTitle)
 
         return when (val modality = detectModality(source)) {
-            TextModality.CONVERSATION -> processConversation(source, documentTitle)
+            TextModality.CONVERSATION -> processConversation(source, documentTitle, chunkSize)
             TextModality.QA_PAIR -> processQAPairs(source, documentTitle, chunkSize)
             TextModality.REASONING -> processReasoningDataset(source, documentTitle, chunkSize)
             TextModality.ARTICLE_NEWS -> processArticleNews(source, documentTitle, chunkSize, overlap)
@@ -702,7 +701,8 @@ object TextModalityProcessor {
      */
     private fun processConversation(
         text: String,
-        documentTitle: String
+        documentTitle: String,
+        chunkSize: Int
     ): List<ProcessedChunk> {
         val turns = mutableListOf<ConversationTurn>()
         var currentRole: TurnRole? = null
@@ -724,14 +724,16 @@ object TextModalityProcessor {
             val rawLine = sourceLine.content
             val escapedLiteralLine =
                 rawLine.isNotEmpty() && rawLine[0] == LITERAL_LINE_ESCAPE
-            val line = if (escapedLiteralLine) rawLine.substring(1) else rawLine
-
             if (escapedLiteralLine) {
+                // Remove one marker. A doubled marker preserves the original leading marker.
                 if (currentRole == null) currentRole = TurnRole.USER
-                currentTurnText.append(pendingSeparator).append(line)
+                currentTurnText.append(pendingSeparator).append(rawLine.substring(1))
                 pendingSeparator = sourceLine.separator
                 continue
             }
+            val line = rawLine
+
+            
 
             val systemMatcher = SYSTEM_TURN_PATTERN.matcher(line)
             val userMatcher = USER_TURN_PATTERN.matcher(line)
@@ -768,7 +770,7 @@ object TextModalityProcessor {
         }
         flushTurn()
 
-        if (turns.isEmpty()) return processGeneralProse(text, documentTitle, 380, 0)
+        if (turns.isEmpty()) return processGeneralProse(text, documentTitle, chunkSize, 0)
         return processConversationTurns(turns, documentTitle)
     }
 

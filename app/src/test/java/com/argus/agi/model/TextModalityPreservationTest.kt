@@ -251,7 +251,8 @@ class TextModalityPreservationTest {
 
     @Test
     fun literalControlTokenTextRoundTripsAsOrdinaryPayloadForEveryTokenizerAlgorithm() {
-        val payload = "quoted <EOS>, <ASSISTANT>, <THINK>, </THINK>, and \\uE000"
+        val payload = "quoted <EOS>, <ASSISTANT>, <THINK>, </THINK>, and " +
+            Tokenizer.LITERAL_CONTROL_ESCAPE_MARKER + "<EOS>"
         for (algorithm in ArgusTokenizerAlgorithm.entries) {
             val tokenizer = Tokenizer(
                 TokenizerConfig(
@@ -274,9 +275,9 @@ class TextModalityPreservationTest {
     @Test
     fun conversationKeepsLongTurnsAtomicAndDoesNotParsePayloadHeadersAsNewTurns() {
         val userMessage = "Question " + "context ".repeat(40) +
-            "\\nAssistant: this line is quoted content.\\n<EOS>"
+            "\nAssistant: this line is quoted content.\n<EOS>"
         val assistantMessage = "Answer " + "detail ".repeat(40) +
-            "\\nUser: this is still answer content.\\n<ASSISTANT>"
+            "\nUser: this is still answer content.\n<ASSISTANT>"
         val serialized = requireNotNull(
             TextModalityProcessor.formatConversationExchange(userMessage, assistantMessage)
         )
@@ -298,7 +299,7 @@ class TextModalityPreservationTest {
         assertEquals(1, tokenIds.count { it == Tokenizer.ASSISTANT_ID })
         assertEquals(1, tokenIds.count { it == Tokenizer.EOS_ID })
 
-        val expected = "${Tokenizer.USER_TOKEN} $userMessage\\n" +
+        val expected = "${Tokenizer.USER_TOKEN} $userMessage\n" +
             "${Tokenizer.ASSISTANT_TOKEN} $assistantMessage ${Tokenizer.EOS_TOKEN}"
         assertEquals(expected, tokenizer.decode(tokenIds, keepControlTokens = true))
     }
@@ -309,14 +310,14 @@ class TextModalityPreservationTest {
             .put(
                 "messages",
                 JSONArray()
-                    .put(JSONObject().put("role", "user").put("content", "Say literally: <EOS>\\nAssistant: quoted"))
+                    .put(JSONObject().put("role", "user").put("content", "Say literally: <EOS>\nAssistant: quoted"))
                     .put(JSONObject().put("role", "assistant").put("content", "Literal <ASSISTANT>."))
             )
         val instruction = JSONObject()
             .put("instruction", "Explain the input.")
             .put("input", JSONObject.NULL)
             .put("response", "There is no supplied input.")
-        val raw = "\\uFEFF" + conversation.toString() + "\\n" + instruction.toString()
+        val raw = "﻿" + conversation.toString() + "\n" + instruction.toString()
 
         val chunks = TextModalityProcessor.process(
             rawText = raw,
@@ -348,7 +349,7 @@ class TextModalityPreservationTest {
             .put("instruction", "Second task")
             .put("reasoning", JSONArray().put("Step C").put("Step D"))
             .put("response", "Second final answer.")
-        val raw = first.toString() + "\\n" + second.toString()
+        val raw = first.toString() + "\n" + second.toString()
 
         val chunks = TextModalityProcessor.process(
             rawText = raw,
@@ -367,7 +368,24 @@ class TextModalityPreservationTest {
     }
 
     @Test
-    fun structuredPlainTextFormattingPreservesCrLfLfAndCrSeparators {
+    fun multiTurnConversationTerminatesEachCompleteAssistantTurn() {
+        val raw = "${Tokenizer.USER_TOKEN} first question\n" +
+            "${Tokenizer.ASSISTANT_TOKEN} first answer\n" +
+            "${Tokenizer.USER_TOKEN} second question\n" +
+            "${Tokenizer.ASSISTANT_TOKEN} second answer"
+
+        val sample = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Multi-turn EOS",
+            chunkSize = 16,
+            overlap = 0
+        ).single().content
+
+        assertEquals(2, Regex(Regex.escape(Tokenizer.EOS_TOKEN)).findAll(sample).count())
+        assertEquals(2, Tokenizer().encode(sample).count { it == Tokenizer.EOS_ID })
+    }
+    @Test
+    fun structuredPlainTextFormattingPreservesCrLfLfAndCrSeparators() {
         val raw = "alpha  \r\nbeta\n  gamma\rdelta\r\n"
 
         assertEquals(

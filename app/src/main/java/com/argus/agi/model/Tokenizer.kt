@@ -134,26 +134,15 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             while (index < text.length) {
                 val character = text[index]
                 if (character == LITERAL_CONTROL_ESCAPE_MARKER) {
-                    val nextSpecial = specialTokenAt(text, index + 1)
-                    when {
-                        nextSpecial != null -> {
-                            result.append(LITERAL_CONTROL_ESCAPE_MARKER).append(nextSpecial)
-                            index += nextSpecial.length + 1
-                        }
-                        index + 1 < text.length &&
-                            text[index + 1] == LITERAL_CONTROL_ESCAPE_MARKER -> {
-                            result.append(LITERAL_CONTROL_ESCAPE_MARKER)
-                                .append(LITERAL_CONTROL_ESCAPE_MARKER)
-                            index += 2
-                        }
-                        else -> {
-                            result.append(LITERAL_CONTROL_ESCAPE_MARKER)
-                                .append(LITERAL_CONTROL_ESCAPE_MARKER)
-                            index++
-                        }
-                    }
+                    // Escape the marker independently. A following special-token literal
+                    // is escaped by the next scanner iteration.
+                    result.append(LITERAL_CONTROL_ESCAPE_MARKER)
+                        .append(LITERAL_CONTROL_ESCAPE_MARKER)
+                    index++
                     continue
                 }
+
+                
 
                 val special = specialTokenAt(text, index)
                 if (special != null) {
