@@ -296,4 +296,147 @@ class VulkanDeviceCapabilitiesTest {
         assertFalse(capabilities.supportsComputeTimestampQueries)
     }
 
+
+    @Test
+    fun parsesRepresentativeAndroidGpuProfilesWithoutVendorSpecificAssumptions() {
+        val maliG57 = VulkanDeviceCapabilities.fromJson(
+            """
+            {
+              "deviceName": "Mali-G57",
+              "vendorId": 5045,
+              "deviceId": 2425415696,
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 3,
+              "apiVersionPatch": 278,
+              "driverName": "ARM Proprietary",
+              "driverInfo": "v1.r49p1",
+              "maxComputeWorkGroupInvocations": 512,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 2147483648,
+              "subgroupSize": 16,
+              "subgroupSupportedStages": 32,
+              "shaderFloat16": true,
+              "storageBuffer16BitAccess": true,
+              "shaderIntegerDotProduct": true,
+              "integerDotProduct8BitUnsignedAccelerated": true,
+              "integerDotProduct8BitSignedAccelerated": true,
+              "integerDotProduct4x8BitPackedUnsignedAccelerated": true,
+              "integerDotProduct4x8BitPackedSignedAccelerated": true
+            }
+            """
+        )
+        val adreno830 = VulkanDeviceCapabilities.fromJson(
+            """
+            {
+              "deviceName": "Adreno 830",
+              "vendorId": 20803,
+              "deviceId": 1145378817,
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 3,
+              "apiVersionPatch": 284,
+              "driverName": "Qualcomm Technologies Inc. Adreno Vulkan Driver",
+              "driverInfo": "Driver Build 72c15dcb23",
+              "maxComputeWorkGroupInvocations": 1024,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 2147483647,
+              "subgroupSize": 64,
+              "subgroupSupportedStages": 32,
+              "shaderIntegerDotProduct": true,
+              "integerDotProduct8BitUnsignedAccelerated": false,
+              "integerDotProduct8BitSignedAccelerated": false,
+              "integerDotProduct4x8BitPackedUnsignedAccelerated": true,
+              "integerDotProduct4x8BitPackedSignedAccelerated": true,
+              "integerDotProduct4x8BitPackedMixedSignednessAccelerated": true,
+              "cooperativeMatrixExtension": true,
+              "cooperativeMatrix": true,
+              "cooperativeMatrixSupportedStages": 32
+            }
+            """
+        )
+        val xclipse940 = VulkanDeviceCapabilities.fromJson(
+            """
+            {
+              "deviceName": "Samsung Xclipse 940",
+              "vendorId": 5197,
+              "deviceId": 39846400,
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 3,
+              "apiVersionPatch": 304,
+              "driverName": "Samsung Proprietary driver",
+              "driverInfo": "SPAL Driver version 25.3.3",
+              "maxComputeWorkGroupInvocations": 1024,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 4294967295,
+              "subgroupSize": 64,
+              "subgroupSupportedStages": 32,
+              "shaderIntegerDotProduct": true,
+              "integerDotProduct8BitUnsignedAccelerated": true,
+              "integerDotProduct8BitSignedAccelerated": true,
+              "integerDotProduct4x8BitPackedUnsignedAccelerated": true,
+              "integerDotProduct4x8BitPackedSignedAccelerated": true
+            }
+            """
+        )
+        val maliG925 = VulkanDeviceCapabilities.fromJson(
+            """
+            {
+              "deviceName": "Mali-G925-Immortalis MC12",
+              "vendorId": 5045,
+              "deviceId": 3627028496,
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 3,
+              "apiVersionPatch": 278,
+              "driverName": "ARM Proprietary",
+              "driverInfo": "v1.r49p1",
+              "maxComputeWorkGroupInvocations": 1024,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 2147483648,
+              "subgroupSize": 16,
+              "subgroupSupportedStages": 32,
+              "shaderIntegerDotProduct": true,
+              "integerDotProduct8BitUnsignedAccelerated": true,
+              "integerDotProduct8BitSignedAccelerated": true,
+              "cooperativeMatrixExtension": true,
+              "cooperativeMatrix": true,
+              "cooperativeMatrixSupportedStages": 32
+            }
+            """
+        )
+
+        assertEquals(5045, maliG57.vendorId)
+        assertEquals("90910010", maliG57.deviceId.toUInt().toString(16))
+        assertEquals("1.3.278", maliG57.apiVersion)
+        assertEquals(16, maliG57.subgroupSize)
+        assertEquals(512, maliG57.maxComputeWorkGroupInvocations)
+        assertTrue(maliG57.hasAcceleratedInt8DotProduct)
+        assertFalse(maliG57.canUseIntegerDotProductKernel)
+
+        assertEquals(20803, adreno830.vendorId)
+        assertEquals("44050001", adreno830.deviceId.toUInt().toString(16))
+        assertEquals("1.3.284", adreno830.apiVersion)
+        assertEquals(64, adreno830.subgroupSize)
+        assertEquals(1024, adreno830.maxComputeWorkGroupInvocations)
+        assertTrue(adreno830.hasAcceleratedInt8DotProduct)
+        assertFalse(adreno830.canUseIntegerDotProductKernel)
+        assertFalse(adreno830.hasUsableCooperativeMatrixConfiguration)
+
+        assertEquals(5197, xclipse940.vendorId)
+        assertEquals("2600200", xclipse940.deviceId.toUInt().toString(16))
+        assertEquals("1.3.304", xclipse940.apiVersion)
+        assertEquals(64, xclipse940.subgroupSize)
+        assertEquals(1024, xclipse940.maxComputeWorkGroupInvocations)
+        assertEquals(4294967295L, xclipse940.maxStorageBufferRangeBytes)
+        assertTrue(xclipse940.hasAcceleratedInt8DotProduct)
+        assertFalse(xclipse940.canUseIntegerDotProductKernel)
+
+        assertEquals(5045, maliG925.vendorId)
+        assertEquals("d8300010", maliG925.deviceId.toUInt().toString(16))
+        assertEquals("1.3.278", maliG925.apiVersion)
+        assertEquals(16, maliG925.subgroupSize)
+        assertEquals(1024, maliG925.maxComputeWorkGroupInvocations)
+        assertTrue(maliG925.hasAcceleratedInt8DotProduct)
+        assertFalse(maliG925.canUseIntegerDotProductKernel)
+        assertFalse(maliG925.hasUsableCooperativeMatrixConfiguration)
+    }
+
 }
