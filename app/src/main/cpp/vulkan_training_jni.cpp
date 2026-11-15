@@ -781,23 +781,37 @@ bool copyBufferSync(
     result = vkBeginCommandBuffer(gRuntime.commandBuffer, &begin);
     if (result != VK_SUCCESS) return false;
 
-    VkBufferMemoryBarrier before{};
-    before.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    before.srcAccessMask = sourceHostWritten
+    VkBufferMemoryBarrier before[2]{};
+    before[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    before[0].srcAccessMask = sourceHostWritten
         ? VK_ACCESS_HOST_WRITE_BIT
         : (VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-    before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    before.buffer = source;
-    before.offset = sourceOffset;
-    before.size = size;
+    before[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    before[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before[0].buffer = source;
+    before[0].offset = sourceOffset;
+    before[0].size = size;
+
+    // The destination range may have been read or written by an earlier GPU dispatch.
+    before[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    before[1].srcAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    before[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    before[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before[1].buffer = destination;
+    before[1].offset = destinationOffset;
+    before[1].size = size;
+
     vkCmdPipelineBarrier(
         gRuntime.commandBuffer,
-        sourceHostWritten ? VK_PIPELINE_STAGE_HOST_BIT
-                          : (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT),
+        sourceHostWritten
+            ? (VK_PIPELINE_STAGE_HOST_BIT |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT)
+            : (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT),
         VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 1, &before, 0, nullptr
+        0, 0, nullptr, 2, before, 0, nullptr
     );
 
     VkBufferCopy region{};
@@ -978,9 +992,7 @@ bool growTensorArena(VkDeviceSize additionalBytes) {
 
     gRuntime.tensorArenaBuffer = nextBuffer;
     gRuntime.tensorArenaMemory = nextMemory;
-    VkMemoryRequirements newRequirements{};
-    vkGetBufferMemoryRequirements(gRuntime.device, nextBuffer, &newRequirements);
-    gRuntime.tensorArenaCapacity = newRequirements.size;
+    gRuntime.tensorArenaCapacity = createdCapacity;
     gRuntime.tensorArenaDeviceLocal = nextDeviceLocal;
     return addArenaFreeBlock(oldCapacity, gRuntime.tensorArenaCapacity - oldCapacity);
 }
