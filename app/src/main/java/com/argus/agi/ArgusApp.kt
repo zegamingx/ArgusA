@@ -10,6 +10,7 @@ import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.argus.agi.model.ArgusNeuralEngine
+import com.argus.agi.model.EngineConfig
 import com.argus.agi.model.GenesisModelManager
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.WorldModel
@@ -40,7 +41,7 @@ sealed interface ArgusCoreInitializationState {
 data class ArgusCoreInitializationProgress(
     val percent: Int = 0,
     val status: String = "Assessing device",
-    val driverInfo: String = "Vulkan driver detection pending"
+    val driverInfo: String = "System Vulkan capability profile pending"
 )
 
 class ArgusApp : Application() {
@@ -62,20 +63,30 @@ class ArgusApp : Application() {
 
         // === Lazy singletons (SYNCHRONIZED = default, dibuat eksplisit untuk dokumentasi) ===
 
-        private val _neuralEngine = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
-            // Stable device capacity selects a fresh model tier. Existing checkpoints
-            // keep their original tensor dimensions to avoid silently discarding weights.
-            val hardwareInfo = hardwareProfile.getHardwareInfo()
-            val resolvedConfig = ArgusNeuralEngine.resolveConfig(
+        private val _hardwareInfo = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            hardwareProfile.getHardwareInfo()
+        }
+        val hardwareInfo: com.argus.agi.sensor.SystemHardwareInfo
+            get() = _hardwareInfo.value
+
+        // Resolve model capacity before allocating tensors. Existing compatible checkpoints
+        // retain their architecture; fresh models use this device's current memory budget.
+        private val _neuralEngineConfig = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            val profile = hardwareInfo
+            ArgusNeuralEngine.resolveConfig(
                 context = instance,
-                totalRamGb = hardwareInfo.totalRamGb,
-                maxHeapMb = hardwareInfo.maxHeapMb,
-                availableRamGb = hardwareInfo.availRamGb,
-                cpuCores = hardwareInfo.cpuCores
+                totalRamGb = profile.totalRamGb,
+                maxHeapMb = profile.maxHeapMb,
+                availableRamGb = profile.availRamGb,
+                cpuCores = profile.cpuCores
             )
+        }
+        val neuralEngineConfig: EngineConfig
+            get() = _neuralEngineConfig.value
 
+        private val _neuralEngine = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            val resolvedConfig = neuralEngineConfig
             Log.i(TAG, "Resolved neural engine architecture: ${resolvedConfig.architectureLabel}")
-
             ArgusNeuralEngine.createBlocking(instance, resolvedConfig)
         }
         val neuralEngine: ArgusNeuralEngine get() = _neuralEngine.value
@@ -253,20 +264,47 @@ class ArgusApp : Application() {
             _coreInitializationProgress.value = ArgusCoreInitializationProgress()
             coreInitializationJob = applicationScope.launch {
                 try {
-                    initializationStage = "Reading hardware profile"
-                    publishCoreProgress(8, "Assessing device")
-                    hardwareProfile
+                    initializationStage = "Reading system device profile"
+                    publishCoreProgress(8, "Reading device specifications")
+                    val profile = hardwareInfo
+                    val advertisedVulkan = if (profile.vulkanSupported) {
+                        "Vulkan API ${profile.vulkanVersionName} advertised"
+                    } else {
+                        "Vulkan is not advertised by the system"
+                    }
+                    publishCoreProgress(
+                        14,
+                        "System device profile captured",
+                        "${profile.socManufacturer} ${profile.socModel} · $advertisedVulkan"
+                    )
 
                     initializationStage = "Registering device safety monitor"
-                    publishCoreProgress(16, "Preparing device safety")
-                    deviceGuard
+                    publishCoreProgress(18, "Assessing device safety")
+                    deviceGuard.refreshState()
+                    val safety = deviceGuard.safetyState.value
 
                     initializationStage = "Opening local database"
                     publishCoreProgress(24, "Opening local database")
                     repository
 
-                    initializationStage = "Allocating neural engine and restoring model tensors"
-                    publishCoreProgress(42, "Constructing and restoring the local model")
+                    initializationStage = "Assessing device compute and memory capacity"
+                    publishCoreProgress(30, "Assessing device compute and memory budget")
+                    val modelConfig = neuralEngineConfig
+                    Log.i(
+                        TAG,
+                        "Device assessment resolved ${modelConfig.architectureLabel}; " +
+                            "available RAM ${profile.availRamGb} GB; " +
+                            "training safety: ${safety.statusMessage}"
+                    )
+                    publishCoreProgress(
+                        36,
+                        "Device assessment complete",
+                        "${modelConfig.modelTier.displayName} · ${modelConfig.layerCount} layers · " +
+                            "batch ${modelConfig.trainingBatchSize}"
+                    )
+
+                    initializationStage = "Constructing model and restoring checkpoint"
+                    publishCoreProgress(48, "Constructing or restoring model tensors")
                     val engine = neuralEngine
 
                     initializationStage = "Restoring world model"

@@ -95,6 +95,17 @@ internal object VulkanTrainingBackend {
         )
     }
 
+    private fun releaseNativeRuntimeAfterFailure(nativeLibraryLoaded: Boolean) {
+        nativeReady = false
+        fp16RuntimeReady = false
+        if (nativeLibraryLoaded) {
+            runCatching { nativeDestroy() }
+                .onFailure { error ->
+                    Log.w(TAG, "Failed to release a partially initialized Vulkan runtime.", error)
+                }
+        }
+    }
+
     @Synchronized
     fun initializeAfterModelReady(): Boolean {
         if (isRuntimeAvailable) {
@@ -119,8 +130,10 @@ internal object VulkanTrainingBackend {
         )
 
         var detectedDriverInfo = "Vulkan driver unavailable"
+        var nativeLibraryLoaded = false
         return try {
             System.loadLibrary("argus_training")
+            nativeLibraryLoaded = true
             val initialized = nativeInitialize()
             if (initialized) {
                 detectedDriverInfo = runCatching { nativeGetDriverInfo() }
@@ -155,11 +168,8 @@ internal object VulkanTrainingBackend {
                 }
             }
 
-            if (initialized && !verified) {
-                runCatching { nativeDestroy() }
-                    .onFailure { error ->
-                        Log.w(TAG, "Failed to release Vulkan after its startup self-check failed.", error)
-                    }
+            if (!verified) {
+                releaseNativeRuntimeAfterFailure(nativeLibraryLoaded)
             }
 
             nativeReady = verified
@@ -193,7 +203,7 @@ internal object VulkanTrainingBackend {
             }
             verified
         } catch (error: LinkageError) {
-            nativeReady = false
+            releaseNativeRuntimeAfterFailure(nativeLibraryLoaded)
             disabledAfterRuntimeFailure = true
             _currentBackend = "Kotlin CPU"
             _runtimeStatus.value = "Kotlin CPU fallback — native Vulkan library unavailable"
@@ -207,7 +217,7 @@ internal object VulkanTrainingBackend {
             Log.i(TAG, "Native Vulkan library or Vulkan loader is unavailable.", error)
             false
         } catch (error: SecurityException) {
-            nativeReady = false
+            releaseNativeRuntimeAfterFailure(nativeLibraryLoaded)
             disabledAfterRuntimeFailure = true
             _currentBackend = "Kotlin CPU"
             _runtimeStatus.value = "Kotlin CPU fallback — native Vulkan access was blocked"
@@ -220,8 +230,22 @@ internal object VulkanTrainingBackend {
             )
             Log.w(TAG, "Native Vulkan library loading was blocked.", error)
             false
+        } catch (error: OutOfMemoryError) {
+            releaseNativeRuntimeAfterFailure(nativeLibraryLoaded)
+            disabledAfterRuntimeFailure = true
+            _currentBackend = "Kotlin CPU"
+            _runtimeStatus.value = "Kotlin CPU fallback — insufficient memory for Vulkan initialization"
+            publishInitializationProgress(
+                percent = 88,
+                status = "Vulkan memory allocation failed — CPU fallback",
+                driverInfo = detectedDriverInfo,
+                isInitializing = false,
+                isCpuFallback = true
+            )
+            Log.w(TAG, "Vulkan initialization exceeded the available memory budget; keeping CPU fallback.", error)
+            false
         } catch (error: RuntimeException) {
-            nativeReady = false
+            releaseNativeRuntimeAfterFailure(nativeLibraryLoaded)
             disabledAfterRuntimeFailure = true
             _currentBackend = "Kotlin CPU"
             _runtimeStatus.value = "Kotlin CPU fallback — Vulkan initialization failed"

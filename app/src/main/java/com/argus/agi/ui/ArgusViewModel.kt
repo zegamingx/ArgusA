@@ -111,7 +111,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
 
-    private val _hardwareInfo = MutableStateFlow(hardwareProfile.getHardwareInfo())
+    private val _hardwareInfo = MutableStateFlow(ArgusApp.hardwareInfo)
     val hardwareInfo: StateFlow<SystemHardwareInfo> = _hardwareInfo.asStateFlow()
 
     val safetyState: StateFlow<DeviceSafetyState> = deviceGuard.safetyState

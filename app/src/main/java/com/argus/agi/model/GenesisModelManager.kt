@@ -301,11 +301,9 @@ class GenesisModelManager(
         logs += "Integrity check: no model weights downloaded; the model identity is created locally."
         throttleStage()
 
-        // Join post-model preparation already scheduled by ArgusViewModel.
-        // The backend initializes only once and keeps driver work off the UI thread.
-        val vulkanReady = withContext(Dispatchers.IO) {
-            neuralEngine.initializeOptionalVulkanRuntime()
-        }
+        // Vulkan was initialized by ArgusApp after model construction/restoration.
+        // Genesis records the verified backend without invoking the native runtime again.
+        val vulkanReady = neuralEngine.isVulkanRuntimeReady
         val computeTarget = resolveComputeTarget()
         logs += "Execution policy: $computeTarget | Context length: ${neuralEngine.maxSeqLen} tokens"
         if (!vulkanReady) {

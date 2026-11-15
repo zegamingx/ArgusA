@@ -64,6 +64,8 @@ struct VulkanRuntime {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties physicalDeviceProperties{};
+    VkPhysicalDeviceDriverProperties driverProperties{};
+    bool hasDriverProperties = false;
     VkPhysicalDeviceMemoryProperties memoryProperties{};
     VkDevice device = VK_NULL_HANDLE;
     VkQueue computeQueue = VK_NULL_HANDLE;
@@ -579,6 +581,31 @@ bool initializeRuntime() {
     if (gRuntime.physicalDevice == VK_NULL_HANDLE) {
         logError("No integrated or discrete Vulkan GPU with a compute queue was found.");
         return false;
+    }
+
+    // VkPhysicalDeviceProperties::driverVersion is vendor-defined. Do not decode
+    // it with VK_VERSION_MAJOR/MINOR/PATCH; Vulkan 1.2 driver properties expose
+    // the driver's own name and descriptive version information.
+    if (gRuntime.instanceApiVersion >= VK_API_VERSION_1_2 &&
+        gRuntime.physicalDeviceProperties.apiVersion >= VK_API_VERSION_1_2) {
+        const auto getPhysicalDeviceProperties2 =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                vkGetInstanceProcAddr(gRuntime.instance, "vkGetPhysicalDeviceProperties2")
+            );
+        if (getPhysicalDeviceProperties2 != nullptr) {
+            VkPhysicalDeviceDriverProperties driverProperties{};
+            driverProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+
+            VkPhysicalDeviceProperties2 properties2{};
+            properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            properties2.pNext = &driverProperties;
+            getPhysicalDeviceProperties2(gRuntime.physicalDevice, &properties2);
+
+            gRuntime.driverProperties = driverProperties;
+            gRuntime.hasDriverProperties =
+                driverProperties.driverName[0] != '\0' ||
+                driverProperties.driverInfo[0] != '\0';
+        }
     }
 
     vkGetPhysicalDeviceMemoryProperties(
@@ -2273,23 +2300,34 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDriverInfo(
 
     const VkPhysicalDeviceProperties& properties =
         gRuntime.physicalDeviceProperties;
-    char driverInfo[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE + 96]{};
-    if (properties.driverVersion == 0u) {
+    char driverInfo[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE +
+                    VK_MAX_DRIVER_NAME_SIZE +
+                    VK_MAX_DRIVER_INFO_SIZE + 32]{};
+
+    if (gRuntime.hasDriverProperties) {
+        const char* driverName =
+            gRuntime.driverProperties.driverName[0] != '\0'
+                ? gRuntime.driverProperties.driverName
+                : "Vulkan driver";
+        const char* details =
+            gRuntime.driverProperties.driverInfo[0] != '\0'
+                ? gRuntime.driverProperties.driverInfo
+                : "version details unavailable";
         std::snprintf(
             driverInfo,
             sizeof(driverInfo),
-            "%s | Vulkan driver version unavailable",
-            properties.deviceName
+            "%s | %s: %s",
+            properties.deviceName,
+            driverName,
+            details
         );
     } else {
         std::snprintf(
             driverInfo,
             sizeof(driverInfo),
-            "%s | Vulkan driver %u.%u.%u",
+            "%s | vendor-defined driver version 0x%08X",
             properties.deviceName,
-            VK_VERSION_MAJOR(properties.driverVersion),
-            VK_VERSION_MINOR(properties.driverVersion),
-            VK_VERSION_PATCH(properties.driverVersion)
+            properties.driverVersion
         );
     }
     return env->NewStringUTF(driverInfo);
