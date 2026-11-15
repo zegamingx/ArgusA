@@ -51,6 +51,11 @@ class VulkanDeviceCapabilitiesTest {
               "vendorId": 0,
               "deviceId": 123,
               "deviceType": 1,
+              "memoryPropertiesAvailable": true,
+              "memoryHeapCount": 1,
+              "memoryTypeCount": 3,
+              "hostVisibleMemoryTypeCount": 2,
+              "hostVisibleDeviceLocalMemoryTypeCount": 1,
               "apiVersionMajor": 1,
               "apiVersionMinor": 3,
               "apiVersionPatch": 278,
@@ -96,6 +101,11 @@ class VulkanDeviceCapabilitiesTest {
         )
 
         assertEquals("Mali-G57", capabilities.deviceName)
+        assertTrue(capabilities.memoryPropertiesAvailable)
+        assertEquals(1, capabilities.memoryHeapCount)
+        assertEquals(3, capabilities.memoryTypeCount)
+        assertEquals(2, capabilities.hostVisibleMemoryTypeCount)
+        assertEquals(1, capabilities.hostVisibleDeviceLocalMemoryTypeCount)
         assertEquals("1.3.278", capabilities.apiVersion)
         assertEquals(16, capabilities.subgroupSize)
         assertTrue(capabilities.supportsComputeSubgroups)

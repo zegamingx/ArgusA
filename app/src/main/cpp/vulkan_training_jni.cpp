@@ -81,6 +81,9 @@ struct VulkanRuntime {
     VkPhysicalDeviceDriverProperties driverProperties{};
     bool hasDriverProperties = false;
     VkPhysicalDeviceMemoryProperties memoryProperties{};
+    bool memoryPropertiesAvailable = false;
+    uint32_t hostVisibleMemoryTypeCount = 0;
+    uint32_t hostVisibleDeviceLocalMemoryTypeCount = 0;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue computeQueue = VK_NULL_HANDLE;
     uint32_t queueFamilyIndex = 0;
@@ -340,6 +343,8 @@ void destroyRuntime() {
 
 bool createStorageBuffer(VkDeviceSize requiredBytes) {
     if (gRuntime.device == VK_NULL_HANDLE ||
+        !gRuntime.memoryPropertiesAvailable ||
+        gRuntime.memoryProperties.memoryTypeCount == 0u ||
         requiredBytes == 0 ||
         requiredBytes > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange) {
         return false;
@@ -803,6 +808,40 @@ bool initializeRuntime() {
         logError("No integrated or discrete Vulkan GPU with a compute queue was found.");
         return false;
     }
+
+    vkGetPhysicalDeviceMemoryProperties(
+        gRuntime.physicalDevice,
+        &gRuntime.memoryProperties
+    );
+    if (gRuntime.memoryProperties.memoryHeapCount == 0u ||
+        gRuntime.memoryProperties.memoryTypeCount == 0u) {
+        logError("Selected Vulkan physical device exposed no usable memory heaps or memory types.");
+        return false;
+    }
+    gRuntime.memoryPropertiesAvailable = true;
+    for (uint32_t memoryTypeIndex = 0;
+         memoryTypeIndex < gRuntime.memoryProperties.memoryTypeCount;
+         ++memoryTypeIndex) {
+        const VkMemoryPropertyFlags memoryFlags =
+            gRuntime.memoryProperties.memoryTypes[memoryTypeIndex].propertyFlags;
+        const bool hostVisible =
+            (memoryFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+        if (hostVisible) {
+            ++gRuntime.hostVisibleMemoryTypeCount;
+            if ((memoryFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0u) {
+                ++gRuntime.hostVisibleDeviceLocalMemoryTypeCount;
+            }
+        }
+    }
+    __android_log_print(
+        ANDROID_LOG_INFO,
+        kLogTag,
+        "Vulkan memory properties: %u heaps, %u types, %u host-visible, %u host-visible/device-local.",
+        gRuntime.memoryProperties.memoryHeapCount,
+        gRuntime.memoryProperties.memoryTypeCount,
+        gRuntime.hostVisibleMemoryTypeCount,
+        gRuntime.hostVisibleDeviceLocalMemoryTypeCount
+    );
 
     uint32_t extensionCount = 0;
     VkResult extensionResult = vkEnumerateDeviceExtensionProperties(
@@ -3016,6 +3055,13 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
          << "\"vendorId\":" << properties.vendorID << ","
          << "\"deviceId\":" << properties.deviceID << ","
          << "\"deviceType\":" << static_cast<uint32_t>(properties.deviceType) << ","
+         << "\"memoryPropertiesAvailable\":"
+         << (gRuntime.memoryPropertiesAvailable ? "true" : "false") << ","
+         << "\"memoryHeapCount\":" << gRuntime.memoryProperties.memoryHeapCount << ","
+         << "\"memoryTypeCount\":" << gRuntime.memoryProperties.memoryTypeCount << ","
+         << "\"hostVisibleMemoryTypeCount\":" << gRuntime.hostVisibleMemoryTypeCount << ","
+         << "\"hostVisibleDeviceLocalMemoryTypeCount\":"
+         << gRuntime.hostVisibleDeviceLocalMemoryTypeCount << ","
          << "\"apiVersionMajor\":" << VK_VERSION_MAJOR(properties.apiVersion) << ","
          << "\"apiVersionMinor\":" << VK_VERSION_MINOR(properties.apiVersion) << ","
          << "\"apiVersionPatch\":" << VK_VERSION_PATCH(properties.apiVersion) << ","

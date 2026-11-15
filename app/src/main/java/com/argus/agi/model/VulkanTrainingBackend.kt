@@ -107,7 +107,12 @@ data class VulkanDeviceCapabilities(
     val storageBuffer16BitAccessEnabled: Boolean,
     val subgroupSizeControlEnabled: Boolean,
     val shaderIntegerDotProductEnabled: Boolean,
-    val cooperativeMatrixEnabled: Boolean
+    val cooperativeMatrixEnabled: Boolean,
+    val memoryPropertiesAvailable: Boolean,
+    val memoryHeapCount: Int,
+    val memoryTypeCount: Int,
+    val hostVisibleMemoryTypeCount: Int,
+    val hostVisibleDeviceLocalMemoryTypeCount: Int
 ) {
     val apiVersion: String
         get() = "$apiVersionMajor.$apiVersionMinor.$apiVersionPatch"
@@ -260,7 +265,13 @@ data class VulkanDeviceCapabilities(
                 storageBuffer16BitAccessEnabled = json.optBoolean("storageBuffer16BitAccessEnabled"),
                 subgroupSizeControlEnabled = json.optBoolean("subgroupSizeControlEnabled"),
                 shaderIntegerDotProductEnabled = json.optBoolean("shaderIntegerDotProductEnabled"),
-                cooperativeMatrixEnabled = json.optBoolean("cooperativeMatrixEnabled")
+                cooperativeMatrixEnabled = json.optBoolean("cooperativeMatrixEnabled"),
+                memoryPropertiesAvailable = json.optBoolean("memoryPropertiesAvailable"),
+                memoryHeapCount = json.optInt("memoryHeapCount"),
+                memoryTypeCount = json.optInt("memoryTypeCount"),
+                hostVisibleMemoryTypeCount = json.optInt("hostVisibleMemoryTypeCount"),
+                hostVisibleDeviceLocalMemoryTypeCount =
+                    json.optInt("hostVisibleDeviceLocalMemoryTypeCount")
             )
         }
     }
