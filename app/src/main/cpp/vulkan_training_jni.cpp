@@ -84,6 +84,15 @@ struct VulkanRuntime {
     bool memoryPropertiesAvailable = false;
     uint32_t hostVisibleMemoryTypeCount = 0;
     uint32_t hostVisibleDeviceLocalMemoryTypeCount = 0;
+    bool memoryBudgetExtensionSupported = false;
+    bool memoryBudgetExtensionEnabled = false;
+    bool memoryBudgetQueryAvailable = false;
+    uint32_t memoryBudgetHeapCount = 0;
+    std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> memoryHeapBudget{};
+    std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> memoryHeapUsage{};
+#if defined(VK_VERSION_1_1)
+    PFN_vkGetPhysicalDeviceMemoryProperties2 getPhysicalDeviceMemoryProperties2 = nullptr;
+#endif
     VkDevice device = VK_NULL_HANDLE;
     VkQueue computeQueue = VK_NULL_HANDLE;
     uint32_t queueFamilyIndex = 0;
@@ -341,6 +350,83 @@ void destroyRuntime() {
     gRuntime = VulkanRuntime{};
 }
 
+
+void refreshMemoryBudget() {
+#if defined(VK_EXT_memory_budget) && defined(VK_VERSION_1_1)
+    if (!gRuntime.memoryBudgetQueryAvailable ||
+        gRuntime.getPhysicalDeviceMemoryProperties2 == nullptr ||
+        gRuntime.physicalDevice == VK_NULL_HANDLE) {
+        return;
+    }
+
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budgetProperties{};
+    budgetProperties.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+
+    VkPhysicalDeviceMemoryProperties2 properties2{};
+    properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    properties2.pNext = &budgetProperties;
+
+    gRuntime.getPhysicalDeviceMemoryProperties2(
+        gRuntime.physicalDevice,
+        &properties2
+    );
+
+    gRuntime.memoryProperties = properties2.memoryProperties;
+    gRuntime.memoryPropertiesAvailable =
+        gRuntime.memoryProperties.memoryHeapCount > 0u &&
+        gRuntime.memoryProperties.memoryTypeCount > 0u;
+    gRuntime.memoryBudgetHeapCount = gRuntime.memoryProperties.memoryHeapCount;
+    gRuntime.memoryHeapBudget = {};
+    gRuntime.memoryHeapUsage = {};
+
+    for (uint32_t heapIndex = 0;
+         heapIndex < gRuntime.memoryBudgetHeapCount;
+         ++heapIndex) {
+        gRuntime.memoryHeapBudget[heapIndex] = budgetProperties.heapBudget[heapIndex];
+        gRuntime.memoryHeapUsage[heapIndex] = budgetProperties.heapUsage[heapIndex];
+    }
+#endif
+}
+
+bool hasMemoryBudgetHeadroom(uint32_t memoryTypeIndex, VkDeviceSize requiredBytes) {
+    if (!gRuntime.memoryBudgetQueryAvailable ||
+        memoryTypeIndex >= gRuntime.memoryProperties.memoryTypeCount) {
+        return true;
+    }
+
+    const uint32_t heapIndex =
+        gRuntime.memoryProperties.memoryTypes[memoryTypeIndex].heapIndex;
+    if (heapIndex >= gRuntime.memoryBudgetHeapCount ||
+        heapIndex >= VK_MAX_MEMORY_HEAPS) {
+        return true;
+    }
+
+    const VkDeviceSize budget = gRuntime.memoryHeapBudget[heapIndex];
+    const VkDeviceSize usage = gRuntime.memoryHeapUsage[heapIndex];
+    // A missing or inconsistent report is advisory-only. Let Vulkan's allocator
+    // return the authoritative allocation result in that case.
+    if (budget == 0u || usage > budget) {
+        return true;
+    }
+
+    const VkDeviceSize remainingBudget = budget - usage;
+    if (requiredBytes <= remainingBudget) {
+        return true;
+    }
+
+    __android_log_print(
+        ANDROID_LOG_WARN,
+        kLogTag,
+        "Vulkan allocation deferred: request=%llu, heap headroom=%llu, budget=%llu, usage=%llu.",
+        static_cast<unsigned long long>(requiredBytes),
+        static_cast<unsigned long long>(remainingBudget),
+        static_cast<unsigned long long>(budget),
+        static_cast<unsigned long long>(usage)
+    );
+    return false;
+}
+
 bool createStorageBuffer(VkDeviceSize requiredBytes) {
     if (gRuntime.device == VK_NULL_HANDLE ||
         !gRuntime.memoryPropertiesAvailable ||
@@ -376,6 +462,7 @@ bool createStorageBuffer(VkDeviceSize requiredBytes) {
         gRuntime.storageBuffer,
         &requirements
     );
+    refreshMemoryBudget();
 
     uint32_t selectedMemoryType = std::numeric_limits<uint32_t>::max();
     bool selectedMemoryIsCoherent = false;
@@ -417,6 +504,11 @@ bool createStorageBuffer(VkDeviceSize requiredBytes) {
 
     if (selectedMemoryType == std::numeric_limits<uint32_t>::max()) {
         logError("No host-visible Vulkan memory type is available.");
+        destroyStorageBuffer();
+        return false;
+    }
+    if (!hasMemoryBudgetHeadroom(selectedMemoryType, requirements.size)) {
+        logError("Vulkan storage allocation exceeds the currently reported memory-heap budget.");
         destroyStorageBuffer();
         return false;
     }
@@ -889,6 +981,14 @@ bool initializeRuntime() {
     const bool physicalSupportsVulkan13 = false;
 #endif
 
+#if defined(VK_EXT_memory_budget) && defined(VK_VERSION_1_1)
+    gRuntime.memoryBudgetExtensionSupported =
+        effectiveApiVersion >= VK_API_VERSION_1_1 &&
+        hasDeviceExtension(deviceExtensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+#else
+    gRuntime.memoryBudgetExtensionSupported = false;
+#endif
+
 #if defined(VK_EXT_subgroup_size_control)
     const bool hasSubgroupSizeControlExtension = hasDeviceExtension(
         deviceExtensions,
@@ -1273,11 +1373,22 @@ bool initializeRuntime() {
     VkPhysicalDeviceFeatures deviceFeatures{};
     VkPhysicalDeviceShaderFloat16Int8Features enabledShaderFloat16{};
     VkPhysicalDeviceFeatures2 enabledFeatures{};
+    std::vector<const char*> enabledDeviceExtensions;
+#if defined(VK_EXT_memory_budget)
+    if (gRuntime.memoryBudgetExtensionSupported) {
+        enabledDeviceExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    }
+#endif
 
     VkDeviceCreateInfo deviceInfo{};
     deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
+    deviceInfo.enabledExtensionCount =
+        static_cast<uint32_t>(enabledDeviceExtensions.size());
+    deviceInfo.ppEnabledExtensionNames = enabledDeviceExtensions.empty()
+        ? nullptr
+        : enabledDeviceExtensions.data();
     if (gRuntime.supportsFp16Compute) {
         enabledShaderFloat16.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
@@ -1305,6 +1416,25 @@ bool initializeRuntime() {
         enabledShaderFloat16.shaderFloat16 == VK_TRUE;
     gRuntime.shaderInt8FeatureEnabled =
         enabledShaderFloat16.shaderInt8 == VK_TRUE;
+#if defined(VK_EXT_memory_budget) && defined(VK_VERSION_1_1)
+    gRuntime.memoryBudgetExtensionEnabled = gRuntime.memoryBudgetExtensionSupported;
+    if (gRuntime.memoryBudgetExtensionEnabled) {
+        gRuntime.getPhysicalDeviceMemoryProperties2 =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+                vkGetInstanceProcAddr(
+                    gRuntime.instance,
+                    "vkGetPhysicalDeviceMemoryProperties2"
+                )
+            );
+        gRuntime.memoryBudgetQueryAvailable =
+            gRuntime.getPhysicalDeviceMemoryProperties2 != nullptr;
+        if (!gRuntime.memoryBudgetQueryAvailable) {
+            logError(
+                "VK_EXT_memory_budget was enabled but vkGetPhysicalDeviceMemoryProperties2 is unavailable."
+            );
+        }
+    }
+#endif
 
     vkGetDeviceQueue(
         gRuntime.device,
@@ -3048,6 +3178,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
         return env->NewStringUTF("{}");
     }
 
+    refreshMemoryBudget();
     const VkPhysicalDeviceProperties& properties = gRuntime.physicalDeviceProperties;
     std::ostringstream json;
     json << "{"
@@ -3062,6 +3193,24 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
          << "\"hostVisibleMemoryTypeCount\":" << gRuntime.hostVisibleMemoryTypeCount << ","
          << "\"hostVisibleDeviceLocalMemoryTypeCount\":"
          << gRuntime.hostVisibleDeviceLocalMemoryTypeCount << ","
+         << "\"memoryBudgetExtensionSupported\":"
+         << (gRuntime.memoryBudgetExtensionSupported ? "true" : "false") << ","
+         << "\"memoryBudgetExtensionEnabled\":"
+         << (gRuntime.memoryBudgetExtensionEnabled ? "true" : "false") << ","
+         << "\"memoryBudgetQueryAvailable\":"
+         << (gRuntime.memoryBudgetQueryAvailable ? "true" : "false") << ","
+         << "\"memoryBudgetHeapCount\":" << gRuntime.memoryBudgetHeapCount << ","
+         << "\"memoryHeapBudgetBytes\":[";
+    for (uint32_t heapIndex = 0; heapIndex < gRuntime.memoryBudgetHeapCount; ++heapIndex) {
+        if (heapIndex > 0u) json << ",";
+        json << gRuntime.memoryHeapBudget[heapIndex];
+    }
+    json << "],"memoryHeapUsageBytes":[";
+    for (uint32_t heapIndex = 0; heapIndex < gRuntime.memoryBudgetHeapCount; ++heapIndex) {
+        if (heapIndex > 0u) json << ",";
+        json << gRuntime.memoryHeapUsage[heapIndex];
+    }
+    json << "],"
          << "\"apiVersionMajor\":" << VK_VERSION_MAJOR(properties.apiVersion) << ","
          << "\"apiVersionMinor\":" << VK_VERSION_MINOR(properties.apiVersion) << ","
          << "\"apiVersionPatch\":" << VK_VERSION_PATCH(properties.apiVersion) << ","

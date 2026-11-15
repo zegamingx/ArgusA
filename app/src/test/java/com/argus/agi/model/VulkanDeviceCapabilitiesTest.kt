@@ -42,6 +42,36 @@ class VulkanDeviceCapabilitiesTest {
         assertEquals(0L, metrics.totalGpuTimeNanoseconds)
     }
 
+
+    @Test
+    fun memoryBudgetRemainsOptionalWhenExtensionIsUnavailable() {
+        val capabilities = VulkanDeviceCapabilities.fromJson(
+            """
+            {
+              "deviceName": "Mali-G57",
+              "memoryPropertiesAvailable": true,
+              "memoryHeapCount": 1,
+              "memoryTypeCount": 2,
+              "hostVisibleMemoryTypeCount": 1,
+              "hostVisibleDeviceLocalMemoryTypeCount": 1,
+              "memoryBudgetExtensionSupported": false,
+              "memoryBudgetExtensionEnabled": false,
+              "memoryBudgetQueryAvailable": false,
+              "memoryBudgetHeapCount": 0,
+              "memoryHeapBudgetBytes": [],
+              "memoryHeapUsageBytes": []
+            }
+            """
+        )
+
+        assertFalse(capabilities.memoryBudgetExtensionSupported)
+        assertFalse(capabilities.memoryBudgetExtensionEnabled)
+        assertFalse(capabilities.memoryBudgetQueryAvailable)
+        assertTrue(capabilities.memoryHeapBudgetBytes.isEmpty())
+        assertTrue(capabilities.memoryHeapUsageBytes.isEmpty())
+        assertTrue(capabilities.memoryBudgetHeadroomBytes.isEmpty())
+    }
+
     @Test
     fun parsesSubgroupPrecisionAndAccelerationFlags() {
         val capabilities = VulkanDeviceCapabilities.fromJson(
@@ -56,6 +86,12 @@ class VulkanDeviceCapabilitiesTest {
               "memoryTypeCount": 3,
               "hostVisibleMemoryTypeCount": 2,
               "hostVisibleDeviceLocalMemoryTypeCount": 1,
+              "memoryBudgetExtensionSupported": true,
+              "memoryBudgetExtensionEnabled": true,
+              "memoryBudgetQueryAvailable": true,
+              "memoryBudgetHeapCount": 2,
+              "memoryHeapBudgetBytes": [1000, 2000],
+              "memoryHeapUsageBytes": [250, 700],
               "apiVersionMajor": 1,
               "apiVersionMinor": 3,
               "apiVersionPatch": 278,
@@ -106,6 +142,13 @@ class VulkanDeviceCapabilitiesTest {
         assertEquals(3, capabilities.memoryTypeCount)
         assertEquals(2, capabilities.hostVisibleMemoryTypeCount)
         assertEquals(1, capabilities.hostVisibleDeviceLocalMemoryTypeCount)
+        assertTrue(capabilities.memoryBudgetExtensionSupported)
+        assertTrue(capabilities.memoryBudgetExtensionEnabled)
+        assertTrue(capabilities.memoryBudgetQueryAvailable)
+        assertEquals(2, capabilities.memoryBudgetHeapCount)
+        assertEquals(listOf(1000L, 2000L), capabilities.memoryHeapBudgetBytes)
+        assertEquals(listOf(250L, 700L), capabilities.memoryHeapUsageBytes)
+        assertEquals(listOf(750L, 1300L), capabilities.memoryBudgetHeadroomBytes)
         assertEquals("1.3.278", capabilities.apiVersion)
         assertEquals(16, capabilities.subgroupSize)
         assertTrue(capabilities.supportsComputeSubgroups)

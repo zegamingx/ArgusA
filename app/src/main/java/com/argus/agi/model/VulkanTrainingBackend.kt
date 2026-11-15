@@ -112,10 +112,21 @@ data class VulkanDeviceCapabilities(
     val memoryHeapCount: Int,
     val memoryTypeCount: Int,
     val hostVisibleMemoryTypeCount: Int,
-    val hostVisibleDeviceLocalMemoryTypeCount: Int
+    val hostVisibleDeviceLocalMemoryTypeCount: Int,
+    val memoryBudgetExtensionSupported: Boolean,
+    val memoryBudgetExtensionEnabled: Boolean,
+    val memoryBudgetQueryAvailable: Boolean,
+    val memoryBudgetHeapCount: Int,
+    val memoryHeapBudgetBytes: List<Long>,
+    val memoryHeapUsageBytes: List<Long>
 ) {
     val apiVersion: String
         get() = "$apiVersionMajor.$apiVersionMinor.$apiVersionPatch"
+
+    val memoryBudgetHeadroomBytes: List<Long>
+        get() = memoryHeapBudgetBytes.zip(memoryHeapUsageBytes) { budget, usage ->
+            (budget - usage).coerceAtLeast(0L)
+        }
 
     val supportsComputeSubgroups: Boolean
         get() = subgroupSize > 0 && (subgroupSupportedStages and COMPUTE_SHADER_STAGE_BIT) != 0
@@ -271,7 +282,20 @@ data class VulkanDeviceCapabilities(
                 memoryTypeCount = json.optInt("memoryTypeCount"),
                 hostVisibleMemoryTypeCount = json.optInt("hostVisibleMemoryTypeCount"),
                 hostVisibleDeviceLocalMemoryTypeCount =
-                    json.optInt("hostVisibleDeviceLocalMemoryTypeCount")
+                    json.optInt("hostVisibleDeviceLocalMemoryTypeCount"),
+                memoryBudgetExtensionSupported =
+                    json.optBoolean("memoryBudgetExtensionSupported"),
+                memoryBudgetExtensionEnabled =
+                    json.optBoolean("memoryBudgetExtensionEnabled"),
+                memoryBudgetQueryAvailable =
+                    json.optBoolean("memoryBudgetQueryAvailable"),
+                memoryBudgetHeapCount = json.optInt("memoryBudgetHeapCount"),
+                memoryHeapBudgetBytes = json.optJSONArray("memoryHeapBudgetBytes")?.let { array ->
+                    List(array.length()) { index -> array.optLong(index) }
+                } ?: emptyList(),
+                memoryHeapUsageBytes = json.optJSONArray("memoryHeapUsageBytes")?.let { array ->
+                    List(array.length()) { index -> array.optLong(index) }
+                } ?: emptyList()
             )
         }
     }
