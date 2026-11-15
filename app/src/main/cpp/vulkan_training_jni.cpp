@@ -7,6 +7,7 @@
 #include "linear_fp16_shader_spv.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1790,41 +1791,65 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         return JNI_FALSE;
     }
 
-    std::vector<jfloat> inputValues;
-    try {
-        inputValues.resize(static_cast<size_t>(inputElements));
-    } catch (const std::bad_alloc&) {
-        logError("Not enough host memory to prepare Vulkan FP16 linear input.");
-        return JNI_FALSE;
-    }
-
-    env->GetFloatArrayRegion(
-        inputArray,
-        0,
-        static_cast<jsize>(inputElements),
-        inputValues.data()
-    );
-    if (env->ExceptionCheck()) {
-        return JNI_FALSE;
-    }
-
+    // Convert FP32 activations directly into the mapped packed-half staging
+    // buffer in bounded chunks. This avoids a second full-size host tensor
+    // allocation while keeping JNI calls large enough to amortize call overhead.
+    constexpr size_t kInputConversionChunkElements = 8192u;
+    std::array<jfloat, kInputConversionChunkElements> inputChunk{};
     auto* packedWords = static_cast<uint32_t*>(gRuntime.mappedStorage);
-    for (size_t index = 0; index < inputValues.size(); index += 2u) {
-        const float firstValue = inputValues[index];
-        if (!std::isfinite(firstValue)) {
+
+    for (uint64_t chunkOffset = 0u;
+         chunkOffset < inputElements;
+         chunkOffset += kInputConversionChunkElements) {
+        const size_t chunkCount = static_cast<size_t>(
+            std::min<uint64_t>(
+                kInputConversionChunkElements,
+                inputElements - chunkOffset
+            )
+        );
+        env->GetFloatArrayRegion(
+            inputArray,
+            static_cast<jsize>(chunkOffset),
+            static_cast<jsize>(chunkCount),
+            inputChunk.data()
+        );
+        if (env->ExceptionCheck()) {
             return JNI_FALSE;
         }
 
-        const uint32_t lowHalf = floatToHalf(firstValue);
-        uint32_t highHalf = 0u;
-        if (index + 1u < inputValues.size()) {
-            const float secondValue = inputValues[index + 1u];
-            if (!std::isfinite(secondValue)) {
+        // Chunk size and offsets are even, so only the final chunk can leave
+        // one high-half slot unused. That slot is explicitly zero-filled.
+        for (size_t localIndex = 0u; localIndex < chunkCount; localIndex += 2u) {
+            const size_t absoluteIndex =
+                static_cast<size_t>(chunkOffset) + localIndex;
+            const float firstValue = inputChunk[localIndex];
+            if (!std::isfinite(firstValue)) {
                 return JNI_FALSE;
             }
-            highHalf = static_cast<uint32_t>(floatToHalf(secondValue)) << 16u;
+
+            const uint16_t lowHalf = floatToHalf(firstValue);
+            if ((lowHalf & 0x7C00u) == 0x7C00u) {
+                logError("FP16 input activation exceeds the finite binary16 range.");
+                return JNI_FALSE;
+            }
+
+            uint32_t highHalf = 0u;
+            if (localIndex + 1u < chunkCount) {
+                const float secondValue = inputChunk[localIndex + 1u];
+                if (!std::isfinite(secondValue)) {
+                    return JNI_FALSE;
+                }
+                const uint16_t encodedSecond = floatToHalf(secondValue);
+                if ((encodedSecond & 0x7C00u) == 0x7C00u) {
+                    logError("FP16 input activation exceeds the finite binary16 range.");
+                    return JNI_FALSE;
+                }
+                highHalf = static_cast<uint32_t>(encodedSecond) << 16u;
+            }
+
+            packedWords[absoluteIndex >> 1u] =
+                static_cast<uint32_t>(lowHalf) | highHalf;
         }
-        packedWords[index >> 1u] = lowHalf | highHalf;
     }
 
     // Weight arrays already contain IEEE-754 binary16 payloads. Copy them
@@ -1858,13 +1883,22 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         }
     }
 
-    // The FP16 shader uses a grid-stride loop, so clamp the physical
-    // dispatch to the device X limit and let each invocation cover its
-    // additional output elements through the shader stride.
+    // Each 8x16 workgroup computes one FP16 output tile. Additional tiles
+    // are covered by the shader's workgroup grid-stride loop.
+    constexpr uint64_t kFp16TileRows = 8u;
+    constexpr uint64_t kFp16TileColumns = 16u;
+    const uint64_t tileRowsPerBatch =
+        1u + (static_cast<uint64_t>(rowsPerBatch) - 1u) / kFp16TileRows;
+    const uint64_t tileColumnsPerBatch =
+        1u + (static_cast<uint64_t>(outputColumns) - 1u) / kFp16TileColumns;
+    const uint64_t totalTileCount =
+        static_cast<uint64_t>(batchCount) *
+        tileRowsPerBatch *
+        tileColumnsPerBatch;
     const uint32_t workGroupCount =
-        calculateDispatchWorkGroupCount(outputElements);
+        calculateDispatchGroupCount(totalTileCount);
     if (workGroupCount == 0u) {
-        logError("Vulkan FP16 linear dispatch has no available compute work-groups.");
+        logError("Vulkan FP16 linear dispatch has no available output tile groups.");
         return JNI_FALSE;
     }
 
@@ -2000,6 +2034,13 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
     }
 
     const auto* mappedWords = static_cast<const uint32_t*>(gRuntime.mappedStorage);
+    for (uint64_t index = 0u; index < outputElements; ++index) {
+        const uint32_t valueBits = mappedWords[outputOffsetWords + index];
+        if ((valueBits & 0x7F800000u) == 0x7F800000u) {
+            logError("Vulkan FP16 linear kernel produced a non-finite output.");
+            return JNI_FALSE;
+        }
+    }
     const auto* outputValues =
         reinterpret_cast<const jfloat*>(mappedWords + outputOffsetWords);
     env->SetFloatArrayRegion(

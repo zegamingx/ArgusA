@@ -409,31 +409,85 @@ internal object VulkanTrainingBackend {
     }
 
     private fun verifyNativeFp16Kernel(): Boolean {
-        val input = floatArrayOf(
-            0.5f, 1.0f, 1.5f,
-            2.0f, 2.5f, 3.0f
-        )
-        val weights = Float16ParameterArray.fromFloatArray(
-            floatArrayOf(
-                0.5f, 1.0f,
-                1.5f, 2.0f,
-                2.5f, 3.0f
-            )
-        ).toShortArray()
-        val output = FloatArray(4)
-        val succeeded = nativeApplyFp16Linear(
-            input = input,
-            weights = weights,
-            output = output,
-            rows = 2,
-            batchCount = 1,
-            rowsPerBatch = 2,
-            inputColumns = 3,
-            outputColumns = 2,
-            transposeWeights = false
-        )
-        return succeeded &&
-            approximatelyEqual(output, floatArrayOf(5.5f, 7.0f, 12.25f, 16.0f), 1e-3f)
+        // Cover partial 8x16 tiles, a second K tile, multiple independent
+        // batches, odd packed-input and weight lengths, and both weight layouts.
+        val batchCount = 3
+        val rowsPerBatch = 9
+        val inputColumns = 19
+        val outputColumns = 19
+        val rowCount = batchCount * rowsPerBatch
+        val input = FloatArray(rowCount * inputColumns) { index ->
+            ((index % 17) - 8) * 0.125f
+        }
+        val sourceWeights = FloatArray(
+            batchCount * inputColumns * outputColumns
+        ) { index ->
+            ((index % 13) - 6) * 0.0625f
+        }
+        val weights = Float16ParameterArray.fromFloatArray(sourceWeights).toShortArray()
+        val transposedWeights = ShortArray(weights.size)
+        val weightBatchSize = inputColumns * outputColumns
+
+        for (batchIndex in 0 until batchCount) {
+            val batchOffset = batchIndex * weightBatchSize
+            for (inner in 0 until inputColumns) {
+                for (column in 0 until outputColumns) {
+                    transposedWeights[batchOffset + column * inputColumns + inner] =
+                        weights[batchOffset + inner * outputColumns + column]
+                }
+            }
+        }
+
+        fun verify(weightValues: ShortArray, transposeWeights: Boolean): Boolean {
+            val expected = FloatArray(rowCount * outputColumns)
+            for (batchIndex in 0 until batchCount) {
+                val inputBatchOffset = batchIndex * rowsPerBatch * inputColumns
+                val weightBatchOffset = batchIndex * weightBatchSize
+                for (row in 0 until rowsPerBatch) {
+                    val inputRowOffset = inputBatchOffset + row * inputColumns
+                    val outputRowOffset =
+                        (batchIndex * rowsPerBatch + row) * outputColumns
+
+                    for (column in 0 until outputColumns) {
+                        var sum = 0f
+                        for (inner in 0 until inputColumns) {
+                            val inputValue = Float16Codec.toFloat(
+                                Float16Codec.fromFiniteFloat(
+                                    input[inputRowOffset + inner]
+                                )
+                            )
+                            val weightIndex = if (transposeWeights) {
+                                weightBatchOffset + column * inputColumns + inner
+                            } else {
+                                weightBatchOffset + inner * outputColumns + column
+                            }
+                            val weightValue = Float16Codec.toFloat(weightValues[weightIndex])
+                            val halfProduct = Float16Codec.toFloat(
+                                Float16Codec.fromFiniteFloat(inputValue * weightValue)
+                            )
+                            sum += halfProduct
+                        }
+                        expected[outputRowOffset + column] = sum
+                    }
+                }
+            }
+
+            val actual = FloatArray(expected.size)
+            return nativeApplyFp16Linear(
+                input = input,
+                weights = weightValues,
+                output = actual,
+                rows = rowCount,
+                batchCount = batchCount,
+                rowsPerBatch = rowsPerBatch,
+                inputColumns = inputColumns,
+                outputColumns = outputColumns,
+                transposeWeights = transposeWeights
+            ) && approximatelyEqual(actual, expected, 1e-3f)
+        }
+
+        return verify(weights, transposeWeights = false) &&
+            verify(transposedWeights, transposeWeights = true)
     }
 
     @Synchronized
