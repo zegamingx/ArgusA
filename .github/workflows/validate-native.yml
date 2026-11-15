@@ -93,7 +93,7 @@ jobs:
           cmake_archive="cmake-${cmake_version}-linux-x86_64.tar.gz"
           cmake_archive_path="${RUNNER_TEMP}/${cmake_archive}"
           cmake_root="${RUNNER_TEMP}/cmake-${cmake_version}"
-# Fetch the official Kitware release asset; the pinned SHA-256 below remains mandatory.
+          # Fetch the official Kitware release asset; the pinned SHA-256 below remains mandatory.
           curl --fail --location --retry 3 --silent --show-error \
             "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/${cmake_archive}" \
             --output "${cmake_archive_path}"
