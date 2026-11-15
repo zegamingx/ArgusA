@@ -29,6 +29,10 @@ data class ProcessedChunk(
  */
 object TextModalityProcessor {
 
+    private val defaultChunkTokenizer: Tokenizer by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        Tokenizer()
+    }
+
     private const val LITERAL_LINE_ESCAPE = '\uE001'
 
     private enum class TurnRole(val token: String) {
@@ -661,11 +665,18 @@ object TextModalityProcessor {
      * Menyiapkan dan membagi teks menjadi potongan chunk training sesuai modalitas.
      * Parameter divalidasi agar tidak terjadi infinite loop saat chunkSize/overlap tidak masuk akal.
      */
+    /**
+     * Processes a complete source document. chunkSize and overlap are measured in
+     * tokens emitted by the supplied tokenizer, not UTF-16 characters. Atomic
+     * conversations, reasoning records, and JSONL records may exceed this soft
+     * ingestion target; the neural engine owns model context-windowing.
+     */
     fun process(
         rawText: String,
         documentTitle: String = "Dokumen",
         chunkSize: Int = 380,
-        overlap: Int = 50
+        overlap: Int = 50,
+        tokenizer: Tokenizer = defaultChunkTokenizer
     ): List<ProcessedChunk> {
         require(chunkSize > 0) { "chunkSize harus > 0, diterima: $chunkSize" }
         require(overlap >= 0) { "overlap tidak boleh negatif, diterima: $overlap" }
@@ -679,13 +690,13 @@ object TextModalityProcessor {
         if (records != null) return processTrainingRecords(records, documentTitle)
 
         return when (detectModality(source)) {
-            TextModality.CONVERSATION -> processConversation(source, documentTitle, chunkSize)
-            TextModality.QA_PAIR -> processQAPairs(source, documentTitle, chunkSize)
+            TextModality.CONVERSATION -> processConversation(source, documentTitle, chunkSize, tokenizer)
+            TextModality.QA_PAIR -> processQAPairs(source, documentTitle, chunkSize, tokenizer)
             TextModality.REASONING -> processReasoningDataset(source, documentTitle, chunkSize)
-            TextModality.ARTICLE_NEWS -> processArticleNews(source, documentTitle, chunkSize, overlap)
-            TextModality.STORY_NARRATIVE -> processStoryNarrative(source, documentTitle, chunkSize, overlap)
-            TextModality.STRUCTURED_DATA -> processStructuredData(source, documentTitle, chunkSize)
-            TextModality.GENERAL_PROSE -> processGeneralProse(source, documentTitle, chunkSize, overlap)
+            TextModality.ARTICLE_NEWS -> processArticleNews(source, documentTitle, chunkSize, overlap, tokenizer)
+            TextModality.STORY_NARRATIVE -> processStoryNarrative(source, documentTitle, chunkSize, overlap, tokenizer)
+            TextModality.STRUCTURED_DATA -> processStructuredData(source, documentTitle, chunkSize, tokenizer)
+            TextModality.GENERAL_PROSE -> processGeneralProse(source, documentTitle, chunkSize, overlap, tokenizer)
         }
     }
 
@@ -719,7 +730,8 @@ object TextModalityProcessor {
     private fun processConversation(
         text: String,
         documentTitle: String,
-        chunkSize: Int
+        chunkSize: Int,
+        tokenizer: Tokenizer
     ): List<ProcessedChunk> {
         val turns = mutableListOf<ConversationTurn>()
         var currentRole: TurnRole? = null
@@ -787,7 +799,7 @@ object TextModalityProcessor {
         }
         flushTurn()
 
-        if (turns.isEmpty()) return processGeneralProse(text, documentTitle, chunkSize, 0)
+        if (turns.isEmpty()) return processGeneralProse(text, documentTitle, chunkSize, 0, tokenizer)
         return processConversationTurns(turns, documentTitle)
     }
 
@@ -815,7 +827,8 @@ object TextModalityProcessor {
     private fun processQAPairs(
         text: String,
         documentTitle: String,
-        chunkSize: Int
+        chunkSize: Int,
+        tokenizer: Tokenizer
     ): List<ProcessedChunk> {
         val pairs = mutableListOf<Pair<String, String>>()
         var currentQuestion: StringBuilder? = null
@@ -868,7 +881,7 @@ object TextModalityProcessor {
         flushPair()
 
         if (pairs.isEmpty()) {
-            return processGeneralProse(text, documentTitle, chunkSize, 0)
+            return processGeneralProse(text, documentTitle, chunkSize, 0, tokenizer)
         }
 
         val chunks = mutableListOf<ProcessedChunk>()
@@ -881,19 +894,30 @@ object TextModalityProcessor {
             val safeAnswer = Tokenizer.escapeLiteralControlTokens(answer)
             val header = "${Tokenizer.USER_TOKEN} Tanya:$safeQuestion\n" +
                 "${Tokenizer.ASSISTANT_TOKEN} Jawab:"
-            val availableForAnswer = chunkSize - header.length - Tokenizer.EOS_TOKEN.length - 1
+            val framedAnswer = header + safeAnswer + " " + Tokenizer.EOS_TOKEN
+            val framedTokenCount = tokenizer.encode(framedAnswer, autoRegister = false).size
+            val headerTokenCount = tokenizer.encode(
+                header + " " + Tokenizer.EOS_TOKEN,
+                autoRegister = false
+            ).size
+            val availableForAnswer = (chunkSize - headerTokenCount).coerceAtLeast(0)
 
-            if (availableForAnswer <= 0 || safeAnswer.length <= availableForAnswer) {
+            if (framedTokenCount <= chunkSize || availableForAnswer == 0) {
                 chunks.add(
                     ProcessedChunk(
-                        content = header + safeAnswer + " " + Tokenizer.EOS_TOKEN,
+                        content = framedAnswer,
                         modality = TextModality.QA_PAIR,
                         segmentTitle = "$documentTitle [T&J $pairNumber/$totalPairs]",
                         tokenHint = "Q&A Pasangan #$pairNumber"
                     )
                 )
             } else {
-                val answerPieces = splitBySentenceBoundaries(safeAnswer, availableForAnswer, 0)
+                val answerPieces = splitBySentenceBoundaries(
+                    safeAnswer,
+                    availableForAnswer,
+                    0,
+                    tokenizer
+                )
                 for ((pieceIndex, piece) in answerPieces.withIndex()) {
                     val isLast = pieceIndex == answerPieces.lastIndex
                     chunks.add(
@@ -920,10 +944,11 @@ object TextModalityProcessor {
         text: String,
         documentTitle: String,
         chunkSize: Int,
-        overlap: Int
+        overlap: Int,
+        tokenizer: Tokenizer
     ): List<ProcessedChunk> {
         val safeText = Tokenizer.escapeLiteralControlTokens(text)
-        val segments = splitBySentenceBoundaries(safeText, chunkSize, overlap)
+        val segments = splitBySentenceBoundaries(safeText, chunkSize, overlap, tokenizer)
         val total = segments.size
         return segments.mapIndexed { index, segment ->
             ProcessedChunk(
@@ -944,10 +969,17 @@ object TextModalityProcessor {
         text: String,
         documentTitle: String,
         chunkSize: Int,
-        overlap: Int
+        overlap: Int,
+        tokenizer: Tokenizer
     ): List<ProcessedChunk> {
         val safeText = Tokenizer.escapeLiteralControlTokens(text)
-        val segments = splitBySentenceBoundaries(safeText, chunkSize, overlap, quoteAware = true)
+        val segments = splitBySentenceBoundaries(
+            safeText,
+            chunkSize,
+            overlap,
+            tokenizer,
+            quoteAware = true
+        )
         val total = segments.size
         return segments.mapIndexed { idx, segment ->
             ProcessedChunk(
@@ -1075,7 +1107,8 @@ object TextModalityProcessor {
     private fun processStructuredData(
         text: String,
         documentTitle: String,
-        chunkSize: Int
+        chunkSize: Int,
+        tokenizer: Tokenizer
     ): List<ProcessedChunk> {
         val formattedText = formatStructuredTextPreservingLineEndings(
             text,
@@ -1083,7 +1116,7 @@ object TextModalityProcessor {
         )
         if (formattedText.isBlank()) return emptyList()
 
-        val records = splitByCompleteLines(formattedText, chunkSize)
+        val records = splitByCompleteLines(formattedText, chunkSize, tokenizer)
         val total = records.size
         return records.mapIndexed { index, record ->
             ProcessedChunk(
@@ -1099,8 +1132,14 @@ object TextModalityProcessor {
      * Packs complete source lines into bounded chunks. A single line may exceed the
      * soft limit but is never split into partial structured records.
      */
-    private fun splitByCompleteLines(text: String, chunkSize: Int): List<String> {
-        if (text.length <= chunkSize) return listOf(text)
+    private fun splitByCompleteLines(
+        text: String,
+        chunkSize: Int,
+        tokenizer: Tokenizer
+    ): List<String> {
+        if (tokenizer.encode(text, autoRegister = false).size <= chunkSize) {
+            return listOf(text)
+        }
         val chunks = mutableListOf<String>()
         val current = StringBuilder()
 
@@ -1113,7 +1152,15 @@ object TextModalityProcessor {
 
         for (line in splitTextLinesPreservingSeparators(text)) {
             val record = line.content + line.separator
-            if (current.isNotEmpty() && current.length + record.length > chunkSize) flush()
+            val candidate = current.toString() + record
+            if (
+                current.isNotEmpty() &&
+                tokenizer.encode(candidate, autoRegister = false).size > chunkSize
+            ) {
+                flush()
+            }
+            // A single structured record remains atomic even when it exceeds this soft target.
+            // The neural engine, not this processor, owns context-window construction.
             current.append(record)
         }
         flush()
@@ -1127,10 +1174,11 @@ object TextModalityProcessor {
         text: String,
         documentTitle: String,
         chunkSize: Int,
-        overlap: Int
+        overlap: Int,
+        tokenizer: Tokenizer
     ): List<ProcessedChunk> {
         val safeText = Tokenizer.escapeLiteralControlTokens(text)
-        val segments = splitBySentenceBoundaries(safeText, chunkSize, overlap)
+        val segments = splitBySentenceBoundaries(safeText, chunkSize, overlap, tokenizer)
         val total = segments.size
         return segments.mapIndexed { idx, seg ->
             ProcessedChunk(
@@ -1192,59 +1240,197 @@ object TextModalityProcessor {
         text: String,
         chunkSize: Int,
         overlap: Int,
+        tokenizer: Tokenizer,
         quoteAware: Boolean = false
     ): List<String> {
-        if (text.length <= chunkSize) return listOf(text)
+        if (tokenizer.encode(text, autoRegister = false).size <= chunkSize) {
+            return listOf(text)
+        }
 
         val result = mutableListOf<String>()
         var start = 0
         while (start < text.length) {
-            var end = minOf(start + chunkSize, text.length)
-            if (end < text.length) {
-                val window = text.substring(start, end)
+            val tokenBudgetEnd = findTokenBudgetEnd(text, start, chunkSize, tokenizer)
+            var end = tokenBudgetEnd
+            if (tokenBudgetEnd < text.length) {
+                val window = text.substring(start, tokenBudgetEnd)
                 val lastDoubleNl = window.lastIndexOf("\n\n")
                 val lastNl = window.lastIndexOf('\n')
                 val lastDot = window.lastIndexOf(". ")
                 val lastQm = window.lastIndexOf("? ")
                 val lastEm = window.lastIndexOf("! ")
-                val minBreak = chunkSize / 3
+                val minimumBreakTokens = chunkSize / 3
 
                 val bestPunct = maxOf(lastDoubleNl, lastNl, lastDot, lastQm, lastEm)
-                if (bestPunct > minBreak) {
-                    var candidateEnd = start + bestPunct + 1
+                var candidateEnd = if (bestPunct >= 0) start + bestPunct + 1 else start
+                var candidateTokenCount = if (candidateEnd > start) {
+                    tokenizer.encode(
+                        text.substring(start, candidateEnd),
+                        autoRegister = false
+                    ).size
+                } else {
+                    0
+                }
+
+                if (candidateTokenCount < minimumBreakTokens) {
+                    val lastSpace = window.lastIndexOf(' ')
+                    candidateEnd = if (lastSpace >= 0) start + lastSpace + 1 else start
+                    candidateTokenCount = if (candidateEnd > start) {
+                        tokenizer.encode(
+                            text.substring(start, candidateEnd),
+                            autoRegister = false
+                        ).size
+                    } else {
+                        0
+                    }
+                }
+
+                if (candidateEnd > start && candidateTokenCount >= minimumBreakTokens) {
                     if (quoteAware) {
                         val expectedCloser = unclosedQuoteCloser(text.substring(start, candidateEnd))
                         if (expectedCloser != null) {
                             val closingQuote = text.indexOf(expectedCloser, candidateEnd)
-                            val overshootLimit = start + chunkSize + 40
-                            if (closingQuote in candidateEnd until overshootLimit) {
-                                candidateEnd = closingQuote + 1
+                            if (closingQuote >= candidateEnd && closingQuote < tokenBudgetEnd) {
+                                val quotedEnd = alignUtf16Boundary(
+                                    text,
+                                    closingQuote + 1,
+                                    preferAfter = true
+                                )
+                                if (
+                                    tokenizer.encode(
+                                        text.substring(start, quotedEnd),
+                                        autoRegister = false
+                                    ).size <= chunkSize
+                                ) {
+                                    candidateEnd = quotedEnd
+                                }
                             }
                         }
                     }
                     end = candidateEnd
-                } else {
-                    val lastSpace = window.lastIndexOf(' ')
-                    if (lastSpace > minBreak) end = start + lastSpace + 1
                 }
             }
 
             end = alignUtf16Boundary(text, end, preferAfter = true)
             val slice = text.substring(start, end)
             if (slice.isNotEmpty()) result.add(slice)
-
             if (end >= text.length) break
-            var nextStart = alignUtf16Boundary(
-                text,
-                end - overlap,
-                preferAfter = false
-            )
+
+            var nextStart = findTokenOverlapStart(text, start, end, overlap, tokenizer)
             if (overlap > 0) {
                 while (nextStart < text.length && text[nextStart].isWhitespace()) nextStart++
-                while (nextStart > start && !text[nextStart - 1].isWhitespace()) nextStart--
             }
             start = if (nextStart <= start) end else nextStart
         }
         return result.ifEmpty { listOf(text) }
+    }
+
+    private fun findTokenBudgetEnd(
+        text: String,
+        start: Int,
+        tokenBudget: Int,
+        tokenizer: Tokenizer
+    ): Int {
+        if (start >= text.length) return text.length
+        require(tokenBudget > 0) { "Token budget must be positive." }
+
+        var accepted = start
+        var step = tokenBudget.coerceAtLeast(1).toLong()
+        var candidate = alignUtf16Boundary(
+            text,
+            (start.toLong() + step).coerceAtMost(text.length.toLong()).toInt(),
+            preferAfter = true
+        )
+
+        while (candidate > accepted) {
+            val count = tokenizer.encode(
+                text.substring(start, candidate),
+                autoRegister = false
+            ).size
+            if (count > tokenBudget) break
+            accepted = candidate
+            if (accepted >= text.length) return text.length
+            step = (step * 2L).coerceAtMost((text.length - accepted).toLong())
+            candidate = alignUtf16Boundary(
+                text,
+                (accepted.toLong() + step).coerceAtMost(text.length.toLong()).toInt(),
+                preferAfter = true
+            )
+            if (candidate <= accepted) candidate = nextCodePointBoundary(text, accepted)
+        }
+
+        var low = accepted
+        var high = candidate
+        if (high <= low) high = nextCodePointBoundary(text, low)
+
+        while (high - low > 1) {
+            val midpoint = low + (high - low) / 2
+            val alignedMidpoint = alignUtf16Boundary(text, midpoint, preferAfter = true)
+            if (alignedMidpoint <= low || alignedMidpoint >= high) break
+            val count = tokenizer.encode(
+                text.substring(start, alignedMidpoint),
+                autoRegister = false
+            ).size
+            if (count <= tokenBudget) low = alignedMidpoint else high = alignedMidpoint
+        }
+
+        var end = low
+        while (
+            end > start &&
+            tokenizer.encode(text.substring(start, end), autoRegister = false).size > tokenBudget
+        ) {
+            end = previousCodePointBoundary(text, end)
+        }
+        while (end < text.length) {
+            val next = nextCodePointBoundary(text, end)
+            if (
+                tokenizer.encode(text.substring(start, next), autoRegister = false).size > tokenBudget
+            ) break
+            end = next
+        }
+        return if (end == start) nextCodePointBoundary(text, start) else end
+    }
+
+    private fun findTokenOverlapStart(
+        text: String,
+        chunkStart: Int,
+        chunkEnd: Int,
+        overlapTokens: Int,
+        tokenizer: Tokenizer
+    ): Int {
+        if (overlapTokens <= 0) return chunkEnd
+
+        var low = chunkStart
+        var high = chunkEnd
+        while (high - low > 1) {
+            val midpoint = low + (high - low) / 2
+            val alignedMidpoint = alignUtf16Boundary(text, midpoint, preferAfter = true)
+            if (alignedMidpoint <= low || alignedMidpoint >= high) break
+            val count = tokenizer.encode(
+                text.substring(alignedMidpoint, chunkEnd),
+                autoRegister = false
+            ).size
+            if (count <= overlapTokens) high = alignedMidpoint else low = alignedMidpoint
+        }
+
+        while (
+            high < chunkEnd &&
+            tokenizer.encode(text.substring(high, chunkEnd), autoRegister = false).size > overlapTokens
+        ) {
+            high = nextCodePointBoundary(text, high)
+        }
+        return alignUtf16Boundary(text, high, preferAfter = false)
+    }
+
+    private fun nextCodePointBoundary(text: String, index: Int): Int {
+        if (index >= text.length) return text.length
+        val codePoint = Character.codePointAt(text, index)
+        return (index + Character.charCount(codePoint)).coerceAtMost(text.length)
+    }
+
+    private fun previousCodePointBoundary(text: String, index: Int): Int {
+        if (index <= 0) return 0
+        val codePoint = Character.codePointBefore(text, index)
+        return (index - Character.charCount(codePoint)).coerceAtLeast(0)
     }
 }

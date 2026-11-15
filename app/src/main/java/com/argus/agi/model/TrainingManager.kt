@@ -363,7 +363,13 @@ class TrainingManager(
 
         if (fullText.isBlank() || closed) return 0
 
-        val processedChunks = TextModalityProcessor.process(fullText, title, chunkSize, overlap)
+        val processedChunks = TextModalityProcessor.process(
+            rawText = fullText,
+            documentTitle = title,
+            chunkSize = chunkSize,
+            overlap = overlap,
+            tokenizer = neuralEngine.tokenizer
+        )
         val chunksPerEpoch = processedChunks.size
         if (chunksPerEpoch == 0) return 0
 
@@ -516,6 +522,17 @@ class TrainingManager(
      *
      * @return Pair(number of generated chunks, total characters read)
      */
+    /**
+     * Reads incrementally but retains the complete source transcript until modality
+     * detection and token-aware processing have finished. Splitting before modality
+     * detection can turn partial conversation roles into unrelated prose and damage SFT.
+     * JSONL records remain atomic in TextModalityProcessor.
+     *
+     * chunkSize and overlap are token counts from the active neural-engine tokenizer.
+     * Model context-window construction remains the engine's responsibility.
+     *
+     * @return Pair(number of generated chunks, total UTF-16 characters read)
+     */
     suspend fun enqueueDocumentStream(
         source: String,
         title: String,
@@ -527,16 +544,16 @@ class TrainingManager(
         canonicalUrl: String? = null,
         rightsStatus: String = "UNVERIFIED"
     ): Pair<Int, Long> {
-        require(chunkSize > 0) { "chunkSize harus > 0." }
-        require(overlap >= 0) { "overlap tidak boleh negatif." }
+        require(chunkSize > 0) { "chunkSize must be positive." }
+        require(overlap >= 0) { "overlap cannot be negative." }
         require(overlap < chunkSize) {
-            "overlap ($overlap) harus < chunkSize ($chunkSize) agar iterasi maju."
+            "overlap ($overlap) must be less than chunkSize ($chunkSize)."
         }
         require(overlap <= chunkSize / 3) {
-            "overlap ($overlap) harus <= chunkSize / 3 (${chunkSize / 3}) agar jaminan sliding window selalu maju"
+            "overlap ($overlap) must be <= one third of chunkSize (${chunkSize / 3})."
         }
         require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
-            "epochs harus berada pada rentang 1..$MAX_DOCUMENT_EPOCHS"
+            "epochs must be in 1..$MAX_DOCUMENT_EPOCHS."
         }
         require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
             "Unsupported corpus rights status: $rightsStatus"
@@ -544,168 +561,43 @@ class TrainingManager(
         requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
         if (closed) return Pair(0, 0L)
 
-        val rawChunks = mutableListOf<String>()
+        val sourceText = StringBuilder()
         val buffer = CharArray(4096)
-        val window = StringBuilder()
         val fingerprintDigest = MessageDigest.getInstance("SHA-256")
         var totalCharsRead = 0L
-
-        fun appendSegment(rawSegment: String) {
-            if (rawSegment.isBlank()) return
-
-            // The stream reader already applies document-level overlap. Reuse the
-            // shared modality processor with zero additional overlap so JSONL,
-            // conversations, Q&A, reasoning, and plain text follow one contract.
-            val processedChunks = TextModalityProcessor.process(
-                rawText = rawSegment,
-                documentTitle = title,
-                chunkSize = chunkSize,
-                overlap = 0
-            )
-            rawChunks.addAll(processedChunks.map(ProcessedChunk::content))
-        }
 
         while (true) {
             val readCount = reader.read(buffer)
             if (readCount < 0) break
+            if (readCount == 0) continue
             if (closed) {
-                rawChunks.clear()
+                sourceText.setLength(0)
                 return Pair(0, totalCharsRead)
             }
 
             updateUtf16BeDigest(fingerprintDigest, buffer, readCount)
-            window.append(buffer, 0, readCount)
+            sourceText.append(buffer, 0, readCount)
             totalCharsRead += readCount.toLong()
-
-            while (window.length > chunkSize) {
-                val minimumBreakPosition = chunkSize / 3
-                val searchText = window.substring(minimumBreakPosition, chunkSize)
-                val lastNewLine = searchText.lastIndexOf('\n')
-                val lastSentenceBreak = max(
-                    searchText.lastIndexOf(". "),
-                    max(searchText.lastIndexOf("? "), searchText.lastIndexOf("! "))
-                )
-                val punctuationBreak = max(lastNewLine, lastSentenceBreak)
-
-                var splitPosition = if (punctuationBreak >= 0) {
-                    minimumBreakPosition + punctuationBreak + 1
-                } else {
-                    val lastSpace = searchText.lastIndexOf(' ')
-                    if (lastSpace >= 0) minimumBreakPosition + lastSpace + 1 else chunkSize
-                }.coerceIn(1, chunkSize)
-                var structuredBoundary = false
-
-                // Never cut a JSON object/array in the middle. JSONL records are
-                // handled individually; pretty-printed values are buffered as one
-                // bounded value before the dataset formatter sees them.
-                var jsonStart = -1
-                var lineStart = 0
-                while (lineStart < splitPosition) {
-                    var candidateStart = lineStart
-                    while (
-                        candidateStart < splitPosition &&
-                        window[candidateStart] != '\n' &&
-                        window[candidateStart].isWhitespace()
-                    ) {
-                        candidateStart++
-                    }
-                    if (
-                        candidateStart < splitPosition &&
-                        window[candidateStart] in charArrayOf('{', '[')
-                    ) {
-                        jsonStart = candidateStart
-                        break
-                    }
-
-                    var nextLineStart = lineStart
-                    while (nextLineStart < splitPosition && window[nextLineStart] != '\n') {
-                        nextLineStart++
-                    }
-                    if (nextLineStart >= splitPosition) break
-                    lineStart = nextLineStart + 1
-                }
-
-                if (jsonStart >= 0) {
-                    if (jsonStart > 0) {
-                        splitPosition = jsonStart
-                        structuredBoundary = true
-                    } else {
-                        val jsonEnd = TextModalityProcessor.findCompleteJsonValueEnd(
-                            text = window.toString(),
-                            startIndex = jsonStart
-                        )
-                        if (jsonEnd == null) {
-                            val bufferedCharacters = window.length - jsonStart
-                            require(bufferedCharacters <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
-                                "A streamed JSON training value exceeds " +
-                                    "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
-                                    "Use JSONL with one training record per line."
-                            }
-                            break
-                        }
-                        val jsonLength = jsonEnd - jsonStart
-                        require(jsonLength <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
-                            "A streamed JSON training value exceeds " +
-                                "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
-                                "Use JSONL with one training record per line."
-                        }
-                        splitPosition = jsonEnd
-                        structuredBoundary = true
-                    }
-                }
-
-                splitPosition = TextModalityProcessor.alignUtf16Boundary(
-                    window,
-                    splitPosition,
-                    preferAfter = true
-                )
-                appendSegment(window.substring(0, splitPosition))
-
-                val nextStart = if (structuredBoundary) {
-                    splitPosition
-                } else {
-                    (splitPosition - overlap).coerceAtLeast(0)
-                }
-                val alignedNextStart = TextModalityProcessor.alignUtf16Boundary(
-                    window,
-                    nextStart,
-                    preferAfter = false
-                )
-                val safeNextStart = if (!structuredBoundary && alignedNextStart == 0 && splitPosition > 0) {
-                    splitPosition
-                } else {
-                    alignedNextStart
-                }
-                val tail = window.substring(safeNextStart)
-                window.setLength(0)
-                window.append(tail)
-            }
         }
 
         if (closed) {
-            rawChunks.clear()
+            sourceText.setLength(0)
             return Pair(0, totalCharsRead)
         }
 
-        val trailingRaw = window.toString()
-        if (trailingRaw.isNotBlank()) {
-            val firstContentIndex = trailingRaw.indexOfFirst { !it.isWhitespace() }
-            if (
-                firstContentIndex >= 0 &&
-                trailingRaw[firstContentIndex] in charArrayOf('{', '[') &&
-                TextModalityProcessor.findCompleteJsonValueEnd(
-                    text = trailingRaw,
-                    startIndex = firstContentIndex
-                ) == null
-            ) {
-                throw IllegalArgumentException(
-                    "The streamed JSON training value is incomplete. " +
-                        "Check the final JSONL record or closing JSON brackets."
-                )
-            }
-            appendSegment(trailingRaw)
-        }
+        val completeTranscript = sourceText.toString()
+        if (completeTranscript.isBlank()) return Pair(0, totalCharsRead)
 
+        validateStreamedJsonValueSizes(completeTranscript)
+
+        val processedChunks = TextModalityProcessor.process(
+            rawText = completeTranscript,
+            documentTitle = title,
+            chunkSize = chunkSize,
+            overlap = overlap,
+            tokenizer = neuralEngine.tokenizer
+        )
+        val rawChunks = processedChunks.map(ProcessedChunk::content)
         val chunksPerEpoch = rawChunks.size
         if (chunksPerEpoch == 0) return Pair(0, totalCharsRead)
 
@@ -743,19 +635,17 @@ class TrainingManager(
         val stored = activeRepository.storeCorpusDocument(corpusDocument, corpusChunks)
         if (!stored) {
             Log.i(TAG, "Duplicate corpus document skipped: $documentId")
-            rawChunks.clear()
             return Pair(0, totalCharsRead)
         }
 
         val totalScheduledChunks = Math.multiplyExact(chunksPerEpoch, epochs)
         val newItems = ArrayList<TrainingData>(totalScheduledChunks)
-
         for (epochIndex in 0 until epochs) {
             rawChunks.forEachIndexed { chunkIndex, chunkText ->
                 val chunkTitle = if (epochs == 1) {
-                    "$title [Blok ${chunkIndex + 1}/$chunksPerEpoch]"
+                    "$title [Block ${chunkIndex + 1}/$chunksPerEpoch]"
                 } else {
-                    "$title [Blok ${chunkIndex + 1}/$chunksPerEpoch] [Epoch ${epochIndex + 1}/$epochs]"
+                    "$title [Block ${chunkIndex + 1}/$chunksPerEpoch] [Epoch ${epochIndex + 1}/$epochs]"
                 }
 
                 newItems += TrainingData(
@@ -770,7 +660,6 @@ class TrainingManager(
                 )
             }
         }
-        rawChunks.clear()
 
         synchronized(queueLock) {
             if (closed) return Pair(0, totalCharsRead)
@@ -786,6 +675,52 @@ class TrainingManager(
                 )
             }
             return Pair(orderedItems.size, totalCharsRead)
+        }
+    }
+
+    private fun validateStreamedJsonValueSizes(text: String) {
+        fun skipWhitespace(start: Int): Int {
+            var index = start
+            while (index < text.length && text[index].isWhitespace()) index++
+            return index
+        }
+
+        var cursor = skipWhitespace(0)
+        if (cursor >= text.length) return
+
+        if (text[cursor] == '[') {
+            val end = TextModalityProcessor.findCompleteJsonValueEnd(text, cursor)
+                ?: throw IllegalArgumentException(
+                    "The streamed JSON array is incomplete. Check its closing brackets."
+                )
+            require(end - cursor <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
+                "A streamed JSON training array exceeds " +
+                    "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
+                    "Use JSONL with one training record per line."
+            }
+            require(skipWhitespace(end) == text.length) {
+                "Unexpected content follows the streamed JSON array."
+            }
+            return
+        }
+
+        if (text[cursor] != '{') return
+
+        while (cursor < text.length) {
+            cursor = skipWhitespace(cursor)
+            if (cursor >= text.length || text[cursor] != '{') return
+
+            val end = TextModalityProcessor.findCompleteJsonValueEnd(text, cursor)
+                ?: throw IllegalArgumentException(
+                    "A streamed JSON training record is incomplete. " +
+                        "Check the final JSONL record or closing JSON braces."
+                )
+            require(end - cursor <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
+                "A streamed JSON training record exceeds " +
+                    "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
+                    "Use smaller JSONL records."
+            }
+            cursor = end
         }
     }
 
@@ -1413,7 +1348,7 @@ class TrainingManager(
     fun enqueueData(source: String, title: String, content: String) {
         if (content.isBlank() || closed) return
 
-        if (content.length > 380) {
+        if (neuralEngine.tokenizer.encode(content, autoRegister = false).size > 380) {
             scope.launch {
                 runSuspendCatching { enqueueDocument(source, title, content) }
                     .onFailure { error ->
@@ -1423,7 +1358,13 @@ class TrainingManager(
             return
         }
 
-        val processed = TextModalityProcessor.process(content, title, chunkSize = 380, overlap = 40)
+        val processed = TextModalityProcessor.process(
+            rawText = content,
+            documentTitle = title,
+            chunkSize = 380,
+            overlap = 40,
+            tokenizer = neuralEngine.tokenizer
+        )
         if (processed.isEmpty()) return
 
         val newItems = processed.map { pChunk ->
@@ -2082,42 +2023,6 @@ class TrainingManager(
                 deviceGuard.consumeForceOverride()
             }
         }.onFailure { Log.w(TAG, "Gagal reset force override", it) }
-    }
-
-    // =====================================================================
-    // Chunking
-    // =====================================================================
-
-    private fun splitIntoTrainingChunks(text: String, chunkSize: Int, overlap: Int): List<String> {
-        require(chunkSize > overlap) { "chunkSize harus > overlap" }
-        if (text.length <= chunkSize) return listOf(text)
-
-        val chunks = mutableListOf<String>()
-        var start = 0
-        while (start < text.length) {
-            var end = min(start + chunkSize, text.length)
-            if (end < text.length) {
-                val window = text.substring(start, end)
-                val lastBreak = max(
-                    window.lastIndexOf('\n'),
-                    max(
-                        window.lastIndexOf(". "),
-                        max(window.lastIndexOf("? "), window.lastIndexOf("! "))
-                    )
-                )
-                if (lastBreak > chunkSize / 3) {
-                    end = start + lastBreak + 1
-                }
-            }
-            val sub = text.substring(start, end)
-            if (sub.isNotEmpty()) chunks.add(sub)
-            if (end >= text.length) break
-
-            val nextStart = end - overlap
-            // Jaminan maju: start harus naik minimal 1
-            start = if (nextStart <= start) end else nextStart
-        }
-        return chunks.ifEmpty { listOf(text) }
     }
 
     // =====================================================================

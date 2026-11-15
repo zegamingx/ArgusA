@@ -377,6 +377,102 @@ class CorpusPersistenceTest {
     }
 
     @Test
+    fun streamedPlainTextConversationIsProcessedOnlyAfterTheCompleteTranscriptArrives() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(
+                context,
+                EngineConfig(maxSeqLen = 64)
+            ),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val firstUserTurn = "First long question " + "context ".repeat(90)
+            val firstAssistantTurn = "First complete answer " + "detail ".repeat(70)
+            val secondUserTurn = "Second question must remain a distinct turn."
+            val secondAssistantTurn = "Second answer must also remain a distinct turn."
+            val transcript = listOf(
+                "User: $firstUserTurn",
+                "Assistant: $firstAssistantTurn",
+                "User: $secondUserTurn",
+                "Assistant: $secondAssistantTurn"
+            ).joinToString("\n")
+
+            val (queuedCount, charactersRead) = manager.enqueueDocumentStream(
+                source = "Long plain-text SFT transcript",
+                title = "Complete streamed conversation",
+                reader = StringReader(transcript),
+                chunkSize = 48,
+                overlap = 0
+            )
+
+            assertEquals(transcript.length.toLong(), charactersRead)
+            assertEquals("A complete conversation remains one atomic SFT sample.", 1, queuedCount)
+            manager.awaitQueuePersistenceIdle()
+
+            val conversationDocument = repository.getCorpusDocuments()
+                .single { it.title == "Complete streamed conversation" }
+            val storedChunk = repository.getCorpusChunks(conversationDocument.id).single().content
+            assertTrue(storedChunk.startsWith(com.argus.agi.model.Tokenizer.USER_TOKEN))
+            assertEquals(
+                2,
+                Regex(Regex.escape(com.argus.agi.model.Tokenizer.USER_TOKEN))
+                    .findAll(storedChunk)
+                    .count()
+            )
+            assertEquals(
+                2,
+                Regex(Regex.escape(com.argus.agi.model.Tokenizer.ASSISTANT_TOKEN))
+                    .findAll(storedChunk)
+                    .count()
+            )
+            assertEquals(
+                2,
+                Regex(Regex.escape(com.argus.agi.model.Tokenizer.EOS_TOKEN))
+                    .findAll(storedChunk)
+                    .count()
+            )
+            assertTrue(storedChunk.contains(firstUserTurn))
+            assertTrue(storedChunk.contains(firstAssistantTurn))
+            assertTrue(storedChunk.contains(secondUserTurn))
+            assertTrue(storedChunk.contains(secondAssistantTurn))
+
+            val jsonl = listOf(
+                """{"instruction":"first prompt","response":"first answer"}""",
+                """{"instruction":"second prompt","response":"second answer"}"""
+            ).joinToString("\n")
+            val (jsonlQueued, _) = manager.enqueueDocumentStream(
+                source = "JSONL per-record regression",
+                title = "JSONL records remain atomic",
+                reader = StringReader(jsonl),
+                chunkSize = 8,
+                overlap = 0
+            )
+            assertEquals("Each JSONL source record must remain its own sample.", 2, jsonlQueued)
+            manager.awaitQueuePersistenceIdle()
+            val jsonlDocument = repository.getCorpusDocuments()
+                .single { it.title == "JSONL records remain atomic" }
+            val jsonlChunks = repository.getCorpusChunks(jsonlDocument.id)
+            assertEquals(2, jsonlChunks.size)
+            assertTrue(jsonlChunks[0].content.contains("first prompt"))
+            assertTrue(jsonlChunks[1].content.contains("second prompt"))
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
+    @Test
     fun retainedCorpusSurvivesQueueClearAndCanBeReplayed() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val database = Room.inMemoryDatabaseBuilder(

@@ -426,6 +426,61 @@ class TextModalityPreservationTest {
     }
 
     @Test
+    fun proseChunkTargetsAreMeasuredWithTheActiveTokenizer() {
+        val tokenizer = Tokenizer()
+        val raw = buildString {
+            repeat(40) { index ->
+                append("Segment $index contains ordinary language and punctuation. ")
+            }
+        }
+
+        val chunks = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Token-budget prose",
+            chunkSize = 32,
+            overlap = 0,
+            tokenizer = tokenizer
+        )
+
+        assertTrue("Token-aware prose must produce multiple chunks.", chunks.size > 1)
+        assertEquals(raw, chunks.joinToString(separator = "") { it.content })
+        chunks.forEach { chunk ->
+            assertTrue(
+                "Every prose chunk must fit the configured tokenizer token budget.",
+                tokenizer.encode(chunk.content, autoRegister = false).size <= 32
+            )
+        }
+    }
+
+    @Test
+    fun structuredLinesArePackedByTokenizerTokenCount() {
+        val tokenizer = Tokenizer()
+        val raw = (1..12).joinToString("\n") { index ->
+            "- record $index: compact structured value"
+        }
+
+        val chunks = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Token-budget structured data",
+            chunkSize = 24,
+            overlap = 0,
+            tokenizer = tokenizer
+        )
+
+        assertTrue("Structured records should be packed into multiple chunks.", chunks.size > 1)
+        val flattenedLines = chunks.flatMap { it.content.lines().filter(String::isNotEmpty) }
+        assertEquals(raw.lines(), flattenedLines)
+        chunks.forEach { chunk ->
+            val singleAtomicLine = chunk.lines().filter(String::isNotEmpty).size == 1
+            assertTrue(
+                "Packed structured chunks must fit the token target unless a single line is oversized.",
+                tokenizer.encode(chunk.content, autoRegister = false).size <= 24 ||
+                    singleAtomicLine
+            )
+        }
+    }
+
+    @Test
     fun proseMentioningBothReasoningMarkersRemainsLiteralGeneralText() {
         val raw = "The documentation names <THINK> and </THINK> as literal control-token examples."
 
