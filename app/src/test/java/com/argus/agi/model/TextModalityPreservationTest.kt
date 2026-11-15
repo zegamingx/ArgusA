@@ -248,8 +248,126 @@ class TextModalityPreservationTest {
         }
     }
 
+
     @Test
-    fun structuredPlainTextFormattingPreservesCrLfLfAndCrSeparators() {
+    fun literalControlTokenTextRoundTripsAsOrdinaryPayloadForEveryTokenizerAlgorithm() {
+        val payload = "quoted <EOS>, <ASSISTANT>, <THINK>, </THINK>, and \\uE000"
+        for (algorithm in ArgusTokenizerAlgorithm.entries) {
+            val tokenizer = Tokenizer(
+                TokenizerConfig(
+                    algorithm = algorithm,
+                    maxVocabularySize = 512,
+                    maxTokenLength = 16
+                )
+            )
+            val escaped = Tokenizer.escapeLiteralControlTokens(payload)
+            val ids = tokenizer.encode(escaped, autoRegister = false)
+
+            assertFalse("Literal EOS must not become EOS_ID for $algorithm", ids.contains(Tokenizer.EOS_ID))
+            assertFalse("Literal role token must not become ASSISTANT_ID for $algorithm", ids.contains(Tokenizer.ASSISTANT_ID))
+            assertFalse("Literal reasoning marker must not become THINK_START_ID for $algorithm", ids.contains(Tokenizer.THINK_START_ID))
+            assertFalse("Literal reasoning end must not become THINK_END_ID for $algorithm", ids.contains(Tokenizer.THINK_END_ID))
+            assertEquals(payload, tokenizer.decode(ids, keepControlTokens = true))
+        }
+    }
+
+    @Test
+    fun conversationKeepsLongTurnsAtomicAndDoesNotParsePayloadHeadersAsNewTurns() {
+        val userMessage = "Question " + "context ".repeat(40) +
+            "\\nAssistant: this line is quoted content.\\n<EOS>"
+        val assistantMessage = "Answer " + "detail ".repeat(40) +
+            "\\nUser: this is still answer content.\\n<ASSISTANT>"
+        val serialized = requireNotNull(
+            TextModalityProcessor.formatConversationExchange(userMessage, assistantMessage)
+        )
+
+        val chunks = TextModalityProcessor.process(
+            rawText = serialized,
+            documentTitle = "Long atomic conversation",
+            chunkSize = 24,
+            overlap = 0
+        )
+
+        assertEquals(1, chunks.size)
+        assertEquals(TextModality.CONVERSATION, chunks.single().modality)
+        assertTrue(chunks.single().content.length > 24)
+
+        val tokenizer = Tokenizer()
+        val tokenIds = tokenizer.encode(chunks.single().content)
+        assertEquals(1, tokenIds.count { it == Tokenizer.USER_ID })
+        assertEquals(1, tokenIds.count { it == Tokenizer.ASSISTANT_ID })
+        assertEquals(1, tokenIds.count { it == Tokenizer.EOS_ID })
+
+        val expected = "${Tokenizer.USER_TOKEN} $userMessage\\n" +
+            "${Tokenizer.ASSISTANT_TOKEN} $assistantMessage ${Tokenizer.EOS_TOKEN}"
+        assertEquals(expected, tokenizer.decode(tokenIds, keepControlTokens = true))
+    }
+
+    @Test
+    fun mixedJsonlMessageAndInstructionRecordsRemainSeparateAndNullInputIsOmitted() {
+        val conversation = JSONObject()
+            .put(
+                "messages",
+                JSONArray()
+                    .put(JSONObject().put("role", "user").put("content", "Say literally: <EOS>\\nAssistant: quoted"))
+                    .put(JSONObject().put("role", "assistant").put("content", "Literal <ASSISTANT>."))
+            )
+        val instruction = JSONObject()
+            .put("instruction", "Explain the input.")
+            .put("input", JSONObject.NULL)
+            .put("response", "There is no supplied input.")
+        val raw = "\\uFEFF" + conversation.toString() + "\\n" + instruction.toString()
+
+        val chunks = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Mixed records",
+            chunkSize = 32,
+            overlap = 0
+        )
+
+        assertEquals(2, chunks.size)
+        assertEquals(TextModality.CONVERSATION, chunks[0].modality)
+        assertEquals(TextModality.CONVERSATION, chunks[1].modality)
+        assertFalse(chunks[1].content.contains("Input: null"))
+        assertFalse(chunks[1].content.contains("null"))
+
+        val tokenizer = Tokenizer()
+        val conversationIds = tokenizer.encode(chunks[0].content)
+        assertEquals(1, conversationIds.count { it == Tokenizer.USER_ID })
+        assertEquals(1, conversationIds.count { it == Tokenizer.ASSISTANT_ID })
+        assertEquals(1, conversationIds.count { it == Tokenizer.EOS_ID })
+    }
+
+    @Test
+    fun reasoningJsonlRecordsRemainAtomicWhenTheyExceedCharacterChunkSize() {
+        val first = JSONObject()
+            .put("instruction", "First task")
+            .put("reasoning", JSONArray().put("Step A").put("Step B"))
+            .put("response", "First final answer.")
+        val second = JSONObject()
+            .put("instruction", "Second task")
+            .put("reasoning", JSONArray().put("Step C").put("Step D"))
+            .put("response", "Second final answer.")
+        val raw = first.toString() + "\\n" + second.toString()
+
+        val chunks = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Atomic reasoning",
+            chunkSize = 12,
+            overlap = 0
+        )
+
+        assertEquals(2, chunks.size)
+        chunks.forEach { chunk ->
+            assertEquals(TextModality.REASONING, chunk.modality)
+            assertEquals(1, Regex(Regex.escape(Tokenizer.THINK_START)).findAll(chunk.content).count())
+            assertEquals(1, Regex(Regex.escape(Tokenizer.THINK_END)).findAll(chunk.content).count())
+            assertTrue(chunk.content.endsWith(Tokenizer.EOS_TOKEN))
+        }
+    }
+
+    @Test
+    fun structuredPlainTextFormattingPreservesCrLfLfAndCrSeparators {
         val raw = "alpha  \r\nbeta\n  gamma\rdelta\r\n"
 
         assertEquals(

@@ -29,6 +29,8 @@ data class ProcessedChunk(
  */
 object TextModalityProcessor {
 
+    private const val LITERAL_LINE_ESCAPE = '\uE001'
+
     private enum class TurnRole(val token: String) {
         SYSTEM(Tokenizer.SYSTEM_TOKEN),
         USER(Tokenizer.USER_TOKEN),
@@ -164,13 +166,14 @@ object TextModalityProcessor {
      * instruction-tuning records before modality detection and chunking.
      */
     private fun normalizeTrainingDatasetInput(text: String): String {
-        val records = parseTrainingDatasetObjects(text) ?: return text
+        val source = text.removePrefix("\uFEFF")
+        val records = parseTrainingDatasetObjects(source) ?: return source
         return records.joinToString("\n\n") { record ->
-            formatConversationRecord(record) ?: record.toString()
+            formatTrainingRecord(record)?.second ?: record.toString()
         }
     }
 
-        /**
+    /**
      * Returns the exclusive end offset of one complete JSON object or array.
      * Braces inside quoted strings and escaped quotes do not affect nesting.
      */
@@ -215,7 +218,7 @@ object TextModalityProcessor {
      * a valid prefix followed by unrelated text is rejected.
      */
     private fun parseTrainingDatasetObjects(rawText: String): List<JSONObject>? {
-        val source = rawText
+        val source = rawText.removePrefix("\uFEFF")
         if (source.isBlank()) return null
 
         fun skipWhitespace(startIndex: Int): Int {
@@ -269,7 +272,7 @@ object TextModalityProcessor {
     internal fun formatTrainingDatasetRecords(rawText: String): List<String>? {
         val records = parseTrainingDatasetObjects(rawText) ?: return null
         return records.map { record ->
-            formatStructuredLineIfJson(record.toString())
+            formatTrainingRecord(record)?.second ?: formatStructuredLineIfJson(record.toString())
         }
     }
 
@@ -322,6 +325,72 @@ object TextModalityProcessor {
 
     private fun isConversationRecord(obj: JSONObject): Boolean =
         extractConversationTurns(obj) != null
+
+    /**
+     * Converts each validated source object directly to its own atomic training record.
+     */
+    private fun formatTrainingRecord(obj: JSONObject): Pair<TextModality, String>? {
+        val turns = extractConversationTurns(obj)
+        if (turns != null) return TextModality.CONVERSATION to serializeConversationTurns(turns)
+        if (!isTrainingRecord(obj)) return null
+
+        val reasoning = extractReasoningText(obj)
+        val explicitInstruction = firstNonBlankPayload(obj, listOf("instruction", "prompt"))
+        val question = firstNonBlankPayload(obj, listOf("question"))
+        val isQuestionAnswer = explicitInstruction.isBlank() && question.isNotBlank()
+        val instruction = if (isQuestionAnswer) "Tanya: $question" else explicitInstruction
+        val responseText = firstNonBlankPayload(obj, listOf("response", "completion", "answer"))
+        val response = if (isQuestionAnswer) "Jawab: $responseText" else responseText
+        val input = firstNonBlankPayload(obj, listOf("input"))
+        val modality = if (reasoning.isNullOrBlank()) TextModality.CONVERSATION else TextModality.REASONING
+
+        return modality to formatInstructionResponse(
+            instruction = instruction,
+            input = input,
+            reasoning = reasoning,
+            response = response
+        )
+    }
+
+    /**
+     * Serializes parsed turns without interpreting payload lines as role headers.
+     * EOS is appended only when the final complete turn belongs to the assistant.
+     */
+    private fun serializeConversationTurns(turns: List<ConversationTurn>): String {
+        if (turns.isEmpty()) return ""
+        val serialized = turns.joinToString("\n") { turn ->
+            "${turn.role.token} ${Tokenizer.escapeLiteralControlTokens(turn.content)}"
+        }
+        return if (turns.last().role == TurnRole.ASSISTANT) {
+            "$serialized ${Tokenizer.EOS_TOKEN}"
+        } else {
+            serialized
+        }
+    }
+
+    /**
+     * Protects role-looking continuation lines in the legacy string exchange format.
+     * processConversation removes the marker before payload serialization.
+     */
+    private fun escapeConversationHeaderLines(text: String): String {
+        val lines = splitTextLinesPreservingSeparators(text)
+        return buildString(text.length + 8) {
+            lines.forEachIndexed { index, sourceLine ->
+                val line = sourceLine.content
+                val looksLikeRoleHeader =
+                    USER_TURN_PATTERN.matcher(line).find() ||
+                    ASSISTANT_TURN_PATTERN.matcher(line).find() ||
+                    SYSTEM_TURN_PATTERN.matcher(line).find()
+                if (
+                    index > 0 && looksLikeRoleHeader &&
+                    (line.isEmpty() || line[0] != LITERAL_LINE_ESCAPE)
+                ) append(LITERAL_LINE_ESCAPE)
+                append(line)
+                append(sourceLine.separator)
+            }
+        }
+    }
+
 
     /**
      * Reads text-only ChatML/OpenAI message content. Unsupported multimodal payloads
@@ -404,9 +473,7 @@ object TextModalityProcessor {
 
     private fun formatConversationRecord(obj: JSONObject): String? {
         val turns = extractConversationTurns(obj) ?: return null
-        return turns.joinToString("\n") { turn ->
-            "${turn.role.token} ${turn.content}"
-        }
+        return serializeConversationTurns(turns)
     }
 
     /**
@@ -419,8 +486,10 @@ object TextModalityProcessor {
     ): String? {
         if (userMessage.isBlank() || assistantMessage.isBlank()) return null
 
-        return "${Tokenizer.USER_TOKEN} $userMessage\n" +
-            "${Tokenizer.ASSISTANT_TOKEN} $assistantMessage"
+        val safeUserMessage = escapeConversationHeaderLines(userMessage)
+        val safeAssistantMessage = escapeConversationHeaderLines(assistantMessage)
+        return "${Tokenizer.USER_TOKEN} $safeUserMessage\n" +
+            "${Tokenizer.ASSISTANT_TOKEN} $safeAssistantMessage"
     }
 
     private fun readReasoningStep(value: Any?): String {
@@ -476,16 +545,21 @@ object TextModalityProcessor {
                 append("Input: ").append(input)
             }
         }
-        val reasoningBlock = reasoning?.takeIf { it.isNotBlank() }
+        val safePrompt = Tokenizer.escapeLiteralControlTokens(prompt)
+        val safeResponse = Tokenizer.escapeLiteralControlTokens(response)
+        val safeReasoning = reasoning
+            ?.takeIf { it.isNotBlank() }
+            ?.let(Tokenizer::escapeLiteralControlTokens)
 
-        return if (reasoningBlock == null) {
-            "${Tokenizer.USER_TOKEN} $prompt\n${Tokenizer.ASSISTANT_TOKEN} $response ${Tokenizer.EOS_TOKEN}"
+        return if (safeReasoning == null) {
+            "${Tokenizer.USER_TOKEN} $safePrompt\n" +
+                "${Tokenizer.ASSISTANT_TOKEN} $safeResponse ${Tokenizer.EOS_TOKEN}"
         } else {
-            "${Tokenizer.USER_TOKEN} $prompt\n" +
+            "${Tokenizer.USER_TOKEN} $safePrompt\n" +
                 "${Tokenizer.ASSISTANT_TOKEN}${Tokenizer.THINK_START}\n" +
-                "$reasoningBlock\n" +
+                "$safeReasoning\n" +
                 "${Tokenizer.THINK_END}\n" +
-                "${Tokenizer.ASSISTANT_TOKEN} $response ${Tokenizer.EOS_TOKEN}"
+                "${Tokenizer.ASSISTANT_TOKEN} $safeResponse ${Tokenizer.EOS_TOKEN}"
         }
     }
 
@@ -504,11 +578,13 @@ object TextModalityProcessor {
             trimmed.contains(Tokenizer.THINK_START) &&
                 trimmed.contains(Tokenizer.THINK_END)
         val containsReasoningRecords = lines.any { line ->
-            runCatching { JSONObject(line) }
-                .getOrNull()
-                ?.let { record ->
-                    isTrainingRecord(record) && !extractReasoningText(record).isNullOrBlank()
-                } == true
+            val candidate = line.trimStart()
+            candidate.startsWith("{") &&
+                runCatching { JSONObject(candidate) }
+                    .getOrNull()
+                    ?.let { record ->
+                        isTrainingRecord(record) && !extractReasoningText(record).isNullOrBlank()
+                    } == true
         }
         if (containsReasoningMarkers || containsReasoningRecords) {
             return TextModality.REASONING
@@ -579,20 +655,43 @@ object TextModalityProcessor {
         require(overlap >= 0) { "overlap tidak boleh negatif, diterima: $overlap" }
         require(overlap < chunkSize) { "overlap ($overlap) harus < chunkSize ($chunkSize)" }
 
-        val normalized = normalizeTrainingDatasetInput(rawText)
-        if (normalized.isBlank()) return emptyList()
+        val source = rawText.removePrefix("\uFEFF")
+        if (source.isBlank()) return emptyList()
 
-        val modality = detectModality(normalized)
+        // Keep JSON/JSONL records typed until serialization; never reparse payload text.
+        val records = parseTrainingDatasetObjects(source)
+        if (records != null) return processTrainingRecords(records, documentTitle)
 
-        return when (modality) {
-            TextModality.CONVERSATION -> processConversation(normalized, documentTitle, chunkSize)
-            TextModality.QA_PAIR -> processQAPairs(normalized, documentTitle, chunkSize)
-            TextModality.REASONING -> processReasoningDataset(normalized, documentTitle, chunkSize)
-            TextModality.ARTICLE_NEWS -> processArticleNews(normalized, documentTitle, chunkSize, overlap)
-            TextModality.STORY_NARRATIVE -> processStoryNarrative(normalized, documentTitle, chunkSize, overlap)
-            TextModality.STRUCTURED_DATA -> processStructuredData(normalized, documentTitle, chunkSize)
-            TextModality.GENERAL_PROSE -> processGeneralProse(normalized, documentTitle, chunkSize, overlap)
+        return when (val modality = detectModality(source)) {
+            TextModality.CONVERSATION -> processConversation(source, documentTitle)
+            TextModality.QA_PAIR -> processQAPairs(source, documentTitle, chunkSize)
+            TextModality.REASONING -> processReasoningDataset(source, documentTitle, chunkSize)
+            TextModality.ARTICLE_NEWS -> processArticleNews(source, documentTitle, chunkSize, overlap)
+            TextModality.STORY_NARRATIVE -> processStoryNarrative(source, documentTitle, chunkSize, overlap)
+            TextModality.STRUCTURED_DATA -> processStructuredData(source, documentTitle, chunkSize)
+            TextModality.GENERAL_PROSE -> processGeneralProse(source, documentTitle, chunkSize, overlap)
         }
+    }
+
+    /**
+     * One complete JSON source record becomes one training sample. Token-level
+     * context windowing remains the responsibility of the neural training engine.
+     */
+    private fun processTrainingRecords(
+        records: List<JSONObject>,
+        documentTitle: String
+    ): List<ProcessedChunk> = records.mapIndexedNotNull { index, record ->
+        val formatted = formatTrainingRecord(record) ?: return@mapIndexedNotNull null
+        ProcessedChunk(
+            content = formatted.second,
+            modality = formatted.first,
+            segmentTitle = "$documentTitle [Record ${index + 1}/${records.size}]",
+            tokenHint = if (formatted.first == TextModality.REASONING) {
+                "Atomic instruction, reasoning, and final answer"
+            } else {
+                "Atomic conversation or instruction record"
+            }
+        )
     }
 
     /**
@@ -603,10 +702,9 @@ object TextModalityProcessor {
      */
     private fun processConversation(
         text: String,
-        documentTitle: String,
-        chunkSize: Int
+        documentTitle: String
     ): List<ProcessedChunk> {
-        val formattedTurns = mutableListOf<String>()
+        val turns = mutableListOf<ConversationTurn>()
         var currentRole: TurnRole? = null
         val currentTurnText = StringBuilder()
         var pendingSeparator = ""
@@ -615,14 +713,7 @@ object TextModalityProcessor {
             val role = currentRole
             val payload = currentTurnText.toString()
             if (role != null && payload.isNotEmpty()) {
-                val availablePayloadLength = chunkSize - role.token.length - 1
-                if (payload.length + role.token.length + 1 > chunkSize && availablePayloadLength > 0) {
-                    splitBySentenceBoundaries(payload, availablePayloadLength, 0).forEach { piece ->
-                        formattedTurns.add(role.token + " " + piece)
-                    }
-                } else {
-                    formattedTurns.add(role.token + " " + payload)
-                }
+                turns += ConversationTurn(role = role, content = payload)
             }
             currentTurnText.setLength(0)
             currentRole = null
@@ -630,11 +721,21 @@ object TextModalityProcessor {
         }
 
         for (sourceLine in splitTextLinesPreservingSeparators(text)) {
-            val line = sourceLine.content
+            val rawLine = sourceLine.content
+            val escapedLiteralLine =
+                rawLine.isNotEmpty() && rawLine[0] == LITERAL_LINE_ESCAPE
+            val line = if (escapedLiteralLine) rawLine.substring(1) else rawLine
+
+            if (escapedLiteralLine) {
+                if (currentRole == null) currentRole = TurnRole.USER
+                currentTurnText.append(pendingSeparator).append(line)
+                pendingSeparator = sourceLine.separator
+                continue
+            }
+
             val systemMatcher = SYSTEM_TURN_PATTERN.matcher(line)
             val userMatcher = USER_TURN_PATTERN.matcher(line)
             val assistantMatcher = ASSISTANT_TURN_PATTERN.matcher(line)
-
             when {
                 systemMatcher.find() -> {
                     flushTurn()
@@ -667,37 +768,23 @@ object TextModalityProcessor {
         }
         flushTurn()
 
-        if (formattedTurns.isEmpty()) {
-            return processGeneralProse(text, documentTitle, chunkSize, 0)
-        }
+        if (turns.isEmpty()) return processGeneralProse(text, documentTitle, 380, 0)
+        return processConversationTurns(turns, documentTitle)
+    }
 
-        val chunks = mutableListOf<ProcessedChunk>()
-        val window = StringBuilder()
-        var turnCount = 0
-
-        fun flushChunk() {
-            if (window.isEmpty()) return
-            chunks.add(
-                ProcessedChunk(
-                    content = window.toString() + " " + Tokenizer.EOS_TOKEN,
-                    modality = TextModality.CONVERSATION,
-                    segmentTitle = "$documentTitle [Dialog ${chunks.size + 1}]",
-                    tokenHint = "Turn Dialog: $turnCount giliran"
-                )
+    private fun processConversationTurns(
+        turns: List<ConversationTurn>,
+        documentTitle: String
+    ): List<ProcessedChunk> {
+        if (turns.isEmpty()) return emptyList()
+        return listOf(
+            ProcessedChunk(
+                content = serializeConversationTurns(turns),
+                modality = TextModality.CONVERSATION,
+                segmentTitle = "$documentTitle [Dialog 1]",
+                tokenHint = "Turn Dialog: ${turns.size} giliran"
             )
-            window.setLength(0)
-            turnCount = 0
-        }
-
-        for (turn in formattedTurns) {
-            if (window.isNotEmpty() && window.length + turn.length + 1 > chunkSize) flushChunk()
-            if (window.isNotEmpty()) window.append('\n')
-            window.append(turn)
-            turnCount++
-        }
-        flushChunk()
-
-        return chunks
+        )
     }
 
     /**
@@ -770,31 +857,32 @@ object TextModalityProcessor {
         var pairIndex = 0
 
         for ((question, answer) in pairs) {
-            val header = "${Tokenizer.USER_TOKEN} Tanya:$question\n" +
+            val pairNumber = ++pairIndex
+            val safeQuestion = Tokenizer.escapeLiteralControlTokens(question)
+            val safeAnswer = Tokenizer.escapeLiteralControlTokens(answer)
+            val header = "${Tokenizer.USER_TOKEN} Tanya:$safeQuestion\n" +
                 "${Tokenizer.ASSISTANT_TOKEN} Jawab:"
             val availableForAnswer = chunkSize - header.length - Tokenizer.EOS_TOKEN.length - 1
 
-            if (availableForAnswer <= 0 || answer.length <= availableForAnswer) {
-                pairIndex++
+            if (availableForAnswer <= 0 || safeAnswer.length <= availableForAnswer) {
                 chunks.add(
                     ProcessedChunk(
-                        content = header + answer + " " + Tokenizer.EOS_TOKEN,
+                        content = header + safeAnswer + " " + Tokenizer.EOS_TOKEN,
                         modality = TextModality.QA_PAIR,
-                        segmentTitle = "$documentTitle [T&J $pairIndex/$totalPairs]",
-                        tokenHint = "Q&A Pasangan #$pairIndex"
+                        segmentTitle = "$documentTitle [T&J $pairNumber/$totalPairs]",
+                        tokenHint = "Q&A Pasangan #$pairNumber"
                     )
                 )
             } else {
-                val answerPieces = splitBySentenceBoundaries(answer, availableForAnswer, 0)
+                val answerPieces = splitBySentenceBoundaries(safeAnswer, availableForAnswer, 0)
                 for ((pieceIndex, piece) in answerPieces.withIndex()) {
-                    pairIndex++
                     val isLast = pieceIndex == answerPieces.lastIndex
                     chunks.add(
                         ProcessedChunk(
                             content = header + piece + if (isLast) " " + Tokenizer.EOS_TOKEN else "",
                             modality = TextModality.QA_PAIR,
-                            segmentTitle = "$documentTitle [T&J $pairIndex/$totalPairs]",
-                            tokenHint = "Q&A Pasangan #$pairIndex (part ${pieceIndex + 1}/${answerPieces.size})"
+                            segmentTitle = "$documentTitle [T&J $pairNumber/$totalPairs]",
+                            tokenHint = "Q&A Pasangan #$pairNumber (part ${pieceIndex + 1}/${answerPieces.size})"
                         )
                     )
                 }
@@ -815,7 +903,8 @@ object TextModalityProcessor {
         chunkSize: Int,
         overlap: Int
     ): List<ProcessedChunk> {
-        val segments = splitBySentenceBoundaries(text, chunkSize, overlap)
+        val safeText = Tokenizer.escapeLiteralControlTokens(text)
+        val segments = splitBySentenceBoundaries(safeText, chunkSize, overlap)
         val total = segments.size
         return segments.mapIndexed { index, segment ->
             ProcessedChunk(
@@ -838,7 +927,8 @@ object TextModalityProcessor {
         chunkSize: Int,
         overlap: Int
     ): List<ProcessedChunk> {
-        val segments = splitBySentenceBoundaries(text, chunkSize, overlap, quoteAware = true)
+        val safeText = Tokenizer.escapeLiteralControlTokens(text)
+        val segments = splitBySentenceBoundaries(safeText, chunkSize, overlap, quoteAware = true)
         val total = segments.size
         return segments.mapIndexed { idx, segment ->
             ProcessedChunk(
@@ -857,56 +947,31 @@ object TextModalityProcessor {
      */
     fun formatStructuredLineIfJson(line: String): String {
         val trimmed = line.trim()
-        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-            val parsed = runCatching {
-                val obj = JSONObject(trimmed)
-                val reasoning = extractReasoningText(obj)
-                when {
-                    obj.has("kata") && obj.has("kata_dasar") -> {
-                        val kata = obj.optString("kata")
-                        val dasar = obj.optString("kata_dasar")
-                        val sumber = obj.optString("sumber")
-                        val extra = if (sumber.isNotBlank()) " [sumber: $sumber]" else ""
-                        "Kata: $kata -> Kata dasar: $dasar$extra"
-                    }
-                    isConversationRecord(obj) -> {
-                        requireNotNull(formatConversationRecord(obj))
-                    }
-                    isTrainingRecord(obj) -> {
-                        val explicitInstruction = firstNonBlankPayload(
-                            obj,
-                            listOf("instruction", "prompt")
-                        )
-                        val question = firstNonBlankPayload(obj, listOf("question"))
-                        val isQuestionAnswer = explicitInstruction.isBlank() && question.isNotBlank()
-                        val instruction = if (isQuestionAnswer) "Tanya: $question" else explicitInstruction
-                        val responseText = firstNonBlankPayload(
-                            obj,
-                            listOf("response", "completion", "answer")
-                        )
-                        val response = if (isQuestionAnswer) "Jawab: $responseText" else responseText
-                        formatInstructionResponse(
-                            instruction = instruction,
-                            input = obj.optString("input"),
-                            reasoning = reasoning,
-                            response = response
-                        )
-                    }
-                    else -> {
-                        val pairs = mutableListOf<String>()
-                        val keys = obj.keys()
-                        while (keys.hasNext()) {
-                            val k = keys.next()
-                            if (obj.isNull(k)) continue
-                            pairs.add("$k: ${obj.opt(k)}")
-                        }
-                        pairs.joinToString(" | ")
-                    }
+        if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return line
+
+        val formatted = runCatching {
+            val obj = JSONObject(trimmed)
+            formatTrainingRecord(obj)?.second ?: when {
+                obj.has("kata") && obj.has("kata_dasar") -> {
+                    val kata = firstNonBlankPayload(obj, listOf("kata"))
+                    val dasar = firstNonBlankPayload(obj, listOf("kata_dasar"))
+                    val sumber = firstNonBlankPayload(obj, listOf("sumber"))
+                    val extra = if (sumber.isNotBlank()) " [sumber: $sumber]" else ""
+                    Tokenizer.escapeLiteralControlTokens("Kata: $kata -> Kata dasar: $dasar$extra")
                 }
-            }.getOrNull()
-            if (parsed != null) return parsed
-        }
-        return line
+                else -> {
+                    val pairs = mutableListOf<String>()
+                    val keys = obj.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        if (obj.isNull(key)) continue
+                        pairs += "$key: ${obj.opt(key)}"
+                    }
+                    Tokenizer.escapeLiteralControlTokens(pairs.joinToString(" | "))
+                }
+            }
+        }.getOrNull()
+        return formatted ?: line
     }
 
     /**
@@ -951,21 +1016,20 @@ object TextModalityProcessor {
     private fun processReasoningDataset(
         text: String,
         documentTitle: String,
-        chunkSize: Int
+        @Suppress("UNUSED_PARAMETER") chunkSize: Int
     ): List<ProcessedChunk> {
         val formattedText = formatStructuredTextPreservingLineEndings(text)
         if (formattedText.isBlank()) return emptyList()
 
-        val chunks = splitBySentenceBoundaries(formattedText, chunkSize, 0)
-        val total = chunks.size
-        return chunks.mapIndexed { index, chunk ->
+        // Keep reasoning and its final answer in one record; the engine owns context windows.
+        return listOf(
             ProcessedChunk(
-                content = chunk,
+                content = formattedText,
                 modality = TextModality.REASONING,
-                segmentTitle = "$documentTitle [Reasoning ${index + 1}/$total]",
-                tokenHint = "Instruction, reasoning steps, and final answer"
+                segmentTitle = "$documentTitle [Reasoning 1]",
+                tokenHint = "Atomic instruction, reasoning steps, and final answer"
             )
-        }
+        )
     }
 
     /**
@@ -976,19 +1040,46 @@ object TextModalityProcessor {
         documentTitle: String,
         chunkSize: Int
     ): List<ProcessedChunk> {
-        val formattedText = formatStructuredTextPreservingLineEndings(text)
+        val formattedText = Tokenizer.escapeLiteralControlTokens(
+            formatStructuredTextPreservingLineEndings(text)
+        )
         if (formattedText.isBlank()) return emptyList()
 
-        val chunks = splitBySentenceBoundaries(formattedText, chunkSize, 0)
-        val total = chunks.size
-        return chunks.mapIndexed { index, chunk ->
+        val records = splitByCompleteLines(formattedText, chunkSize)
+        val total = records.size
+        return records.mapIndexed { index, record ->
             ProcessedChunk(
-                content = chunk,
+                content = record,
                 modality = TextModality.STRUCTURED_DATA,
                 segmentTitle = "$documentTitle [Struktur ${index + 1}/$total]",
-                tokenHint = "Entri Data Terstruktur"
+                tokenHint = "Complete structured record(s)"
             )
         }
+    }
+
+    /**
+     * Packs complete source lines into bounded chunks. A single line may exceed the
+     * soft limit but is never split into partial structured records.
+     */
+    private fun splitByCompleteLines(text: String, chunkSize: Int): List<String> {
+        if (text.length <= chunkSize) return listOf(text)
+        val chunks = mutableListOf<String>()
+        val current = StringBuilder()
+
+        fun flush() {
+            if (current.isNotEmpty()) {
+                chunks += current.toString()
+                current.setLength(0)
+            }
+        }
+
+        for (line in splitTextLinesPreservingSeparators(text)) {
+            val record = line.content + line.separator
+            if (current.isNotEmpty() && current.length + record.length > chunkSize) flush()
+            current.append(record)
+        }
+        flush()
+        return chunks.ifEmpty { listOf(text) }
     }
 
     /**
@@ -1000,7 +1091,8 @@ object TextModalityProcessor {
         chunkSize: Int,
         overlap: Int
     ): List<ProcessedChunk> {
-        val segments = splitBySentenceBoundaries(text, chunkSize, overlap)
+        val safeText = Tokenizer.escapeLiteralControlTokens(text)
+        val segments = splitBySentenceBoundaries(safeText, chunkSize, overlap)
         val total = segments.size
         return segments.mapIndexed { idx, seg ->
             ProcessedChunk(
@@ -1104,11 +1196,15 @@ object TextModalityProcessor {
             if (slice.isNotEmpty()) result.add(slice)
 
             if (end >= text.length) break
-            val nextStart = alignUtf16Boundary(
+            var nextStart = alignUtf16Boundary(
                 text,
                 end - overlap,
                 preferAfter = false
             )
+            if (overlap > 0) {
+                while (nextStart < text.length && text[nextStart].isWhitespace()) nextStart++
+                while (nextStart > start && !text[nextStart - 1].isWhitespace()) nextStart--
+            }
             start = if (nextStart <= start) end else nextStart
         }
         return result.ifEmpty { listOf(text) }

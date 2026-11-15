@@ -117,6 +117,82 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         private val CONTROL_TOKENS: Set<String> = SPECIAL_IDS.keys +
                 setOf(PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, UNK_TOKEN)
         private val REASONING_TOKENS: Set<String> = setOf(THINK_START, THINK_END)
+
+        /** Prefix for literal control-token text; it is restored after decode. */
+        internal const val LITERAL_CONTROL_ESCAPE_MARKER: Char = '\uE000'
+
+        private fun specialTokenAt(text: String, index: Int): String? {
+            if (index !in text.indices || text[index] != '<') return null
+            return SPECIAL_TOKENS.firstOrNull { token -> text.startsWith(token, index) }
+        }
+
+        /** Escapes payload tokens without changing the final decoded text. */
+        internal fun escapeLiteralControlTokens(text: String): String {
+            if (text.isEmpty()) return text
+            val result = StringBuilder(text.length + 8)
+            var index = 0
+            while (index < text.length) {
+                val character = text[index]
+                if (character == LITERAL_CONTROL_ESCAPE_MARKER) {
+                    val nextSpecial = specialTokenAt(text, index + 1)
+                    when {
+                        nextSpecial != null -> {
+                            result.append(LITERAL_CONTROL_ESCAPE_MARKER).append(nextSpecial)
+                            index += nextSpecial.length + 1
+                        }
+                        index + 1 < text.length &&
+                            text[index + 1] == LITERAL_CONTROL_ESCAPE_MARKER -> {
+                            result.append(LITERAL_CONTROL_ESCAPE_MARKER)
+                                .append(LITERAL_CONTROL_ESCAPE_MARKER)
+                            index += 2
+                        }
+                        else -> {
+                            result.append(LITERAL_CONTROL_ESCAPE_MARKER)
+                                .append(LITERAL_CONTROL_ESCAPE_MARKER)
+                            index++
+                        }
+                    }
+                    continue
+                }
+
+                val special = specialTokenAt(text, index)
+                if (special != null) {
+                    result.append(LITERAL_CONTROL_ESCAPE_MARKER).append(special)
+                    index += special.length
+                } else {
+                    result.append(character)
+                    index++
+                }
+            }
+            return result.toString()
+        }
+
+        private fun restoreEscapedControlTokenLiterals(text: String): String {
+            if (LITERAL_CONTROL_ESCAPE_MARKER !in text) return text
+            val result = StringBuilder(text.length)
+            var index = 0
+            while (index < text.length) {
+                if (text[index] != LITERAL_CONTROL_ESCAPE_MARKER) {
+                    result.append(text[index++])
+                    continue
+                }
+                val next = index + 1
+                if (next < text.length && text[next] == LITERAL_CONTROL_ESCAPE_MARKER) {
+                    result.append(LITERAL_CONTROL_ESCAPE_MARKER)
+                    index += 2
+                    continue
+                }
+                val special = specialTokenAt(text, next)
+                if (special != null) {
+                    result.append(special)
+                    index += special.length + 1
+                } else {
+                    result.append(LITERAL_CONTROL_ESCAPE_MARKER)
+                    index++
+                }
+            }
+            return result.toString()
+        }
     }
 
     // All public reads and writes share this tokenizer's monitor.
@@ -763,7 +839,10 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         var cursor = 0
         var segmentStart = 0
         while (cursor < text.length) {
-            val specialToken = if (text[cursor] == '<') {
+            val specialToken = if (
+                text[cursor] == '<' &&
+                (cursor == 0 || text[cursor - 1] != LITERAL_CONTROL_ESCAPE_MARKER)
+            ) {
                 SPECIAL_TOKENS.firstOrNull { token -> text.startsWith(token, cursor) }
             } else {
                 null
@@ -917,7 +996,10 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         var segmentStart = 0
 
         while (cursor < text.length) {
-            val specialToken = if (text[cursor] == '<') {
+            val specialToken = if (
+                text[cursor] == '<' &&
+                (cursor == 0 || text[cursor - 1] != LITERAL_CONTROL_ESCAPE_MARKER)
+            ) {
                 SPECIAL_TOKENS.firstOrNull { token -> text.startsWith(token, cursor) }
             } else {
                 null
@@ -995,7 +1077,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         }
 
         flushBytes()
-        return output.toString()
+        return restoreEscapedControlTokenLiterals(output.toString())
     }
 
     private fun encodeLearnedBpe(cleanText: String, autoRegister: Boolean): List<Int> {
@@ -1007,7 +1089,10 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             val c = cleanText[i]
 
             // 1. Special tokens
-            if (c == '<') {
+            if (
+                c == '<' &&
+                (i == 0 || cleanText[i - 1] != LITERAL_CONTROL_ESCAPE_MARKER)
+            ) {
                 var matched = false
                 for (sp in SPECIAL_TOKENS) {
                     if (cleanText.startsWith(sp, i)) {
@@ -1024,7 +1109,10 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             var segmentEnd = n
             for (sp in SPECIAL_TOKENS) {
                 val spIdx = cleanText.indexOf(sp, i)
-                if (spIdx in i until segmentEnd) {
+                if (
+                    spIdx in i until segmentEnd &&
+                    (spIdx == 0 || cleanText[spIdx - 1] != LITERAL_CONTROL_ESCAPE_MARKER)
+                ) {
                     segmentEnd = spIdx
                 }
             }
@@ -1123,7 +1211,10 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             val c = cleanText[i]
 
             // 1. Special tokens — semua diawali '<', jadi bisa dipangkas cepat
-            if (c == '<') {
+            if (
+                c == '<' &&
+                (i == 0 || cleanText[i - 1] != LITERAL_CONTROL_ESCAPE_MARKER)
+            ) {
                 var matched = false
                 for (sp in SPECIAL_TOKENS) {
                     if (cleanText.startsWith(sp, i)) {
@@ -1210,7 +1301,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             if (!preserveToken && token in CONTROL_TOKENS) continue
             sb.append(token)
         }
-        return decodeUnicodeFallbacks(sb.toString())
+        return restoreEscapedControlTokenLiterals(decodeUnicodeFallbacks(sb.toString()))
     }
 
     /**
