@@ -11,6 +11,38 @@ import org.robolectric.RobolectricTestRunner
 class VulkanDeviceCapabilitiesTest {
 
     @Test
+    fun parsesGpuTimestampPerformanceMetrics() {
+        val metrics = VulkanGpuPerformanceMetrics.fromJson(
+            """
+            {
+              "timestampProfilingAvailable": true,
+              "timestampedDispatchCount": 12,
+              "lastAdamwGpuTimeNanoseconds": 48000,
+              "lastLinearGpuTimeNanoseconds": 9200,
+              "lastFp16LinearGpuTimeNanoseconds": 6100,
+              "totalGpuTimeNanoseconds": 90000
+            }
+            """
+        )
+
+        assertTrue(metrics.timestampProfilingAvailable)
+        assertEquals(12L, metrics.timestampedDispatchCount)
+        assertEquals(48000L, metrics.lastAdamwGpuTimeNanoseconds)
+        assertEquals(9200L, metrics.lastLinearGpuTimeNanoseconds)
+        assertEquals(6100L, metrics.lastFp16LinearGpuTimeNanoseconds)
+        assertEquals(90000L, metrics.totalGpuTimeNanoseconds)
+    }
+
+    @Test
+    fun missingGpuTimestampMetricsRemainSafelyUnavailable() {
+        val metrics = VulkanGpuPerformanceMetrics.fromJson("{}")
+
+        assertFalse(metrics.timestampProfilingAvailable)
+        assertEquals(0L, metrics.timestampedDispatchCount)
+        assertEquals(0L, metrics.totalGpuTimeNanoseconds)
+    }
+
+    @Test
     fun parsesSubgroupPrecisionAndAccelerationFlags() {
         val capabilities = VulkanDeviceCapabilities.fromJson(
             """

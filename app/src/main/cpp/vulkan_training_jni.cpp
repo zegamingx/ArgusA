@@ -91,6 +91,13 @@ struct VulkanRuntime {
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
     VkFence submissionFence = VK_NULL_HANDLE;
+    VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
+    bool timestampProfilingAvailable = false;
+    uint64_t timestampedDispatchCount = 0;
+    uint64_t lastAdamwGpuTimeNanoseconds = 0;
+    uint64_t lastLinearGpuTimeNanoseconds = 0;
+    uint64_t lastFp16LinearGpuTimeNanoseconds = 0;
+    uint64_t totalGpuTimeNanoseconds = 0;
 
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
@@ -310,6 +317,9 @@ void destroyRuntime() {
                 gRuntime.descriptorSetLayout,
                 nullptr
             );
+        }
+        if (gRuntime.timestampQueryPool != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(gRuntime.device, gRuntime.timestampQueryPool, nullptr);
         }
         if (gRuntime.submissionFence != VK_NULL_HANDLE) {
             vkDestroyFence(gRuntime.device, gRuntime.submissionFence, nullptr);
@@ -559,6 +569,99 @@ bool submitAndWait(const VkSubmitInfo& submitInfo, const char* operation) {
     }
 
     return true;
+}
+
+
+bool beginGpuTimestampCapture(VkCommandBuffer commandBuffer) {
+    if (!gRuntime.timestampProfilingAvailable ||
+        gRuntime.timestampQueryPool == VK_NULL_HANDLE ||
+        commandBuffer == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    vkCmdResetQueryPool(
+        commandBuffer,
+        gRuntime.timestampQueryPool,
+        0,
+        2
+    );
+    vkCmdWriteTimestamp(
+        commandBuffer,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        gRuntime.timestampQueryPool,
+        0
+    );
+    return true;
+}
+
+void endGpuTimestampCapture(VkCommandBuffer commandBuffer, bool captureStarted) {
+    if (!captureStarted) {
+        return;
+    }
+
+    vkCmdWriteTimestamp(
+        commandBuffer,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        gRuntime.timestampQueryPool,
+        1
+    );
+}
+
+bool readGpuTimestampDurationNanoseconds(uint64_t& durationNanoseconds) {
+    durationNanoseconds = 0;
+    if (!gRuntime.timestampProfilingAvailable ||
+        gRuntime.timestampQueryPool == VK_NULL_HANDLE ||
+        gRuntime.computeQueueTimestampValidBits == 0u) {
+        return false;
+    }
+
+    std::array<uint64_t, 2> timestamps{};
+    const VkResult result = vkGetQueryPoolResults(
+        gRuntime.device,
+        gRuntime.timestampQueryPool,
+        0,
+        static_cast<uint32_t>(timestamps.size()),
+        sizeof(timestamps),
+        timestamps.data(),
+        sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT
+    );
+    if (result != VK_SUCCESS) {
+        logError("Vulkan GPU timestamp results are unavailable.", result);
+        return false;
+    }
+
+    const uint32_t validBits = gRuntime.computeQueueTimestampValidBits;
+    uint64_t tickDelta = timestamps[1] - timestamps[0];
+    if (validBits < 64u) {
+        const uint64_t validMask = (uint64_t{1} << validBits) - 1u;
+        tickDelta &= validMask;
+    }
+
+    const double elapsedNanoseconds =
+        static_cast<double>(tickDelta) *
+        static_cast<double>(gRuntime.physicalDeviceProperties.limits.timestampPeriod);
+    if (!std::isfinite(elapsedNanoseconds) ||
+        elapsedNanoseconds < 0.0 ||
+        elapsedNanoseconds > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+        return false;
+    }
+
+    durationNanoseconds = static_cast<uint64_t>(elapsedNanoseconds);
+    return true;
+}
+
+void recordGpuTiming(uint64_t durationNanoseconds, uint64_t& operationDuration) {
+    operationDuration = durationNanoseconds;
+    if (std::numeric_limits<uint64_t>::max() - gRuntime.totalGpuTimeNanoseconds >=
+        durationNanoseconds) {
+        gRuntime.totalGpuTimeNanoseconds += durationNanoseconds;
+    } else {
+        gRuntime.totalGpuTimeNanoseconds = std::numeric_limits<uint64_t>::max();
+    }
+    if (gRuntime.timestampedDispatchCount < std::numeric_limits<uint64_t>::max()) {
+        ++gRuntime.timestampedDispatchCount;
+    }
 }
 
 bool initializeRuntime() {
@@ -1223,6 +1326,28 @@ bool initializeRuntime() {
         return false;
     }
 
+    if (gRuntime.computeQueueTimestampValidBits > 0u &&
+        gRuntime.physicalDeviceProperties.limits.timestampPeriod > 0.0f) {
+        VkQueryPoolCreateInfo timestampPoolInfo{};
+        timestampPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        timestampPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        timestampPoolInfo.queryCount = 2;
+        const VkResult timestampPoolResult = vkCreateQueryPool(
+            gRuntime.device,
+            &timestampPoolInfo,
+            nullptr,
+            &gRuntime.timestampQueryPool
+        );
+        if (timestampPoolResult == VK_SUCCESS) {
+            gRuntime.timestampProfilingAvailable = true;
+        } else {
+            logError(
+                "Vulkan timestamp query pool could not be created; GPU profiling is disabled.",
+                timestampPoolResult
+            );
+        }
+    }
+
     VkDescriptorSetLayoutBinding storageBinding{};
     storageBinding.binding = 0;
     storageBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1756,6 +1881,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
     VkResult result = VK_SUCCESS;
     size_t pageOffset = 0u;
     size_t pageIndex = 0u;
+    uint64_t adamwGpuTimeNanoseconds = 0u;
+    uint64_t timestampedAdamwPages = 0u;
     const size_t pageCount =
         1u + (totalElements - 1u) / maxPageElements;
 
@@ -1887,6 +2014,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
         }
+        const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
 
         VkMemoryBarrier hostToComputeBarrier{};
         hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -2004,6 +2132,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             nullptr
         );
 
+        endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
         result = vkEndCommandBuffer(gRuntime.commandBuffer);
         if (result != VK_SUCCESS) {
             logError("Failed to finish the Vulkan AdamW page command buffer.", result);
@@ -2023,6 +2153,18 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             )) {
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
+        }
+        if (timestampCapture) {
+            uint64_t pageDurationNanoseconds = 0u;
+            if (readGpuTimestampDurationNanoseconds(pageDurationNanoseconds)) {
+                if (std::numeric_limits<uint64_t>::max() - adamwGpuTimeNanoseconds >=
+                    pageDurationNanoseconds) {
+                    adamwGpuTimeNanoseconds += pageDurationNanoseconds;
+                } else {
+                    adamwGpuTimeNanoseconds = std::numeric_limits<uint64_t>::max();
+                }
+                ++timestampedAdamwPages;
+            }
         }
 
         if (!gRuntime.hostCoherent) {
@@ -2095,6 +2237,22 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             logError("Vulkan AdamW staged output contains a non-finite value.");
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
+        }
+    }
+
+    if (timestampedAdamwPages > 0u) {
+        recordGpuTiming(
+            adamwGpuTimeNanoseconds,
+            gRuntime.lastAdamwGpuTimeNanoseconds
+        );
+        if (timestampedAdamwPages > 1u) {
+            const uint64_t additionalSamples = timestampedAdamwPages - 1u;
+            if (std::numeric_limits<uint64_t>::max() - gRuntime.timestampedDispatchCount >=
+                additionalSamples) {
+                gRuntime.timestampedDispatchCount += additionalSamples;
+            } else {
+                gRuntime.timestampedDispatchCount = std::numeric_limits<uint64_t>::max();
+            }
         }
     }
 
@@ -2298,6 +2456,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         logError("Failed to begin the Vulkan linear command buffer.", result);
         return JNI_FALSE;
     }
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
 
     VkMemoryBarrier hostToComputeBarrier{};
     hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -2380,6 +2539,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         nullptr
     );
 
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
     result = vkEndCommandBuffer(gRuntime.commandBuffer);
     if (result != VK_SUCCESS) {
         logError("Failed to finish the Vulkan linear command buffer.", result);
@@ -2396,6 +2557,12 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
             "Vulkan linear submission or fence wait failed."
         )) {
         return JNI_FALSE;
+    }
+    if (timestampCapture) {
+        uint64_t durationNanoseconds = 0u;
+        if (readGpuTimestampDurationNanoseconds(durationNanoseconds)) {
+            recordGpuTiming(durationNanoseconds, gRuntime.lastLinearGpuTimeNanoseconds);
+        }
     }
 
     if (!gRuntime.hostCoherent) {
@@ -2644,6 +2811,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         logError("Failed to begin the Vulkan FP16 linear command buffer.", result);
         return JNI_FALSE;
     }
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
 
     VkMemoryBarrier hostToComputeBarrier{};
     hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -2722,6 +2890,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         nullptr
     );
 
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
     result = vkEndCommandBuffer(gRuntime.commandBuffer);
     if (result != VK_SUCCESS) {
         logError("Failed to finish the Vulkan FP16 linear command buffer.", result);
@@ -2737,6 +2907,12 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
             "Vulkan FP16 linear submission or fence wait failed."
         )) {
         return JNI_FALSE;
+    }
+    if (timestampCapture) {
+        uint64_t durationNanoseconds = 0u;
+        if (readGpuTimestampDurationNanoseconds(durationNanoseconds)) {
+            recordGpuTiming(durationNanoseconds, gRuntime.lastFp16LinearGpuTimeNanoseconds);
+        }
     }
 
     if (!gRuntime.hostCoherent) {
@@ -2955,6 +3131,27 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
     }
 
     json << "]}";
+    const std::string payload = json.str();
+    return env->NewStringUTF(payload.c_str());
+}
+
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetGpuPerformanceMetrics(
+    JNIEnv* env,
+    jobject
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    std::ostringstream json;
+    json << "{"
+         << "\"timestampProfilingAvailable\":"
+         << (gRuntime.timestampProfilingAvailable ? "true" : "false") << ","
+         << "\"timestampedDispatchCount\":" << gRuntime.timestampedDispatchCount << ","
+         << "\"lastAdamwGpuTimeNanoseconds\":" << gRuntime.lastAdamwGpuTimeNanoseconds << ","
+         << "\"lastLinearGpuTimeNanoseconds\":" << gRuntime.lastLinearGpuTimeNanoseconds << ","
+         << "\"lastFp16LinearGpuTimeNanoseconds\":" << gRuntime.lastFp16LinearGpuTimeNanoseconds << ","
+         << "\"totalGpuTimeNanoseconds\":" << gRuntime.totalGpuTimeNanoseconds
+         << "}";
     const std::string payload = json.str();
     return env->NewStringUTF(payload.c_str());
 }

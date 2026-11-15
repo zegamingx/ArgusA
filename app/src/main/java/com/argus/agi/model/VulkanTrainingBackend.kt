@@ -13,6 +13,30 @@ data class VulkanInitializationProgress(
     val isCpuFallback: Boolean = false
 )
 
+data class VulkanGpuPerformanceMetrics(
+    val timestampProfilingAvailable: Boolean = false,
+    val timestampedDispatchCount: Long = 0L,
+    val lastAdamwGpuTimeNanoseconds: Long = 0L,
+    val lastLinearGpuTimeNanoseconds: Long = 0L,
+    val lastFp16LinearGpuTimeNanoseconds: Long = 0L,
+    val totalGpuTimeNanoseconds: Long = 0L
+) {
+    companion object {
+        fun fromJson(payload: String): VulkanGpuPerformanceMetrics {
+            val json = org.json.JSONObject(payload)
+            return VulkanGpuPerformanceMetrics(
+                timestampProfilingAvailable = json.optBoolean("timestampProfilingAvailable"),
+                timestampedDispatchCount = json.optLong("timestampedDispatchCount"),
+                lastAdamwGpuTimeNanoseconds = json.optLong("lastAdamwGpuTimeNanoseconds"),
+                lastLinearGpuTimeNanoseconds = json.optLong("lastLinearGpuTimeNanoseconds"),
+                lastFp16LinearGpuTimeNanoseconds =
+                    json.optLong("lastFp16LinearGpuTimeNanoseconds"),
+                totalGpuTimeNanoseconds = json.optLong("totalGpuTimeNanoseconds")
+            )
+        }
+    }
+}
+
 data class VulkanCooperativeMatrixType(
     val mSize: Int,
     val nSize: Int,
@@ -285,6 +309,10 @@ internal object VulkanTrainingBackend {
     val deviceCapabilities: StateFlow<VulkanDeviceCapabilities?> =
         _deviceCapabilities.asStateFlow()
 
+    private val _gpuPerformanceMetrics = MutableStateFlow(VulkanGpuPerformanceMetrics())
+    val gpuPerformanceMetrics: StateFlow<VulkanGpuPerformanceMetrics> =
+        _gpuPerformanceMetrics.asStateFlow()
+
     internal val hasAttemptedInitialization: Boolean
         get() = initializationAttempted
 
@@ -319,6 +347,17 @@ internal object VulkanTrainingBackend {
             isVerified = isVerified,
             isCpuFallback = isCpuFallback
         )
+    }
+
+    private fun refreshGpuPerformanceMetrics() {
+        if (!nativeReady) return
+        runCatching {
+            VulkanGpuPerformanceMetrics.fromJson(nativeGetGpuPerformanceMetrics())
+        }.onSuccess { metrics ->
+            _gpuPerformanceMetrics.value = metrics
+        }.onFailure { error ->
+            Log.d(TAG, "GPU timestamp metrics could not be read.", error)
+        }
     }
 
     private fun releaseNativeRuntimeAfterFailure(nativeLibraryLoaded: Boolean) {
@@ -414,6 +453,7 @@ internal object VulkanTrainingBackend {
 
             nativeReady = verified
             if (verified) {
+                refreshGpuPerformanceMetrics()
                 _currentBackend = "Kotlin CPU"
                 _runtimeStatus.value =
                     "Vulkan runtime verified — eligible operations can use the GPU"
@@ -968,6 +1008,7 @@ internal object VulkanTrainingBackend {
                 )
             }
         }
+        refreshGpuPerformanceMetrics()
         _currentBackend = "Vulkan Compute (FP16 multiply / FP32 accumulation)"
         return true
     }
@@ -1136,6 +1177,7 @@ internal object VulkanTrainingBackend {
                 )
             }
         }
+        refreshGpuPerformanceMetrics()
         _currentBackend = "Vulkan Compute (Batched Linear)"
         return true
     }
@@ -1383,6 +1425,7 @@ internal object VulkanTrainingBackend {
         }
 
         if (updated) {
+            refreshGpuPerformanceMetrics()
             _currentBackend = "Vulkan Compute (AdamW)"
             return true
         }
@@ -1403,6 +1446,8 @@ internal object VulkanTrainingBackend {
     private external fun nativeGetDriverInfo(): String
 
     private external fun nativeGetDeviceCapabilities(): String
+
+    private external fun nativeGetGpuPerformanceMetrics(): String
 
     private external fun nativeSupportsFp16(): Boolean
 
