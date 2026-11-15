@@ -85,7 +85,9 @@ headers, Android loader, and physical device (including 1.4 when available).
 GPU execution uses Vulkan Synchronization 2 (Vulkan 1.3 core or
 `VK_KHR_synchronization2`); devices without that feature remain on the Kotlin
 CPU fallback. The backend does not issue legacy Synchronization 1 queue-submit,
-pipeline-barrier, or timestamp commands.
+pipeline-barrier, or timestamp commands. Buffer copies use the Synchronization 2
+`COPY` stage and storage-buffer-specific access masks; timestamp placement does
+not use deprecated top-of-pipe or bottom-of-pipe pseudo-stages.
 It uses the NDK-bundled glslc compiler to
 compile the AdamW (`adamw.comp`), batched-linear (`linear.comp`), and Vulkan 1.2 FP16-weight linear (`linear_fp16.comp`) compute shaders to SPIR-V during the native build.
 

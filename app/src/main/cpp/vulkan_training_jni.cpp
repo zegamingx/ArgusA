@@ -865,12 +865,12 @@ bool copyBufferSync(
     before[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
     before[0].srcStageMask =
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR |
-        VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
         (sourceHostWritten ? VK_PIPELINE_STAGE_2_HOST_BIT_KHR : 0u);
     before[0].srcAccessMask =
-        VK_ACCESS_2_SHADER_WRITE_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
         (sourceHostWritten ? VK_ACCESS_2_HOST_WRITE_BIT_KHR : 0u);
-    before[0].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR;
+    before[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
     before[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
     before[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     before[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -883,11 +883,11 @@ bool copyBufferSync(
     before[1].srcStageMask =
         VK_PIPELINE_STAGE_2_HOST_BIT_KHR |
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR |
-        VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR;
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
     before[1].srcAccessMask =
-        VK_ACCESS_2_HOST_WRITE_BIT_KHR | VK_ACCESS_2_SHADER_READ_BIT_KHR |
-        VK_ACCESS_2_SHADER_WRITE_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
-    before[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR;
+        VK_ACCESS_2_HOST_WRITE_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    before[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
     before[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
     before[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     before[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -909,14 +909,14 @@ bool copyBufferSync(
 
     VkBufferMemoryBarrier2KHR after{};
     after.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
-    after.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR;
+    after.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
     after.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
     after.dstStageMask = destinationHostReadable
         ? VK_PIPELINE_STAGE_2_HOST_BIT_KHR
         : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
     after.dstAccessMask = destinationHostReadable
         ? VK_ACCESS_2_HOST_READ_BIT_KHR
-        : (VK_ACCESS_2_SHADER_READ_BIT_KHR | VK_ACCESS_2_SHADER_WRITE_BIT_KHR);
+        : (VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR);
     after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     after.buffer = destination;
@@ -1297,7 +1297,7 @@ bool beginGpuTimestampCapture(VkCommandBuffer commandBuffer) {
     );
     gRuntime.cmdWriteTimestamp2(
         commandBuffer,
-        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,
         gRuntime.timestampQueryPool,
         0
     );
@@ -1311,7 +1311,7 @@ void endGpuTimestampCapture(VkCommandBuffer commandBuffer, bool captureStarted) 
 
     gRuntime.cmdWriteTimestamp2(
         commandBuffer,
-        VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT_KHR,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,
         gRuntime.timestampQueryPool,
         1
     );
@@ -1667,8 +1667,9 @@ bool initializeRuntime() {
 #endif
 
     // Query extension and promoted-core features before creating the logical device.
-    // Only the existing FP16 path is enabled today; other feature flags are recorded
-    // for later pipeline selection and are deliberately not enabled speculatively.
+    // Synchronization2 is required by the native submit, barrier, and timestamp path.
+    // FP16 is enabled only when supported; other capabilities remain telemetry until
+    // their matching shader kernels and logical-device feature chains are implemented.
     VkPhysicalDeviceFeatures2 supportedFeatures{};
     supportedFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     void** featureChainTail = &supportedFeatures.pNext;
@@ -3027,7 +3028,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         hostToComputeBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
         hostToComputeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
         hostToComputeBarrier.dstAccessMask =
-            VK_ACCESS_2_SHADER_READ_BIT_KHR | VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
         VkDependencyInfoKHR hostToComputeDependency{};
         hostToComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
         hostToComputeDependency.memoryBarrierCount = 1u;
@@ -3118,7 +3119,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         VkMemoryBarrier2KHR computeToHostBarrier{};
         computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
         computeToHostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
-        computeToHostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+        computeToHostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
         computeToHostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
         computeToHostBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR;
         VkDependencyInfoKHR computeToHostDependency{};
@@ -3452,7 +3453,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
     hostToComputeBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
     hostToComputeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
     hostToComputeBarrier.dstAccessMask =
-        VK_ACCESS_2_SHADER_READ_BIT_KHR | VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
     VkDependencyInfoKHR hostToComputeDependency{};
     hostToComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
     hostToComputeDependency.memoryBarrierCount = 1u;
@@ -3506,7 +3507,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
     VkMemoryBarrier2KHR computeToHostBarrier{};
     computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
     computeToHostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
-    computeToHostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+    computeToHostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
     computeToHostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
     computeToHostBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR;
     VkDependencyInfoKHR computeToHostDependency{};
@@ -3787,7 +3788,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
     hostToComputeBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
     hostToComputeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
     hostToComputeBarrier.dstAccessMask =
-        VK_ACCESS_2_SHADER_READ_BIT_KHR | VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
     VkDependencyInfoKHR hostToComputeDependency{};
     hostToComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
     hostToComputeDependency.memoryBarrierCount = 1u;
@@ -3839,7 +3840,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
     VkMemoryBarrier2KHR computeToHostBarrier{};
     computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
     computeToHostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
-    computeToHostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+    computeToHostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
     computeToHostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
     computeToHostBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR;
     VkDependencyInfoKHR computeToHostDependency{};
