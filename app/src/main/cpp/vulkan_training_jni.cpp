@@ -93,6 +93,9 @@ struct VulkanRuntime {
     VkPhysicalDeviceProperties physicalDeviceProperties{};
     VkPhysicalDeviceDriverProperties driverProperties{};
     bool hasDriverProperties = false;
+    bool hasDeviceIdentityProperties = false;
+    std::array<uint8_t, VK_UUID_SIZE> deviceUuid{};
+    std::array<uint8_t, VK_UUID_SIZE> driverUuid{};
     VkPhysicalDeviceMemoryProperties memoryProperties{};
     bool memoryPropertiesAvailable = false;
     uint32_t hostVisibleMemoryTypeCount = 0;
@@ -168,6 +171,27 @@ struct VulkanRuntime {
     bool supportsCooperativeMatrixRobustBufferAccess = false;
     uint32_t cooperativeMatrixSupportedStages = 0;
     std::vector<CooperativeMatrixCapability> cooperativeMatrixTypes;
+
+    bool armTensorsExtensionSupported = false;
+    bool armTensorsFeatureQueryAvailable = false;
+    bool armTensorsFeatureSupported = false;
+    bool armTensorNonPackedSupported = false;
+    bool armTensorShaderAccessSupported = false;
+    bool armTensorDynamicIndexingSupported = false;
+    bool armTensorNonUniformIndexingSupported = false;
+    bool armTensorUpdateAfterBindSupported = false;
+    bool armTensorDeviceFeaturesEnabled = false;
+    uint32_t shaderTensorSupportedStages = 0;
+    uint32_t armTensorMaxDimensionCount = 0;
+    uint64_t armTensorMaxElements = 0;
+    uint64_t armTensorMaxPerDimensionElements = 0;
+    int64_t armTensorMaxStride = 0;
+    uint64_t armTensorMaxSizeBytes = 0;
+    uint32_t armTensorMaxShaderAccessArrayLength = 0;
+    uint32_t armTensorMaxShaderAccessSizeBytes = 0;
+    uint32_t armTensorMaxDescriptorSetStorageTensors = 0;
+    uint32_t armTensorMaxPerStageDescriptorSetStorageTensors = 0;
+    bool armTensorNonUniformIndexingNative = false;
 
     VkBuffer storageBuffer = VK_NULL_HANDLE;
     VkDeviceMemory storageMemory = VK_NULL_HANDLE;
@@ -283,6 +307,22 @@ std::string escapeJsonString(const char* value) {
         }
     }
     return escaped;
+}
+
+std::string formatUuid(const uint8_t* uuid) {
+    if (uuid == nullptr) {
+        return {};
+    }
+
+    static constexpr char kHexDigits[] = "0123456789ABCDEF";
+    std::string formatted;
+    formatted.reserve(VK_UUID_SIZE * 2u);
+    for (size_t index = 0u; index < VK_UUID_SIZE; ++index) {
+        const uint8_t value = uuid[index];
+        formatted.push_back(kHexDigits[(value >> 4u) & 0x0Fu]);
+        formatted.push_back(kHexDigits[value & 0x0Fu]);
+    }
+    return formatted;
 }
 
 uint32_t calculateDispatchGroupCount(uint64_t requiredGroupCount) {
@@ -1545,6 +1585,17 @@ bool initializeRuntime() {
     );
 #endif
 
+    // This remains capability telemetry until Argus has an ARM tensor pipeline.
+    gRuntime.armTensorsExtensionSupported =
+        physicalSupportsVulkan13 &&
+        hasDeviceExtension(deviceExtensions, "VK_ARM_tensors");
+#if defined(VK_ARM_tensors)
+    gRuntime.armTensorsFeatureQueryAvailable =
+        gRuntime.armTensorsExtensionSupported;
+#else
+    gRuntime.armTensorsFeatureQueryAvailable = false;
+#endif
+
     // Query extension and promoted-core features before creating the logical device.
     // Only the existing FP16 path is enabled today; other feature flags are recorded
     // for later pipeline selection and are deliberately not enabled speculatively.
@@ -1626,6 +1677,15 @@ bool initializeRuntime() {
     }
 #endif
 
+#if defined(VK_ARM_tensors)
+    VkPhysicalDeviceTensorFeaturesARM supportedArmTensorFeatures{};
+    if (gRuntime.armTensorsFeatureQueryAvailable) {
+        supportedArmTensorFeatures.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TENSOR_FEATURES_ARM;
+        appendFeature(supportedArmTensorFeatures);
+    }
+#endif
+
     const auto getPhysicalDeviceFeatures2 =
         reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
             vkGetInstanceProcAddr(gRuntime.instance, "vkGetPhysicalDeviceFeatures2")
@@ -1679,6 +1739,22 @@ bool initializeRuntime() {
         gRuntime.supportsCooperativeMatrixRobustBufferAccess =
             gRuntime.hasCooperativeMatrixExtension &&
             supportedCooperativeMatrix.cooperativeMatrixRobustBufferAccess == VK_TRUE;
+#endif
+#if defined(VK_ARM_tensors)
+        if (gRuntime.armTensorsFeatureQueryAvailable) {
+            gRuntime.armTensorsFeatureSupported =
+                supportedArmTensorFeatures.tensors == VK_TRUE;
+            gRuntime.armTensorNonPackedSupported =
+                supportedArmTensorFeatures.tensorNonPacked == VK_TRUE;
+            gRuntime.armTensorShaderAccessSupported =
+                supportedArmTensorFeatures.shaderTensorAccess == VK_TRUE;
+            gRuntime.armTensorDynamicIndexingSupported =
+                supportedArmTensorFeatures.shaderStorageTensorArrayDynamicIndexing == VK_TRUE;
+            gRuntime.armTensorNonUniformIndexingSupported =
+                supportedArmTensorFeatures.shaderStorageTensorArrayNonUniformIndexing == VK_TRUE;
+            gRuntime.armTensorUpdateAfterBindSupported =
+                supportedArmTensorFeatures.descriptorBindingStorageTensorUpdateAfterBind == VK_TRUE;
+        }
 #endif
     } else {
         gRuntime.supportsFp16Compute = false;
@@ -1759,6 +1835,21 @@ bool initializeRuntime() {
         }
 #endif
 
+#if defined(VK_VERSION_1_1)
+        VkPhysicalDeviceIDProperties idProperties{};
+        idProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+        appendProperty(idProperties);
+#endif
+
+#if defined(VK_ARM_tensors)
+        VkPhysicalDeviceTensorPropertiesARM armTensorProperties{};
+        if (gRuntime.armTensorsFeatureQueryAvailable) {
+            armTensorProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TENSOR_PROPERTIES_ARM;
+            appendProperty(armTensorProperties);
+        }
+#endif
+
         getPhysicalDeviceProperties2(gRuntime.physicalDevice, &properties2);
         gRuntime.physicalDeviceProperties = properties2.properties;
         gRuntime.subgroupSize = subgroupProperties.subgroupSize;
@@ -1773,6 +1864,12 @@ bool initializeRuntime() {
                 driverProperties.driverName[0] != '\0' ||
                 driverProperties.driverInfo[0] != '\0';
         }
+
+#if defined(VK_VERSION_1_1)
+        std::copy_n(idProperties.deviceUUID, VK_UUID_SIZE, gRuntime.deviceUuid.begin());
+        std::copy_n(idProperties.driverUUID, VK_UUID_SIZE, gRuntime.driverUuid.begin());
+        gRuntime.hasDeviceIdentityProperties = true;
+#endif
 
 #if defined(VK_VERSION_1_3)
         if (querySubgroupSizeControl) {
@@ -1830,6 +1927,29 @@ bool initializeRuntime() {
         if (gRuntime.hasCooperativeMatrixExtension) {
             gRuntime.cooperativeMatrixSupportedStages =
                 cooperativeMatrixProperties.cooperativeMatrixSupportedStages;
+        }
+#endif
+#if defined(VK_ARM_tensors)
+        if (gRuntime.armTensorsFeatureQueryAvailable) {
+            gRuntime.shaderTensorSupportedStages =
+                armTensorProperties.shaderTensorSupportedStages;
+            gRuntime.armTensorMaxDimensionCount =
+                armTensorProperties.maxTensorDimensionCount;
+            gRuntime.armTensorMaxElements = armTensorProperties.maxTensorElements;
+            gRuntime.armTensorMaxPerDimensionElements =
+                armTensorProperties.maxPerDimensionTensorElements;
+            gRuntime.armTensorMaxStride = armTensorProperties.maxTensorStride;
+            gRuntime.armTensorMaxSizeBytes = armTensorProperties.maxTensorSize;
+            gRuntime.armTensorMaxShaderAccessArrayLength =
+                armTensorProperties.maxTensorShaderAccessArrayLength;
+            gRuntime.armTensorMaxShaderAccessSizeBytes =
+                armTensorProperties.maxTensorShaderAccessSize;
+            gRuntime.armTensorMaxDescriptorSetStorageTensors =
+                armTensorProperties.maxDescriptorSetStorageTensors;
+            gRuntime.armTensorMaxPerStageDescriptorSetStorageTensors =
+                armTensorProperties.maxPerStageDescriptorSetStorageTensors;
+            gRuntime.armTensorNonUniformIndexingNative =
+                armTensorProperties.shaderStorageTensorArrayNonUniformIndexingNative == VK_TRUE;
         }
 #endif
     }
@@ -3755,6 +3875,50 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
                 gRuntime.hasDriverProperties ? gRuntime.driverProperties.driverInfo : ""
             ) << "\","
          << "\"driverVersionRaw\":" << properties.driverVersion << ","
+         << "\"deviceIdentityPropertiesAvailable\":"
+         << (gRuntime.hasDeviceIdentityProperties ? "true" : "false") << ","
+         << "\"deviceUUID\":\"" << formatUuid(
+                gRuntime.hasDeviceIdentityProperties ? gRuntime.deviceUuid.data() : nullptr
+            ) << "\","
+         << "\"driverUUID\":\"" << formatUuid(
+                gRuntime.hasDeviceIdentityProperties ? gRuntime.driverUuid.data() : nullptr
+            ) << "\","
+         << "\"pipelineCacheUUID\":\"" << formatUuid(properties.pipelineCacheUUID) << "\","
+         << "\"armTensorsExtensionSupported\":"
+         << (gRuntime.armTensorsExtensionSupported ? "true" : "false") << ","
+         << "\"armTensorsFeatureQueryAvailable\":"
+         << (gRuntime.armTensorsFeatureQueryAvailable ? "true" : "false") << ","
+         << "\"armTensorsFeatureSupported\":"
+         << (gRuntime.armTensorsFeatureSupported ? "true" : "false") << ","
+         << "\"armTensorNonPackedSupported\":"
+         << (gRuntime.armTensorNonPackedSupported ? "true" : "false") << ","
+         << "\"armTensorShaderAccessSupported\":"
+         << (gRuntime.armTensorShaderAccessSupported ? "true" : "false") << ","
+         << "\"armTensorDynamicIndexingSupported\":"
+         << (gRuntime.armTensorDynamicIndexingSupported ? "true" : "false") << ","
+         << "\"armTensorNonUniformIndexingSupported\":"
+         << (gRuntime.armTensorNonUniformIndexingSupported ? "true" : "false") << ","
+         << "\"armTensorUpdateAfterBindSupported\":"
+         << (gRuntime.armTensorUpdateAfterBindSupported ? "true" : "false") << ","
+         << "\"armTensorDeviceFeaturesEnabled\":"
+         << (gRuntime.armTensorDeviceFeaturesEnabled ? "true" : "false") << ","
+         << "\"shaderTensorSupportedStages\":" << gRuntime.shaderTensorSupportedStages << ","
+         << "\"armTensorMaxDimensionCount\":" << gRuntime.armTensorMaxDimensionCount << ","
+         << "\"armTensorMaxElements\":" << gRuntime.armTensorMaxElements << ","
+         << "\"armTensorMaxPerDimensionElements\":"
+         << gRuntime.armTensorMaxPerDimensionElements << ","
+         << "\"armTensorMaxStride\":" << gRuntime.armTensorMaxStride << ","
+         << "\"armTensorMaxSizeBytes\":" << gRuntime.armTensorMaxSizeBytes << ","
+         << "\"armTensorMaxShaderAccessArrayLength\":"
+         << gRuntime.armTensorMaxShaderAccessArrayLength << ","
+         << "\"armTensorMaxShaderAccessSizeBytes\":"
+         << gRuntime.armTensorMaxShaderAccessSizeBytes << ","
+         << "\"armTensorMaxDescriptorSetStorageTensors\":"
+         << gRuntime.armTensorMaxDescriptorSetStorageTensors << ","
+         << "\"armTensorMaxPerStageDescriptorSetStorageTensors\":"
+         << gRuntime.armTensorMaxPerStageDescriptorSetStorageTensors << ","
+         << "\"armTensorNonUniformIndexingNative\":"
+         << (gRuntime.armTensorNonUniformIndexingNative ? "true" : "false") << ","
          << "\"maxComputeWorkGroupInvocations\":"
          << properties.limits.maxComputeWorkGroupInvocations << ","
          << "\"maxComputeWorkGroupSizeX\":"
