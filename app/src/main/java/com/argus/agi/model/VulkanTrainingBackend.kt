@@ -111,6 +111,7 @@ data class VulkanDeviceCapabilities(
     val shaderFloat16: Boolean,
     val shaderInt8: Boolean,
     val storageBuffer16BitAccess: Boolean,
+    val storageBuffer8BitAccess: Boolean,
     val shaderIntegerDotProduct: Boolean,
     val integerDotProduct8BitUnsignedAccelerated: Boolean,
     val integerDotProduct8BitSignedAccelerated: Boolean,
@@ -143,6 +144,16 @@ data class VulkanDeviceCapabilities(
     val armTensorMaxDescriptorSetStorageTensors: Int,
     val armTensorMaxPerStageDescriptorSetStorageTensors: Int,
     val armTensorNonUniformIndexingNative: Boolean,
+    val armShaderCorePropertiesExtensionSupported: Boolean,
+    val armShaderCoreBuiltinsExtensionSupported: Boolean,
+    val armShaderCoreBuiltinsFeatureQueryAvailable: Boolean,
+    val armShaderCoreBuiltinsFeatureSupported: Boolean,
+    val armShaderCoreBuiltinsFeatureEnabled: Boolean,
+    val armShaderCoreCount: Int,
+    val armShaderWarpsPerCore: Int,
+    val armShaderFmaRate: Int,
+    val armShaderPixelRate: Int,
+    val armShaderTexelRate: Int,
     val effectiveApiVersionMajor: Int,
     val effectiveApiVersionMinor: Int,
     val effectiveApiVersionPatch: Int,
@@ -154,6 +165,7 @@ data class VulkanDeviceCapabilities(
     val shaderFloat16FeatureEnabled: Boolean,
     val shaderInt8FeatureEnabled: Boolean,
     val storageBuffer16BitAccessEnabled: Boolean,
+    val storageBuffer8BitAccessEnabled: Boolean,
     val subgroupSizeControlEnabled: Boolean,
     val shaderIntegerDotProductEnabled: Boolean,
     val cooperativeMatrixEnabled: Boolean,
@@ -228,6 +240,16 @@ data class VulkanDeviceCapabilities(
     val canUseArmTensorCompute: Boolean
         get() = supportsComputeArmTensors && armTensorDeviceFeaturesEnabled
 
+    val hasArmShaderCoreTopology: Boolean
+        get() = armShaderCoreBuiltinsExtensionSupported &&
+            armShaderCoreBuiltinsFeatureQueryAvailable &&
+            armShaderCoreBuiltinsFeatureSupported &&
+            armShaderCoreCount > 0 &&
+            armShaderWarpsPerCore > 0
+
+    val hasArmShaderCorePerformanceProfile: Boolean
+        get() = armShaderCorePropertiesExtensionSupported && armShaderFmaRate > 0
+
     companion object {
         private const val COMPUTE_SHADER_STAGE_BIT = 0x00000020
         private const val SUBGROUP_FEATURE_ARITHMETIC_BIT = 0x00000004
@@ -295,6 +317,7 @@ data class VulkanDeviceCapabilities(
                 shaderFloat16 = json.optBoolean("shaderFloat16"),
                 shaderInt8 = json.optBoolean("shaderInt8"),
                 storageBuffer16BitAccess = json.optBoolean("storageBuffer16BitAccess"),
+                storageBuffer8BitAccess = json.optBoolean("storageBuffer8BitAccess"),
                 shaderIntegerDotProduct = json.optBoolean("shaderIntegerDotProduct"),
                 integerDotProduct8BitUnsignedAccelerated =
                     json.optBoolean("integerDotProduct8BitUnsignedAccelerated"),
@@ -341,6 +364,21 @@ data class VulkanDeviceCapabilities(
                     json.optInt("armTensorMaxPerStageDescriptorSetStorageTensors"),
                 armTensorNonUniformIndexingNative =
                     json.optBoolean("armTensorNonUniformIndexingNative"),
+                armShaderCorePropertiesExtensionSupported =
+                    json.optBoolean("armShaderCorePropertiesExtensionSupported"),
+                armShaderCoreBuiltinsExtensionSupported =
+                    json.optBoolean("armShaderCoreBuiltinsExtensionSupported"),
+                armShaderCoreBuiltinsFeatureQueryAvailable =
+                    json.optBoolean("armShaderCoreBuiltinsFeatureQueryAvailable"),
+                armShaderCoreBuiltinsFeatureSupported =
+                    json.optBoolean("armShaderCoreBuiltinsFeatureSupported"),
+                armShaderCoreBuiltinsFeatureEnabled =
+                    json.optBoolean("armShaderCoreBuiltinsFeatureEnabled"),
+                armShaderCoreCount = json.optInt("armShaderCoreCount"),
+                armShaderWarpsPerCore = json.optInt("armShaderWarpsPerCore"),
+                armShaderFmaRate = json.optInt("armShaderFmaRate"),
+                armShaderPixelRate = json.optInt("armShaderPixelRate"),
+                armShaderTexelRate = json.optInt("armShaderTexelRate"),
                 effectiveApiVersionMajor = json.optInt(
                     "effectiveApiVersionMajor",
                     json.optInt("apiVersionMajor")
@@ -364,6 +402,7 @@ data class VulkanDeviceCapabilities(
                 shaderFloat16FeatureEnabled = json.optBoolean("shaderFloat16FeatureEnabled"),
                 shaderInt8FeatureEnabled = json.optBoolean("shaderInt8FeatureEnabled"),
                 storageBuffer16BitAccessEnabled = json.optBoolean("storageBuffer16BitAccessEnabled"),
+                storageBuffer8BitAccessEnabled = json.optBoolean("storageBuffer8BitAccessEnabled"),
                 subgroupSizeControlEnabled = json.optBoolean("subgroupSizeControlEnabled"),
                 shaderIntegerDotProductEnabled = json.optBoolean("shaderIntegerDotProductEnabled"),
                 cooperativeMatrixEnabled = json.optBoolean("cooperativeMatrixEnabled"),

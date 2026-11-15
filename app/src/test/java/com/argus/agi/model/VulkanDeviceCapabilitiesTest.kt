@@ -440,6 +440,114 @@ class VulkanDeviceCapabilitiesTest {
     }
 
 
+
+    @Test
+    fun parsesSamsungGalaxyA34MaliG68ShaderCoreProfileWithoutEnablingVendorKernels() {
+        val capabilities = VulkanDeviceCapabilities.fromJson(
+            """
+            {
+              "deviceName": "Mali-G68 MC4",
+              "vendorId": 5045,
+              "deviceId": 2449739792,
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 3,
+              "apiVersionPatch": 278,
+              "driverName": "Mali-G68 MC4",
+              "driverInfo": "v1.r49p1-03bet0.3666fcaacb504f548df1f5efc729b42d",
+              "deviceIdentityPropertiesAvailable": true,
+              "deviceUUID": "10100492010000000000000000000000",
+              "driverUUID": "4E02E2B0CEBEF9B79A6FD34809684BF3",
+              "pipelineCacheUUID": "68586441A476998CBA24892B10AD89AE",
+              "maxComputeWorkGroupInvocations": 512,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 512,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 2147483648,
+              "subgroupSize": 16,
+              "subgroupSupportedStages": 48,
+              "subgroupSupportedOperations": 511,
+              "subgroupSizeControl": true,
+              "computeFullSubgroups": true,
+              "minSubgroupSize": 16,
+              "maxSubgroupSize": 16,
+              "maxComputeWorkgroupSubgroups": 32,
+              "requiredSubgroupSizeStages": 48,
+              "timestampPeriodNanoseconds": 76.9231,
+              "timestampComputeAndGraphics": true,
+              "shaderFloat16": true,
+              "shaderInt8": true,
+              "storageBuffer16BitAccess": true,
+              "storageBuffer8BitAccess": true,
+              "shaderIntegerDotProduct": true,
+              "integerDotProduct8BitUnsignedAccelerated": true,
+              "integerDotProduct8BitSignedAccelerated": true,
+              "integerDotProduct8BitMixedSignednessAccelerated": false,
+              "integerDotProduct4x8BitPackedUnsignedAccelerated": true,
+              "integerDotProduct4x8BitPackedSignedAccelerated": true,
+              "integerDotProduct4x8BitPackedMixedSignednessAccelerated": false,
+              "shaderFloat16FeatureSupported": true,
+              "shaderFloat16FeatureEnabled": true,
+              "shaderInt8FeatureEnabled": false,
+              "storageBuffer16BitAccessEnabled": false,
+              "storageBuffer8BitAccessEnabled": false,
+              "shaderIntegerDotProductEnabled": false,
+              "cooperativeMatrixExtension": false,
+              "armTensorsExtensionSupported": false,
+              "armShaderCorePropertiesExtensionSupported": true,
+              "armShaderCoreBuiltinsExtensionSupported": true,
+              "armShaderCoreBuiltinsFeatureQueryAvailable": true,
+              "armShaderCoreBuiltinsFeatureSupported": true,
+              "armShaderCoreBuiltinsFeatureEnabled": false,
+              "armShaderCoreCount": 4,
+              "armShaderWarpsPerCore": 32,
+              "armShaderFmaRate": 32,
+              "armShaderPixelRate": 2,
+              "armShaderTexelRate": 4
+            }
+            """
+        )
+
+        assertEquals("Mali-G68 MC4", capabilities.deviceName)
+        assertEquals(5045, capabilities.vendorId)
+        assertEquals("92041010", capabilities.deviceId.toUInt().toString(16))
+        assertEquals("1.3.278", capabilities.apiVersion)
+        assertEquals("v1.r49p1-03bet0.3666fcaacb504f548df1f5efc729b42d", capabilities.driverInfo)
+        assertEquals("10100492010000000000000000000000", capabilities.deviceUuid)
+        assertEquals("4E02E2B0CEBEF9B79A6FD34809684BF3", capabilities.driverUuid)
+        assertEquals("68586441A476998CBA24892B10AD89AE", capabilities.pipelineCacheUuid)
+
+        assertEquals(512, capabilities.maxComputeWorkGroupInvocations)
+        assertEquals(32768L, capabilities.maxComputeSharedMemoryBytes)
+        assertEquals(2147483648L, capabilities.maxStorageBufferRangeBytes)
+        assertEquals(16, capabilities.subgroupSize)
+        assertTrue(capabilities.supportsComputeSubgroups)
+        assertTrue(capabilities.supportsComputeSubgroupArithmetic)
+        assertTrue(capabilities.supportsComputeSubgroupShuffle)
+
+        assertTrue(capabilities.shaderFloat16FeatureSupported)
+        assertTrue(capabilities.shaderFloat16FeatureEnabled)
+        assertTrue(capabilities.shaderInt8)
+        assertFalse(capabilities.shaderInt8FeatureEnabled)
+        assertTrue(capabilities.storageBuffer16BitAccess)
+        assertFalse(capabilities.storageBuffer16BitAccessEnabled)
+        assertTrue(capabilities.storageBuffer8BitAccess)
+        assertFalse(capabilities.storageBuffer8BitAccessEnabled)
+        assertTrue(capabilities.hasAcceleratedInt8DotProduct)
+        assertFalse(capabilities.canUseIntegerDotProductKernel)
+        assertFalse(capabilities.hasUsableCooperativeMatrixConfiguration)
+        assertFalse(capabilities.armTensorsExtensionSupported)
+
+        assertTrue(capabilities.hasArmShaderCoreTopology)
+        assertTrue(capabilities.hasArmShaderCorePerformanceProfile)
+        assertEquals(4, capabilities.armShaderCoreCount)
+        assertEquals(32, capabilities.armShaderWarpsPerCore)
+        assertEquals(32, capabilities.armShaderFmaRate)
+        assertEquals(2, capabilities.armShaderPixelRate)
+        assertEquals(4, capabilities.armShaderTexelRate)
+        assertFalse(capabilities.armShaderCoreBuiltinsFeatureEnabled)
+    }
+
     @Test
     fun parsesMaliG2UltraArmTensorAndIdentityProfileWithoutEnablingIt() {
         val capabilities = VulkanDeviceCapabilities.fromJson(

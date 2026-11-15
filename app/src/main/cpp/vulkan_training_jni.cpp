@@ -140,9 +140,11 @@ struct VulkanRuntime {
     bool supportsShaderFloat16Feature = false;
     bool supportsShaderInt8 = false;
     bool supportsStorageBuffer16BitAccess = false;
+    bool supportsStorageBuffer8BitAccess = false;
     bool shaderFloat16FeatureEnabled = false;
     bool shaderInt8FeatureEnabled = false;
     bool storageBuffer16BitAccessEnabled = false;
+    bool storageBuffer8BitAccessEnabled = false;
 
     uint32_t subgroupSize = 0;
     uint32_t subgroupSupportedStages = 0;
@@ -192,6 +194,18 @@ struct VulkanRuntime {
     uint32_t armTensorMaxDescriptorSetStorageTensors = 0;
     uint32_t armTensorMaxPerStageDescriptorSetStorageTensors = 0;
     bool armTensorNonUniformIndexingNative = false;
+
+    // ARM shader-core values are telemetry only; no vendor shader feature is enabled.
+    bool armShaderCorePropertiesExtensionSupported = false;
+    bool armShaderCoreBuiltinsExtensionSupported = false;
+    bool armShaderCoreBuiltinsFeatureQueryAvailable = false;
+    bool armShaderCoreBuiltinsFeatureSupported = false;
+    bool armShaderCoreBuiltinsFeatureEnabled = false;
+    uint32_t armShaderCoreCount = 0;
+    uint32_t armShaderWarpsPerCore = 0;
+    uint32_t armShaderFmaRate = 0;
+    uint32_t armShaderPixelRate = 0;
+    uint32_t armShaderTexelRate = 0;
 
     VkBuffer storageBuffer = VK_NULL_HANDLE;
     VkDeviceMemory storageMemory = VK_NULL_HANDLE;
@@ -1596,6 +1610,24 @@ bool initializeRuntime() {
     gRuntime.armTensorsFeatureQueryAvailable = false;
 #endif
 
+#if defined(VK_ARM_shader_core_properties)
+    gRuntime.armShaderCorePropertiesExtensionSupported = hasDeviceExtension(
+        deviceExtensions,
+        VK_ARM_SHADER_CORE_PROPERTIES_EXTENSION_NAME
+    );
+#endif
+
+#if defined(VK_ARM_shader_core_builtins)
+    gRuntime.armShaderCoreBuiltinsExtensionSupported = hasDeviceExtension(
+        deviceExtensions,
+        VK_ARM_SHADER_CORE_BUILTINS_EXTENSION_NAME
+    );
+    const bool queryArmShaderCoreBuiltins =
+        gRuntime.armShaderCoreBuiltinsExtensionSupported;
+#else
+    const bool queryArmShaderCoreBuiltins = false;
+#endif
+
     // Query extension and promoted-core features before creating the logical device.
     // Only the existing FP16 path is enabled today; other feature flags are recorded
     // for later pipeline selection and are deliberately not enabled speculatively.
@@ -1626,6 +1658,15 @@ bool initializeRuntime() {
         supportedStorage16.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
         appendFeature(supportedStorage16);
+    }
+#endif
+
+#if defined(VK_VERSION_1_2)
+    VkPhysicalDevice8BitStorageFeatures supportedStorage8{};
+    if (physicalSupportsVulkan12) {
+        supportedStorage8.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
+        appendFeature(supportedStorage8);
     }
 #endif
 
@@ -1686,6 +1727,15 @@ bool initializeRuntime() {
     }
 #endif
 
+#if defined(VK_ARM_shader_core_builtins)
+    VkPhysicalDeviceShaderCoreBuiltinsFeaturesARM supportedArmShaderCoreBuiltins{};
+    if (queryArmShaderCoreBuiltins) {
+        supportedArmShaderCoreBuiltins.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_BUILTINS_FEATURES_ARM;
+        appendFeature(supportedArmShaderCoreBuiltins);
+    }
+#endif
+
     const auto getPhysicalDeviceFeatures2 =
         reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
             vkGetInstanceProcAddr(gRuntime.instance, "vkGetPhysicalDeviceFeatures2")
@@ -1706,6 +1756,11 @@ bool initializeRuntime() {
         gRuntime.supportsStorageBuffer16BitAccess =
             physicalSupportsVulkan11 &&
             supportedStorage16.storageBuffer16BitAccess == VK_TRUE;
+#endif
+#if defined(VK_VERSION_1_2)
+        gRuntime.supportsStorageBuffer8BitAccess =
+            physicalSupportsVulkan12 &&
+            supportedStorage8.storageBuffer8BitAccess == VK_TRUE;
 #endif
 #if defined(VK_VERSION_1_3)
         gRuntime.supportsSubgroupSizeControl =
@@ -1756,9 +1811,18 @@ bool initializeRuntime() {
                 supportedArmTensorFeatures.descriptorBindingStorageTensorUpdateAfterBind == VK_TRUE;
         }
 #endif
+        gRuntime.armShaderCoreBuiltinsFeatureQueryAvailable =
+            queryArmShaderCoreBuiltins && features2Available;
+#if defined(VK_ARM_shader_core_builtins)
+        if (gRuntime.armShaderCoreBuiltinsFeatureQueryAvailable) {
+            gRuntime.armShaderCoreBuiltinsFeatureSupported =
+                supportedArmShaderCoreBuiltins.shaderCoreBuiltins == VK_TRUE;
+        }
+#endif
     } else {
         gRuntime.supportsFp16Compute = false;
         gRuntime.supportsShaderInt8 = false;
+        gRuntime.supportsStorageBuffer8BitAccess = false;
     }
 
     // Properties are queried separately from features. A supported bit is not
@@ -1847,6 +1911,24 @@ bool initializeRuntime() {
             armTensorProperties.sType =
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TENSOR_PROPERTIES_ARM;
             appendProperty(armTensorProperties);
+        }
+#endif
+
+#if defined(VK_ARM_shader_core_properties)
+        VkPhysicalDeviceShaderCorePropertiesARM armShaderCoreProperties{};
+        if (gRuntime.armShaderCorePropertiesExtensionSupported) {
+            armShaderCoreProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_ARM;
+            appendProperty(armShaderCoreProperties);
+        }
+#endif
+
+#if defined(VK_ARM_shader_core_builtins)
+        VkPhysicalDeviceShaderCoreBuiltinsPropertiesARM armShaderCoreBuiltinsProperties{};
+        if (gRuntime.armShaderCoreBuiltinsExtensionSupported) {
+            armShaderCoreBuiltinsProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_BUILTINS_PROPERTIES_ARM;
+            appendProperty(armShaderCoreBuiltinsProperties);
         }
 #endif
 
@@ -1950,6 +2032,19 @@ bool initializeRuntime() {
                 armTensorProperties.maxPerStageDescriptorSetStorageTensors;
             gRuntime.armTensorNonUniformIndexingNative =
                 armTensorProperties.shaderStorageTensorArrayNonUniformIndexingNative == VK_TRUE;
+        }
+#endif
+#if defined(VK_ARM_shader_core_properties)
+        if (gRuntime.armShaderCorePropertiesExtensionSupported) {
+            gRuntime.armShaderFmaRate = armShaderCoreProperties.fmaRate;
+            gRuntime.armShaderPixelRate = armShaderCoreProperties.pixelRate;
+            gRuntime.armShaderTexelRate = armShaderCoreProperties.texelRate;
+        }
+#endif
+#if defined(VK_ARM_shader_core_builtins)
+        if (gRuntime.armShaderCoreBuiltinsExtensionSupported) {
+            gRuntime.armShaderCoreCount = armShaderCoreBuiltinsProperties.shaderCoreCount;
+            gRuntime.armShaderWarpsPerCore = armShaderCoreBuiltinsProperties.shaderWarpsPerCore;
         }
 #endif
     }
@@ -3884,6 +3979,21 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
                 gRuntime.hasDeviceIdentityProperties ? gRuntime.driverUuid.data() : nullptr
             ) << "\","
          << "\"pipelineCacheUUID\":\"" << formatUuid(properties.pipelineCacheUUID) << "\","
+         << "\"armShaderCorePropertiesExtensionSupported\":"
+         << (gRuntime.armShaderCorePropertiesExtensionSupported ? "true" : "false") << ","
+         << "\"armShaderCoreBuiltinsExtensionSupported\":"
+         << (gRuntime.armShaderCoreBuiltinsExtensionSupported ? "true" : "false") << ","
+         << "\"armShaderCoreBuiltinsFeatureQueryAvailable\":"
+         << (gRuntime.armShaderCoreBuiltinsFeatureQueryAvailable ? "true" : "false") << ","
+         << "\"armShaderCoreBuiltinsFeatureSupported\":"
+         << (gRuntime.armShaderCoreBuiltinsFeatureSupported ? "true" : "false") << ","
+         << "\"armShaderCoreBuiltinsFeatureEnabled\":"
+         << (gRuntime.armShaderCoreBuiltinsFeatureEnabled ? "true" : "false") << ","
+         << "\"armShaderCoreCount\":" << gRuntime.armShaderCoreCount << ","
+         << "\"armShaderWarpsPerCore\":" << gRuntime.armShaderWarpsPerCore << ","
+         << "\"armShaderFmaRate\":" << gRuntime.armShaderFmaRate << ","
+         << "\"armShaderPixelRate\":" << gRuntime.armShaderPixelRate << ","
+         << "\"armShaderTexelRate\":" << gRuntime.armShaderTexelRate << ","
          << "\"armTensorsExtensionSupported\":"
          << (gRuntime.armTensorsExtensionSupported ? "true" : "false") << ","
          << "\"armTensorsFeatureQueryAvailable\":"
@@ -3973,6 +4083,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
          << (gRuntime.supportsStorageBuffer16BitAccess ? "true" : "false") << ","
          << "\"storageBuffer16BitAccessEnabled\":"
          << (gRuntime.storageBuffer16BitAccessEnabled ? "true" : "false") << ","
+         << "\"storageBuffer8BitAccess\":"
+         << (gRuntime.supportsStorageBuffer8BitAccess ? "true" : "false") << ","
+         << "\"storageBuffer8BitAccessEnabled\":"
+         << (gRuntime.storageBuffer8BitAccessEnabled ? "true" : "false") << ","
          << "\"shaderIntegerDotProduct\":"
          << (gRuntime.supportsShaderIntegerDotProduct ? "true" : "false") << ","
          << "\"shaderIntegerDotProductEnabled\":"
