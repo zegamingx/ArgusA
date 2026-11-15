@@ -1105,6 +1105,13 @@ bool initializeRuntime() {
     }
 #endif
 
+    const float queuePriority = 1.0f;
+    VkDeviceQueueCreateInfo queueInfo{};
+    queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queueInfo.queueFamilyIndex = gRuntime.queueFamilyIndex;
+    queueInfo.queueCount = 1;
+    queueInfo.pQueuePriorities = &queuePriority;
+
     VkPhysicalDeviceFeatures deviceFeatures{};
     VkPhysicalDeviceShaderFloat16Int8Features enabledShaderFloat16{};
     VkPhysicalDeviceFeatures2 enabledFeatures{};
