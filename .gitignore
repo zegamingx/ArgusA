@@ -21,3 +21,6 @@ debug.keystore
 /signing/
 *.jks
 *.p12
+
+# Generated CMake compatibility launcher and local CMake path metadata.
+/tools/cmake-compat/runtime/
