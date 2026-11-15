@@ -71,6 +71,7 @@ struct VulkanRuntime {
 
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    VkFence submissionFence = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
@@ -196,6 +197,9 @@ void destroyRuntime() {
                 nullptr
             );
         }
+        if (gRuntime.submissionFence != VK_NULL_HANDLE) {
+            vkDestroyFence(gRuntime.device, gRuntime.submissionFence, nullptr);
+        }
         if (gRuntime.commandPool != VK_NULL_HANDLE) {
             vkDestroyCommandPool(gRuntime.device, gRuntime.commandPool, nullptr);
         }
@@ -246,8 +250,10 @@ bool createStorageBuffer(VkDeviceSize requiredBytes) {
 
     uint32_t selectedMemoryType = std::numeric_limits<uint32_t>::max();
     bool selectedMemoryIsCoherent = false;
-    uint32_t fallbackMemoryType = std::numeric_limits<uint32_t>::max();
+    int selectedMemoryScore = -1;
 
+    // Prefer host-visible/device-local memory on UMA GPUs while preserving
+    // coherent and cached-memory preferences for safe CPU readback.
     for (uint32_t index = 0;
          index < gRuntime.memoryProperties.memoryTypeCount;
          ++index) {
@@ -257,25 +263,27 @@ bool createStorageBuffer(VkDeviceSize requiredBytes) {
 
         const VkMemoryPropertyFlags flags =
             gRuntime.memoryProperties.memoryTypes[index].propertyFlags;
-
         if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0u) {
             continue;
         }
 
-        if (fallbackMemoryType == std::numeric_limits<uint32_t>::max()) {
-            fallbackMemoryType = index;
-        }
-
+        int score = 0;
         if ((flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u) {
-            selectedMemoryType = index;
-            selectedMemoryIsCoherent = true;
-            break;
+            score += 4;
         }
-    }
+        if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0u) {
+            score += 2;
+        }
+        if ((flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u) {
+            score += 1;
+        }
 
-    if (selectedMemoryType == std::numeric_limits<uint32_t>::max()) {
-        selectedMemoryType = fallbackMemoryType;
-        selectedMemoryIsCoherent = false;
+        if (score > selectedMemoryScore) {
+            selectedMemoryType = index;
+            selectedMemoryScore = score;
+            selectedMemoryIsCoherent =
+                (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u;
+        }
     }
 
     if (selectedMemoryType == std::numeric_limits<uint32_t>::max()) {
@@ -356,13 +364,87 @@ bool createStorageBuffer(VkDeviceSize requiredBytes) {
 }
 
 bool ensureStorageBuffer(VkDeviceSize requiredBytes) {
+    const VkDeviceSize maximumRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    if (requiredBytes == 0u || requiredBytes > maximumRange) {
+        return false;
+    }
+
     if (gRuntime.storageBuffer != VK_NULL_HANDLE &&
         gRuntime.storageCapacity >= requiredBytes) {
-        return requiredBytes <=
-            gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+        return true;
+    }
+
+    // Geometric growth amortizes allocation churn as tensor workload sizes change.
+    // Fall back to the exact requested capacity when additional headroom cannot be allocated.
+    if (gRuntime.storageCapacity > 0u) {
+        const VkDeviceSize growth = std::max<VkDeviceSize>(
+            gRuntime.storageCapacity / 2u,
+            4096u
+        );
+        const VkDeviceSize remainingRange = maximumRange - gRuntime.storageCapacity;
+        const VkDeviceSize grownCapacity = growth > remainingRange
+            ? maximumRange
+            : gRuntime.storageCapacity + growth;
+        const VkDeviceSize targetCapacity =
+            std::max(requiredBytes, grownCapacity);
+
+        if (targetCapacity > requiredBytes &&
+            createStorageBuffer(targetCapacity)) {
+            return true;
+        }
     }
 
     return createStorageBuffer(requiredBytes);
+}
+
+bool submitAndWait(const VkSubmitInfo& submitInfo, const char* operation) {
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.computeQueue == VK_NULL_HANDLE ||
+        gRuntime.submissionFence == VK_NULL_HANDLE) {
+        logError(operation);
+        return false;
+    }
+
+    VkResult result = vkResetFences(
+        gRuntime.device,
+        1,
+        &gRuntime.submissionFence
+    );
+    if (result != VK_SUCCESS) {
+        logError(operation, result);
+        return false;
+    }
+
+    result = vkQueueSubmit(
+        gRuntime.computeQueue,
+        1,
+        &submitInfo,
+        gRuntime.submissionFence
+    );
+    if (result != VK_SUCCESS) {
+        logError(operation, result);
+        return false;
+    }
+
+    result = vkWaitForFences(
+        gRuntime.device,
+        1,
+        &gRuntime.submissionFence,
+        VK_TRUE,
+        std::numeric_limits<uint64_t>::max()
+    );
+    if (result != VK_SUCCESS) {
+        logError(operation, result);
+        // Error-only recovery before caller releases or reuses mapped resources.
+        const VkResult recoveryResult = vkQueueWaitIdle(gRuntime.computeQueue);
+        if (recoveryResult != VK_SUCCESS) {
+            logError("Vulkan queue-idle recovery after fence failure also failed.", recoveryResult);
+        }
+        return false;
+    }
+
+    return true;
 }
 
 bool initializeRuntime() {
@@ -607,6 +689,19 @@ bool initializeRuntime() {
     );
     if (result != VK_SUCCESS) {
         logError("Vulkan command-buffer allocation failed.", result);
+        return false;
+    }
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    result = vkCreateFence(
+        gRuntime.device,
+        &fenceInfo,
+        nullptr,
+        &gRuntime.submissionFence
+    );
+    if (result != VK_SUCCESS) {
+        logError("Vulkan submission-fence creation failed.", result);
         return false;
     }
 
@@ -1402,24 +1497,12 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
-        result = vkQueueSubmit(
-            gRuntime.computeQueue,
-            1,
-            &submitInfo,
-            VK_NULL_HANDLE
-        );
-        if (result != VK_SUCCESS) {
-            logError("Vulkan AdamW page queue submission failed.", result);
-            releaseGroupReferences(env, groups);
-            return JNI_FALSE;
-        }
-
-        // This is deliberately synchronous while the single mapped page is
-        // reused. Replacing it with fences alone would not remove the
-        // dependency on reading each page back before the next page overwrites it.
-        result = vkQueueWaitIdle(gRuntime.computeQueue);
-        if (result != VK_SUCCESS) {
-            logError("Vulkan AdamW page queue did not complete.", result);
+        // The mapped page is read back before reuse, so completion remains synchronous.
+        // A fence targets this dispatch instead of idling the entire queue.
+        if (!submitAndWait(
+                submitInfo,
+                "Vulkan AdamW page submission or fence wait failed."
+            )) {
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
         }
@@ -1790,15 +1873,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
 
-    result = vkQueueSubmit(gRuntime.computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    if (result != VK_SUCCESS) {
-        logError("Vulkan linear queue submission failed.", result);
-        return JNI_FALSE;
-    }
-
-    result = vkQueueWaitIdle(gRuntime.computeQueue);
-    if (result != VK_SUCCESS) {
-        logError("Vulkan linear queue did not complete.", result);
+    if (!submitAndWait(
+            submitInfo,
+            "Vulkan linear submission or fence wait failed."
+        )) {
         return JNI_FALSE;
     }
 
@@ -2136,15 +2214,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
-    result = vkQueueSubmit(gRuntime.computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    if (result != VK_SUCCESS) {
-        logError("Vulkan FP16 linear queue submission failed.", result);
-        return JNI_FALSE;
-    }
-
-    result = vkQueueWaitIdle(gRuntime.computeQueue);
-    if (result != VK_SUCCESS) {
-        logError("Vulkan FP16 linear queue did not complete.", result);
+    if (!submitAndWait(
+            submitInfo,
+            "Vulkan FP16 linear submission or fence wait failed."
+        )) {
         return JNI_FALSE;
     }
 

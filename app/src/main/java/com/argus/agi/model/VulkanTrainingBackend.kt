@@ -36,19 +36,9 @@ internal object VulkanTrainingBackend {
     @Volatile
     private var initializationAttempted = false
 
-    private val _runtimeStatus = MutableStateFlow("Kotlin CPU — Vulkan disabled by default")
+    private val _runtimeStatus =
+        MutableStateFlow("Kotlin CPU — waiting for model readiness")
     val runtimeStatus: StateFlow<String> = _runtimeStatus.asStateFlow()
-
-    private val _isVulkanEnabledForCurrentSession = MutableStateFlow(false)
-    val isVulkanEnabledForCurrentSession: StateFlow<Boolean> =
-        _isVulkanEnabledForCurrentSession.asStateFlow()
-
-    private val _isInitializingRuntime = MutableStateFlow(false)
-    val isInitializingRuntime: StateFlow<Boolean> = _isInitializingRuntime.asStateFlow()
-
-    private val _canInitializeForCurrentSession = MutableStateFlow(true)
-    val canInitializeForCurrentSession: StateFlow<Boolean> =
-        _canInitializeForCurrentSession.asStateFlow()
 
     internal val hasAttemptedInitialization: Boolean
         get() = initializationAttempted
@@ -61,26 +51,22 @@ internal object VulkanTrainingBackend {
      * as a side effect of rendering a screen or building the foreground notification.
      */
     val isRuntimeAvailable: Boolean
-        get() = nativeReady &&
-            _isVulkanEnabledForCurrentSession.value &&
-            !disabledAfterRuntimeFailure
+        get() = nativeReady && !disabledAfterRuntimeFailure
 
     val isFp16ComputeAvailable: Boolean
         get() = isRuntimeAvailable && fp16RuntimeReady && !fp16DisabledAfterRuntimeFailure
 
     /**
-     * Vulkan is opt-in for the current process only. The default path remains Kotlin CPU,
-     * so a device-specific Vulkan driver failure cannot prevent the application from opening.
+     * Initialize Vulkan only after ArgusNeuralEngine has constructed or restored its tensors.
+     * Driver verification is isolated from application cold-start; failure keeps Kotlin CPU active.
      */
     @Synchronized
-    fun enableForCurrentSession(): Boolean {
+    fun initializeAfterModelReady(): Boolean {
         if (isRuntimeAvailable) return true
-        if (initializationAttempted || !_canInitializeForCurrentSession.value) return false
+        if (initializationAttempted) return false
 
         initializationAttempted = true
-        _canInitializeForCurrentSession.value = false
-        _isInitializingRuntime.value = true
-        _runtimeStatus.value = "Checking the optional Vulkan runtime…"
+        _runtimeStatus.value = "Preparing Vulkan after model initialization…"
 
         return try {
             System.loadLibrary("argus_training")
@@ -109,10 +95,10 @@ internal object VulkanTrainingBackend {
             }
 
             nativeReady = verified
-            _isVulkanEnabledForCurrentSession.value = verified
             if (verified) {
                 _currentBackend = "Kotlin CPU"
-                _runtimeStatus.value = "Vulkan verified — enabled for this session"
+                _runtimeStatus.value =
+                    "Vulkan runtime verified — eligible operations can use the GPU"
                 Log.i(
                     TAG,
                     "Vulkan Compute initialized and passed linear, batched-linear, and AdamW numerical self-checks."
@@ -124,10 +110,9 @@ internal object VulkanTrainingBackend {
                 Log.w(TAG, "Vulkan is unavailable or failed verification; Kotlin CPU remains active.")
             }
             verified
-        } catch (error: UnsatisfiedLinkError) {
+        } catch (error: LinkageError) {
             nativeReady = false
             disabledAfterRuntimeFailure = true
-            _isVulkanEnabledForCurrentSession.value = false
             _currentBackend = "Kotlin CPU"
             _runtimeStatus.value = "Kotlin CPU fallback — native Vulkan library unavailable"
             Log.i(TAG, "Native Vulkan library or Vulkan loader is unavailable.", error)
@@ -135,7 +120,6 @@ internal object VulkanTrainingBackend {
         } catch (error: SecurityException) {
             nativeReady = false
             disabledAfterRuntimeFailure = true
-            _isVulkanEnabledForCurrentSession.value = false
             _currentBackend = "Kotlin CPU"
             _runtimeStatus.value = "Kotlin CPU fallback — native Vulkan access was blocked"
             Log.w(TAG, "Native Vulkan library loading was blocked.", error)
@@ -143,39 +127,13 @@ internal object VulkanTrainingBackend {
         } catch (error: RuntimeException) {
             nativeReady = false
             disabledAfterRuntimeFailure = true
-            _isVulkanEnabledForCurrentSession.value = false
             _currentBackend = "Kotlin CPU"
             _runtimeStatus.value = "Kotlin CPU fallback — Vulkan initialization failed"
             Log.w(TAG, "Native Vulkan initialization failed.", error)
             false
-        } finally {
-            _isInitializingRuntime.value = false
         }
     }
 
-    @Synchronized
-    fun disableForCurrentSession() {
-        val wasInitialized = nativeReady
-        _isVulkanEnabledForCurrentSession.value = false
-
-        if (wasInitialized) {
-            runCatching { nativeDestroy() }
-                .onFailure { error ->
-                    Log.w(TAG, "Failed to release the Vulkan runtime after it was disabled.", error)
-                }
-            nativeReady = false
-        }
-
-        fp16RuntimeReady = false
-        fp16DisabledAfterRuntimeFailure = false
-        _currentBackend = "Kotlin CPU"
-        _runtimeStatus.value = "Kotlin CPU — Vulkan disabled for this session"
-
-        if (wasInitialized && !disabledAfterRuntimeFailure) {
-            initializationAttempted = false
-            _canInitializeForCurrentSession.value = true
-        }
-    }
 
     private fun verifyNativeKernels(): Boolean {
         val input = floatArrayOf(
@@ -621,7 +579,7 @@ internal object VulkanTrainingBackend {
                 outputColumns = outputColumns,
                 transposeWeights = transposeWeights
             )
-        } catch (error: UnsatisfiedLinkError) {
+        } catch (error: LinkageError) {
             Log.e(TAG, "Vulkan FP16 linear entry point is unavailable; disabling FP16 dispatch.", error)
             false
         } catch (error: RuntimeException) {
@@ -784,7 +742,7 @@ internal object VulkanTrainingBackend {
                 outputColumns = outputColumns,
                 transposeWeights = transposeWeights
             )
-        } catch (error: UnsatisfiedLinkError) {
+        } catch (error: LinkageError) {
             Log.e(TAG, "Vulkan batched-linear entry point is unavailable; disabling the backend.", error)
             false
         } catch (error: RuntimeException) {
@@ -794,7 +752,6 @@ internal object VulkanTrainingBackend {
 
         if (!updated) {
             disabledAfterRuntimeFailure = true
-            _isVulkanEnabledForCurrentSession.value = false
             _runtimeStatus.value = "Kotlin CPU fallback — Vulkan linear dispatch failed"
             _currentBackend = "Kotlin CPU"
             runCatching { nativeDestroy() }
@@ -1056,7 +1013,7 @@ internal object VulkanTrainingBackend {
                 epsilon = epsilon,
                 gradientClipFactor = gradientClipFactor
             )
-        } catch (error: UnsatisfiedLinkError) {
+        } catch (error: LinkageError) {
             Log.e(TAG, "Vulkan optimizer entry point is unavailable; disabling the backend.", error)
             false
         } catch (error: RuntimeException) {
@@ -1070,7 +1027,6 @@ internal object VulkanTrainingBackend {
         }
 
         disabledAfterRuntimeFailure = true
-        _isVulkanEnabledForCurrentSession.value = false
         _runtimeStatus.value = "Kotlin CPU fallback — Vulkan optimizer dispatch failed"
         _currentBackend = "Kotlin CPU"
         runCatching { nativeDestroy() }

@@ -312,18 +312,8 @@ class ArgusNeuralEngine private constructor(
         get() = VulkanTrainingBackend.isRuntimeAvailable
     val computeBackendStatus: StateFlow<String>
         get() = VulkanTrainingBackend.runtimeStatus
-    val isVulkanEnabledForCurrentSession: StateFlow<Boolean>
-        get() = VulkanTrainingBackend.isVulkanEnabledForCurrentSession
-    val isVulkanInitializationInProgress: StateFlow<Boolean>
-        get() = VulkanTrainingBackend.isInitializingRuntime
-    val canInitializeVulkanForCurrentSession: StateFlow<Boolean>
-        get() = VulkanTrainingBackend.canInitializeForCurrentSession
-
-    fun enableVulkanForCurrentSession(): Boolean =
-        VulkanTrainingBackend.enableForCurrentSession()
-
-    fun disableVulkanForCurrentSession() =
-        VulkanTrainingBackend.disableForCurrentSession()
+    fun initializeOptionalVulkanRuntime(): Boolean =
+        VulkanTrainingBackend.initializeAfterModelReady()
 
     val checkpointInterval: Int
         get() = CHECKPOINT_INTERVAL

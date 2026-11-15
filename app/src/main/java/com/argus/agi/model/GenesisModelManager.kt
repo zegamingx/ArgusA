@@ -262,11 +262,8 @@ class GenesisModelManager(
             "Selecting tensor dimensions based on the device compute and memory budget...")
 
         val archTier = neuralEngine.config.architectureLabel
-        // Vulkan accelerates eligible dense operations and AdamW after its runtime self-checks.
-        // Remaining operations continue to use the Kotlin CPU implementation.
-        val computeTarget = resolveComputeTarget()
         logs += "Selected configuration: $archTier"
-        logs += "Execution policy: $computeTarget | Context length: ${neuralEngine.maxSeqLen} tokens"
+        logs += "Context length: ${neuralEngine.maxSeqLen} tokens"
         throttleStage()
 
         publish(GenesisLifecycleStage.PREPARING_TOKENIZER,
@@ -303,6 +300,17 @@ class GenesisModelManager(
         logs += "LoRA A uses Gaussian initialization; LoRA B starts at zero for stability."
         logs += "Integrity check: no model weights downloaded; the model identity is created locally."
         throttleStage()
+
+        // Join post-model preparation already scheduled by ArgusViewModel.
+        // The backend initializes only once and keeps driver work off the UI thread.
+        val vulkanReady = withContext(Dispatchers.IO) {
+            neuralEngine.initializeOptionalVulkanRuntime()
+        }
+        val computeTarget = resolveComputeTarget()
+        logs += "Execution policy: $computeTarget | Context length: ${neuralEngine.maxSeqLen} tokens"
+        if (!vulkanReady) {
+            logs += "Vulkan runtime verification was unavailable; Kotlin CPU remains the active fallback."
+        }
 
         publish(GenesisLifecycleStage.COMMITTING_INITIAL_GENERATION,
             "Validating the forward pass and saving the initial ARG4 checkpoint...")

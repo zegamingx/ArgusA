@@ -127,28 +127,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     val activeComputeBackend get() = neuralEngine.optimizerBackend
     val isVulkanRuntimeReady get() = neuralEngine.isVulkanRuntimeReady
     val computeBackendStatus = neuralEngine.computeBackendStatus
-    val isVulkanEnabledForCurrentSession = neuralEngine.isVulkanEnabledForCurrentSession
-    val isVulkanInitializationInProgress = neuralEngine.isVulkanInitializationInProgress
-    val canInitializeVulkanForCurrentSession = neuralEngine.canInitializeVulkanForCurrentSession
     val checkpointInterval get() = neuralEngine.checkpointInterval
-
-    fun toggleVulkanForCurrentSession() {
-        if (neuralEngine.isVulkanInitializationInProgress.value) return
-
-        if (neuralEngine.isVulkanEnabledForCurrentSession.value) {
-            neuralEngine.disableVulkanForCurrentSession()
-            return
-        }
-
-        if (!neuralEngine.canInitializeVulkanForCurrentSession.value) return
-
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { neuralEngine.enableVulkanForCurrentSession() }
-                .onFailure { error ->
-                    Log.e(TAG, "Optional Vulkan initialization failed; Kotlin CPU remains active.", error)
-                }
-        }
-    }
     val worldEntities: StateFlow<List<WorldEntity>> = worldModel.entitiesFlow
     val currentContextSummary: StateFlow<String> = worldModel.currentContextSummary
     val genesisState: StateFlow<com.argus.agi.model.GenesisLifecycleState> = genesisModelManager.lifecycleState
@@ -239,6 +218,20 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     private var generationSequence = 0L
 
     init {
+        // Model tensors and saved checkpoints are ready before this ViewModel exists.
+        // Vulkan preparation is asynchronous and never gates application opening.
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { neuralEngine.initializeOptionalVulkanRuntime() }
+                .onSuccess { initialized ->
+                    if (!initialized) {
+                        Log.i(TAG, "Optional Vulkan runtime is unavailable; Kotlin CPU remains active.")
+                    }
+                }
+                .onFailure { error ->
+                    Log.w(TAG, "Optional Vulkan preparation failed; Kotlin CPU remains active.", error)
+                }
+        }
+
         runCatching { ArgusForegroundService.startService(application) }
             .onFailure { error ->
                 Log.e(TAG, "Failed to start foreground service", error)

@@ -18,7 +18,7 @@ Argus is a native Android application built with Kotlin and Jetpack Compose.
 | Android NDK | 30.0.16248370 | Native C/C++ toolchain |
 | C++ language standard | C++23 | Vulkan JNI native library |
 | JUnit | 6.1.3 | Host-side unit-test platform and Jupiter API |
-| CMake | 3.31.6 | Native build configuration; minimum project requirement is 3.28.0 |
+| CMake | 4.5.0 | Native build configuration; minimum project requirement is 3.28 |
 
 JDK 25 is the runtime for Gradle; it does not set the application's Java
 bytecode target. Argus compiles Java-compatible application bytecode for
@@ -78,8 +78,8 @@ are not uploaded automatically.
 
 ## Vulkan training backend
 
-The native training module is built with Android NDK r30, CMake 3.31.6
-(project minimum 3.28.0), and C++23 for arm64-v8a, armeabi-v7a, and x86_64.
+The native training module is built with Android NDK r30, CMake 4.5.0
+(project minimum 3.28), and C++23 for arm64-v8a, armeabi-v7a, and x86_64.
 It uses the NDK-bundled glslc compiler to
 compile the AdamW (`adamw.comp`), batched-linear (`linear.comp`), and Vulkan 1.2 FP16-weight linear (`linear_fp16.comp`) compute shaders to SPIR-V during the native build.
 
@@ -88,7 +88,7 @@ matrix products in batched Q/K/V projections, attention output projection, SwiGL
 the output head, output-head backward, attention output-projection backward,
 SwiGLU backward, batched attention backward, and Q/K/V weight-gradient accumulation
 can run through Vulkan Compute (using `linear_fp16.comp` with FP16 weights and FP32
-accumulation when GPU 16-bit storage/arithmetic passes startup self-checks, or `linear.comp` otherwise). The three Q/K/V input-gradient products used by
+accumulation when GPU FP16 arithmetic passes post-model runtime self-checks, or `linear.comp` otherwise). The three Q/K/V input-gradient products used by
 embedding backpropagation are also batched through Vulkan. The fused AdamW update
 runs on Vulkan for workloads with at least 49,152 optimizer elements. Attention
 score generation, softmax, the softmax-Jacobian reduction, layer normalization,
@@ -96,10 +96,11 @@ low-rank LoRA gradient accumulation, token-ID embedding scatter, and global
 gradient-norm reduction remain in Kotlin. This is an incremental GPU training
 path, not a fully GPU-resident training graph.
 
-Vulkan is declared as an optional device feature. Devices without a compatible
-Vulkan driver, compute queue, shader pipeline, suitable storage memory, or
-sufficiently large optimizer workload use the existing Kotlin CPU optimizer.
-The CPU path preserves the same AdamW update and remains the required fallback.
+Vulkan is prepared asynchronously only after the local model has been constructed
+or restored; application cold-start does not create the Vulkan runtime. Devices
+without a compatible driver, compute queue, shader pipeline, suitable storage
+memory, or sufficiently large optimizer workload use the existing Kotlin CPU
+optimizer. Runtime verification failures also preserve the CPU fallback.
 NPU/APU detection is informational only; no vendor-specific NPU training
 runtime is currently integrated.
 
@@ -107,7 +108,7 @@ The CI pull-request workflow builds the native library and verifies that the
 APK contains the configured ABI libraries. Main, pull-request, and release
 workflows execute Gradle on JDK 25; the Android app's Java source and bytecode
 compatibility target remains Java 21. All workflows install the checksum-pinned
-CMake 3.31.6 distribution and NDK r30 for native builds.
+CMake 4.5.0 distribution and NDK r30 for native builds.
 
 ## Background training service
 

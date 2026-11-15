@@ -21,7 +21,7 @@ class VulkanTrainingBackendSafetyTest {
     }
 
     @Test
-    fun denseOperationUsesCpuFallbackUntilVulkanIsExplicitlyEnabled() {
+    fun denseOperationUsesCpuFallbackUntilPostModelRuntimePreparation() {
         val input = Array(64) { FloatArray(64) }
         val weights = FloatArray(64 * 64)
         val output = Array(64) { FloatArray(64) }
@@ -34,7 +34,7 @@ class VulkanTrainingBackendSafetyTest {
             outputColumns = 64
         )
 
-        assertFalse("Vulkan must remain opt-in for a new app process.", updated)
+        assertFalse("The GPU path must remain inactive until post-model runtime preparation.", updated)
         assertFalse("CPU fallback must not attempt to load JNI.", VulkanTrainingBackend.hasAttemptedInitialization)
         assertFalse(VulkanTrainingBackend.isRuntimeAvailable)
     }
