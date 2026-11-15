@@ -614,10 +614,9 @@ object TextModalityProcessor {
                     thinkEndIndex + Tokenizer.THINK_END.length
                 ) >= 0
 
-        if (
-            containsReasoningMarkers &&
-            (!hasConversationStructure || hasAssistantThinkFraming)
-        ) {
+        // Reasoning markers are structural only inside the canonical assistant
+        // reasoning frame. Their occurrence in prose/documentation is literal text.
+        if (containsReasoningMarkers && hasAssistantThinkFraming) {
             return TextModality.REASONING
         }
         if (hasConversationStructure) return TextModality.CONVERSATION

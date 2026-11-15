@@ -104,7 +104,7 @@ class TextModalityPreservationTest {
         val formatted = TextModalityProcessor.formatTrainingDatasetRecords(raw).orEmpty()
 
         assertEquals(1, formatted.size)
-        assertEquals(expected, formatted.single())
+        assertEquals("${expected} ${Tokenizer.EOS_TOKEN}", formatted.single())
 
         val chunks = TextModalityProcessor.process(
             rawText = raw,
@@ -423,6 +423,27 @@ class TextModalityPreservationTest {
         assertEquals("$first\n", chunks[0].content)
         assertEquals(second, chunks[1].content)
         assertTrue(chunks.all { it.modality == TextModality.STRUCTURED_DATA })
+    }
+
+    @Test
+    fun proseMentioningBothReasoningMarkersRemainsLiteralGeneralText() {
+        val raw = "The documentation names <THINK> and </THINK> as literal control-token examples."
+
+        assertEquals(TextModality.GENERAL_PROSE, TextModalityProcessor.detectModality(raw))
+
+        val chunk = TextModalityProcessor.process(
+            rawText = raw,
+            documentTitle = "Literal marker documentation",
+            chunkSize = 512,
+            overlap = 0
+        ).single()
+        assertEquals(TextModality.GENERAL_PROSE, chunk.modality)
+
+        val tokenizer = Tokenizer()
+        val ids = tokenizer.encode(chunk.content)
+        assertFalse(ids.contains(Tokenizer.THINK_START_ID))
+        assertFalse(ids.contains(Tokenizer.THINK_END_ID))
+        assertEquals(raw, tokenizer.decode(ids, keepControlTokens = true))
     }
 
     @Test
