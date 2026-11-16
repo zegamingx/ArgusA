@@ -2,18 +2,22 @@ package com.argus.agi.model
 
 import java.util.IdentityHashMap
 
-/** A named reference to one authoritative Kotlin model-parameter tensor. */
+/** A named reference to one authoritative model-parameter tensor. */
 internal data class VulkanModelParameterTensor(
     val name: String,
     val parameters: Float16ParameterArray
 )
 
 /**
- * Keeps read-only GPU replicas of authoritative Kotlin FP16 model tensors.
- * Kotlin remains the source of truth; uploads occur only after mutation revisions change.
+ * Owns revision-tracked FP16 model allocations in the Vulkan Tensor Arena.
  *
- * The registry refuses partial model residency: its configured byte budget is checked
- * against the complete inventory before any allocation is created.
+ * Host arrays are the checkpoint and CPU-recovery mirror. While a resident training
+ * transaction is active, the GPU allocation is authoritative; host readback is deferred
+ * until inference, CPU fallback, checkpointing, or runtime recovery needs it.
+ *
+ * Parameter replacement is all-or-nothing at the registry boundary. Replaced handles
+ * remain tracked until native release succeeds, so an arena cannot silently undercount
+ * memory after a failed release.
  */
 internal class VulkanTensorResidencyRegistry(
     private val allocate: (Long) -> VulkanTensorAllocation?,
@@ -23,13 +27,15 @@ internal class VulkanTensorResidencyRegistry(
     private val maxResidentBytes: () -> Long = { Long.MAX_VALUE }
 ) {
     private data class Entry(
-        val allocation: VulkanTensorAllocation,
+        var allocation: VulkanTensorAllocation,
         var uploadedRevision: Long,
         var hostMirrorCurrent: Boolean
     )
 
     private val entries = IdentityHashMap<Float16ParameterArray, Entry>()
+    private val retiredAllocations = ArrayList<VulkanTensorAllocation>()
     private var residentBytes: Long = 0L
+    private var retiredResidentBytes: Long = 0L
 
     @Synchronized
     fun acquire(parameters: Float16ParameterArray): VulkanTensorAllocation? {
@@ -43,8 +49,11 @@ internal class VulkanTensorResidencyRegistry(
         }
 
         if (candidate == null) {
+            val currentBytes = runCatching {
+                Math.addExact(residentBytes, retiredResidentBytes)
+            }.getOrNull() ?: return null
             val nextResidentBytes = runCatching {
-                Math.addExact(residentBytes, byteCount)
+                Math.addExact(currentBytes, byteCount)
             }.getOrNull() ?: return null
             if (nextResidentBytes > maxResidentBytes().coerceAtLeast(0L)) return null
 
@@ -94,6 +103,7 @@ internal class VulkanTensorResidencyRegistry(
      */
     @Synchronized
     fun synchronizeAll(tensors: List<VulkanModelParameterTensor>): Boolean {
+        if (!releaseRetiredAllocations()) return false
         require(tensors.isNotEmpty()) {
             "The model parameter residency inventory cannot be empty."
         }
@@ -166,7 +176,9 @@ internal class VulkanTensorResidencyRegistry(
     fun invalidate(releaseAllocations: Boolean): Boolean {
         if (!releaseAllocations) {
             entries.clear()
+            retiredAllocations.clear()
             residentBytes = 0L
+            retiredResidentBytes = 0L
             return true
         }
 
@@ -179,6 +191,7 @@ internal class VulkanTensorResidencyRegistry(
                 allReleased = false
             }
         }
+        if (!releaseRetiredAllocations()) allReleased = false
         return allReleased
     }
 
@@ -284,11 +297,108 @@ internal class VulkanTensorResidencyRegistry(
         return true
     }
 
+    /** Validates a complete replacement before either the caller or this registry commits it. */
+    @Synchronized
+    fun canReplaceAll(
+        tensors: List<Float16ParameterArray>,
+        expectedAllocations: List<VulkanTensorAllocation>,
+        replacementAllocations: List<VulkanTensorAllocation>
+    ): Boolean = validateReplacement(tensors, expectedAllocations, replacementAllocations)
+
+    /**
+     * Swaps every resident parameter handle as one registry transaction. GPU candidate
+     * buffers are already fully initialized; host mirrors remain stale until requested.
+     * Old handles are retained for deferred release if Vulkan refuses an individual free.
+     */
+    @Synchronized
+    fun replaceAll(
+        tensors: List<Float16ParameterArray>,
+        expectedAllocations: List<VulkanTensorAllocation>,
+        replacementAllocations: List<VulkanTensorAllocation>
+    ): Boolean {
+        if (!validateReplacement(tensors, expectedAllocations, replacementAllocations)) return false
+
+        var nextRetiredBytes = retiredResidentBytes
+        for (allocation in expectedAllocations) {
+            nextRetiredBytes = runCatching {
+                Math.addExact(nextRetiredBytes, allocation.byteCount)
+            }.getOrNull() ?: return false
+        }
+
+        for (index in tensors.indices) {
+            val tensor = tensors[index]
+            val entry = entries[tensor] ?: return false
+            val previous = entry.allocation
+            entry.allocation = replacementAllocations[index]
+            entry.uploadedRevision = tensor.mutationVersion
+            entry.hostMirrorCurrent = false
+            retiredAllocations.add(previous)
+        }
+        retiredResidentBytes = nextRetiredBytes
+        releaseRetiredAllocations()
+        return true
+    }
+
+    private fun validateReplacement(
+        tensors: List<Float16ParameterArray>,
+        expectedAllocations: List<VulkanTensorAllocation>,
+        replacementAllocations: List<VulkanTensorAllocation>
+    ): Boolean {
+        if (tensors.isEmpty() ||
+            tensors.size != expectedAllocations.size ||
+            tensors.size != replacementAllocations.size ||
+            entries.size != tensors.size) {
+            return false
+        }
+
+        val seenTensors = IdentityHashMap<Float16ParameterArray, Boolean>()
+        val seenReplacementHandles = HashSet<Long>()
+        for (index in tensors.indices) {
+            val tensor = tensors[index]
+            if (seenTensors.put(tensor, true) != null) return false
+            val entry = entries[tensor] ?: return false
+            val expected = expectedAllocations[index]
+            val replacement = replacementAllocations[index]
+            if (entry.allocation.nativeHandle != expected.nativeHandle ||
+                entry.allocation.byteCount != expected.byteCount ||
+                replacement.nativeHandle <= 0L ||
+                replacement.byteCount != expected.byteCount ||
+                !seenReplacementHandles.add(replacement.nativeHandle)) {
+                return false
+            }
+            if (entries.values.any { current ->
+                    current.allocation.nativeHandle == replacement.nativeHandle
+                } ||
+                retiredAllocations.any { retired ->
+                    retired.nativeHandle == replacement.nativeHandle
+                }) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private fun releaseRetiredAllocations(): Boolean {
+        var allReleased = true
+        val iterator = retiredAllocations.iterator()
+        while (iterator.hasNext()) {
+            val allocation = iterator.next()
+            if (release(allocation)) {
+                retiredResidentBytes =
+                    (retiredResidentBytes - allocation.byteCount).coerceAtLeast(0L)
+                iterator.remove()
+            } else {
+                allReleased = false
+            }
+        }
+        return allReleased
+    }
+
     @Synchronized
     fun residentTensorCount(): Int = entries.size
 
     @Synchronized
-    fun residentByteCount(): Long = residentBytes
+    fun residentByteCount(): Long = Math.addExact(residentBytes, retiredResidentBytes)
 
     private fun discard(parameters: Float16ParameterArray, entry: Entry) {
         if (release(entry.allocation)) {
