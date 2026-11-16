@@ -147,6 +147,7 @@ struct ResidentAdamwPushConstants {
     uint32_t elementCount;
     uint32_t pairCount;
     uint32_t parameterOffsetWords;
+    uint32_t candidateParameterOffsetWords;
     uint32_t gradientOffsetWords;
     uint32_t gradientElementOffset;
     uint32_t firstMomentOffsetWords;
@@ -164,12 +165,13 @@ struct ResidentAdamwPushConstants {
     float weightDecay;
 };
 
-static_assert(sizeof(ResidentAdamwPushConstants) == 76);
+static_assert(sizeof(ResidentAdamwPushConstants) == 80);
 static_assert(offsetof(ResidentAdamwPushConstants, parameterOffsetWords) == 12);
-static_assert(offsetof(ResidentAdamwPushConstants, candidateFirstMomentOffsetWords) == 32);
-static_assert(offsetof(ResidentAdamwPushConstants, statusOffsetWords) == 40);
-static_assert(offsetof(ResidentAdamwPushConstants, learningRate) == 44);
-static_assert(offsetof(ResidentAdamwPushConstants, weightDecay) == 72);
+static_assert(offsetof(ResidentAdamwPushConstants, candidateParameterOffsetWords) == 16);
+static_assert(offsetof(ResidentAdamwPushConstants, candidateFirstMomentOffsetWords) == 36);
+static_assert(offsetof(ResidentAdamwPushConstants, statusOffsetWords) == 44);
+static_assert(offsetof(ResidentAdamwPushConstants, learningRate) == 48);
+static_assert(offsetof(ResidentAdamwPushConstants, weightDecay) == 76);
 
 struct CooperativeMatrixCapability {
     uint32_t mSize = 0;
@@ -6791,6 +6793,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     JNIEnv* env,
     jobject,
     jlongArray parameterHandles,
+    jlongArray candidateParameterHandles,
     jlong gradientHandle,
     jlongArray firstMomentHandles,
     jlongArray secondMomentHandles,
@@ -6817,6 +6820,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         gRuntime.queueSubmit2 == nullptr ||
         gRuntime.cmdPipelineBarrier2 == nullptr ||
         parameterHandles == nullptr ||
+        candidateParameterHandles == nullptr ||
         firstMomentHandles == nullptr ||
         secondMomentHandles == nullptr ||
         candidateFirstMomentHandles == nullptr ||
@@ -6838,6 +6842,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
 
     const jsize groupCount = env->GetArrayLength(parameterHandles);
     if (env->ExceptionCheck() || groupCount <= 0 ||
+        env->GetArrayLength(candidateParameterHandles) != groupCount ||
         env->GetArrayLength(firstMomentHandles) != groupCount ||
         env->GetArrayLength(secondMomentHandles) != groupCount ||
         env->GetArrayLength(candidateFirstMomentHandles) != groupCount ||
@@ -6848,6 +6853,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     }
 
     std::vector<jlong> parameterHandleValues;
+    std::vector<jlong> candidateParameterHandleValues;
     std::vector<jlong> firstMomentHandleValues;
     std::vector<jlong> secondMomentHandleValues;
     std::vector<jlong> candidateFirstMomentHandleValues;
@@ -6857,6 +6863,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     try {
         const size_t count = static_cast<size_t>(groupCount);
         parameterHandleValues.resize(count);
+        candidateParameterHandleValues.resize(count);
         firstMomentHandleValues.resize(count);
         secondMomentHandleValues.resize(count);
         candidateFirstMomentHandleValues.resize(count);
@@ -6869,6 +6876,9 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
 
     env->GetLongArrayRegion(
         parameterHandles, 0, groupCount, parameterHandleValues.data()
+    );
+    env->GetLongArrayRegion(
+        candidateParameterHandles, 0, groupCount, candidateParameterHandleValues.data()
     );
     env->GetLongArrayRegion(
         firstMomentHandles, 0, groupCount, firstMomentHandleValues.data()
@@ -6922,6 +6932,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     uint64_t totalGradientElements = 0u;
     uint64_t allocatedPairCount = 0u;
     std::vector<TensorArenaAllocation*> parameterAllocations;
+    std::vector<TensorArenaAllocation*> candidateParameterAllocations;
     std::vector<TensorArenaAllocation*> firstMomentAllocations;
     std::vector<TensorArenaAllocation*> secondMomentAllocations;
     std::vector<TensorArenaAllocation*> candidateFirstMomentAllocations;
@@ -6929,6 +6940,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     try {
         const size_t count = static_cast<size_t>(groupCount);
         parameterAllocations.reserve(count);
+        candidateParameterAllocations.reserve(count);
         firstMomentAllocations.reserve(count);
         secondMomentAllocations.reserve(count);
         candidateFirstMomentAllocations.reserve(count);
@@ -6939,7 +6951,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
 
     std::vector<jlong> uniqueHandles;
     try {
-        uniqueHandles.reserve(static_cast<size_t>(groupCount) * 5u + 2u);
+        uniqueHandles.reserve(static_cast<size_t>(groupCount) * 6u + 2u);
     } catch (const std::bad_alloc&) {
         return JNI_FALSE;
     }
@@ -6949,6 +6961,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     for (jsize index = 0; index < groupCount; ++index) {
         const size_t groupIndex = static_cast<size_t>(index);
         const jlong parameterHandle = parameterHandleValues[groupIndex];
+        const jlong candidateParameterHandle = candidateParameterHandleValues[groupIndex];
         const jlong firstMomentHandle = firstMomentHandleValues[groupIndex];
         const jlong secondMomentHandle = secondMomentHandleValues[groupIndex];
         const jlong candidateFirstMomentHandle =
@@ -6958,8 +6971,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         const jint rawElementCount = elementCounts[groupIndex];
         const jfloat weightDecay = weightDecayValues[groupIndex];
 
-        if (parameterHandle <= 0 || firstMomentHandle <= 0 ||
-            secondMomentHandle <= 0 ||
+        if (parameterHandle <= 0 || candidateParameterHandle <= 0 ||
+            firstMomentHandle <= 0 || secondMomentHandle <= 0 ||
             candidateFirstMomentHandle <= 0 ||
             candidateSecondMomentHandle <= 0 ||
             rawElementCount <= 0 ||
@@ -6970,6 +6983,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
 
         const jlong groupHandles[] = {
             parameterHandle,
+            candidateParameterHandle,
             firstMomentHandle,
             secondMomentHandle,
             candidateFirstMomentHandle,
@@ -6986,6 +7000,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
 
         TensorArenaAllocation* parameterAllocation =
             findArenaAllocation(parameterHandle);
+        TensorArenaAllocation* candidateParameterAllocation =
+            findArenaAllocation(candidateParameterHandle);
         TensorArenaAllocation* firstMomentAllocation =
             findArenaAllocation(firstMomentHandle);
         TensorArenaAllocation* secondMomentAllocation =
@@ -6995,6 +7011,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         TensorArenaAllocation* candidateSecondMomentAllocation =
             findArenaAllocation(candidateSecondMomentHandle);
         if (parameterAllocation == nullptr ||
+            candidateParameterAllocation == nullptr ||
             firstMomentAllocation == nullptr ||
             secondMomentAllocation == nullptr ||
             candidateFirstMomentAllocation == nullptr ||
@@ -7011,11 +7028,14 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         if (elementCount > std::numeric_limits<uint64_t>::max() / sizeof(float) ||
             parameterAllocation->logicalSize < parameterBytes ||
             parameterAllocation->allocatedSize < packedParameterBytes ||
+            candidateParameterAllocation->logicalSize != parameterAllocation->logicalSize ||
+            candidateParameterAllocation->allocatedSize != parameterAllocation->allocatedSize ||
             firstMomentAllocation->logicalSize < momentBytes ||
             secondMomentAllocation->logicalSize < momentBytes ||
             candidateFirstMomentAllocation->logicalSize < momentBytes ||
             candidateSecondMomentAllocation->logicalSize < momentBytes ||
             (parameterAllocation->offset & 3u) != 0u ||
+            (candidateParameterAllocation->offset & 3u) != 0u ||
             (firstMomentAllocation->offset & 3u) != 0u ||
             (secondMomentAllocation->offset & 3u) != 0u ||
             (candidateFirstMomentAllocation->offset & 3u) != 0u ||
@@ -7026,6 +7046,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
 
         const uint64_t parameterOffsetWords =
             parameterAllocation->offset / sizeof(uint32_t);
+        const uint64_t candidateParameterOffsetWords =
+            candidateParameterAllocation->offset / sizeof(uint32_t);
         const uint64_t firstMomentOffsetWords =
             firstMomentAllocation->offset / sizeof(uint32_t);
         const uint64_t secondMomentOffsetWords =
@@ -7036,11 +7058,13 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             candidateSecondMomentAllocation->offset / sizeof(uint32_t);
         const uint64_t pairCount = (elementCount + 1u) / 2u;
         if (parameterOffsetWords > kMaximumShaderIndex ||
+            candidateParameterOffsetWords > kMaximumShaderIndex ||
             firstMomentOffsetWords > kMaximumShaderIndex ||
             secondMomentOffsetWords > kMaximumShaderIndex ||
             candidateFirstMomentOffsetWords > kMaximumShaderIndex ||
             candidateSecondMomentOffsetWords > kMaximumShaderIndex ||
             pairCount - 1u > kMaximumShaderIndex - parameterOffsetWords ||
+            pairCount - 1u > kMaximumShaderIndex - candidateParameterOffsetWords ||
             elementCount - 1u > kMaximumShaderIndex - firstMomentOffsetWords ||
             elementCount - 1u > kMaximumShaderIndex - secondMomentOffsetWords ||
             elementCount - 1u > kMaximumShaderIndex - candidateFirstMomentOffsetWords ||
@@ -7054,6 +7078,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         totalGradientElements += elementCount;
         allocatedPairCount += pairCount;
         parameterAllocations.push_back(parameterAllocation);
+        candidateParameterAllocations.push_back(candidateParameterAllocation);
         firstMomentAllocations.push_back(firstMomentAllocation);
         secondMomentAllocations.push_back(secondMomentAllocation);
         candidateFirstMomentAllocations.push_back(candidateFirstMomentAllocation);
@@ -7108,6 +7133,61 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     beforeComputeDependency.pMemoryBarriers = &beforeCompute;
     gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeComputeDependency);
 
+    // Clone each complete parameter allocation before any update dispatch. This preserves
+    // inactive vocabulary-capacity rows when the gradient only covers the active prefix.
+    VkMemoryBarrier2KHR computeToParameterCopy{};
+    computeToParameterCopy.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    computeToParameterCopy.srcStageMask =
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    computeToParameterCopy.srcAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    computeToParameterCopy.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    computeToParameterCopy.dstAccessMask =
+        VK_ACCESS_2_TRANSFER_READ_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    VkDependencyInfoKHR computeToParameterCopyDependency{};
+    computeToParameterCopyDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    computeToParameterCopyDependency.memoryBarrierCount = 1u;
+    computeToParameterCopyDependency.pMemoryBarriers = &computeToParameterCopy;
+    gRuntime.cmdPipelineBarrier2(
+        gRuntime.commandBuffer,
+        &computeToParameterCopyDependency
+    );
+
+    for (size_t index = 0u; index < parameterAllocations.size(); ++index) {
+        const TensorArenaAllocation* source = parameterAllocations[index];
+        const TensorArenaAllocation* destination = candidateParameterAllocations[index];
+        if (source->allocatedSize == 0u ||
+            source->allocatedSize != destination->allocatedSize ||
+            source->offset == destination->offset) {
+            logError("Resident AdamW candidate parameter clone range is invalid.");
+            return JNI_FALSE;
+        }
+        VkBufferCopy parameterCopy{};
+        parameterCopy.srcOffset = source->offset;
+        parameterCopy.dstOffset = destination->offset;
+        parameterCopy.size = source->allocatedSize;
+        vkCmdCopyBuffer(
+            gRuntime.commandBuffer,
+            gRuntime.tensorArenaBuffer,
+            gRuntime.tensorArenaBuffer,
+            1u,
+            &parameterCopy
+        );
+    }
+
+    VkMemoryBarrier2KHR parameterCopyToCompute{};
+    parameterCopyToCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    parameterCopyToCompute.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    parameterCopyToCompute.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    parameterCopyToCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    parameterCopyToCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR parameterCopyDependency{};
+    parameterCopyDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    parameterCopyDependency.memoryBarrierCount = 1u;
+    parameterCopyDependency.pMemoryBarriers = &parameterCopyToCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &parameterCopyDependency);
+
     const uint64_t gradientLogicalWords =
         gradientAllocation->offset / sizeof(uint32_t);
     uint64_t gradientElementOffset = 0u;
@@ -7119,6 +7199,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         const uint64_t pairCount = (elementCount + 1u) / 2u;
         const uint64_t parameterOffsetWords =
             parameterAllocations[groupIndex]->offset / sizeof(uint32_t);
+        const uint64_t candidateParameterOffsetWords =
+            candidateParameterAllocations[groupIndex]->offset / sizeof(uint32_t);
         const uint64_t firstMomentOffsetWords =
             firstMomentAllocations[groupIndex]->offset / sizeof(uint32_t);
         const uint64_t secondMomentOffsetWords =
@@ -7133,6 +7215,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             calculateDispatchGroupCount(requiredGroups);
         if (dispatchGroups == 0u ||
             parameterOffsetWords > kMaximumShaderIndex ||
+            candidateParameterOffsetWords > kMaximumShaderIndex ||
             firstMomentOffsetWords > kMaximumShaderIndex ||
             secondMomentOffsetWords > kMaximumShaderIndex ||
             candidateFirstMomentOffsetWords > kMaximumShaderIndex ||
@@ -7146,6 +7229,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             static_cast<uint32_t>(elementCount),
             static_cast<uint32_t>(pairCount),
             static_cast<uint32_t>(parameterOffsetWords),
+            static_cast<uint32_t>(candidateParameterOffsetWords),
             static_cast<uint32_t>(gradientLogicalWords),
             static_cast<uint32_t>(gradientElementOffset),
             static_cast<uint32_t>(firstMomentOffsetWords),
