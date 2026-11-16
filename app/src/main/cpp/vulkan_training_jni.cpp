@@ -7021,12 +7021,24 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         }
 
         const uint64_t elementCount = static_cast<uint64_t>(rawElementCount);
-        const uint64_t parameterBytes = elementCount * sizeof(uint16_t);
+        if ((parameterAllocation->logicalSize % sizeof(uint16_t)) != 0u) {
+            logError("Resident AdamW FP16 parameter capacity is not element-aligned.");
+            return JNI_FALSE;
+        }
+        const uint64_t parameterCapacity =
+            parameterAllocation->logicalSize / sizeof(uint16_t);
+        if (parameterCapacity == 0u ||
+            parameterCapacity > std::numeric_limits<uint64_t>::max() / sizeof(float) ||
+            elementCount > parameterCapacity) {
+            logError("Resident AdamW active gradient prefix exceeds its parameter capacity.");
+            return JNI_FALSE;
+        }
+        const uint64_t parameterBytes =
+            parameterCapacity * sizeof(uint16_t);
         const uint64_t packedParameterBytes =
-            ((elementCount + 1u) / 2u) * sizeof(uint32_t);
-        const uint64_t momentBytes = elementCount * sizeof(float);
-        if (elementCount > std::numeric_limits<uint64_t>::max() / sizeof(float) ||
-            parameterAllocation->logicalSize < parameterBytes ||
+            ((parameterCapacity + 1u) / 2u) * sizeof(uint32_t);
+        const uint64_t momentBytes = parameterCapacity * sizeof(float);
+        if (parameterAllocation->logicalSize < parameterBytes ||
             parameterAllocation->allocatedSize < packedParameterBytes ||
             candidateParameterAllocation->logicalSize != parameterAllocation->logicalSize ||
             candidateParameterAllocation->allocatedSize != parameterAllocation->allocatedSize ||
@@ -7070,12 +7082,12 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             elementCount - 1u > kMaximumShaderIndex - candidateFirstMomentOffsetWords ||
             elementCount - 1u > kMaximumShaderIndex - candidateSecondMomentOffsetWords ||
             totalGradientElements > kMaximumShaderIndex ||
-            elementCount > kMaximumShaderIndex - totalGradientElements) {
+            parameterCapacity > kMaximumShaderIndex - totalGradientElements) {
             logError("Resident AdamW tensor offsets exceed 32-bit shader addressability.");
             return JNI_FALSE;
         }
 
-        totalGradientElements += elementCount;
+        totalGradientElements += parameterCapacity;
         allocatedPairCount += pairCount;
         parameterAllocations.push_back(parameterAllocation);
         candidateParameterAllocations.push_back(candidateParameterAllocation);
@@ -7308,7 +7320,11 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             &pushConstants
         );
         vkCmdDispatch(gRuntime.commandBuffer, dispatchGroups, 1u, 1u);
-        gradientElementOffset += elementCount;
+        // M4 stores one full-capacity gradient segment per parameter group. The active
+        // prefix controls how many elements AdamW updates; the next group starts after
+        // the complete parameter capacity, not after this group's active prefix.
+        gradientElementOffset +=
+            parameterAllocations[groupIndex]->logicalSize / sizeof(uint16_t);
         return true;
     };
 
