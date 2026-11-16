@@ -3753,11 +3753,11 @@ internal object VulkanTrainingBackend {
                         candidateSecondMomentAllocations[group], rejectedCandidateSecond
                     ) ||
                     !rejectedParameters.contentEquals(parameterBytes[group]) ||
-                    !rejectedCandidateParameters.contentEquals(validCandidateParameterBytes[group]) ||
+                    !rejectedCandidateParameters.contentEquals(parameterBytes[group]) ||
                     !rejectedFirstMoments.contentEquals(firstMomentBytes[group]) ||
                     !rejectedSecondMoments.contentEquals(secondMomentBytes[group]) ||
-                    !rejectedCandidateFirst.contentEquals(validCandidateFirstBytes[group]) ||
-                    !rejectedCandidateSecond.contentEquals(validCandidateSecondBytes[group])) {
+                    !rejectedCandidateFirst.contentEquals(firstMomentBytes[group]) ||
+                    !rejectedCandidateSecond.contentEquals(secondMomentBytes[group])) {
                     return false
                 }
             }
