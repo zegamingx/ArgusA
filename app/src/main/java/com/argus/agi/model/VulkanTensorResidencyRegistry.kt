@@ -175,6 +175,26 @@ internal class VulkanTensorResidencyRegistry(
         return allReleased
     }
 
+
+    /**
+     * Records a completed device-side parameter update without scheduling a redundant
+     * host-to-device upload. The caller must first commit the matching GPU readback to
+     * the Float16ParameterArray while holding the model-update lock.
+     */
+    @Synchronized
+    fun markGpuReplicaSynchronized(
+        parameters: Float16ParameterArray,
+        allocation: VulkanTensorAllocation
+    ): Boolean {
+        val entry = entries[parameters] ?: return false
+        if (entry.allocation.nativeHandle != allocation.nativeHandle ||
+            entry.allocation.byteCount != allocation.byteCount) {
+            return false
+        }
+        entry.uploadedRevision = parameters.mutationVersion
+        return true
+    }
+
     @Synchronized
     fun residentTensorCount(): Int = entries.size
 
