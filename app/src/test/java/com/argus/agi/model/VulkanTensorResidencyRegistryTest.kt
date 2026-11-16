@@ -727,4 +727,106 @@ class VulkanTensorResidencyRegistryTest {
             second.toShortArray()
         )
     }
+
+    @Test
+    fun rejectsPreparedParameterSwapWhenHostRevisionChangesBeforeCommit() {
+        var nextHandle = 1L
+        var uploadCount = 0
+        val gpuBytes = LinkedHashMap<Long, ByteArray>()
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount ->
+                VulkanTensorAllocation(nextHandle++, byteCount).also { allocation ->
+                    gpuBytes[allocation.nativeHandle] = ByteArray(byteCount.toInt())
+                }
+            },
+            upload = { allocation, bytes ->
+                val destination = gpuBytes[allocation.nativeHandle]
+                if (destination == null || destination.size != bytes.size) {
+                    false
+                } else {
+                    bytes.copyInto(destination)
+                    uploadCount++
+                    true
+                }
+            },
+            release = { allocation -> gpuBytes.remove(allocation.nativeHandle) != null }
+        )
+        val parameters = Float16ParameterArray.fromFloatArray(floatArrayOf(0.25f, -0.5f))
+        val inventory = listOf(VulkanModelParameterTensor("layer.weight", parameters))
+        assertTrue(registry.synchronizeAll(inventory))
+        val original = registry.acquire(parameters)
+            ?: error("The original resident parameter allocation is missing.")
+        val candidate = VulkanTensorAllocation(nextHandle++, original.byteCount)
+        gpuBytes[candidate.nativeHandle] = Float16ParameterArray
+            .fromFloatArray(floatArrayOf(1.0f, 1.5f))
+            .toLittleEndianByteArray()
+
+        assertTrue(registry.canReplaceAll(listOf(parameters), listOf(original), listOf(candidate)))
+        parameters[0] = 7.0f
+
+        assertFalse(
+            registry.commitReplacementAfterPreflight(
+                tensors = listOf(parameters),
+                expectedAllocations = listOf(original),
+                replacementAllocations = listOf(candidate)
+            )
+        )
+        assertEquals(original.nativeHandle, registry.acquire(parameters)?.nativeHandle)
+        assertEquals(2, uploadCount)
+        assertEquals(2L, registry.deviceRevision(parameters))
+        assertFalse(gpuBytes.containsKey(candidate.nativeHandle))
+    }
+
+    @Test
+    fun rejectsReadbackWhenHostMutationOccursDuringGpuDownload() {
+        var nextHandle = 1L
+        lateinit var parameters: Float16ParameterArray
+        val gpuBytes = LinkedHashMap<Long, ByteArray>()
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount ->
+                VulkanTensorAllocation(nextHandle++, byteCount).also { allocation ->
+                    gpuBytes[allocation.nativeHandle] = ByteArray(byteCount.toInt())
+                }
+            },
+            upload = { allocation, bytes ->
+                val destination = gpuBytes[allocation.nativeHandle]
+                if (destination == null || destination.size != bytes.size) {
+                    false
+                } else {
+                    bytes.copyInto(destination)
+                    true
+                }
+            },
+            release = { allocation -> gpuBytes.remove(allocation.nativeHandle) != null },
+            download = { allocation, destination ->
+                val sourceBytes = gpuBytes[allocation.nativeHandle]
+                if (sourceBytes == null || sourceBytes.size != destination.size) {
+                    false
+                } else {
+                    sourceBytes.copyInto(destination)
+                    parameters[0] = 9.0f
+                    true
+                }
+            }
+        )
+        parameters = Float16ParameterArray.fromFloatArray(floatArrayOf(0.25f, -0.5f))
+        assertTrue(
+            registry.synchronizeAll(
+                listOf(VulkanModelParameterTensor("layer.weight", parameters))
+            )
+        )
+        val allocation = registry.acquire(parameters)
+            ?: error("The resident parameter allocation is missing.")
+        val updatedGpuBytes = Float16ParameterArray
+            .fromFloatArray(floatArrayOf(1.25f, 1.5f))
+            .toLittleEndianByteArray()
+        updatedGpuBytes.copyInto(requireNotNull(gpuBytes[allocation.nativeHandle]))
+        registry.markDeviceMutationPending(listOf(parameters))
+
+        assertFalse(registry.synchronizeHostMirror(parameters))
+        assertEquals(9.0f, parameters[0], 0.0f)
+        assertFalse(registry.areHostMirrorsCurrent())
+    }
+
+
 }
