@@ -5744,6 +5744,8 @@ internal object VulkanTrainingBackend {
         gradientHandle: Long,
         firstMomentHandles: LongArray,
         secondMomentHandles: LongArray,
+        candidateFirstMomentHandles: LongArray,
+        candidateSecondMomentHandles: LongArray,
         activeElementCounts: IntArray,
         weightDecayByGroup: FloatArray,
         learningRate: Float,
@@ -5755,7 +5757,6 @@ internal object VulkanTrainingBackend {
         gradientClipFactor: Float,
         statusHandle: Long
     ): Boolean
-    private external fun nativeAllocateTensor(byteCount: Long): Long
 
     private external fun nativeUploadTensor(tensorHandle: Long, source: ByteArray): Boolean
 
