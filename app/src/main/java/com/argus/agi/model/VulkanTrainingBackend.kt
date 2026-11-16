@@ -3458,19 +3458,20 @@ internal object VulkanTrainingBackend {
     private fun verifyResidentAdamwKernel(): Boolean {
         val initialParameters = arrayOf(
             floatArrayOf(1.0f, -2.0f, 0.5f, -0.25f, 0.125f),
-            floatArrayOf(-0.75f, 0.375f, 1.25f, -1.5f)
+            floatArrayOf(-0.75f, 0.375f, 1.25f, -1.5f, 0.875f, -0.25f)
         )
+        // Active gradient prefixes deliberately differ from persistent tensor capacity.
         val initialGradients = arrayOf(
-            floatArrayOf(0.1f, -0.2f, 0.05f, 0.025f, -0.0125f),
-            floatArrayOf(-0.03f, 0.04f, 0.07f, -0.09f)
+            floatArrayOf(0.1f, -0.2f, 0.05f, 0.025f),
+            floatArrayOf(-0.03f, 0.04f, 0.07f)
         )
         val initialFirstMoments = arrayOf(
             floatArrayOf(0.01f, -0.02f, 0.03f, -0.04f, 0.005f),
-            floatArrayOf(-0.01f, 0.02f, -0.03f, 0.04f)
+            floatArrayOf(-0.01f, 0.02f, -0.03f, 0.04f, -0.005f, 0.006f)
         )
         val initialSecondMoments = arrayOf(
             floatArrayOf(0.001f, 0.002f, 0.003f, 0.004f, 0.0005f),
-            floatArrayOf(0.0005f, 0.0004f, 0.0007f, 0.0009f)
+            floatArrayOf(0.0005f, 0.0004f, 0.0007f, 0.0009f, 0.0002f, 0.0003f)
         )
         val weightDecayByGroup = floatArrayOf(0.0f, 0.013f)
         val parameterBytes = Array(initialParameters.size) { index ->
@@ -3482,8 +3483,8 @@ internal object VulkanTrainingBackend {
         val secondMomentBytes = Array(initialSecondMoments.size) { index ->
             encodeFloatArray(initialSecondMoments[index])
         }
-        val activeElementCounts = IntArray(initialParameters.size) { index ->
-            initialParameters[index].size
+        val activeElementCounts = IntArray(initialGradients.size) { index ->
+            initialGradients[index].size
         }
         val totalGradientElements = initialGradients.fold(0) { total, gradient ->
             Math.addExact(total, gradient.size)
@@ -3591,16 +3592,16 @@ internal object VulkanTrainingBackend {
             }
 
             val expectedParameters = Array(initialParameters.size) { group ->
-                FloatArray(initialParameters[group].size)
+                initialParameters[group].copyOf()
             }
             val expectedFirstMoments = Array(initialParameters.size) { group ->
-                FloatArray(initialParameters[group].size)
+                initialFirstMoments[group].copyOf()
             }
             val expectedSecondMoments = Array(initialParameters.size) { group ->
-                FloatArray(initialParameters[group].size)
+                initialSecondMoments[group].copyOf()
             }
             for (group in initialParameters.indices) {
-                for (element in initialParameters[group].indices) {
+                for (element in initialGradients[group].indices) {
                     val gradient = initialGradients[group][element] * gradientClipFactor
                     val firstMoment =
                         beta1 * initialFirstMoments[group][element] + (1.0f - beta1) * gradient
@@ -3621,6 +3622,9 @@ internal object VulkanTrainingBackend {
                 }
             }
 
+            val validCandidateParameterBytes = Array(initialParameters.size) { group ->
+                ByteArray(parameterBytes[group].size)
+            }
             val validCandidateFirstBytes = Array(initialParameters.size) { group ->
                 ByteArray(firstMomentBytes[group].size)
             }
@@ -3628,7 +3632,7 @@ internal object VulkanTrainingBackend {
                 ByteArray(secondMomentBytes[group].size)
             }
             for (group in initialParameters.indices) {
-                val updatedParameterBytes = ByteArray(parameterBytes[group].size)
+                val updatedParameterBytes = validCandidateParameterBytes[group]
                 val unchangedActiveParameterBytes = ByteArray(parameterBytes[group].size)
                 if (!downloadGpuTensor(
                         candidateParameterAllocations[group],
@@ -3724,7 +3728,7 @@ internal object VulkanTrainingBackend {
                         candidateSecondMomentAllocations[group], rejectedCandidateSecond
                     ) ||
                     !rejectedParameters.contentEquals(parameterBytes[group]) ||
-                    !rejectedCandidateParameters.contentEquals(parameterBytes[group]) ||
+                    !rejectedCandidateParameters.contentEquals(validCandidateParameterBytes[group]) ||
                     !rejectedFirstMoments.contentEquals(firstMomentBytes[group]) ||
                     !rejectedSecondMoments.contentEquals(secondMomentBytes[group]) ||
                     !rejectedCandidateFirst.contentEquals(firstMomentBytes[group]) ||
