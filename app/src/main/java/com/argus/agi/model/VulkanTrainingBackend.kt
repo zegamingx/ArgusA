@@ -1099,6 +1099,42 @@ internal object VulkanTrainingBackend {
         _modelTensorResidencyReady.value = false
 
         if (!isRuntimeAvailable) {
+            // A runtime may be disabled for dispatch while native handles are still alive
+            // because an earlier GPU readback/teardown was postponed. Never drop those
+            // handles until the host mirrors are verified or the entire arena is cleared.
+            if (nativeReady) {
+                if (!synchronizeTrainingStateMirrors()) {
+                    residencySuspended = false
+                    _modelTensorResidencyReady.value = wasResidencyReady
+                    Log.e(
+                        TAG,
+                        "Memory-pressure release was postponed; disabled Vulkan still owns unrecovered model or optimizer state."
+                    )
+                    return false
+                }
+                val disabledRuntimeArenaCleared = runCatching {
+                    nativeClearTensorArena()
+                }.getOrDefault(false)
+                if (disabledRuntimeArenaCleared) {
+                    invalidateTensorResidency(releaseAllocations = false)
+                    refreshTensorArenaMetrics()
+                    return true
+                }
+                val teardownCompleted = destroyNativeRuntime()
+                if (teardownCompleted) {
+                    refreshTensorArenaMetrics()
+                    return true
+                }
+                residencySuspended = false
+                _modelTensorResidencyReady.value = wasResidencyReady
+                Log.e(
+                    TAG,
+                    "Memory-pressure release was postponed because the disabled Vulkan arena could not be safely cleared or destroyed."
+                )
+                return false
+            }
+            // With no native device alive, the successfully recovered host arrays are
+            // authoritative and no native allocation handles remain to be preserved.
             invalidateTensorResidency(releaseAllocations = false)
             return false
         }
