@@ -1672,6 +1672,15 @@ internal object VulkanTrainingBackend {
             residentGradientAccumulatorReady = verified && residentBackwardReady && runCatching {
                 verifyResidentGradientAccumulator()
             }.getOrDefault(false)
+            residentAdamwReady = verified && residentActivationLinearReady && runCatching {
+                verifyResidentAdamwKernel()
+            }.getOrDefault(false)
+            if (verified && residentActivationLinearReady && !residentAdamwReady) {
+                Log.w(
+                    TAG,
+                    "Resident FP16 AdamW self-check failed; staged optimizer and CPU fallback remain available."
+                )
+            }
             if (verified && residentBackwardReady && !residentGradientAccumulatorReady) {
                 Log.w(
                     TAG,
@@ -3287,6 +3296,176 @@ internal object VulkanTrainingBackend {
         return true
     }
 
+    private fun verifyResidentAdamwKernel(): Boolean {
+        val initialParameters = floatArrayOf(1.0f, -2.0f, 0.5f, -0.25f)
+        val initialGradients = floatArrayOf(0.1f, -0.2f, 0.05f, 0.025f)
+        val initialFirstMoments = FloatArray(initialParameters.size)
+        val initialSecondMoments = FloatArray(initialParameters.size)
+        val parameterArray = Float16ParameterArray.fromFloatArray(initialParameters)
+        val parameterBytes = parameterArray.toLittleEndianByteArray()
+        val gradientBytes = encodeFloatArray(initialGradients)
+        val firstMomentBytes = encodeFloatArray(initialFirstMoments)
+        val secondMomentBytes = encodeFloatArray(initialSecondMoments)
+        val parameterAllocation = allocateGpuTensor(parameterBytes.size.toLong()) ?: return false
+        var gradientAllocation: VulkanTensorAllocation? = null
+        var firstMomentAllocation: VulkanTensorAllocation? = null
+        var secondMomentAllocation: VulkanTensorAllocation? = null
+        var statusAllocation: VulkanTensorAllocation? = null
+        var verified = false
+
+        try {
+            gradientAllocation = allocateGpuTensor(gradientBytes.size.toLong()) ?: return false
+            firstMomentAllocation = allocateGpuTensor(firstMomentBytes.size.toLong()) ?: return false
+            secondMomentAllocation = allocateGpuTensor(secondMomentBytes.size.toLong()) ?: return false
+            statusAllocation = allocateGpuTensor(Int.SIZE_BYTES.toLong()) ?: return false
+
+            if (!uploadGpuTensor(parameterAllocation, parameterBytes) ||
+                !uploadGpuTensor(gradientAllocation, gradientBytes) ||
+                !uploadGpuTensor(firstMomentAllocation, firstMomentBytes) ||
+                !uploadGpuTensor(secondMomentAllocation, secondMomentBytes) ||
+                !uploadGpuTensor(statusAllocation, ByteArray(Int.SIZE_BYTES))) {
+                return false
+            }
+
+            val learningRate = 0.01f
+            val beta1 = 0.9f
+            val beta2 = 0.999f
+            val biasCorrection1 = 0.1f
+            val biasCorrection2 = 0.001f
+            val epsilon = 1.0e-8f
+            val weightDecay = 0.01f
+            val applied = nativeApplyResidentAdamWUpdate(
+                parameterHandles = longArrayOf(parameterAllocation.nativeHandle),
+                gradientHandle = gradientAllocation.nativeHandle,
+                firstMomentHandles = longArrayOf(firstMomentAllocation.nativeHandle),
+                secondMomentHandles = longArrayOf(secondMomentAllocation.nativeHandle),
+                activeElementCounts = intArrayOf(initialParameters.size),
+                weightDecayByGroup = floatArrayOf(weightDecay),
+                learningRate = learningRate,
+                beta1 = beta1,
+                beta2 = beta2,
+                biasCorrection1 = biasCorrection1,
+                biasCorrection2 = biasCorrection2,
+                epsilon = epsilon,
+                gradientClipFactor = 1.0f,
+                statusHandle = statusAllocation.nativeHandle
+            )
+            if (!applied) return false
+
+            val statusBytes = ByteArray(Int.SIZE_BYTES)
+            val updatedParameterBytes = ByteArray(parameterBytes.size)
+            val updatedFirstMomentBytes = ByteArray(firstMomentBytes.size)
+            val updatedSecondMomentBytes = ByteArray(secondMomentBytes.size)
+            if (!downloadGpuTensor(statusAllocation, statusBytes) ||
+                ByteBuffer.wrap(statusBytes).order(ByteOrder.LITTLE_ENDIAN).int != 0 ||
+                !downloadGpuTensor(parameterAllocation, updatedParameterBytes) ||
+                !downloadGpuTensor(firstMomentAllocation, updatedFirstMomentBytes) ||
+                !downloadGpuTensor(secondMomentAllocation, updatedSecondMomentBytes)) {
+                return false
+            }
+
+            val expectedParameters = FloatArray(initialParameters.size)
+            val expectedFirstMoments = FloatArray(initialParameters.size)
+            val expectedSecondMoments = FloatArray(initialParameters.size)
+            for (index in initialParameters.indices) {
+                val gradient = initialGradients[index]
+                expectedFirstMoments[index] = (1.0f - beta1) * gradient
+                expectedSecondMoments[index] = (1.0f - beta2) * gradient * gradient
+                val correctedFirst = expectedFirstMoments[index] / biasCorrection1
+                val correctedSecond = expectedSecondMoments[index] / biasCorrection2
+                val update = correctedFirst / (kotlin.math.sqrt(correctedSecond) + epsilon) +
+                    weightDecay * initialParameters[index]
+                expectedParameters[index] = Float16Codec.toFloat(
+                    Float16Codec.fromFiniteFloat(initialParameters[index] - learningRate * update)
+                )
+            }
+
+            val actualParameters = Float16ParameterArray(initialParameters.size)
+            actualParameters.copyPrefixFromLittleEndianByteArray(
+                updatedParameterBytes,
+                initialParameters.size
+            )
+            if (!approximatelyEqual(actualParameters.toFloatArray(), expectedParameters, 2.0e-3f) ||
+                !approximatelyEqual(decodeFloatArray(updatedFirstMomentBytes), expectedFirstMoments, 1.0e-6f) ||
+                !approximatelyEqual(decodeFloatArray(updatedSecondMomentBytes), expectedSecondMoments, 1.0e-7f)) {
+                return false
+            }
+
+            // The validation pass must reject a non-finite gradient before the update pass.
+            val invalidGradientBytes = ByteBuffer.allocate(gradientBytes.size)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .apply {
+                    putFloat(Float.NaN)
+                    putFloat(-0.2f)
+                    putFloat(0.05f)
+                    putFloat(0.025f)
+                }
+                .array()
+            if (!uploadGpuTensor(parameterAllocation, parameterBytes) ||
+                !uploadGpuTensor(gradientAllocation, invalidGradientBytes) ||
+                !uploadGpuTensor(firstMomentAllocation, firstMomentBytes) ||
+                !uploadGpuTensor(secondMomentAllocation, secondMomentBytes) ||
+                !uploadGpuTensor(statusAllocation, ByteArray(Int.SIZE_BYTES))) {
+                return false
+            }
+            if (!nativeApplyResidentAdamWUpdate(
+                    parameterHandles = longArrayOf(parameterAllocation.nativeHandle),
+                    gradientHandle = gradientAllocation.nativeHandle,
+                    firstMomentHandles = longArrayOf(firstMomentAllocation.nativeHandle),
+                    secondMomentHandles = longArrayOf(secondMomentAllocation.nativeHandle),
+                    activeElementCounts = intArrayOf(initialParameters.size),
+                    weightDecayByGroup = floatArrayOf(weightDecay),
+                    learningRate = learningRate,
+                    beta1 = beta1,
+                    beta2 = beta2,
+                    biasCorrection1 = biasCorrection1,
+                    biasCorrection2 = biasCorrection2,
+                    epsilon = epsilon,
+                    gradientClipFactor = 1.0f,
+                    statusHandle = statusAllocation.nativeHandle
+                )) {
+                return false
+            }
+
+            val rejectedStatus = ByteArray(Int.SIZE_BYTES)
+            val rejectedParameters = ByteArray(parameterBytes.size)
+            val rejectedFirstMoments = ByteArray(firstMomentBytes.size)
+            val rejectedSecondMoments = ByteArray(secondMomentBytes.size)
+            if (!downloadGpuTensor(statusAllocation, rejectedStatus) ||
+                ByteBuffer.wrap(rejectedStatus).order(ByteOrder.LITTLE_ENDIAN).int == 0 ||
+                !downloadGpuTensor(parameterAllocation, rejectedParameters) ||
+                !downloadGpuTensor(firstMomentAllocation, rejectedFirstMoments) ||
+                !downloadGpuTensor(secondMomentAllocation, rejectedSecondMoments)) {
+                return false
+            }
+            verified = rejectedParameters.contentEquals(parameterBytes) &&
+                rejectedFirstMoments.contentEquals(firstMomentBytes) &&
+                rejectedSecondMoments.contentEquals(secondMomentBytes)
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident AdamW JNI self-check entry point is unavailable.", error)
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident AdamW numerical self-check failed.", error)
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident AdamW self-check exceeded the available memory budget.", error)
+        } finally {
+            var cleanupSucceeded = true
+            val temporary = listOf(
+                statusAllocation,
+                secondMomentAllocation,
+                firstMomentAllocation,
+                gradientAllocation,
+                parameterAllocation
+            )
+            for (allocation in temporary) {
+                if (allocation != null && !releaseGpuTensor(allocation)) cleanupSucceeded = false
+            }
+            if (!cleanupSucceeded) {
+                Log.e(TAG, "Resident AdamW self-check could not release all temporary tensors.")
+                runCatching { nativeClearTensorArena() }
+            }
+        }
+        return verified
+    }
     private fun verifyResidentBackwardKernels(): Boolean {
         val rows = 5
         val vocabulary = 19
