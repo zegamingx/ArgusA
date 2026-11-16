@@ -2858,7 +2858,7 @@ internal object VulkanTrainingBackend {
             val result = stagedOutputs[index] ?: return false
             System.arraycopy(result, 0, outputs[index], 0, result.size)
         }
-        refreshGpuPerformanceMetrics()
+        runCatching { refreshGpuPerformanceMetrics() }
         _currentBackend = "Vulkan Compute (resident backward)"
         return true
     }
@@ -2957,28 +2957,31 @@ internal object VulkanTrainingBackend {
         val flattened = flattenGradientTensors(gradientTensors, accumulator.tensorSizes) ?: return false
         if (flattened.size != accumulator.elementCount) return false
 
-        return try {
+        val committed = try {
             val inputBytes = encodeFloatArray(flattened)
-            if (!uploadGpuTensor(accumulator.staging, inputBytes)) return false
-            val updated = nativeRunResidentBackward(
-                operation = BACKWARD_GRADIENT_ACCUMULATE,
-                input0Handle = accumulator.staging.nativeHandle,
-                input1Handle = accumulator.active.nativeHandle,
-                input2Handle = 0L,
-                output0Handle = accumulator.spare.nativeHandle,
-                output1Handle = 0L,
-                rows = accumulator.elementCount,
-                columns = 1,
-                sequenceLength = 0,
-                scale = targetWeight.toFloat(),
-                epsilon = 1.0e-5f
-            )
-            if (!updated) return false
-            val previous = accumulator.active
-            accumulator.active = accumulator.spare
-            accumulator.spare = previous
-            refreshGpuPerformanceMetrics()
-            true
+            if (!uploadGpuTensor(accumulator.staging, inputBytes)) {
+                false
+            } else {
+                val updated = nativeRunResidentBackward(
+                    operation = BACKWARD_GRADIENT_ACCUMULATE,
+                    input0Handle = accumulator.staging.nativeHandle,
+                    input1Handle = accumulator.active.nativeHandle,
+                    input2Handle = 0L,
+                    output0Handle = accumulator.spare.nativeHandle,
+                    output1Handle = 0L,
+                    rows = accumulator.elementCount,
+                    columns = 1,
+                    sequenceLength = 0,
+                    scale = targetWeight.toFloat(),
+                    epsilon = 1.0e-5f
+                )
+                if (updated) {
+                    val previous = accumulator.active
+                    accumulator.active = accumulator.spare
+                    accumulator.spare = previous
+                }
+                updated
+            }
         } catch (error: LinkageError) {
             Log.e(TAG, "Resident gradient-accumulation JNI entry point is unavailable.", error)
             false
@@ -2989,6 +2992,11 @@ internal object VulkanTrainingBackend {
             Log.w(TAG, "Resident gradient accumulation exceeded available memory.", error)
             false
         }
+
+        // Once the buffer swap is committed, optional metrics must not turn success into
+        // a failure signal that would cause the caller to append the same sample twice.
+        if (committed) runCatching { refreshGpuPerformanceMetrics() }
+        return committed
     }
 
     @Synchronized

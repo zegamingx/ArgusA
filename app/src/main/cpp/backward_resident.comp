@@ -285,7 +285,7 @@ void normalizeAndClipGradient() {
     // scale is 1 / targetCount and epsilon carries the maximum permitted gradient norm.
     float squaredNorm = uintBitsToFloat(values[parameters.input1OffsetWords]);
     if (isnan(squaredNorm) || isinf(squaredNorm) || squaredNorm < 0.0) {
-        values[parameters.output0OffsetWords + index] = uintBitsToFloat(0x7fc00000u);
+        values[parameters.output0OffsetWords + index] = 0x7fc00000u;
         return;
     }
 
