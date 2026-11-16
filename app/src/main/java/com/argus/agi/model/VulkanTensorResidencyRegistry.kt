@@ -183,6 +183,15 @@ internal class VulkanTensorResidencyRegistry(
     }
 
 
+    /** Marks the host mirrors stale before a dispatch that may mutate resident weights. */
+    @Synchronized
+    fun markDeviceMutationPending(parameters: List<Float16ParameterArray>) {
+        for (parameter in parameters) {
+            val entry = entries[parameter] ?: continue
+            entry.hostMirrorCurrent = false
+        }
+    }
+
     /** Synchronizes one host tensor only when its resident GPU copy has changed. */
     @Synchronized
     fun synchronizeHostMirror(parameters: Float16ParameterArray): Boolean {
