@@ -2831,7 +2831,7 @@ class ArgusNeuralEngine private constructor(
     ) {
         val fp16Dispatched = VulkanTrainingBackend.tryApplyFp16BatchedLinear(
             inputBatches = inputs,
-            weightBatches = Array(weights.size) { index -> weights[index].toShortArray() },
+            weightBatches = weights,
             outputBatches = outputs,
             inputColumns = inputColumns,
             outputColumns = outputColumns,

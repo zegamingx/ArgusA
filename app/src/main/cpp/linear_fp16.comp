@@ -20,6 +20,7 @@ layout(push_constant) uniform LinearParameters {
     uint weightOffset;
     uint outputOffset;
     uint transposeWeights;
+    uint weightOffsetsTableOffset;
 } parameters;
 
 const uint TILE_ROWS = 8u;
@@ -60,9 +61,13 @@ void main() {
         const uint inputBatchOffset =
             parameters.inputOffset +
             batchIndex * parameters.rowsPerBatch * parameters.inputColumns;
-        const uint weightBatchOffset =
+        uint weightBatchOffset =
             parameters.weightOffset +
             batchIndex * parameters.inputColumns * parameters.outputColumns;
+        if (parameters.weightOffsetsTableOffset != 0xffffffffu) {
+            // Entries contain half-element offsets into the Tensor Arena.
+            weightBatchOffset = values[parameters.weightOffsetsTableOffset + batchIndex];
+        }
 
         float accumulated = 0.0;
         for (uint kBase = 0u; kBase < parameters.inputColumns; kBase += TILE_K) {

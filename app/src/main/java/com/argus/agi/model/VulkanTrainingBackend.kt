@@ -1191,9 +1191,11 @@ internal object VulkanTrainingBackend {
         val updated = try {
             nativeApplyFp16LinearWithArena(
                 input = flattenedInput,
-                weightHandle = weightAllocation.nativeHandle,
+                weightHandles = longArrayOf(weightAllocation.nativeHandle),
                 output = flattenedOutput,
                 rows = rowCount,
+                batchCount = 1,
+                rowsPerBatch = rowCount,
                 inputColumns = inputColumns,
                 outputColumns = outputColumns,
                 transposeWeights = transposeWeights
@@ -1231,24 +1233,33 @@ internal object VulkanTrainingBackend {
     @Synchronized
     fun tryApplyFp16BatchedLinear(
         inputBatches: Array<Array<FloatArray>>,
-        weightBatches: Array<ShortArray>,
+        weightBatches: Array<Float16ParameterArray>,
         outputBatches: Array<Array<FloatArray>>,
         inputColumns: Int,
         outputColumns: Int,
         transposeWeights: Boolean = false
     ): Boolean {
-        require(inputBatches.isNotEmpty()) { "FP16 batched linear input must contain at least one batch." }
+        require(inputBatches.isNotEmpty()) {
+            "FP16 batched linear input must contain at least one batch."
+        }
         require(inputColumns > 0 && outputColumns > 0) {
             "FP16 batched linear dimensions must be positive."
         }
+
         val batchCount = inputBatches.size
         require(weightBatches.size == batchCount && outputBatches.size == batchCount) {
             "FP16 batched linear inputs, weights, and outputs must have the same batch count."
         }
+
         val rowsPerBatch = inputBatches[0].size
-        require(rowsPerBatch > 0) { "Every FP16 batched linear input must contain at least one row." }
-        val requiredWeightElementsLong =
-            inputColumns.toLong() * outputColumns.toLong()
+        require(rowsPerBatch > 0) {
+            "Every FP16 batched linear input must contain at least one row."
+        }
+
+        val requiredWeightElementsLong = Math.multiplyExact(
+            inputColumns.toLong(),
+            outputColumns.toLong()
+        )
         if (requiredWeightElementsLong > Int.MAX_VALUE.toLong()) return false
         val requiredWeightElements = requiredWeightElementsLong.toInt()
 
@@ -1259,13 +1270,8 @@ internal object VulkanTrainingBackend {
             require(outputBatches[batchIndex].size == rowsPerBatch) {
                 "FP16 batched linear outputs must match the input row count."
             }
-            // Some model tensors are allocated to their maximum capacity while a
-            // training pass only uses an active prefix (for example, wHead when the
-            // tokenizer vocabulary has not filled its configured capacity).
-            // The staging copy below intentionally copies only this active matrix.
-            if (weightBatches[batchIndex].size < requiredWeightElements) {
-                return false
-            }
+            if (weightBatches[batchIndex].size < requiredWeightElements) return false
+
             for (row in 0 until rowsPerBatch) {
                 require(inputBatches[batchIndex][row].size == inputColumns) {
                     "FP16 input row $row in batch $batchIndex has an unexpected width."
@@ -1279,61 +1285,68 @@ internal object VulkanTrainingBackend {
         val totalRowsLong = batchCount.toLong() * rowsPerBatch.toLong()
         if (totalRowsLong > Int.MAX_VALUE.toLong()) return false
 
-        val inputElementsLong = totalRowsLong * inputColumns.toLong()
-        val weightElementsLong = batchCount.toLong() * requiredWeightElements.toLong()
-        val outputElementsLong = totalRowsLong * outputColumns.toLong()
+        val inputElementsLong = runCatching {
+            Math.multiplyExact(totalRowsLong, inputColumns.toLong())
+        }.getOrNull() ?: return false
+        val outputElementsLong = runCatching {
+            Math.multiplyExact(totalRowsLong, outputColumns.toLong())
+        }.getOrNull() ?: return false
+        val totalWeightElementsLong = runCatching {
+            Math.multiplyExact(batchCount.toLong(), requiredWeightElementsLong)
+        }.getOrNull() ?: return false
         if (inputElementsLong > Int.MAX_VALUE.toLong() ||
-            weightElementsLong > Int.MAX_VALUE.toLong() ||
-            outputElementsLong > Int.MAX_VALUE.toLong()) {
+            outputElementsLong > Int.MAX_VALUE.toLong() ||
+            totalWeightElementsLong > Int.MAX_VALUE.toLong()) {
             return false
         }
 
-        val operationCount = totalRowsLong *
-            inputColumns.toLong() *
-            outputColumns.toLong()
-        if (!isFp16ComputeAvailable ||
-            operationCount < MIN_LINEAR_OPERATION_COUNT) {
+        val operationCount = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(totalRowsLong, inputColumns.toLong()),
+                outputColumns.toLong()
+            )
+        }.getOrNull() ?: return false
+        if (!isFp16ComputeAvailable || operationCount < MIN_LINEAR_OPERATION_COUNT) {
             return false
         }
 
         val flattenedInput: FloatArray
-        val flattenedWeights: ShortArray
         val flattenedOutput: FloatArray
         try {
             flattenedInput = FloatArray(inputElementsLong.toInt())
-            flattenedWeights = ShortArray(weightElementsLong.toInt())
             flattenedOutput = FloatArray(outputElementsLong.toInt())
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Not enough heap memory to stage a Vulkan FP16 linear operation.", error)
+            Log.w(TAG, "Not enough heap memory to stage FP16 batched linear activations.", error)
             return false
         }
 
         val inputBatchSize = rowsPerBatch * inputColumns
-        val weightBatchSize = requiredWeightElements
         for (batchIndex in 0 until batchCount) {
-            val inputOffset = batchIndex * inputBatchSize
+            val inputBatchOffset = batchIndex * inputBatchSize
             for (row in 0 until rowsPerBatch) {
                 System.arraycopy(
                     inputBatches[batchIndex][row],
                     0,
                     flattenedInput,
-                    inputOffset + row * inputColumns,
+                    inputBatchOffset + row * inputColumns,
                     inputColumns
                 )
             }
-            System.arraycopy(
-                weightBatches[batchIndex],
-                0,
-                flattenedWeights,
-                batchIndex * weightBatchSize,
-                weightBatchSize
-            )
+        }
+
+        // The registry keeps one GPU allocation per authoritative Kotlin tensor.
+        // Unchanged revisions reuse their allocation without another weight upload.
+        val weightHandles = LongArray(batchCount)
+        for (batchIndex in 0 until batchCount) {
+            val allocation = tensorResidencyRegistry.acquire(weightBatches[batchIndex])
+                ?: return false
+            weightHandles[batchIndex] = allocation.nativeHandle
         }
 
         val updated = try {
-            nativeApplyFp16Linear(
+            nativeApplyFp16LinearWithArena(
                 input = flattenedInput,
-                weights = flattenedWeights,
+                weightHandles = weightHandles,
                 output = flattenedOutput,
                 rows = totalRowsLong.toInt(),
                 batchCount = batchCount,
@@ -1343,17 +1356,21 @@ internal object VulkanTrainingBackend {
                 transposeWeights = transposeWeights
             )
         } catch (error: LinkageError) {
-            Log.e(TAG, "Vulkan FP16 linear entry point is unavailable; disabling FP16 dispatch.", error)
+            Log.e(TAG, "Persistent batched FP16 Vulkan entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Vulkan FP16 linear dispatch failed; disabling FP16 dispatch.", error)
+            Log.e(TAG, "Persistent batched FP16 Vulkan dispatch failed.", error)
             false
         }
 
         if (!updated) {
             fp16DisabledAfterRuntimeFailure = true
             fp16RuntimeReady = false
-            Log.w(TAG, "Vulkan FP16 dispatch was not completed; the verified FP32 Vulkan/CPU path remains available.")
+            tensorResidencyRegistry.invalidate(releaseAllocations = true)
+            Log.w(
+                TAG,
+                "Persistent batched FP16 dispatch failed; retaining the verified FP32 Vulkan/CPU fallback."
+            )
             return false
         }
 
@@ -1370,8 +1387,9 @@ internal object VulkanTrainingBackend {
                 )
             }
         }
+
         refreshGpuPerformanceMetrics()
-        _currentBackend = "Vulkan Compute (FP16 multiply / FP32 accumulation)"
+        _currentBackend = "Vulkan Compute (FP16 persistent batched model weights)"
         return true
     }
 
@@ -1827,9 +1845,11 @@ internal object VulkanTrainingBackend {
 
     private external fun nativeApplyFp16LinearWithArena(
         input: FloatArray,
-        weightHandle: Long,
+        weightHandles: LongArray,
         output: FloatArray,
         rows: Int,
+        batchCount: Int,
+        rowsPerBatch: Int,
         inputColumns: Int,
         outputColumns: Int,
         transposeWeights: Boolean

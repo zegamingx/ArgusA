@@ -62,10 +62,12 @@ struct LinearPushConstants {
     uint32_t weightOffset;
     uint32_t outputOffset;
     uint32_t transposeWeights;
+    uint32_t weightOffsetsTableOffset = std::numeric_limits<uint32_t>::max();
 };
 
-static_assert(sizeof(LinearPushConstants) == 36);
+static_assert(sizeof(LinearPushConstants) == 40);
 static_assert(offsetof(LinearPushConstants, transposeWeights) == 32);
+static_assert(offsetof(LinearPushConstants, weightOffsetsTableOffset) == 36);
 
 struct CooperativeMatrixCapability {
     uint32_t mSize = 0;
@@ -3855,9 +3857,11 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
     JNIEnv* env,
     jobject,
     jfloatArray inputArray,
-    jlong weightHandle,
+    jlongArray weightHandleArray,
     jfloatArray outputArray,
     jint rowCount,
+    jint batchCount,
+    jint rowsPerBatch,
     jint inputColumns,
     jint outputColumns,
     jboolean transposeWeights
@@ -3872,18 +3876,26 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
         gRuntime.queueSubmit2 == nullptr ||
         gRuntime.cmdPipelineBarrier2 == nullptr ||
         inputArray == nullptr ||
+        weightHandleArray == nullptr ||
         outputArray == nullptr ||
         rowCount <= 0 ||
+        batchCount <= 0 ||
+        rowsPerBatch <= 0 ||
+        static_cast<uint64_t>(batchCount) * static_cast<uint64_t>(rowsPerBatch) !=
+            static_cast<uint64_t>(rowCount) ||
         inputColumns <= 0 ||
         outputColumns <= 0) {
         return JNI_FALSE;
     }
 
     const uint64_t rows = static_cast<uint64_t>(rowCount);
+    const uint64_t batches = static_cast<uint64_t>(batchCount);
+    const uint64_t rowsInBatch = static_cast<uint64_t>(rowsPerBatch);
     const uint64_t inputWidth = static_cast<uint64_t>(inputColumns);
     const uint64_t outputWidth = static_cast<uint64_t>(outputColumns);
     const uint64_t maximumArrayElements =
         static_cast<uint64_t>(std::numeric_limits<jsize>::max());
+
     if (rows > maximumArrayElements / inputWidth ||
         rows > maximumArrayElements / outputWidth ||
         inputWidth > maximumArrayElements / outputWidth) {
@@ -3893,96 +3905,159 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
     const uint64_t inputElements = rows * inputWidth;
     const uint64_t outputElements = rows * outputWidth;
     const uint64_t weightElements = inputWidth * outputWidth;
-    const jsize actualInputCount = env->GetArrayLength(inputArray);
-    if (env->ExceptionCheck() ||
-        actualInputCount != static_cast<jsize>(inputElements)) {
-        return JNI_FALSE;
-    }
-    const jsize actualOutputCount = env->GetArrayLength(outputArray);
-    if (env->ExceptionCheck() ||
-        actualOutputCount != static_cast<jsize>(outputElements) ||
-        weightElements > std::numeric_limits<uint64_t>::max() / sizeof(uint16_t) ||
-        outputElements > std::numeric_limits<uint64_t>::max() / sizeof(float)) {
+    if (inputElements > std::numeric_limits<uint32_t>::max() ||
+        outputElements > std::numeric_limits<uint32_t>::max() ||
+        weightElements > maximumArrayElements ||
+        weightElements > std::numeric_limits<uint32_t>::max()) {
         return JNI_FALSE;
     }
 
-    const VkDeviceSize weightByteCount =
-        static_cast<VkDeviceSize>(weightElements * sizeof(uint16_t));
-    const VkDeviceSize inputByteCount =
-        static_cast<VkDeviceSize>(inputElements * sizeof(uint16_t));
-    const VkDeviceSize outputByteCount =
-        static_cast<VkDeviceSize>(outputElements * sizeof(float));
+    if (env->GetArrayLength(inputArray) != static_cast<jsize>(inputElements) ||
+        env->GetArrayLength(outputArray) != static_cast<jsize>(outputElements) ||
+        env->GetArrayLength(weightHandleArray) != batchCount ||
+        env->ExceptionCheck()) {
+        return JNI_FALSE;
+    }
+
+    std::vector<jlong> weightHandles;
+    try {
+        weightHandles.resize(static_cast<size_t>(batches));
+    } catch (const std::bad_alloc&) {
+        logError("Persistent FP16 batch handle staging allocation failed.");
+        return JNI_FALSE;
+    }
+    env->GetLongArrayRegion(
+        weightHandleArray,
+        0,
+        batchCount,
+        weightHandles.data()
+    );
+    if (env->ExceptionCheck()) return JNI_FALSE;
+
+    const uint64_t weightByteCount64 = weightElements * sizeof(uint16_t);
+    const uint64_t inputByteCount64 = inputElements * sizeof(uint16_t);
+    const uint64_t outputByteCount64 = outputElements * sizeof(float);
+    if (weightByteCount64 == 0u ||
+        inputByteCount64 == 0u ||
+        outputByteCount64 == 0u ||
+        weightByteCount64 > std::numeric_limits<VkDeviceSize>::max() ||
+        inputByteCount64 > std::numeric_limits<VkDeviceSize>::max() ||
+        outputByteCount64 > std::numeric_limits<VkDeviceSize>::max()) {
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize weightByteCount = static_cast<VkDeviceSize>(weightByteCount64);
+    const VkDeviceSize inputByteCount = static_cast<VkDeviceSize>(inputByteCount64);
+    const VkDeviceSize outputByteCount = static_cast<VkDeviceSize>(outputByteCount64);
 
     VkDeviceSize inputPaddedBytes = 0u;
-    if (!alignArenaSize(inputByteCount, 4u, inputPaddedBytes) ||
-        outputByteCount == 0u ||
-        inputPaddedBytes > std::numeric_limits<VkDeviceSize>::max() - outputByteCount) {
+    if (!alignArenaSize(inputByteCount, 4u, inputPaddedBytes)) {
         return JNI_FALSE;
     }
-    const VkDeviceSize scratchByteCount = inputPaddedBytes + outputByteCount;
+
+    const VkDeviceSize tableByteCount =
+        static_cast<VkDeviceSize>(batches * sizeof(uint32_t));
+    if (inputPaddedBytes > std::numeric_limits<VkDeviceSize>::max() - outputByteCount ||
+        inputPaddedBytes + outputByteCount >
+            std::numeric_limits<VkDeviceSize>::max() - tableByteCount ||
+        inputPaddedBytes > std::numeric_limits<VkDeviceSize>::max() - tableByteCount) {
+        return JNI_FALSE;
+    }
+    const VkDeviceSize scratchByteCount =
+        inputPaddedBytes + outputByteCount + tableByteCount;
+    const VkDeviceSize inputAndTableByteCount =
+        inputPaddedBytes + tableByteCount;
+
     const VkDeviceSize maximumStorageRange =
         gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
-    if (weightByteCount == 0u ||
-        weightByteCount > maximumStorageRange ||
+    if (weightByteCount > maximumStorageRange ||
         scratchByteCount > maximumStorageRange ||
-        outputByteCount > maximumStorageRange ||
-        inputPaddedBytes > maximumStorageRange) {
+        inputAndTableByteCount > maximumStorageRange ||
+        outputByteCount > maximumStorageRange) {
         return JNI_FALSE;
     }
 
     constexpr uint64_t kTileRows = 8u;
     constexpr uint64_t kTileColumns = 16u;
-    const uint64_t tileRows = 1u + (rows - 1u) / kTileRows;
-    const uint64_t tileColumns = 1u + (outputWidth - 1u) / kTileColumns;
-    if (tileRows > std::numeric_limits<uint64_t>::max() / tileColumns) {
+    const uint64_t tileRowsPerBatch = 1u + (rowsInBatch - 1u) / kTileRows;
+    const uint64_t tileColumnsPerBatch = 1u + (outputWidth - 1u) / kTileColumns;
+    if (tileRowsPerBatch > std::numeric_limits<uint64_t>::max() / tileColumnsPerBatch) {
         return JNI_FALSE;
     }
-    const uint64_t totalTileCount = tileRows * tileColumns;
+    const uint64_t tilesPerBatch = tileRowsPerBatch * tileColumnsPerBatch;
+    if (batches > std::numeric_limits<uint64_t>::max() / tilesPerBatch) {
+        return JNI_FALSE;
+    }
+    const uint64_t totalTileCount = batches * tilesPerBatch;
     const uint32_t workGroupCount = calculateDispatchGroupCount(totalTileCount);
     if (workGroupCount == 0u) {
-        logError("Persistent-weight FP16 linear dispatch has no available workgroups.");
+        logError("Persistent batched FP16 linear dispatch has no available workgroups.");
         return JNI_FALSE;
     }
 
     const jlong scratchHandle = allocateArenaTensor(scratchByteCount);
     if (scratchHandle == 0) {
-        logError("Persistent-weight FP16 linear scratch allocation failed.");
+        logError("Persistent batched FP16 linear scratch allocation failed.");
         return JNI_FALSE;
     }
     ScopedTensorArenaAllocation scratchRelease(static_cast<uint64_t>(scratchHandle));
-
-    // Resolve handles after allocation because arena growth may relocate metadata.
-    TensorArenaAllocation* weightAllocation = findArenaAllocation(weightHandle);
-    TensorArenaAllocation* scratchAllocation = findArenaAllocation(scratchHandle);
-    if (weightAllocation == nullptr ||
-        scratchAllocation == nullptr ||
-        weightAllocation->logicalSize < weightByteCount ||
+    TensorArenaAllocation* scratchAllocation =
+        findArenaAllocation(static_cast<uint64_t>(scratchHandle));
+    if (scratchAllocation == nullptr ||
         scratchAllocation->logicalSize < scratchByteCount) {
-        logError("Persistent-weight FP16 linear received an invalid arena allocation.");
+        logError("Persistent batched FP16 linear scratch allocation is invalid.");
         return JNI_FALSE;
     }
 
-    if ((scratchAllocation->offset & 3u) != 0u ||
-        (weightAllocation->offset & 1u) != 0u ||
+    std::vector<TensorArenaAllocation*> weightAllocations;
+    try {
+        weightAllocations.reserve(static_cast<size_t>(batches));
+    } catch (const std::bad_alloc&) {
+        logError("Persistent FP16 batch allocation metadata staging failed.");
+        return JNI_FALSE;
+    }
+
+    for (uint64_t batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+        const jlong handle = weightHandles[static_cast<size_t>(batchIndex)];
+        if (handle <= 0) {
+            logError("Persistent FP16 batch contains an invalid tensor handle.");
+            return JNI_FALSE;
+        }
+        TensorArenaAllocation* allocation =
+            findArenaAllocation(static_cast<uint64_t>(handle));
+        if (allocation == nullptr ||
+            allocation->logicalSize < weightByteCount ||
+            (allocation->offset & 1u) != 0u ||
+            allocation->offset / 2u > std::numeric_limits<uint32_t>::max()) {
+            logError("Persistent FP16 batch references an invalid or undersized weight allocation.");
+            return JNI_FALSE;
+        }
+        weightAllocations.push_back(allocation);
+    }
+
+    const VkDeviceSize scratchEnd = scratchAllocation->offset + scratchByteCount;
+    const VkDeviceSize offsetTableByteOffset =
+        scratchAllocation->offset + inputPaddedBytes + outputByteCount;
+    if (scratchEnd < scratchAllocation->offset ||
+        (scratchAllocation->offset & 3u) != 0u ||
         scratchAllocation->offset / 2u > std::numeric_limits<uint32_t>::max() ||
-        weightAllocation->offset / 2u > std::numeric_limits<uint32_t>::max() ||
         (scratchAllocation->offset + inputPaddedBytes) / 4u >
             std::numeric_limits<uint32_t>::max() ||
-        inputElements > std::numeric_limits<uint32_t>::max() ||
-        outputElements > std::numeric_limits<uint32_t>::max() ||
-        weightElements > std::numeric_limits<uint32_t>::max()) {
-        logError("Persistent-weight FP16 linear tensor offsets exceed shader address limits.");
+        offsetTableByteOffset / 4u > std::numeric_limits<uint32_t>::max() ||
+        offsetTableByteOffset / 4u + batches - 1u >
+            std::numeric_limits<uint32_t>::max()) {
+        logError("Persistent batched FP16 scratch offsets exceed shader address limits.");
         return JNI_FALSE;
     }
 
-    const VkDeviceSize stagingCapacity = std::max(inputPaddedBytes, outputByteCount);
+    const VkDeviceSize stagingCapacity = std::max(inputAndTableByteCount, outputByteCount);
     if (!ensureStorageBuffer(stagingCapacity) || gRuntime.mappedStorage == nullptr) {
-        logError("Persistent-weight FP16 linear staging-buffer allocation failed.");
+        logError("Persistent batched FP16 staging-buffer allocation failed.");
         return JNI_FALSE;
     }
 
     auto* mappedWords = static_cast<uint32_t*>(gRuntime.mappedStorage);
-    std::memset(mappedWords, 0, static_cast<size_t>(inputPaddedBytes));
+    std::memset(mappedWords, 0, static_cast<size_t>(inputAndTableByteCount));
 
     constexpr size_t kInputConversionChunkElements = 8192u;
     std::array<jfloat, kInputConversionChunkElements> inputChunk{};
@@ -4007,12 +4082,12 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
             const uint64_t absoluteIndex = chunkOffset + localIndex;
             const float firstValue = inputChunk[localIndex];
             if (!std::isfinite(firstValue)) {
-                logError("Persistent-weight FP16 linear input contains a non-finite activation.");
+                logError("Persistent batched FP16 input contains a non-finite activation.");
                 return JNI_FALSE;
             }
             const uint16_t lowHalf = floatToHalf(firstValue);
             if ((lowHalf & 0x7C00u) == 0x7C00u) {
-                logError("Persistent-weight FP16 linear input exceeds the finite binary16 range.");
+                logError("Persistent batched FP16 input exceeds the finite binary16 range.");
                 return JNI_FALSE;
             }
 
@@ -4020,12 +4095,12 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
             if (localIndex + 1u < chunkCount) {
                 const float secondValue = inputChunk[localIndex + 1u];
                 if (!std::isfinite(secondValue)) {
-                    logError("Persistent-weight FP16 linear input contains a non-finite activation.");
+                    logError("Persistent batched FP16 input contains a non-finite activation.");
                     return JNI_FALSE;
                 }
                 const uint16_t highHalf = floatToHalf(secondValue);
                 if ((highHalf & 0x7C00u) == 0x7C00u) {
-                    logError("Persistent-weight FP16 linear input exceeds the finite binary16 range.");
+                    logError("Persistent batched FP16 input exceeds the finite binary16 range.");
                     return JNI_FALSE;
                 }
                 packed |= static_cast<uint32_t>(highHalf) << 16u;
@@ -4034,11 +4109,19 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
         }
     }
 
+    auto* offsetTableWords = mappedWords + inputPaddedBytes / sizeof(uint32_t);
+    for (uint64_t batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+        const VkDeviceSize halfOffset =
+            weightAllocations[static_cast<size_t>(batchIndex)]->offset / 2u;
+        if (halfOffset > std::numeric_limits<uint32_t>::max()) return JNI_FALSE;
+        offsetTableWords[batchIndex] = static_cast<uint32_t>(halfOffset);
+    }
+
     if (!syncStagingMemory(false)) return JNI_FALSE;
 
     VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
     if (result != VK_SUCCESS) {
-        logError("Failed to reset the persistent-weight FP16 command buffer.", result);
+        logError("Failed to reset the persistent batched FP16 command buffer.", result);
         return JNI_FALSE;
     }
 
@@ -4047,21 +4130,26 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
     if (result != VK_SUCCESS) {
-        logError("Failed to begin the persistent-weight FP16 command buffer.", result);
+        logError("Failed to begin the persistent batched FP16 command buffer.", result);
         return JNI_FALSE;
     }
 
     VkBufferMemoryBarrier2KHR beforeInputCopy[2]{};
     beforeInputCopy[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
-    beforeInputCopy[0].srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
-    beforeInputCopy[0].srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
+    beforeInputCopy[0].srcStageMask =
+        VK_PIPELINE_STAGE_2_HOST_BIT_KHR | VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    beforeInputCopy[0].srcAccessMask =
+        VK_ACCESS_2_HOST_WRITE_BIT_KHR |
+        VK_ACCESS_2_HOST_READ_BIT_KHR |
+        VK_ACCESS_2_TRANSFER_READ_BIT_KHR |
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
     beforeInputCopy[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
     beforeInputCopy[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
     beforeInputCopy[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     beforeInputCopy[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     beforeInputCopy[0].buffer = gRuntime.storageBuffer;
     beforeInputCopy[0].offset = 0u;
-    beforeInputCopy[0].size = inputPaddedBytes;
+    beforeInputCopy[0].size = inputAndTableByteCount;
 
     beforeInputCopy[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
     beforeInputCopy[1].srcStageMask =
@@ -4077,7 +4165,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
     beforeInputCopy[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     beforeInputCopy[1].buffer = gRuntime.tensorArenaBuffer;
     beforeInputCopy[1].offset = scratchAllocation->offset;
-    beforeInputCopy[1].size = inputPaddedBytes;
+    beforeInputCopy[1].size = scratchByteCount;
 
     VkDependencyInfoKHR beforeInputDependency{};
     beforeInputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
@@ -4085,65 +4173,37 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
     beforeInputDependency.pBufferMemoryBarriers = beforeInputCopy;
     gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeInputDependency);
 
-    VkBufferCopy inputCopy{};
-    inputCopy.srcOffset = 0u;
-    inputCopy.dstOffset = scratchAllocation->offset;
-    inputCopy.size = inputPaddedBytes;
+    VkBufferCopy inputAndTableCopies[2]{};
+    inputAndTableCopies[0].srcOffset = 0u;
+    inputAndTableCopies[0].dstOffset = scratchAllocation->offset;
+    inputAndTableCopies[0].size = inputPaddedBytes;
+    inputAndTableCopies[1].srcOffset = inputPaddedBytes;
+    inputAndTableCopies[1].dstOffset = offsetTableByteOffset;
+    inputAndTableCopies[1].size = tableByteCount;
     vkCmdCopyBuffer(
         gRuntime.commandBuffer,
         gRuntime.storageBuffer,
         gRuntime.tensorArenaBuffer,
-        1u,
-        &inputCopy
+        2u,
+        inputAndTableCopies
     );
 
-    VkBufferMemoryBarrier2KHR beforeCompute[3]{};
-    beforeCompute[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
-    beforeCompute[0].srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
-    beforeCompute[0].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
-    beforeCompute[0].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
-    beforeCompute[0].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR;
-    beforeCompute[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    beforeCompute[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    beforeCompute[0].buffer = gRuntime.tensorArenaBuffer;
-    beforeCompute[0].offset = scratchAllocation->offset;
-    beforeCompute[0].size = inputPaddedBytes;
-
-    beforeCompute[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
-    beforeCompute[1].srcStageMask =
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
         VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
-    beforeCompute[1].srcAccessMask =
+    beforeCompute.srcAccessMask =
         VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
-    beforeCompute[1].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
-    beforeCompute[1].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR;
-    beforeCompute[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    beforeCompute[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    beforeCompute[1].buffer = gRuntime.tensorArenaBuffer;
-    beforeCompute[1].offset = weightAllocation->offset;
-    beforeCompute[1].size = weightByteCount;
-
-    beforeCompute[2].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
-    beforeCompute[2].srcStageMask =
-        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
-    beforeCompute[2].srcAccessMask =
-        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
         VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
-    beforeCompute[2].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
-    beforeCompute[2].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
-    beforeCompute[2].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    beforeCompute[2].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    beforeCompute[2].buffer = gRuntime.tensorArenaBuffer;
-    beforeCompute[2].offset = scratchAllocation->offset + inputPaddedBytes;
-    beforeCompute[2].size = outputByteCount;
-
     VkDependencyInfoKHR beforeComputeDependency{};
     beforeComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
-    beforeComputeDependency.bufferMemoryBarrierCount = 3u;
-    beforeComputeDependency.pBufferMemoryBarriers = beforeCompute;
+    beforeComputeDependency.memoryBarrierCount = 1u;
+    beforeComputeDependency.pMemoryBarriers = &beforeCompute;
     gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeComputeDependency);
 
     const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
@@ -4165,16 +4225,15 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
 
     const LinearPushConstants pushConstants{
         static_cast<uint32_t>(rowCount),
-        1u,
-        static_cast<uint32_t>(rowCount),
+        static_cast<uint32_t>(batchCount),
+        static_cast<uint32_t>(rowsPerBatch),
         static_cast<uint32_t>(inputColumns),
         static_cast<uint32_t>(outputColumns),
         static_cast<uint32_t>(scratchAllocation->offset / 2u),
-        static_cast<uint32_t>(weightAllocation->offset / 2u),
-        static_cast<uint32_t>(
-            (scratchAllocation->offset + inputPaddedBytes) / 4u
-        ),
-        transposeWeights == JNI_TRUE ? 1u : 0u
+        0u,
+        static_cast<uint32_t>((scratchAllocation->offset + inputPaddedBytes) / 4u),
+        transposeWeights == JNI_TRUE ? 1u : 0u,
+        static_cast<uint32_t>(offsetTableByteOffset / 4u)
     };
     vkCmdPushConstants(
         gRuntime.commandBuffer,
@@ -4258,10 +4317,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
 
     result = vkEndCommandBuffer(gRuntime.commandBuffer);
     if (result != VK_SUCCESS) {
-        logError("Failed to finish the persistent-weight FP16 command buffer.", result);
+        logError("Failed to finish the persistent batched FP16 command buffer.", result);
         return JNI_FALSE;
     }
-    if (!submitAndWait("Persistent-weight FP16 submission or fence wait failed.")) {
+    if (!submitAndWait("Persistent batched FP16 submission or fence wait failed.")) {
         return JNI_FALSE;
     }
     if (timestampCapture) {
@@ -4275,7 +4334,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
     const auto* outputValues = static_cast<const float*>(gRuntime.mappedStorage);
     for (uint64_t index = 0u; index < outputElements; ++index) {
         if (!std::isfinite(outputValues[index])) {
-            logError("Persistent-weight FP16 linear kernel produced a non-finite result.");
+            logError("Persistent batched FP16 linear kernel produced a non-finite result.");
             return JNI_FALSE;
         }
     }
@@ -4288,6 +4347,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
     if (env->ExceptionCheck()) return JNI_FALSE;
     return JNI_TRUE;
 }
+
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDriverInfo(

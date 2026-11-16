@@ -34,6 +34,39 @@ class VulkanTensorResidencyRegistryTest {
     }
 
     @Test
+    fun keepsIndependentBatchTensorsResidentAndRefreshesOnlyMutatedWeights() {
+        var nextHandle = 1L
+        val uploadedHandles = mutableListOf<Long>()
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount -> VulkanTensorAllocation(nextHandle++, byteCount) },
+            upload = { allocation, _ -> uploadedHandles += allocation.nativeHandle; true },
+            release = { true }
+        )
+        val queryWeights = Float16ParameterArray.fromFloatArray(floatArrayOf(0.1f, 0.2f))
+        val keyWeights = Float16ParameterArray.fromFloatArray(floatArrayOf(0.3f, 0.4f))
+        val valueWeights = Float16ParameterArray.fromFloatArray(floatArrayOf(0.5f, 0.6f))
+
+        val firstBatch = listOf(queryWeights, keyWeights, valueWeights).map(registry::acquire)
+        val secondBatch = listOf(queryWeights, keyWeights, valueWeights).map(registry::acquire)
+
+        assertEquals(3, firstBatch.mapNotNull { it?.nativeHandle }.distinct().size)
+        assertEquals(
+            firstBatch.map { it?.nativeHandle },
+            secondBatch.map { it?.nativeHandle }
+        )
+        assertEquals(3, uploadedHandles.size)
+        assertEquals(3, registry.residentTensorCount())
+
+        keyWeights[0] = 0.9f
+        registry.acquire(queryWeights)
+        registry.acquire(keyWeights)
+        registry.acquire(valueWeights)
+
+        assertEquals(4, uploadedHandles.size)
+        assertEquals(3, registry.residentTensorCount())
+    }
+
+    @Test
     fun serializesHalfValuesInLittleEndianOrder() {
         val weights = Float16ParameterArray.fromFloatArray(floatArrayOf(1.0f, -2.0f))
         assertArrayEquals(
