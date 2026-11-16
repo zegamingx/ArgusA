@@ -286,4 +286,76 @@ class VulkanTensorResidencyRegistryTest {
         assertEquals(2, releaseCount)
         assertEquals(0, registry.residentTensorCount())
     }
+    @Test
+    fun synchronizesHostParameterMirrorsOnlyAfterEveryGpuReadbackSucceeds() {
+        var nextHandle = 1L
+        val gpuBytes = LinkedHashMap<Long, ByteArray>()
+        var failedHandle: Long? = null
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount ->
+                VulkanTensorAllocation(nextHandle++, byteCount)
+            },
+            upload = { allocation, bytes ->
+                gpuBytes[allocation.nativeHandle] = bytes.copyOf()
+                true
+            },
+            download = { allocation, destination ->
+                if (allocation.nativeHandle == failedHandle) {
+                    false
+                } else {
+                    val source = gpuBytes[allocation.nativeHandle] ?: return@VulkanTensorResidencyRegistry false
+                    if (source.size != destination.size) {
+                        false
+                    } else {
+                        source.copyInto(destination)
+                        true
+                    }
+                }
+            },
+            release = { allocation ->
+                gpuBytes.remove(allocation.nativeHandle) != null
+            }
+        )
+        val first = Float16ParameterArray.fromFloatArray(floatArrayOf(0.25f, -0.5f))
+        val second = Float16ParameterArray.fromFloatArray(floatArrayOf(0.75f, -1.0f))
+        assertTrue(
+            registry.synchronizeAll(
+                listOf(
+                    VulkanModelParameterTensor("first", first),
+                    VulkanModelParameterTensor("second", second)
+                )
+            )
+        )
+        val firstAllocation = registry.acquire(first) ?: error("First allocation missing.")
+        val secondAllocation = registry.acquire(second) ?: error("Second allocation missing.")
+        val previousFirst = first.toShortArray()
+        val previousSecond = second.toShortArray()
+        gpuBytes[firstAllocation.nativeHandle] =
+            Float16ParameterArray.fromFloatArray(floatArrayOf(1.25f, 1.5f)).toLittleEndianByteArray()
+        gpuBytes[secondAllocation.nativeHandle] =
+            Float16ParameterArray.fromFloatArray(floatArrayOf(1.75f, 2.0f)).toLittleEndianByteArray()
+        failedHandle = secondAllocation.nativeHandle
+
+        assertFalse(registry.synchronizeHostMirrors())
+        assertArrayEquals(previousFirst, first.toShortArray())
+        assertArrayEquals(previousSecond, second.toShortArray())
+
+        failedHandle = null
+        assertTrue(registry.synchronizeHostMirrors())
+        assertArrayEquals(
+            Float16ParameterArray.fromFloatArray(floatArrayOf(1.25f, 1.5f)).toShortArray(),
+            first.toShortArray()
+        )
+        assertArrayEquals(
+            Float16ParameterArray.fromFloatArray(floatArrayOf(1.75f, 2.0f)).toShortArray(),
+            second.toShortArray()
+        )
+        assertTrue(registry.isSynchronizedWith(
+            listOf(
+                VulkanModelParameterTensor("first", first),
+                VulkanModelParameterTensor("second", second)
+            )
+        ))
+    }
+
 }
