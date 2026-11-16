@@ -915,6 +915,9 @@ class ArgusNeuralEngine private constructor(
 
     private fun resizeVocabCapacityTo(targetCap: Int) {
         if (targetCap <= 0 || targetCap == vocabCap) return
+        check(VulkanTrainingBackend.synchronizeTrainingStateMirrors()) {
+            "GPU model weights and optimizer moments must be recovered before vocabulary capacity changes."
+        }
         requireSafeVocabularyCapacity(targetCap)
         val targetElements = Math.multiplyExact(targetCap, dModel)
         val newEmbed = Float16ParameterArray(targetElements)
@@ -963,6 +966,9 @@ class ArgusNeuralEngine private constructor(
         generationContext.ensureActive()
         synchronized(modelLock) {
             generationContext.ensureActive()
+            check(VulkanTrainingBackend.synchronizeModelParameterMirrors()) {
+                "GPU-resident model weights could not be recovered before CPU autoregressive inference."
+            }
             val formattedPrompt = formatGenerationPrompt(prompt, reasoningMode)
 
             // PENTING: autoRegister = false saat inference agar kamus token stabil
@@ -1709,6 +1715,18 @@ class ArgusNeuralEngine private constructor(
     ): Float {
         val seqLen = seq.size
         if (seqLen < 2) return Float.NaN
+
+        val hostDirectParameters = ArrayList<Float16ParameterArray>(1 + layerCount * 4)
+        hostDirectParameters.add(wEmbed)
+        for (block in blocks) {
+            if (block.loraQa.size > 0) hostDirectParameters.add(block.loraQa)
+            if (block.loraQb.size > 0) hostDirectParameters.add(block.loraQb)
+            if (block.loraVa.size > 0) hostDirectParameters.add(block.loraVa)
+            if (block.loraVb.size > 0) hostDirectParameters.add(block.loraVb)
+        }
+        check(VulkanTrainingBackend.synchronizeModelParameterTensors(hostDirectParameters)) {
+            "GPU-resident embedding or LoRA weights could not be recovered before host-side training operations."
+        }
 
         if (updateParameters && gradientAccumulator == null) adamStep++
         val lr = if (updateParameters && gradientAccumulator == null) {
@@ -3180,6 +3198,9 @@ class ArgusNeuralEngine private constructor(
             transposeWeights = transposeWeights
         )
         if (fp16Dispatched) return
+        check(VulkanTrainingBackend.synchronizeModelParameterTensor(weights)) {
+            "GPU-resident linear weights could not be recovered before CPU fallback."
+        }
 
         computeLinearBatch(
             inputs = inputs,
@@ -3262,6 +3283,9 @@ class ArgusNeuralEngine private constructor(
             transposeWeights = transposeWeights
         )
         if (fp16Dispatched) return
+        check(VulkanTrainingBackend.synchronizeModelParameterTensors(weights.toList())) {
+            "GPU-resident batched weights could not be recovered before CPU fallback."
+        }
 
         val fp32Weights = Array(weights.size) { index -> weights[index].toFloatArray() }
         computeBatchedLinear(
