@@ -759,7 +759,16 @@ internal object VulkanTrainingBackend {
             _tensorArenaMetrics.value = VulkanTensorArenaMetrics()
             true
         } catch (error: RuntimeException) {
+            disabledAfterRuntimeFailure = true
+            _currentBackend = "Kotlin CPU — Vulkan teardown failed after state recovery"
+            _runtimeStatus.value = "Vulkan teardown failed; recovered host state is retained"
             Log.e(TAG, "Vulkan native runtime destruction failed.", error)
+            false
+        } catch (error: LinkageError) {
+            disabledAfterRuntimeFailure = true
+            _currentBackend = "Kotlin CPU — Vulkan teardown entry point unavailable"
+            _runtimeStatus.value = "Vulkan teardown failed; recovered host state is retained"
+            Log.e(TAG, "Vulkan native runtime destruction entry point is unavailable.", error)
             false
         }
     }
