@@ -488,6 +488,12 @@ internal object VulkanTrainingBackend {
     val tensorArenaMetrics: StateFlow<VulkanTensorArenaMetrics> =
         _tensorArenaMetrics.asStateFlow()
 
+    private val tensorResidencyRegistry = VulkanTensorResidencyRegistry(
+        allocate = { byteCount -> allocateGpuTensor(byteCount) },
+        upload = { allocation, bytes -> uploadGpuTensor(allocation, bytes) },
+        release = { allocation -> releaseGpuTensor(allocation) }
+    )
+
     internal val hasAttemptedInitialization: Boolean
         get() = initializationAttempted
 
@@ -535,14 +541,24 @@ internal object VulkanTrainingBackend {
         }
     }
 
+    private fun destroyNativeRuntime() {
+        try {
+            nativeDestroy()
+        } finally {
+            tensorResidencyRegistry.invalidate(releaseAllocations = false)
+        }
+    }
+
     private fun releaseNativeRuntimeAfterFailure(nativeLibraryLoaded: Boolean) {
         nativeReady = false
         fp16RuntimeReady = false
         if (nativeLibraryLoaded) {
-            runCatching { nativeDestroy() }
+            runCatching { destroyNativeRuntime() }
                 .onFailure { error ->
                     Log.w(TAG, "Failed to release a partially initialized Vulkan runtime.", error)
                 }
+        } else {
+            tensorResidencyRegistry.invalidate(releaseAllocations = false)
         }
     }
 
@@ -654,6 +670,7 @@ internal object VulkanTrainingBackend {
         return try {
             System.loadLibrary("argus_training")
             nativeLibraryLoaded = true
+            tensorResidencyRegistry.invalidate(releaseAllocations = false)
             val initialized = nativeInitialize()
             if (initialized) {
                 detectedDriverInfo = runCatching { nativeGetDriverInfo() }
@@ -1105,6 +1122,10 @@ internal object VulkanTrainingBackend {
             verify(transposedWeights, transposeWeights = true)
     }
 
+    /**
+     * Uses a persistent GPU replica for a single FP16 model matrix. Kotlin remains
+     * authoritative; the registry uploads only after the model tensor is mutated.
+     */
     @Synchronized
     fun tryApplyFp16Linear(
         inputRows: Array<FloatArray>,
@@ -1113,14 +1134,99 @@ internal object VulkanTrainingBackend {
         inputColumns: Int,
         outputColumns: Int,
         transposeWeights: Boolean = false
-    ): Boolean = tryApplyFp16BatchedLinear(
-        inputBatches = arrayOf(inputRows),
-        weightBatches = arrayOf(weights.toShortArray()),
-        outputBatches = arrayOf(outputRows),
-        inputColumns = inputColumns,
-        outputColumns = outputColumns,
-        transposeWeights = transposeWeights
-    )
+    ): Boolean {
+        require(inputRows.isNotEmpty()) { "FP16 linear input must contain at least one row." }
+        require(inputColumns > 0 && outputColumns > 0) {
+            "FP16 linear dimensions must be positive."
+        }
+        require(outputRows.size == inputRows.size) {
+            "FP16 linear output row count must match its input."
+        }
+        val requiredWeightElements = inputColumns.toLong() * outputColumns.toLong()
+        if (requiredWeightElements > weights.size.toLong()) return false
+
+        for (row in inputRows.indices) {
+            require(inputRows[row].size == inputColumns) {
+                "FP16 input row $row has an unexpected width."
+            }
+            require(outputRows[row].size == outputColumns) {
+                "FP16 output row $row has an unexpected width."
+            }
+        }
+
+        val rowCount = inputRows.size
+        val inputElements = rowCount.toLong() * inputColumns.toLong()
+        val outputElements = rowCount.toLong() * outputColumns.toLong()
+        if (inputElements > Int.MAX_VALUE.toLong() ||
+            outputElements > Int.MAX_VALUE.toLong()) {
+            return false
+        }
+        val operationCount = runCatching {
+            Math.multiplyExact(inputElements, outputColumns.toLong())
+        }.getOrNull() ?: return false
+        if (!isFp16ComputeAvailable || operationCount < MIN_LINEAR_OPERATION_COUNT) {
+            return false
+        }
+
+        val flattenedInput: FloatArray
+        val flattenedOutput: FloatArray
+        try {
+            flattenedInput = FloatArray(inputElements.toInt())
+            flattenedOutput = FloatArray(outputElements.toInt())
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Not enough heap memory to stage a persistent-weight Vulkan linear operation.", error)
+            return false
+        }
+        for (row in inputRows.indices) {
+            System.arraycopy(
+                inputRows[row],
+                0,
+                flattenedInput,
+                row * inputColumns,
+                inputColumns
+            )
+        }
+
+        val weightAllocation = tensorResidencyRegistry.acquire(weights) ?: return false
+        val updated = try {
+            nativeApplyFp16LinearWithArena(
+                input = flattenedInput,
+                weightHandle = weightAllocation.nativeHandle,
+                output = flattenedOutput,
+                rows = rowCount,
+                inputColumns = inputColumns,
+                outputColumns = outputColumns,
+                transposeWeights = transposeWeights
+            )
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Persistent-weight Vulkan FP16 entry point is unavailable.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Persistent-weight Vulkan FP16 dispatch failed.", error)
+            false
+        }
+
+        if (!updated) {
+            fp16DisabledAfterRuntimeFailure = true
+            fp16RuntimeReady = false
+            tensorResidencyRegistry.invalidate(releaseAllocations = true)
+            Log.w(TAG, "Persistent-weight FP16 dispatch failed; using the Kotlin CPU path.")
+            return false
+        }
+
+        for (row in outputRows.indices) {
+            System.arraycopy(
+                flattenedOutput,
+                row * outputColumns,
+                outputRows[row],
+                0,
+                outputColumns
+            )
+        }
+        refreshGpuPerformanceMetrics()
+        _currentBackend = "Vulkan Compute (FP16 persistent model weights)"
+        return true
+    }
 
     @Synchronized
     fun tryApplyFp16BatchedLinear(
@@ -1412,7 +1518,7 @@ internal object VulkanTrainingBackend {
             disabledAfterRuntimeFailure = true
             _runtimeStatus.value = "Kotlin CPU fallback — Vulkan linear dispatch failed"
             _currentBackend = "Kotlin CPU"
-            runCatching { nativeDestroy() }
+            runCatching { destroyNativeRuntime() }
                 .onFailure { error ->
                     Log.w(TAG, "Failed to release Vulkan after a batched-linear dispatch failure.", error)
                 }
@@ -1689,7 +1795,7 @@ internal object VulkanTrainingBackend {
         disabledAfterRuntimeFailure = true
         _runtimeStatus.value = "Kotlin CPU fallback — Vulkan optimizer dispatch failed"
         _currentBackend = "Kotlin CPU"
-        runCatching { nativeDestroy() }
+        runCatching { destroyNativeRuntime() }
             .onFailure { error ->
                 Log.w(TAG, "Failed to release the Vulkan runtime after a dispatch failure.", error)
             }
@@ -1714,6 +1820,16 @@ internal object VulkanTrainingBackend {
         rows: Int,
         batchCount: Int,
         rowsPerBatch: Int,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean
+    ): Boolean
+
+    private external fun nativeApplyFp16LinearWithArena(
+        input: FloatArray,
+        weightHandle: Long,
+        output: FloatArray,
+        rows: Int,
         inputColumns: Int,
         outputColumns: Int,
         transposeWeights: Boolean

@@ -128,6 +128,7 @@ struct VulkanRuntime {
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    VkDescriptorSet tensorArenaDescriptorSet = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipeline linearPipeline = VK_NULL_HANDLE;
@@ -976,6 +977,31 @@ bool createArenaBacking(
     return false;
 }
 
+void updateTensorArenaDescriptorSet() {
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaCapacity == 0u) {
+        return;
+    }
+
+    VkDescriptorBufferInfo descriptorInfo{};
+    descriptorInfo.buffer = gRuntime.tensorArenaBuffer;
+    descriptorInfo.offset = 0u;
+    descriptorInfo.range = gRuntime.tensorArenaCapacity;
+
+    VkWriteDescriptorSet descriptorWrite{};
+    descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrite.dstSet = gRuntime.tensorArenaDescriptorSet;
+    descriptorWrite.dstBinding = 0u;
+    descriptorWrite.dstArrayElement = 0u;
+    descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    descriptorWrite.descriptorCount = 1u;
+    descriptorWrite.pBufferInfo = &descriptorInfo;
+
+    vkUpdateDescriptorSets(gRuntime.device, 1u, &descriptorWrite, 0u, nullptr);
+}
+
 bool growTensorArena(VkDeviceSize additionalBytes) {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(
         4u, gRuntime.physicalDeviceProperties.limits.minStorageBufferOffsetAlignment
@@ -985,8 +1011,12 @@ bool growTensorArena(VkDeviceSize additionalBytes) {
         oldCapacity > std::numeric_limits<VkDeviceSize>::max() - additionalBytes) {
         return false;
     }
+    const VkDeviceSize maximumRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    const VkDeviceSize maximumCapacity = maximumRange - (maximumRange % alignment);
     VkDeviceSize minimumCapacity = 0u;
-    if (!alignArenaSize(oldCapacity + additionalBytes, alignment, minimumCapacity)) {
+    if (!alignArenaSize(oldCapacity + additionalBytes, alignment, minimumCapacity) ||
+        minimumCapacity > maximumCapacity) {
         return false;
     }
     VkDeviceSize targetCapacity = minimumCapacity;
@@ -999,6 +1029,10 @@ bool growTensorArena(VkDeviceSize additionalBytes) {
         }
     }
     if (!alignArenaSize(targetCapacity, alignment, targetCapacity)) return false;
+    targetCapacity = std::min(targetCapacity, maximumCapacity);
+    if (targetCapacity < minimumCapacity || targetCapacity > maximumRange) {
+        return false;
+    }
 
     if (!gRuntime.tensorArena.prepareCapacityExtension()) {
         logError("Not enough host memory to prepare the Vulkan tensor-arena capacity update.");
@@ -1047,18 +1081,36 @@ bool growTensorArena(VkDeviceSize additionalBytes) {
         return false;
     }
 
-    if (gRuntime.tensorArenaBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(gRuntime.device, gRuntime.tensorArenaBuffer, nullptr);
-        vkFreeMemory(gRuntime.device, gRuntime.tensorArenaMemory, nullptr);
-    }
+    const VkBuffer previousBuffer = gRuntime.tensorArenaBuffer;
+    const VkDeviceMemory previousMemory = gRuntime.tensorArenaMemory;
     gRuntime.tensorArenaBuffer = nextBuffer;
     gRuntime.tensorArenaMemory = nextMemory;
     gRuntime.tensorArenaCapacity = createdCapacity;
     gRuntime.tensorArenaDeviceLocal = nextDeviceLocal;
+    updateTensorArenaDescriptorSet();
+
+    if (previousBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(gRuntime.device, previousBuffer, nullptr);
+        vkFreeMemory(gRuntime.device, previousMemory, nullptr);
+    }
     return true;
 }
 
 using TensorArenaAllocation = argus::vulkan::TensorArenaCore::Allocation;
+
+struct ScopedTensorArenaAllocation final {
+    explicit ScopedTensorArenaAllocation(uint64_t allocationToken) noexcept
+        : token(allocationToken) {}
+
+    ~ScopedTensorArenaAllocation() {
+        if (token != 0u) gRuntime.tensorArena.release(token);
+    }
+
+    ScopedTensorArenaAllocation(const ScopedTensorArenaAllocation&) = delete;
+    ScopedTensorArenaAllocation& operator=(const ScopedTensorArenaAllocation&) = delete;
+
+    uint64_t token;
+};
 
 TensorArenaAllocation* findArenaAllocation(jlong rawHandle) {
     if (rawHandle == 0) return nullptr;
@@ -2422,12 +2474,12 @@ bool initializeRuntime() {
 
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 1;
+    poolSize.descriptorCount = 2u;
 
     VkDescriptorPoolCreateInfo descriptorPoolInfo{};
     descriptorPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    descriptorPoolInfo.maxSets = 1;
-    descriptorPoolInfo.poolSizeCount = 1;
+    descriptorPoolInfo.maxSets = 2u;
+    descriptorPoolInfo.poolSizeCount = 1u;
     descriptorPoolInfo.pPoolSizes = &poolSize;
 
     result = vkCreateDescriptorPool(
@@ -2441,21 +2493,29 @@ bool initializeRuntime() {
         return false;
     }
 
+    const std::array<VkDescriptorSetLayout, 2> setLayouts{
+        gRuntime.descriptorSetLayout,
+        gRuntime.descriptorSetLayout
+    };
+    std::array<VkDescriptorSet, 2> descriptorSets{};
+
     VkDescriptorSetAllocateInfo descriptorSetInfo{};
     descriptorSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     descriptorSetInfo.descriptorPool = gRuntime.descriptorPool;
-    descriptorSetInfo.descriptorSetCount = 1;
-    descriptorSetInfo.pSetLayouts = &gRuntime.descriptorSetLayout;
+    descriptorSetInfo.descriptorSetCount = static_cast<uint32_t>(descriptorSets.size());
+    descriptorSetInfo.pSetLayouts = setLayouts.data();
 
     result = vkAllocateDescriptorSets(
         gRuntime.device,
         &descriptorSetInfo,
-        &gRuntime.descriptorSet
+        descriptorSets.data()
     );
     if (result != VK_SUCCESS) {
         logError("Vulkan descriptor-set allocation failed.", result);
         return false;
     }
+    gRuntime.descriptorSet = descriptorSets[0];
+    gRuntime.tensorArenaDescriptorSet = descriptorSets[1];
 
     __android_log_print(
         ANDROID_LOG_INFO,
@@ -3787,6 +3847,445 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
     if (env->ExceptionCheck()) {
         return JNI_FALSE;
     }
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
+    JNIEnv* env,
+    jobject,
+    jfloatArray inputArray,
+    jlong weightHandle,
+    jfloatArray outputArray,
+    jint rowCount,
+    jint inputColumns,
+    jint outputColumns,
+    jboolean transposeWeights
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        !gRuntime.supportsFp16Compute ||
+        gRuntime.fp16LinearPipeline == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        inputArray == nullptr ||
+        outputArray == nullptr ||
+        rowCount <= 0 ||
+        inputColumns <= 0 ||
+        outputColumns <= 0) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t rows = static_cast<uint64_t>(rowCount);
+    const uint64_t inputWidth = static_cast<uint64_t>(inputColumns);
+    const uint64_t outputWidth = static_cast<uint64_t>(outputColumns);
+    const uint64_t maximumArrayElements =
+        static_cast<uint64_t>(std::numeric_limits<jsize>::max());
+    if (rows > maximumArrayElements / inputWidth ||
+        rows > maximumArrayElements / outputWidth ||
+        inputWidth > maximumArrayElements / outputWidth) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t inputElements = rows * inputWidth;
+    const uint64_t outputElements = rows * outputWidth;
+    const uint64_t weightElements = inputWidth * outputWidth;
+    const jsize actualInputCount = env->GetArrayLength(inputArray);
+    if (env->ExceptionCheck() ||
+        actualInputCount != static_cast<jsize>(inputElements)) {
+        return JNI_FALSE;
+    }
+    const jsize actualOutputCount = env->GetArrayLength(outputArray);
+    if (env->ExceptionCheck() ||
+        actualOutputCount != static_cast<jsize>(outputElements) ||
+        weightElements > std::numeric_limits<uint64_t>::max() / sizeof(uint16_t) ||
+        outputElements > std::numeric_limits<uint64_t>::max() / sizeof(float)) {
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize weightByteCount =
+        static_cast<VkDeviceSize>(weightElements * sizeof(uint16_t));
+    const VkDeviceSize inputByteCount =
+        static_cast<VkDeviceSize>(inputElements * sizeof(uint16_t));
+    const VkDeviceSize outputByteCount =
+        static_cast<VkDeviceSize>(outputElements * sizeof(float));
+
+    VkDeviceSize inputPaddedBytes = 0u;
+    if (!alignArenaSize(inputByteCount, 4u, inputPaddedBytes) ||
+        outputByteCount == 0u ||
+        inputPaddedBytes > std::numeric_limits<VkDeviceSize>::max() - outputByteCount) {
+        return JNI_FALSE;
+    }
+    const VkDeviceSize scratchByteCount = inputPaddedBytes + outputByteCount;
+    const VkDeviceSize maximumStorageRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    if (weightByteCount == 0u ||
+        weightByteCount > maximumStorageRange ||
+        scratchByteCount > maximumStorageRange ||
+        outputByteCount > maximumStorageRange ||
+        inputPaddedBytes > maximumStorageRange) {
+        return JNI_FALSE;
+    }
+
+    constexpr uint64_t kTileRows = 8u;
+    constexpr uint64_t kTileColumns = 16u;
+    const uint64_t tileRows = 1u + (rows - 1u) / kTileRows;
+    const uint64_t tileColumns = 1u + (outputWidth - 1u) / kTileColumns;
+    if (tileRows > std::numeric_limits<uint64_t>::max() / tileColumns) {
+        return JNI_FALSE;
+    }
+    const uint64_t totalTileCount = tileRows * tileColumns;
+    const uint32_t workGroupCount = calculateDispatchGroupCount(totalTileCount);
+    if (workGroupCount == 0u) {
+        logError("Persistent-weight FP16 linear dispatch has no available workgroups.");
+        return JNI_FALSE;
+    }
+
+    const jlong scratchHandle = allocateArenaTensor(scratchByteCount);
+    if (scratchHandle == 0) {
+        logError("Persistent-weight FP16 linear scratch allocation failed.");
+        return JNI_FALSE;
+    }
+    ScopedTensorArenaAllocation scratchRelease(static_cast<uint64_t>(scratchHandle));
+
+    // Resolve handles after allocation because arena growth may relocate metadata.
+    TensorArenaAllocation* weightAllocation = findArenaAllocation(weightHandle);
+    TensorArenaAllocation* scratchAllocation = findArenaAllocation(scratchHandle);
+    if (weightAllocation == nullptr ||
+        scratchAllocation == nullptr ||
+        weightAllocation->logicalSize < weightByteCount ||
+        scratchAllocation->logicalSize < scratchByteCount) {
+        logError("Persistent-weight FP16 linear received an invalid arena allocation.");
+        return JNI_FALSE;
+    }
+
+    if ((scratchAllocation->offset & 3u) != 0u ||
+        (weightAllocation->offset & 1u) != 0u ||
+        scratchAllocation->offset / 2u > std::numeric_limits<uint32_t>::max() ||
+        weightAllocation->offset / 2u > std::numeric_limits<uint32_t>::max() ||
+        (scratchAllocation->offset + inputPaddedBytes) / 4u >
+            std::numeric_limits<uint32_t>::max() ||
+        inputElements > std::numeric_limits<uint32_t>::max() ||
+        outputElements > std::numeric_limits<uint32_t>::max() ||
+        weightElements > std::numeric_limits<uint32_t>::max()) {
+        logError("Persistent-weight FP16 linear tensor offsets exceed shader address limits.");
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize stagingCapacity = std::max(inputPaddedBytes, outputByteCount);
+    if (!ensureStorageBuffer(stagingCapacity) || gRuntime.mappedStorage == nullptr) {
+        logError("Persistent-weight FP16 linear staging-buffer allocation failed.");
+        return JNI_FALSE;
+    }
+
+    auto* mappedWords = static_cast<uint32_t*>(gRuntime.mappedStorage);
+    std::memset(mappedWords, 0, static_cast<size_t>(inputPaddedBytes));
+
+    constexpr size_t kInputConversionChunkElements = 8192u;
+    std::array<jfloat, kInputConversionChunkElements> inputChunk{};
+    for (uint64_t chunkOffset = 0u;
+         chunkOffset < inputElements;
+         chunkOffset += kInputConversionChunkElements) {
+        const size_t chunkCount = static_cast<size_t>(
+            std::min<uint64_t>(
+                kInputConversionChunkElements,
+                inputElements - chunkOffset
+            )
+        );
+        env->GetFloatArrayRegion(
+            inputArray,
+            static_cast<jsize>(chunkOffset),
+            static_cast<jsize>(chunkCount),
+            inputChunk.data()
+        );
+        if (env->ExceptionCheck()) return JNI_FALSE;
+
+        for (size_t localIndex = 0u; localIndex < chunkCount; localIndex += 2u) {
+            const uint64_t absoluteIndex = chunkOffset + localIndex;
+            const float firstValue = inputChunk[localIndex];
+            if (!std::isfinite(firstValue)) {
+                logError("Persistent-weight FP16 linear input contains a non-finite activation.");
+                return JNI_FALSE;
+            }
+            const uint16_t lowHalf = floatToHalf(firstValue);
+            if ((lowHalf & 0x7C00u) == 0x7C00u) {
+                logError("Persistent-weight FP16 linear input exceeds the finite binary16 range.");
+                return JNI_FALSE;
+            }
+
+            uint32_t packed = static_cast<uint32_t>(lowHalf);
+            if (localIndex + 1u < chunkCount) {
+                const float secondValue = inputChunk[localIndex + 1u];
+                if (!std::isfinite(secondValue)) {
+                    logError("Persistent-weight FP16 linear input contains a non-finite activation.");
+                    return JNI_FALSE;
+                }
+                const uint16_t highHalf = floatToHalf(secondValue);
+                if ((highHalf & 0x7C00u) == 0x7C00u) {
+                    logError("Persistent-weight FP16 linear input exceeds the finite binary16 range.");
+                    return JNI_FALSE;
+                }
+                packed |= static_cast<uint32_t>(highHalf) << 16u;
+            }
+            mappedWords[absoluteIndex >> 1u] = packed;
+        }
+    }
+
+    if (!syncStagingMemory(false)) return JNI_FALSE;
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset the persistent-weight FP16 command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin the persistent-weight FP16 command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkBufferMemoryBarrier2KHR beforeInputCopy[2]{};
+    beforeInputCopy[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    beforeInputCopy[0].srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    beforeInputCopy[0].srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
+    beforeInputCopy[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    beforeInputCopy[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+    beforeInputCopy[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeInputCopy[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeInputCopy[0].buffer = gRuntime.storageBuffer;
+    beforeInputCopy[0].offset = 0u;
+    beforeInputCopy[0].size = inputPaddedBytes;
+
+    beforeInputCopy[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    beforeInputCopy[1].srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeInputCopy[1].srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeInputCopy[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    beforeInputCopy[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    beforeInputCopy[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeInputCopy[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeInputCopy[1].buffer = gRuntime.tensorArenaBuffer;
+    beforeInputCopy[1].offset = scratchAllocation->offset;
+    beforeInputCopy[1].size = inputPaddedBytes;
+
+    VkDependencyInfoKHR beforeInputDependency{};
+    beforeInputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeInputDependency.bufferMemoryBarrierCount = 2u;
+    beforeInputDependency.pBufferMemoryBarriers = beforeInputCopy;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeInputDependency);
+
+    VkBufferCopy inputCopy{};
+    inputCopy.srcOffset = 0u;
+    inputCopy.dstOffset = scratchAllocation->offset;
+    inputCopy.size = inputPaddedBytes;
+    vkCmdCopyBuffer(
+        gRuntime.commandBuffer,
+        gRuntime.storageBuffer,
+        gRuntime.tensorArenaBuffer,
+        1u,
+        &inputCopy
+    );
+
+    VkBufferMemoryBarrier2KHR beforeCompute[3]{};
+    beforeCompute[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    beforeCompute[0].srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    beforeCompute[0].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    beforeCompute[0].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute[0].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR;
+    beforeCompute[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCompute[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCompute[0].buffer = gRuntime.tensorArenaBuffer;
+    beforeCompute[0].offset = scratchAllocation->offset;
+    beforeCompute[0].size = inputPaddedBytes;
+
+    beforeCompute[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    beforeCompute[1].srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute[1].srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute[1].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute[1].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR;
+    beforeCompute[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCompute[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCompute[1].buffer = gRuntime.tensorArenaBuffer;
+    beforeCompute[1].offset = weightAllocation->offset;
+    beforeCompute[1].size = weightByteCount;
+
+    beforeCompute[2].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    beforeCompute[2].srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute[2].srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute[2].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute[2].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute[2].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCompute[2].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCompute[2].buffer = gRuntime.tensorArenaBuffer;
+    beforeCompute[2].offset = scratchAllocation->offset + inputPaddedBytes;
+    beforeCompute[2].size = outputByteCount;
+
+    VkDependencyInfoKHR beforeComputeDependency{};
+    beforeComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeComputeDependency.bufferMemoryBarrierCount = 3u;
+    beforeComputeDependency.pBufferMemoryBarriers = beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeComputeDependency);
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.fp16LinearPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0u,
+        1u,
+        &gRuntime.tensorArenaDescriptorSet,
+        0u,
+        nullptr
+    );
+
+    const LinearPushConstants pushConstants{
+        static_cast<uint32_t>(rowCount),
+        1u,
+        static_cast<uint32_t>(rowCount),
+        static_cast<uint32_t>(inputColumns),
+        static_cast<uint32_t>(outputColumns),
+        static_cast<uint32_t>(scratchAllocation->offset / 2u),
+        static_cast<uint32_t>(weightAllocation->offset / 2u),
+        static_cast<uint32_t>(
+            (scratchAllocation->offset + inputPaddedBytes) / 4u
+        ),
+        transposeWeights == JNI_TRUE ? 1u : 0u
+    };
+    vkCmdPushConstants(
+        gRuntime.commandBuffer,
+        gRuntime.pipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(LinearPushConstants),
+        &pushConstants
+    );
+    vkCmdDispatch(gRuntime.commandBuffer, workGroupCount, 1u, 1u);
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    VkBufferMemoryBarrier2KHR outputToCopy{};
+    outputToCopy.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    outputToCopy.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    outputToCopy.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    outputToCopy.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    outputToCopy.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+    outputToCopy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputToCopy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputToCopy.buffer = gRuntime.tensorArenaBuffer;
+    outputToCopy.offset = scratchAllocation->offset + inputPaddedBytes;
+    outputToCopy.size = outputByteCount;
+
+    VkBufferMemoryBarrier2KHR stagingBeforeOutput{};
+    stagingBeforeOutput.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    stagingBeforeOutput.srcStageMask =
+        VK_PIPELINE_STAGE_2_HOST_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    stagingBeforeOutput.srcAccessMask =
+        VK_ACCESS_2_HOST_READ_BIT_KHR |
+        VK_ACCESS_2_HOST_WRITE_BIT_KHR |
+        VK_ACCESS_2_TRANSFER_READ_BIT_KHR |
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    stagingBeforeOutput.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    stagingBeforeOutput.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    stagingBeforeOutput.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    stagingBeforeOutput.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    stagingBeforeOutput.buffer = gRuntime.storageBuffer;
+    stagingBeforeOutput.offset = 0u;
+    stagingBeforeOutput.size = outputByteCount;
+
+    VkBufferMemoryBarrier2KHR outputBarriers[2]{};
+    outputBarriers[0] = outputToCopy;
+    outputBarriers[1] = stagingBeforeOutput;
+    VkDependencyInfoKHR outputDependency{};
+    outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    outputDependency.bufferMemoryBarrierCount = 2u;
+    outputDependency.pBufferMemoryBarriers = outputBarriers;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputDependency);
+
+    VkBufferCopy outputCopy{};
+    outputCopy.srcOffset = scratchAllocation->offset + inputPaddedBytes;
+    outputCopy.dstOffset = 0u;
+    outputCopy.size = outputByteCount;
+    vkCmdCopyBuffer(
+        gRuntime.commandBuffer,
+        gRuntime.tensorArenaBuffer,
+        gRuntime.storageBuffer,
+        1u,
+        &outputCopy
+    );
+
+    VkBufferMemoryBarrier2KHR outputToHost{};
+    outputToHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    outputToHost.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    outputToHost.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    outputToHost.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    outputToHost.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR;
+    outputToHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputToHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputToHost.buffer = gRuntime.storageBuffer;
+    outputToHost.offset = 0u;
+    outputToHost.size = outputByteCount;
+
+    VkDependencyInfoKHR outputToHostDependency{};
+    outputToHostDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    outputToHostDependency.bufferMemoryBarrierCount = 1u;
+    outputToHostDependency.pBufferMemoryBarriers = &outputToHost;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputToHostDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish the persistent-weight FP16 command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Persistent-weight FP16 submission or fence wait failed.")) {
+        return JNI_FALSE;
+    }
+    if (timestampCapture) {
+        uint64_t durationNanoseconds = 0u;
+        if (readGpuTimestampDurationNanoseconds(durationNanoseconds)) {
+            recordGpuTiming(durationNanoseconds, gRuntime.lastFp16LinearGpuTimeNanoseconds);
+        }
+    }
+    if (!syncStagingMemory(true)) return JNI_FALSE;
+
+    const auto* outputValues = static_cast<const float*>(gRuntime.mappedStorage);
+    for (uint64_t index = 0u; index < outputElements; ++index) {
+        if (!std::isfinite(outputValues[index])) {
+            logError("Persistent-weight FP16 linear kernel produced a non-finite result.");
+            return JNI_FALSE;
+        }
+    }
+    env->SetFloatArrayRegion(
+        outputArray,
+        0,
+        static_cast<jsize>(outputElements),
+        outputValues
+    );
+    if (env->ExceptionCheck()) return JNI_FALSE;
     return JNI_TRUE;
 }
 

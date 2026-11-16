@@ -12,6 +12,17 @@ class Float16ParameterArray(size: Int) {
 
     private val storage: ShortArray
 
+    @Volatile
+    private var currentMutationVersion: Long = 0L
+
+    /** Changes whenever the authoritative Kotlin parameter storage is mutated. */
+    internal val mutationVersion: Long
+        get() = currentMutationVersion
+
+    private fun markModified() {
+        currentMutationVersion += 1L
+    }
+
     init {
         require(size >= 0) { "Parameter-array size cannot be negative." }
         storage = ShortArray(size)
@@ -27,15 +38,18 @@ class Float16ParameterArray(size: Int) {
 
     operator fun set(index: Int, value: Float) {
         storage[index] = Float16Codec.fromFiniteFloat(value)
+        markModified()
     }
 
     fun fill(value: Float) {
         storage.fill(Float16Codec.fromFiniteFloat(value))
+        if (storage.isNotEmpty()) markModified()
     }
 
     fun copyFrom(source: Float16ParameterArray) {
         require(source.size == size) { "FP16 parameter-array sizes must match." }
         System.arraycopy(source.storage, 0, storage, 0, size)
+        if (size > 0) markModified()
     }
 
     fun copyFrom(
@@ -54,12 +68,26 @@ class Float16ParameterArray(size: Int) {
             "FP16 destination range exceeds its parameter array."
         }
         System.arraycopy(source.storage, sourceOffset, storage, destinationOffset, length)
+        if (length > 0) markModified()
     }
 
     fun toFloatArray(): FloatArray = FloatArray(size) { index -> get(index) }
 
     /** Returns a defensive copy of the underlying IEEE-754 binary16 values. */
     fun toShortArray(): ShortArray = storage.copyOf()
+
+    /** Returns the binary16 payload in explicit little-endian byte order for Vulkan. */
+    internal fun toLittleEndianByteArray(): ByteArray {
+        val byteCount = Math.multiplyExact(storage.size, Short.SIZE_BYTES)
+        return ByteArray(byteCount).also { bytes ->
+            for (index in storage.indices) {
+                val value = storage[index].toInt() and 0xFFFF
+                val byteOffset = index * Short.SIZE_BYTES
+                bytes[byteOffset] = value.toByte()
+                bytes[byteOffset + 1] = (value ushr 8).toByte()
+            }
+        }
+    }
 
     companion object {
         fun fromFloatArray(values: FloatArray): Float16ParameterArray =
