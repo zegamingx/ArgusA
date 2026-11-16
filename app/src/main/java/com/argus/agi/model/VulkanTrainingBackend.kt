@@ -509,6 +509,7 @@ internal object VulkanTrainingBackend {
     val modelTensorResidencyReady: StateFlow<Boolean> =
         _modelTensorResidencyReady.asStateFlow()
 
+    @Volatile
     private var residentActivationLinearReady = false
     private val activationTensorRegistry = VulkanActivationTensorRegistry(
         allocate = { byteCount -> allocateGpuTensor(byteCount) },

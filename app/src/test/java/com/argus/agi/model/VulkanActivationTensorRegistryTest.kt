@@ -75,6 +75,7 @@ class VulkanActivationTensorRegistryTest {
         )
         val input = requireNotNull(registry.allocate(2, 3))
         val output = requireNotNull(registry.allocate(2, 2))
+        allocations[100L] = ByteArray(3 * 2 * Short.SIZE_BYTES)
         val weights = VulkanTensorAllocation(100L, 3L * 2L * Short.SIZE_BYTES)
 
         assertTrue(registry.upload(input, arrayOf(
