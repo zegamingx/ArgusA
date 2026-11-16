@@ -5378,6 +5378,22 @@ internal object VulkanTrainingBackend {
             }
             candidateMomentsCommitted = true
             deviceCommitCompleted = true
+
+            // Only now are both registries on the same optimizer step. Retired allocations
+            // may be released; failed releases remain accounted and are retried later.
+            val oldParametersReleased = runCatching {
+                tensorResidencyRegistry.finishReplacementAfterPreflight()
+            }.getOrDefault(false)
+            val oldMomentsReleased = runCatching {
+                optimizerStateResidencyRegistry.finishReplacementAfterPreflight()
+            }.getOrDefault(false)
+            if (!oldParametersReleased || !oldMomentsReleased) {
+                Log.w(
+                    TAG,
+                    "Resident AdamW committed successfully; one or more old buffers remain tracked for deferred release."
+                )
+            }
+
             // Candidate FP16 parameters and FP32 moments are now authoritative together.
             // Host mirrors remain stale until an explicit CPU/inference/checkpoint boundary.
             optimizerStateMirrorReliable = false
