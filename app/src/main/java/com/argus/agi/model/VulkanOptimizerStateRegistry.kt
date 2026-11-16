@@ -203,7 +203,7 @@ internal class VulkanOptimizerStateRegistry(
             retiredAllocations.add(previous)
         }
         retiredResidentBytes = nextRetiredBytes
-        releaseRetiredAllocations()
+        runCatching { releaseRetiredAllocations() }
         return true
     }
     private fun validateReplacement(
