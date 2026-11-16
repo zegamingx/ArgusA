@@ -4911,6 +4911,7 @@ internal object VulkanTrainingBackend {
         var totalActiveElements = 0L
         var totalGradientBytes = 0L
         var totalParameterBytes = 0L
+        var totalMomentBytes = 0L
         for (index in parameters.indices) {
             val parameterSize = parameters[index].size
             val activeSize = gradients[index].size
@@ -4920,10 +4921,12 @@ internal object VulkanTrainingBackend {
                 !weightDecayByGroup[index].isFinite() ||
                 weightDecayByGroup[index] < 0.0f ||
                 gradients[index].any { value -> !value.isFinite() } ||
-                firstMoments[index].any { value -> !value.isFinite() } ||
-                secondMoments[index].any { value -> !value.isFinite() }) {
+                (optimizerStateMirrorReliable &&
+                    (firstMoments[index].any { value -> !value.isFinite() } ||
+                        secondMoments[index].any { value -> !value.isFinite() }))) {
                 return false
             }
+
             totalActiveElements = runCatching {
                 Math.addExact(totalActiveElements, activeSize.toLong())
             }.getOrNull() ?: return false
@@ -4939,12 +4942,38 @@ internal object VulkanTrainingBackend {
                     Math.multiplyExact(parameterSize.toLong(), Short.SIZE_BYTES.toLong())
                 )
             }.getOrNull() ?: return false
+            totalMomentBytes = runCatching {
+                val bytesPerMoment = Math.multiplyExact(
+                    parameterSize.toLong(),
+                    Float.SIZE_BYTES.toLong()
+                )
+                Math.addExact(totalMomentBytes, Math.multiplyExact(bytesPerMoment, 2L))
+            }.getOrNull() ?: return false
         }
 
         if (totalActiveElements < MIN_GPU_UPDATE_ELEMENTS ||
             totalActiveElements > Int.MAX_VALUE.toLong() ||
             totalGradientBytes <= 0L ||
             totalGradientBytes > Int.MAX_VALUE.toLong()) {
+            return false
+        }
+
+        // Active FP32 moments and their candidate replacements must both fit in
+        // the optimizer-state reservation during the atomic swap window.
+        val optimizerBudget = _optimizerStateResidencyBudgetBytes.value.coerceAtLeast(0L)
+        val maximumDoubleBufferedBytes = if (optimizerBudget > Long.MAX_VALUE / 2L) {
+            Long.MAX_VALUE
+        } else {
+            optimizerBudget * 2L
+        }
+        val requiredMomentArenaBytes = runCatching {
+            Math.addExact(
+                optimizerStateResidencyRegistry.residentByteCount(),
+                totalMomentBytes
+            )
+        }.getOrNull() ?: return false
+        if (requiredMomentArenaBytes > maximumDoubleBufferedBytes) {
+            Log.d(TAG, "Resident AdamW candidate moments exceed the reserved double-buffer budget.")
             return false
         }
 
@@ -4987,6 +5016,9 @@ internal object VulkanTrainingBackend {
 
         var gradientAllocation: VulkanTensorAllocation? = null
         var statusAllocation: VulkanTensorAllocation? = null
+        val candidateFirstMoments = ArrayList<VulkanTensorAllocation>(parameters.size)
+        val candidateSecondMoments = ArrayList<VulkanTensorAllocation>(parameters.size)
+        var candidateMomentsCommitted = false
         var gradientReleased = false
         var statusReleased = false
         var dispatchAttempted = false
@@ -5003,6 +5035,17 @@ internal object VulkanTrainingBackend {
                 gradientCursor = Math.addExact(gradientCursor, gradient.size)
             }
 
+            for (group in parameters.indices) {
+                val momentBytes = Math.multiplyExact(
+                    parameters[group].size.toLong(),
+                    Float.SIZE_BYTES.toLong()
+                )
+                val candidateFirst = allocateGpuTensor(momentBytes) ?: return false
+                candidateFirstMoments.add(candidateFirst)
+                val candidateSecond = allocateGpuTensor(momentBytes) ?: return false
+                candidateSecondMoments.add(candidateSecond)
+            }
+
             val gradientTensor = allocateGpuTensor(totalGradientBytes) ?: return false
             gradientAllocation = gradientTensor
             val statusTensor = allocateGpuTensor(Int.SIZE_BYTES.toLong()) ?: return false
@@ -5014,8 +5057,6 @@ internal object VulkanTrainingBackend {
             }
 
             dispatchAttempted = true
-            // A failed submission can have an uncertain commit point. The runtime
-            // teardown path must recover both mirrors before allowing CPU fallback.
             modelParameterMirrorReliable = false
             optimizerStateMirrorReliable = false
             val dispatched = try {
@@ -5029,6 +5070,12 @@ internal object VulkanTrainingBackend {
                     },
                     secondMomentHandles = LongArray(residentSecondMoments.size) { index ->
                         residentSecondMoments[index].nativeHandle
+                    },
+                    candidateFirstMomentHandles = LongArray(candidateFirstMoments.size) { index ->
+                        candidateFirstMoments[index].nativeHandle
+                    },
+                    candidateSecondMomentHandles = LongArray(candidateSecondMoments.size) { index ->
+                        candidateSecondMoments[index].nativeHandle
                     },
                     activeElementCounts = IntArray(gradients.size) { index -> gradients[index].size },
                     weightDecayByGroup = weightDecayByGroup,
@@ -5063,9 +5110,10 @@ internal object VulkanTrainingBackend {
                 .order(ByteOrder.LITTLE_ENDIAN)
                 .int
             if (transactionStatus != 0) {
-                // Validation runs in a separate dispatch phase. The update phase sees
-                // the non-zero status and skips every group, so the resident state is unchanged.
-                Log.e(TAG, "Resident AdamW rejected a non-finite or out-of-range update before host commit.")
+                // The validation phase rejected the step. Active weights and moments
+                // were not written; only the status flag and candidate buffers were touched.
+                modelParameterMirrorReliable = true
+                Log.e(TAG, "Resident AdamW rejected a non-finite or out-of-range update.")
                 return false
             }
 
@@ -5082,26 +5130,7 @@ internal object VulkanTrainingBackend {
                 snapshot
             }
 
-            // Check the CPU recovery mirror before releasing any GPU transaction resources.
-            for (group in gradients.indices) {
-                for (element in gradients[group].indices) {
-                    val gradient = gradients[group][element] * gradientClipFactor
-                    val nextFirstMoment =
-                        beta1 * firstMoments[group][element] + (1.0f - beta1) * gradient
-                    val nextSecondMoment =
-                        beta2 * secondMoments[group][element] +
-                            (1.0f - beta2) * gradient * gradient
-                    if (!gradient.isFinite() ||
-                        !nextFirstMoment.isFinite() ||
-                        !nextSecondMoment.isFinite() ||
-                        nextSecondMoment < 0.0f) {
-                        teardownRequired = true
-                        return false
-                    }
-                }
-            }
-
-            // Release transient staging before committing the host recovery mirror.
+            // Release transient staging before publishing candidate moment allocations.
             if (!releaseGpuTensor(gradientTensor)) {
                 teardownRequired = true
                 return false
@@ -5113,26 +5142,33 @@ internal object VulkanTrainingBackend {
             }
             statusReleased = true
 
+            val expectedMomentAllocations = ArrayList<VulkanTensorAllocation>(parameters.size * 2)
+            expectedMomentAllocations.addAll(residentFirstMoments)
+            expectedMomentAllocations.addAll(residentSecondMoments)
+            val candidateMomentAllocations = ArrayList<VulkanTensorAllocation>(parameters.size * 2)
+            candidateMomentAllocations.addAll(candidateFirstMoments)
+            candidateMomentAllocations.addAll(candidateSecondMoments)
+            if (!optimizerStateResidencyRegistry.replaceAll(
+                    tensors = momentInventory,
+                    expectedAllocations = expectedMomentAllocations,
+                    replacementAllocations = candidateMomentAllocations
+                )) {
+                teardownRequired = true
+                Log.e(TAG, "Resident AdamW could not atomically publish candidate moment buffers.")
+                return false
+            }
+            candidateMomentsCommitted = true
+
             for (index in parameters.indices) {
                 parameters[index].copyPrefixFromLittleEndianByteArray(
                     parameterSnapshots[index],
                     gradients[index].size
                 )
             }
-            for (group in gradients.indices) {
-                for (element in gradients[group].indices) {
-                    val gradient = gradients[group][element] * gradientClipFactor
-                    firstMoments[group][element] =
-                        beta1 * firstMoments[group][element] + (1.0f - beta1) * gradient
-                    secondMoments[group][element] =
-                        beta2 * secondMoments[group][element] +
-                            (1.0f - beta2) * gradient * gradient
-                }
-            }
             hostCommitCompleted = true
             modelParameterMirrorReliable = true
-            // Host moments are a recovery mirror. Keep the GPU copy authoritative and
-            // read it back only at checkpoint, fallback, memory-pressure, or teardown.
+            // The GPU candidate moments are now authoritative. Host moments are refreshed
+            // only at checkpoint, CPU fallback, memory pressure, or runtime teardown.
             optimizerStateMirrorReliable = false
 
             val revisionsSynchronized = parameters.indices.all { index ->
@@ -5150,10 +5186,18 @@ internal object VulkanTrainingBackend {
             return true
         } catch (error: OutOfMemoryError) {
             Log.w(TAG, "Resident AdamW exceeded the available host memory budget.", error)
+            if (hostCommitCompleted) {
+                teardownRequired = true
+                return true
+            }
             if (dispatchAttempted) teardownRequired = true
             return false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident AdamW transaction failed before host commit.", error)
+            Log.e(TAG, "Resident AdamW transaction failed.", error)
+            if (hostCommitCompleted) {
+                teardownRequired = true
+                return true
+            }
             if (dispatchAttempted) teardownRequired = true
             return false
         } finally {
@@ -5171,10 +5215,21 @@ internal object VulkanTrainingBackend {
                     teardownRequired = true
                 }
             }
+
+            if (!candidateMomentsCommitted && isRuntimeAvailable) {
+                for (allocation in candidateSecondMoments.asReversed() +
+                    candidateFirstMoments.asReversed()) {
+                    if (!releaseGpuTensor(allocation)) teardownRequired = true
+                }
+            }
+
             if (teardownRequired && nativeReady) {
-                // Teardown performs an atomic readback of model weights and optimizer
-                // moments before clearing the arena. Failed recovery leaves the mirrors
-                // marked stale, which prevents a destructive CPU fallback.
+                if (!hostCommitCompleted && !candidateMomentsCommitted) {
+                    // We discard this runtime as a rollback. Host weights were not committed,
+                    // and the active moment buffers were read-only; preserve the old host weights
+                    // while recovering the unchanged active FP32 moments.
+                    modelParameterMirrorReliable = true
+                }
                 runCatching { destroyNativeRuntime() }
                     .onFailure { error ->
                         Log.e(TAG, "Vulkan teardown after a failed resident AdamW transaction failed.", error)
@@ -5185,6 +5240,7 @@ internal object VulkanTrainingBackend {
             }
         }
     }
+
     /**
      * Adapts binary16 model parameters to the FP32 Vulkan AdamW kernel.
      *
