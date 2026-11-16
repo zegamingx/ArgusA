@@ -151,6 +151,8 @@ struct ResidentAdamwPushConstants {
     uint32_t gradientElementOffset;
     uint32_t firstMomentOffsetWords;
     uint32_t secondMomentOffsetWords;
+    uint32_t candidateFirstMomentOffsetWords;
+    uint32_t candidateSecondMomentOffsetWords;
     uint32_t statusOffsetWords;
     float learningRate;
     float beta1;
@@ -162,10 +164,12 @@ struct ResidentAdamwPushConstants {
     float weightDecay;
 };
 
-static_assert(sizeof(ResidentAdamwPushConstants) == 68);
+static_assert(sizeof(ResidentAdamwPushConstants) == 76);
 static_assert(offsetof(ResidentAdamwPushConstants, parameterOffsetWords) == 12);
-static_assert(offsetof(ResidentAdamwPushConstants, learningRate) == 36);
-static_assert(offsetof(ResidentAdamwPushConstants, weightDecay) == 64);
+static_assert(offsetof(ResidentAdamwPushConstants, candidateFirstMomentOffsetWords) == 32);
+static_assert(offsetof(ResidentAdamwPushConstants, statusOffsetWords) == 40);
+static_assert(offsetof(ResidentAdamwPushConstants, learningRate) == 44);
+static_assert(offsetof(ResidentAdamwPushConstants, weightDecay) == 72);
 
 struct CooperativeMatrixCapability {
     uint32_t mSize = 0;
@@ -6790,6 +6794,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     jlong gradientHandle,
     jlongArray firstMomentHandles,
     jlongArray secondMomentHandles,
+    jlongArray candidateFirstMomentHandles,
+    jlongArray candidateSecondMomentHandles,
     jintArray activeElementCounts,
     jfloatArray weightDecayByGroup,
     jfloat learningRate,
@@ -6813,6 +6819,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         parameterHandles == nullptr ||
         firstMomentHandles == nullptr ||
         secondMomentHandles == nullptr ||
+        candidateFirstMomentHandles == nullptr ||
+        candidateSecondMomentHandles == nullptr ||
         activeElementCounts == nullptr ||
         weightDecayByGroup == nullptr ||
         gradientHandle <= 0 ||
@@ -6832,6 +6840,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     if (env->ExceptionCheck() || groupCount <= 0 ||
         env->GetArrayLength(firstMomentHandles) != groupCount ||
         env->GetArrayLength(secondMomentHandles) != groupCount ||
+        env->GetArrayLength(candidateFirstMomentHandles) != groupCount ||
+        env->GetArrayLength(candidateSecondMomentHandles) != groupCount ||
         env->GetArrayLength(activeElementCounts) != groupCount ||
         env->GetArrayLength(weightDecayByGroup) != groupCount) {
         return JNI_FALSE;
@@ -6840,6 +6850,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     std::vector<jlong> parameterHandleValues;
     std::vector<jlong> firstMomentHandleValues;
     std::vector<jlong> secondMomentHandleValues;
+    std::vector<jlong> candidateFirstMomentHandleValues;
+    std::vector<jlong> candidateSecondMomentHandleValues;
     std::vector<jint> elementCounts;
     std::vector<jfloat> weightDecayValues;
     try {
@@ -6847,6 +6859,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         parameterHandleValues.resize(count);
         firstMomentHandleValues.resize(count);
         secondMomentHandleValues.resize(count);
+        candidateFirstMomentHandleValues.resize(count);
+        candidateSecondMomentHandleValues.resize(count);
         elementCounts.resize(count);
         weightDecayValues.resize(count);
     } catch (const std::bad_alloc&) {
@@ -6861,6 +6875,18 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     );
     env->GetLongArrayRegion(
         secondMomentHandles, 0, groupCount, secondMomentHandleValues.data()
+    );
+    env->GetLongArrayRegion(
+        candidateFirstMomentHandles,
+        0,
+        groupCount,
+        candidateFirstMomentHandleValues.data()
+    );
+    env->GetLongArrayRegion(
+        candidateSecondMomentHandles,
+        0,
+        groupCount,
+        candidateSecondMomentHandleValues.data()
     );
     env->GetIntArrayRegion(
         activeElementCounts, 0, groupCount, elementCounts.data()
@@ -6898,18 +6924,22 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     std::vector<TensorArenaAllocation*> parameterAllocations;
     std::vector<TensorArenaAllocation*> firstMomentAllocations;
     std::vector<TensorArenaAllocation*> secondMomentAllocations;
+    std::vector<TensorArenaAllocation*> candidateFirstMomentAllocations;
+    std::vector<TensorArenaAllocation*> candidateSecondMomentAllocations;
     try {
         const size_t count = static_cast<size_t>(groupCount);
         parameterAllocations.reserve(count);
         firstMomentAllocations.reserve(count);
         secondMomentAllocations.reserve(count);
+        candidateFirstMomentAllocations.reserve(count);
+        candidateSecondMomentAllocations.reserve(count);
     } catch (const std::bad_alloc&) {
         return JNI_FALSE;
     }
 
     std::vector<jlong> uniqueHandles;
     try {
-        uniqueHandles.reserve(static_cast<size_t>(groupCount) * 3u + 2u);
+        uniqueHandles.reserve(static_cast<size_t>(groupCount) * 5u + 2u);
     } catch (const std::bad_alloc&) {
         return JNI_FALSE;
     }
@@ -6921,18 +6951,29 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         const jlong parameterHandle = parameterHandleValues[groupIndex];
         const jlong firstMomentHandle = firstMomentHandleValues[groupIndex];
         const jlong secondMomentHandle = secondMomentHandleValues[groupIndex];
+        const jlong candidateFirstMomentHandle =
+            candidateFirstMomentHandleValues[groupIndex];
+        const jlong candidateSecondMomentHandle =
+            candidateSecondMomentHandleValues[groupIndex];
         const jint rawElementCount = elementCounts[groupIndex];
         const jfloat weightDecay = weightDecayValues[groupIndex];
 
         if (parameterHandle <= 0 || firstMomentHandle <= 0 ||
-            secondMomentHandle <= 0 || rawElementCount <= 0 ||
+            secondMomentHandle <= 0 ||
+            candidateFirstMomentHandle <= 0 ||
+            candidateSecondMomentHandle <= 0 ||
+            rawElementCount <= 0 ||
             !std::isfinite(weightDecay) || weightDecay < 0.0f) {
             logError("Resident AdamW group handles, dimensions, or weight decay are invalid.");
             return JNI_FALSE;
         }
 
         const jlong groupHandles[] = {
-            parameterHandle, firstMomentHandle, secondMomentHandle
+            parameterHandle,
+            firstMomentHandle,
+            secondMomentHandle,
+            candidateFirstMomentHandle,
+            candidateSecondMomentHandle
         };
         for (jlong handle : groupHandles) {
             if (std::find(uniqueHandles.begin(), uniqueHandles.end(), handle) !=
@@ -6949,9 +6990,15 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             findArenaAllocation(firstMomentHandle);
         TensorArenaAllocation* secondMomentAllocation =
             findArenaAllocation(secondMomentHandle);
+        TensorArenaAllocation* candidateFirstMomentAllocation =
+            findArenaAllocation(candidateFirstMomentHandle);
+        TensorArenaAllocation* candidateSecondMomentAllocation =
+            findArenaAllocation(candidateSecondMomentHandle);
         if (parameterAllocation == nullptr ||
             firstMomentAllocation == nullptr ||
-            secondMomentAllocation == nullptr) {
+            secondMomentAllocation == nullptr ||
+            candidateFirstMomentAllocation == nullptr ||
+            candidateSecondMomentAllocation == nullptr) {
             logError("Resident AdamW references an unknown Tensor Arena allocation.");
             return JNI_FALSE;
         }
@@ -6966,9 +7013,13 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             parameterAllocation->allocatedSize < packedParameterBytes ||
             firstMomentAllocation->logicalSize < momentBytes ||
             secondMomentAllocation->logicalSize < momentBytes ||
+            candidateFirstMomentAllocation->logicalSize < momentBytes ||
+            candidateSecondMomentAllocation->logicalSize < momentBytes ||
             (parameterAllocation->offset & 3u) != 0u ||
             (firstMomentAllocation->offset & 3u) != 0u ||
-            (secondMomentAllocation->offset & 3u) != 0u) {
+            (secondMomentAllocation->offset & 3u) != 0u ||
+            (candidateFirstMomentAllocation->offset & 3u) != 0u ||
+            (candidateSecondMomentAllocation->offset & 3u) != 0u) {
             logError("Resident AdamW tensor sizes or alignments do not match the active prefix.");
             return JNI_FALSE;
         }
@@ -6979,13 +7030,21 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             firstMomentAllocation->offset / sizeof(uint32_t);
         const uint64_t secondMomentOffsetWords =
             secondMomentAllocation->offset / sizeof(uint32_t);
+        const uint64_t candidateFirstMomentOffsetWords =
+            candidateFirstMomentAllocation->offset / sizeof(uint32_t);
+        const uint64_t candidateSecondMomentOffsetWords =
+            candidateSecondMomentAllocation->offset / sizeof(uint32_t);
         const uint64_t pairCount = (elementCount + 1u) / 2u;
         if (parameterOffsetWords > kMaximumShaderIndex ||
             firstMomentOffsetWords > kMaximumShaderIndex ||
             secondMomentOffsetWords > kMaximumShaderIndex ||
+            candidateFirstMomentOffsetWords > kMaximumShaderIndex ||
+            candidateSecondMomentOffsetWords > kMaximumShaderIndex ||
             pairCount - 1u > kMaximumShaderIndex - parameterOffsetWords ||
             elementCount - 1u > kMaximumShaderIndex - firstMomentOffsetWords ||
             elementCount - 1u > kMaximumShaderIndex - secondMomentOffsetWords ||
+            elementCount - 1u > kMaximumShaderIndex - candidateFirstMomentOffsetWords ||
+            elementCount - 1u > kMaximumShaderIndex - candidateSecondMomentOffsetWords ||
             totalGradientElements > kMaximumShaderIndex ||
             elementCount > kMaximumShaderIndex - totalGradientElements) {
             logError("Resident AdamW tensor offsets exceed 32-bit shader addressability.");
@@ -6997,6 +7056,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         parameterAllocations.push_back(parameterAllocation);
         firstMomentAllocations.push_back(firstMomentAllocation);
         secondMomentAllocations.push_back(secondMomentAllocation);
+        candidateFirstMomentAllocations.push_back(candidateFirstMomentAllocation);
+        candidateSecondMomentAllocations.push_back(candidateSecondMomentAllocation);
     }
 
     if (totalGradientElements == 0u ||
@@ -7062,6 +7123,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             firstMomentAllocations[groupIndex]->offset / sizeof(uint32_t);
         const uint64_t secondMomentOffsetWords =
             secondMomentAllocations[groupIndex]->offset / sizeof(uint32_t);
+        const uint64_t candidateFirstMomentOffsetWords =
+            candidateFirstMomentAllocations[groupIndex]->offset / sizeof(uint32_t);
+        const uint64_t candidateSecondMomentOffsetWords =
+            candidateSecondMomentAllocations[groupIndex]->offset / sizeof(uint32_t);
         const uint64_t requiredGroups =
             1u + (pairCount - 1u) / kLocalWorkGroupSize;
         const uint32_t dispatchGroups =
@@ -7070,6 +7135,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             parameterOffsetWords > kMaximumShaderIndex ||
             firstMomentOffsetWords > kMaximumShaderIndex ||
             secondMomentOffsetWords > kMaximumShaderIndex ||
+            candidateFirstMomentOffsetWords > kMaximumShaderIndex ||
+            candidateSecondMomentOffsetWords > kMaximumShaderIndex ||
             gradientElementOffset > kMaximumShaderIndex) {
             return false;
         }
@@ -7083,6 +7150,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             static_cast<uint32_t>(gradientElementOffset),
             static_cast<uint32_t>(firstMomentOffsetWords),
             static_cast<uint32_t>(secondMomentOffsetWords),
+            static_cast<uint32_t>(candidateFirstMomentOffsetWords),
+            static_cast<uint32_t>(candidateSecondMomentOffsetWords),
             static_cast<uint32_t>(statusOffsetWords),
             learningRate,
             beta1,
