@@ -25,296 +25,338 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.argus.agi.ui.theme.ArgusCyanGlow
+import com.argus.agi.ui.theme.ArgusCyanPrimary
 import com.argus.agi.ui.theme.ArgusDarkBg
+import com.argus.agi.ui.theme.ArgusSurface
 import com.argus.agi.ui.theme.ArgusTextMuted
-import com.argus.agi.ui.theme.ArgusTextSecondary
-import kotlin.math.ceil
+import kotlin.math.cos
+import kotlin.math.sin
 
 @Composable
 fun ArgusModernLoadingScreen(
-    title: String = "ARGUS",
-    subtitle: String = "Restoring the neural core",
+    title: String = "A . R . G . U . S",
+    subtitle: String = "INITIALIZING LOCAL NEURAL RUNTIME",
     progressPercent: Int? = null,
-    driverInfo: String = "Local neural runtime"
+    supportingText: String? = null,
+    driverInfo: String = "STANDALONE ON-DEVICE ARCHITECTURE",
+    isError: Boolean = false,
+    onRetry: (() -> Unit)? = null
 ) {
-    val determinateProgress = progressPercent?.coerceIn(0, 100)?.div(100f)
+    val accentColor = if (isError) MaterialTheme.colorScheme.error else ArgusCyanPrimary
+    val glowColor = if (isError) accentColor.copy(alpha = 0.82f) else ArgusCyanGlow
+    val safeProgressPercent = progressPercent?.coerceIn(0, 100)
+    val determinateProgress = safeProgressPercent?.div(100f)
+
     val animatedProgress by animateFloatAsState(
-        targetValue = determinateProgress ?: 0.22f,
+        targetValue = determinateProgress ?: 0f,
         animationSpec = tween(320, easing = FastOutSlowInEasing),
-        label = "startup_progress"
+        label = "loading_progress"
     )
 
-    val transition = rememberInfiniteTransition(label = "startup_eye")
-    val sweepRotation by transition.animateFloat(
-        initialValue = -90f,
-        targetValue = 270f,
+    val infiniteTransition = rememberInfiniteTransition(label = "loading_infinite")
+    val rotation by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
         animationSpec = infiniteRepeatable(
-            animation = tween(2200, easing = LinearEasing),
+            animation = tween(4_000, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         ),
-        label = "startup_sweep"
+        label = "reactor_rotation"
     )
-    val pulse by transition.animateFloat(
-        initialValue = 0.94f,
-        targetValue = 1.04f,
+    val pulse by infiniteTransition.animateFloat(
+        initialValue = 0.85f,
+        targetValue = 1.15f,
         animationSpec = infiniteRepeatable(
-            animation = tween(1800, easing = FastOutSlowInEasing),
+            animation = tween(1_400, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
         ),
-        label = "startup_pulse"
+        label = "reactor_pulse"
     )
-
-    val progressColor = Color(0xFF8CA5CC)
-    val ringTrack = Color(0xFF26344A)
-    val activeDots = if (determinateProgress == null) {
-        2 + ((sweepRotation + 90f) / 360f * 3f).toInt().coerceIn(0, 2)
-    } else {
-        ceil(animatedProgress * 5f).toInt().coerceIn(0, 5)
-    }
-    val percentLabel = determinateProgress?.let { "${(animatedProgress * 100f).toInt()}%" } ?: "..."
+    val scanLine by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2_000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "progress_scan"
+    )
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(ArgusDarkBg)
-            .padding(horizontal = 24.dp, vertical = 22.dp)
+            .background(ArgusDarkBg),
+        contentAlignment = Alignment.Center
     ) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = title,
-                    color = ArgusTextSecondary,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Medium,
-                    fontSize = 12.sp,
-                    letterSpacing = 1.6.sp
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val step = 48.dp.toPx()
+            var x = 0f
+            while (x < size.width) {
+                drawLine(
+                    color = accentColor.copy(alpha = 0.035f),
+                    start = Offset(x, 0f),
+                    end = Offset(x, size.height),
+                    strokeWidth = 1f
                 )
-                Text(
-                    text = "STATUS: ${subtitle.uppercase()}${determinateProgress?.let { " · $percentLabel" } ?: ""}",
-                    modifier = Modifier.width(230.dp),
-                    color = ArgusTextMuted,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 9.sp,
-                    letterSpacing = 0.3.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.End
-                )
+                x += step
             }
 
-            Spacer(modifier = Modifier.weight(1f))
-
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(198.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Canvas(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(190.dp)
-                    ) {
-                        val centerX = size.width / 2f
-                        val centerY = size.height / 2f
-                        val halfWidth = minOf(size.width * 0.43f, 190.dp.toPx())
-                        val eyeHeight = 48.dp.toPx()
-                        val left = centerX - halfWidth
-                        val right = centerX + halfWidth
-
-                        val eyeOutline = Path().apply {
-                            moveTo(left, centerY)
-                            cubicTo(
-                                centerX - halfWidth * 0.52f,
-                                centerY - eyeHeight,
-                                centerX + halfWidth * 0.52f,
-                                centerY - eyeHeight,
-                                right,
-                                centerY
-                            )
-                            cubicTo(
-                                centerX + halfWidth * 0.52f,
-                                centerY + eyeHeight,
-                                centerX - halfWidth * 0.52f,
-                                centerY + eyeHeight,
-                                left,
-                                centerY
-                            )
-                            close()
-                        }
-                        drawPath(
-                            path = eyeOutline,
-                            color = progressColor.copy(alpha = 0.58f),
-                            style = Stroke(width = 1.7.dp.toPx())
-                        )
-                    }
-
-                    Box(
-                        modifier = Modifier.size(122.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Canvas(modifier = Modifier.fillMaxSize()) {
-                            val center = Offset(size.width / 2f, size.height / 2f)
-                            val radius = size.minDimension * 0.43f
-                            drawCircle(
-                                color = Color(0xFF19263A).copy(alpha = 0.96f),
-                                radius = radius,
-                                center = center
-                            )
-                            if (determinateProgress != null) {
-                                drawArc(
-                                    color = progressColor.copy(alpha = 0.22f),
-                                    startAngle = -90f,
-                                    sweepAngle = animatedProgress * 360f,
-                                    useCenter = true,
-                                    topLeft = Offset(center.x - radius, center.y - radius),
-                                    size = androidx.compose.ui.geometry.Size(radius * 2f, radius * 2f)
-                                )
-                            }
-                            drawCircle(
-                                color = progressColor.copy(alpha = 0.72f),
-                                radius = radius,
-                                center = center,
-                                style = Stroke(width = 2.dp.toPx())
-                            )
-                            drawCircle(
-                                color = ringTrack,
-                                radius = radius + 5.dp.toPx(),
-                                center = center,
-                                style = Stroke(width = 1.dp.toPx())
-                            )
-                            val arcSweep = if (determinateProgress != null) animatedProgress * 360f else 94f
-                            val arcStart = if (determinateProgress != null) -90f else sweepRotation
-                            drawArc(
-                                color = progressColor.copy(alpha = pulse.coerceIn(0f, 1f)),
-                                startAngle = arcStart,
-                                sweepAngle = arcSweep.coerceAtLeast(2f),
-                                useCenter = false,
-                                topLeft = Offset(center.x - radius - 5.dp.toPx(), center.y - radius - 5.dp.toPx()),
-                                size = androidx.compose.ui.geometry.Size(
-                                    (radius + 5.dp.toPx()) * 2f,
-                                    (radius + 5.dp.toPx()) * 2f
-                                ),
-                                style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
-                            )
-                        }
-                        Text(
-                            text = percentLabel,
-                            color = Color(0xFFD7E2F2),
-                            fontSize = 24.sp,
-                            fontWeight = FontWeight.Medium,
-                            fontFamily = FontFamily.Monospace,
-                            letterSpacing = 0.2.sp
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(22.dp))
-
-                Text(
-                    text = subtitle,
-                    color = progressColor,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+            var y = 0f
+            while (y < size.height) {
+                drawLine(
+                    color = accentColor.copy(alpha = 0.035f),
+                    start = Offset(0f, y),
+                    end = Offset(size.width, y),
+                    strokeWidth = 1f
                 )
+                y += step
+            }
+        }
 
-                Spacer(modifier = Modifier.height(18.dp))
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.Center)
+                .padding(horizontal = 24.dp, vertical = 28.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Box(
+                modifier = Modifier.size(160.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val centerX = size.width / 2f
+                    val centerY = size.height / 2f
+                    val baseRadius = size.width * 0.42f
 
-                Canvas(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 10.dp)
-                        .height(3.dp)
-                        .clip(RoundedCornerShape(2.dp))
-                ) {
-                    drawLine(
-                        color = ringTrack,
-                        start = Offset(0f, size.height / 2f),
-                        end = Offset(size.width, size.height / 2f),
-                        strokeWidth = size.height,
-                        cap = StrokeCap.Round
-                    )
-                    val fillWidth = if (determinateProgress != null) {
-                        size.width * animatedProgress
-                    } else {
-                        size.width * 0.28f
-                    }
-                    val startX = if (determinateProgress != null) {
-                        0f
-                    } else {
-                        ((size.width + fillWidth) * (sweepRotation + 90f) / 360f) - fillWidth
-                    }.coerceIn(0f, size.width)
-                    val endX = if (determinateProgress != null) {
-                        fillWidth
-                    } else {
-                        (startX + fillWidth).coerceAtMost(size.width)
-                    }
-                    drawLine(
-                        color = progressColor,
-                        start = Offset(startX, size.height / 2f),
-                        end = Offset(endX, size.height / 2f),
-                        strokeWidth = size.height,
-                        cap = StrokeCap.Round
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(24.dp))
-
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(9.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    repeat(5) { index ->
-                        Box(
-                            modifier = Modifier
-                                .size(7.dp)
-                                .clip(CircleShape)
-                                .background(if (index < activeDots) progressColor else ringTrack)
+                    for (index in 0 until 12) {
+                        val angleDegrees = rotation + index * 30f
+                        val angleRadians = Math.toRadians(angleDegrees.toDouble())
+                        val innerRadius = baseRadius - 8.dp.toPx()
+                        val start = Offset(
+                            (centerX + innerRadius * cos(angleRadians)).toFloat(),
+                            (centerY + innerRadius * sin(angleRadians)).toFloat()
+                        )
+                        val end = Offset(
+                            (centerX + baseRadius * cos(angleRadians)).toFloat(),
+                            (centerY + baseRadius * sin(angleRadians)).toFloat()
+                        )
+                        drawLine(
+                            color = accentColor.copy(alpha = 0.45f),
+                            start = start,
+                            end = end,
+                            strokeWidth = 2.dp.toPx(),
+                            cap = StrokeCap.Round
                         )
                     }
+
+                    drawArc(
+                        brush = Brush.sweepGradient(
+                            listOf(Color.Transparent, accentColor, glowColor, Color.Transparent)
+                        ),
+                        startAngle = rotation,
+                        sweepAngle = 220f,
+                        useCenter = false,
+                        style = Stroke(width = 2.5.dp.toPx(), cap = StrokeCap.Round),
+                        size = androidx.compose.ui.geometry.Size(
+                            baseRadius * 2f,
+                            baseRadius * 2f
+                        ),
+                        topLeft = Offset(centerX - baseRadius, centerY - baseRadius)
+                    )
+
+                    val innerRadius = baseRadius * 0.75f
+                    drawArc(
+                        brush = Brush.sweepGradient(
+                            listOf(Color.Transparent, glowColor, Color.Transparent)
+                        ),
+                        startAngle = -rotation * 1.5f,
+                        sweepAngle = 140f,
+                        useCenter = false,
+                        style = Stroke(width = 1.5.dp.toPx(), cap = StrokeCap.Round),
+                        size = androidx.compose.ui.geometry.Size(
+                            innerRadius * 2f,
+                            innerRadius * 2f
+                        ),
+                        topLeft = Offset(centerX - innerRadius, centerY - innerRadius)
+                    )
+
+                    val coreRadius = 24.dp.toPx() * pulse
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                Color.White,
+                                glowColor,
+                                accentColor.copy(alpha = 0.4f),
+                                Color.Transparent
+                            ),
+                            center = Offset(centerX, centerY),
+                            radius = coreRadius * 1.8f
+                        ),
+                        radius = coreRadius * 1.8f,
+                        center = Offset(centerX, centerY)
+                    )
+                    drawCircle(
+                        color = Color.White,
+                        radius = 4.dp.toPx(),
+                        center = Offset(centerX, centerY)
+                    )
                 }
             }
 
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(modifier = Modifier.height(32.dp))
 
             Text(
-                text = driverInfo,
-                modifier = Modifier.fillMaxWidth(),
-                color = ArgusTextMuted,
+                text = title,
+                style = MaterialTheme.typography.headlineSmall,
+                color = accentColor,
+                fontWeight = FontWeight.Bold,
                 fontFamily = FontFamily.Monospace,
-                fontSize = 9.sp,
-                letterSpacing = 0.3.sp,
-                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                letterSpacing = 6.sp,
+                textAlign = TextAlign.Center,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.labelSmall,
+                color = glowColor,
+                fontFamily = FontFamily.Monospace,
+                letterSpacing = 1.5.sp,
+                fontSize = 10.sp,
+                textAlign = TextAlign.Center,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+
+            if (!supportingText.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    text = supportingText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = ArgusTextMuted,
+                    fontSize = 11.sp,
+                    textAlign = TextAlign.Center,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            Spacer(modifier = Modifier.height(28.dp))
+
+            Box(
+                modifier = Modifier
+                    .width(220.dp)
+                    .height(3.dp)
+                    .clip(RoundedCornerShape(1.5.dp))
+                    .background(ArgusSurface)
+            ) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val centerY = size.height / 2f
+                    if (determinateProgress != null) {
+                        drawLine(
+                            color = accentColor,
+                            start = Offset(0f, centerY),
+                            end = Offset(size.width * animatedProgress.coerceIn(0f, 1f), centerY),
+                            strokeWidth = size.height,
+                            cap = StrokeCap.Round
+                        )
+                    } else {
+                        val scanWidth = size.width * 0.35f
+                        val startX = (size.width + scanWidth) * scanLine - scanWidth
+                        val endX = startX + scanWidth
+                        drawLine(
+                            brush = Brush.horizontalGradient(
+                                colors = listOf(
+                                    Color.Transparent,
+                                    accentColor,
+                                    Color.White,
+                                    accentColor,
+                                    Color.Transparent
+                                ),
+                                startX = startX,
+                                endX = endX
+                            ),
+                            start = Offset(startX, centerY),
+                            end = Offset(endX, centerY),
+                            strokeWidth = size.height,
+                            cap = StrokeCap.Round
+                        )
+                    }
+                }
+            }
+
+            if (safeProgressPercent != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = safeProgressPercent.toString() + "%",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = glowColor,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 9.sp
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .clip(CircleShape)
+                        .background(glowColor)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = driverInfo,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ArgusTextMuted,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 9.sp,
+                    textAlign = TextAlign.Center,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            if (isError && onRetry != null) {
+                Spacer(modifier = Modifier.height(14.dp))
+                TextButton(onClick = onRetry) {
+                    Text(
+                        text = "RETRY GENESIS",
+                        color = accentColor,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 10.sp,
+                        letterSpacing = 1.sp
+                    )
+                }
+            }
         }
     }
 }
