@@ -34,13 +34,6 @@ class VulkanOptimizerStateRegistryTest {
         }
 
         fun download(allocation: VulkanTensorAllocation, destination: ByteArray): Boolean {
-            val source = contents[allocation.nativeHandle] ?: return false
-            if (source.size != destination.size) return false
-            source.copyInto(destination)
-            return true
-        }
-
-        fun download(allocation: VulkanTensorAllocation, destination: ByteArray): Boolean {
             if (allocation.nativeHandle == downloadFailureHandle) return false
             val source = contents[allocation.nativeHandle] ?: return false
             if (source.size != destination.size) return false
