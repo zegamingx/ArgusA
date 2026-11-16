@@ -3053,7 +3053,15 @@ class ArgusNeuralEngine private constructor(
                 residentGradient = residentGradient
             )
         if (gpuOrStagedUpdateCompleted) {
-            synchronizeVulkanModelTensorResidency("Vulkan AdamW parameter update")
+            runCatching {
+                synchronizeVulkanModelTensorResidency("Vulkan AdamW parameter update")
+            }.onFailure { error ->
+                Log.w(
+                    TAG,
+                    "AdamW committed successfully, but model-residency telemetry/reconciliation needs retry.",
+                    error
+                )
+            }
             return
         }
 
@@ -3126,7 +3134,15 @@ class ArgusNeuralEngine private constructor(
                 wd = weightDecayByGroup[index]
             )
         }
-        synchronizeVulkanModelTensorResidency("Kotlin AdamW fallback parameter update")
+        runCatching {
+            synchronizeVulkanModelTensorResidency("Kotlin AdamW fallback parameter update")
+        }.onFailure { error ->
+            Log.w(
+                TAG,
+                "CPU AdamW committed successfully, but Vulkan model-residency reconciliation needs retry.",
+                error
+            )
+        }
     }
 
     private fun normalizeGradient(grad: FloatArray, div: Float) {
