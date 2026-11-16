@@ -2982,7 +2982,8 @@ class ArgusNeuralEngine private constructor(
             "AdamW tensor and weight-decay group counts must match."
         }
 
-        if (VulkanTrainingBackend.tryApplyFp16AdamWUpdate(
+        val gpuOrStagedUpdateCompleted = try {
+            VulkanTrainingBackend.tryApplyFp16AdamWUpdate(
                 parameters = parameters,
                 gradients = gradients,
                 firstMoments = firstMoments,
@@ -2995,7 +2996,14 @@ class ArgusNeuralEngine private constructor(
                 biasCorrection2 = biasCorrection2,
                 epsilon = epsilon,
                 gradientClipFactor = gradientClipFactor
-            )) {
+            )
+        } catch (error: RuntimeException) {
+            // The caller incremented the logical optimizer step before dispatch.
+            // A failed state recovery must not advance that step or continue on stale state.
+            adamStep = (adamStep - 1).coerceAtLeast(0)
+            throw error
+        }
+        if (gpuOrStagedUpdateCompleted) {
             synchronizeVulkanModelTensorResidency("Vulkan AdamW parameter update")
             return
         }
@@ -3535,8 +3543,8 @@ class ArgusNeuralEngine private constructor(
     fun saveCheckpoint(): Boolean {
         return try {
             synchronized(modelLock) {
-                check(VulkanTrainingBackend.synchronizeOptimizerStateMirrors()) {
-                    "GPU optimizer moments could not be recovered before checkpoint serialization."
+                check(VulkanTrainingBackend.synchronizeTrainingStateMirrors()) {
+                    "GPU model or optimizer state could not be recovered before checkpoint serialization."
                 }
                 writeArg4Checkpoint()
             }
