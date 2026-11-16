@@ -5683,7 +5683,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
         VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
     VkDependencyInfoKHR beforeDependency{};
-    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_2_KHR;
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
     beforeDependency.memoryBarrierCount = 1u;
     beforeDependency.pMemoryBarriers = &beforeCompute;
     gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
@@ -5717,7 +5717,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
         VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
     VkDependencyInfoKHR betweenDependency{};
-    betweenDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_2_KHR;
+    betweenDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
     betweenDependency.memoryBarrierCount = 1u;
     betweenDependency.pMemoryBarriers = &betweenStages;
 
@@ -5772,7 +5772,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
         outputBarriers[index].size = outputSizes[index];
     }
     VkDependencyInfoKHR outputDependency{};
-    outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_2_KHR;
+    outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
     outputDependency.bufferMemoryBarrierCount = 4u;
     outputDependency.pBufferMemoryBarriers = outputBarriers;
     gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputDependency);

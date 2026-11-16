@@ -1989,7 +1989,7 @@ internal object VulkanTrainingBackend {
                     }
                     val score = dot * scale
                     expectedScores[head * sequenceLength + queryIndex][keyIndex] = score
-                    maximum = max(maximum, score)
+                    maximum = maxOf(maximum, score)
                 }
                 var denominator = 0f
                 for (keyIndex in 0..queryIndex) {
