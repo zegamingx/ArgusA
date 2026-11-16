@@ -770,7 +770,9 @@ internal object VulkanTrainingBackend {
         lastModelParameterInventory = tensors.toList()
         residencyRebuildPending = false
         _modelTensorResidencyReady.value = false
-        if (residencySuspended || residencyBlockedAfterFailure || !isFp16ComputeAvailable) {
+        if (residencySuspended ||
+            residencyBlockedAfterFailure ||
+            (!isFp16ComputeAvailable && !isResidentActivationLinearAvailable)) {
             return false
         }
 
@@ -882,6 +884,29 @@ internal object VulkanTrainingBackend {
         residencyRebuildPending = false
         if (inventory.isEmpty()) return false
         return synchronizeModelTensorResidency(inventory)
+    }
+
+    /**
+     * Acquires a revision-synchronized FP16 model tensor for the resident FP32-activation
+     * compute graph. This path does not require shaderFloat16 support because the resident
+     * linear shader unpacks the stored binary16 words to FP32 before accumulation.
+     */
+    @Synchronized
+    internal fun acquireResidentModelParameterTensor(
+        parameters: Float16ParameterArray
+    ): VulkanTensorAllocation? {
+        if (!isResidentActivationLinearAvailable || !ensureModelTensorResidencyReady()) {
+            return null
+        }
+        return try {
+            tensorResidencyRegistry.acquire(parameters)
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident model parameter synchronization exceeded available memory.", error)
+            null
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident model parameter synchronization failed.", error)
+            null
+        }
     }
 
     /** Reset failed native state before the user explicitly retries Vulkan initialization. */

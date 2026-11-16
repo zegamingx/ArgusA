@@ -340,7 +340,10 @@ class ArgusNeuralEngine private constructor(
     }
 
     private fun synchronizeVulkanModelTensorResidency(reason: String) {
-        if (!VulkanTrainingBackend.isFp16ComputeAvailable) return
+        if (!VulkanTrainingBackend.isFp16ComputeAvailable &&
+            !VulkanTrainingBackend.isResidentActivationLinearAvailable) {
+            return
+        }
         val synchronized = VulkanTrainingBackend.synchronizeModelTensorResidency(
             currentNamedParameterTensors()
         )
