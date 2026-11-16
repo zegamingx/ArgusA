@@ -19,6 +19,7 @@ internal class VulkanTensorResidencyRegistry(
     private val allocate: (Long) -> VulkanTensorAllocation?,
     private val upload: (VulkanTensorAllocation, ByteArray) -> Boolean,
     private val release: (VulkanTensorAllocation) -> Boolean,
+    private val download: ((VulkanTensorAllocation, ByteArray) -> Boolean)? = null,
     private val maxResidentBytes: () -> Long = { Long.MAX_VALUE }
 ) {
     private data class Entry(
