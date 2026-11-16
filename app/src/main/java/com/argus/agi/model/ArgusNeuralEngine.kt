@@ -3040,14 +3040,63 @@ class ArgusNeuralEngine private constructor(
             return
         }
 
-        for (index in parameters.indices) {
+        // Validate every CPU update before mutating any authoritative model or
+        // optimizer tensor. This keeps the fallback transactional without allocating
+        // a second full copy of the model, first moments, or second moments.
+        for (groupIndex in parameters.indices) {
+            val parameter = parameters[groupIndex]
+            val gradient = gradients[groupIndex]
+            val firstMoment = firstMoments[groupIndex]
+            val secondMoment = secondMoments[groupIndex]
             require(
-                gradients[index].size <= parameters[index].size &&
-                    parameters[index].size == firstMoments[index].size &&
-                    parameters[index].size == secondMoments[index].size
+                gradient.size <= parameter.size &&
+                    parameter.size == firstMoment.size &&
+                    parameter.size == secondMoment.size
             ) {
-                "AdamW tensor shape mismatch at parameter group $index."
+                "AdamW tensor shape mismatch at parameter group $groupIndex."
             }
+            val weightDecayValue = weightDecayByGroup[groupIndex]
+            require(weightDecayValue.isFinite() && weightDecayValue >= 0f) {
+                "AdamW weight decay must be finite and non-negative."
+            }
+            for (elementIndex in gradient.indices) {
+                val clippedGradient = gradient[elementIndex] * gradientClipFactor
+                val oldParameter = parameter[elementIndex]
+                val oldFirstMoment = firstMoment[elementIndex]
+                val oldSecondMoment = secondMoment[elementIndex]
+                require(
+                    clippedGradient.isFinite() &&
+                        oldParameter.isFinite() &&
+                        oldFirstMoment.isFinite() &&
+                        oldSecondMoment.isFinite() &&
+                        oldSecondMoment >= 0f
+                ) {
+                    "AdamW CPU fallback input contains a non-finite or invalid value at group $groupIndex, index $elementIndex."
+                }
+
+                val nextFirstMoment =
+                    beta1 * oldFirstMoment + (1f - beta1) * clippedGradient
+                val nextSecondMoment =
+                    beta2 * oldSecondMoment +
+                        (1f - beta2) * clippedGradient * clippedGradient
+                require(
+                    nextFirstMoment.isFinite() &&
+                        nextSecondMoment.isFinite() &&
+                        nextSecondMoment >= 0f
+                ) {
+                    "AdamW CPU fallback produced invalid moments at group $groupIndex, index $elementIndex."
+                }
+                val correctedFirstMoment = nextFirstMoment / biasCorrection1
+                val correctedSecondMoment = nextSecondMoment / biasCorrection2
+                val update =
+                    correctedFirstMoment / (sqrt(correctedSecondMoment) + epsilon) +
+                        weightDecayValue * oldParameter
+                Float16Codec.fromFiniteFloat(oldParameter - learningRate * update)
+            }
+        }
+
+        // Commit only after every parameter group has passed numerical validation.
+        for (index in parameters.indices) {
             applyClip(gradients[index], gradientClipFactor)
             adamUpdate(
                 param = parameters[index],
