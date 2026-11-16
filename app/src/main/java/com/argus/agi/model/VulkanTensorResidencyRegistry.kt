@@ -400,9 +400,13 @@ internal class VulkanTensorResidencyRegistry(
             retiredAllocations.add(previous)
         }
         retiredResidentBytes = nextRetiredBytes
-        runCatching { releaseRetiredAllocations() }
         return true
     }
+
+    /** Releases old buffers after the paired optimizer-state registry has committed. */
+    @Synchronized
+    internal fun finishReplacementAfterPreflight(): Boolean =
+        releaseRetiredAllocations()
     private fun validateReplacement(
         tensors: List<Float16ParameterArray>,
         expectedAllocations: List<VulkanTensorAllocation>,
