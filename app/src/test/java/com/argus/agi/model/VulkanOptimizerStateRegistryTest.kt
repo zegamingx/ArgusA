@@ -258,4 +258,46 @@ class VulkanOptimizerStateRegistryTest {
         assertEquals(2, state.residentTensorCount())
     }
 
+    @Test
+    fun commitsPreflightedMomentSwapWithoutReallocatingDuringPublication() {
+        val arena = FakeArena()
+        val state = registry(arena)
+        val first = FloatArray(4) { index -> 0.1f * (index + 1) }
+        val second = FloatArray(4) { index -> -0.2f * (index + 1) }
+        assertTrue(state.synchronizeAll(listOf(first, second)))
+
+        val oldFirst = state.acquire(first) ?: error("First active moment buffer is missing.")
+        val oldSecond = state.acquire(second) ?: error("Second active moment buffer is missing.")
+        val candidateFirst = arena.allocate(oldFirst.byteCount)
+            ?: error("First candidate moment allocation failed.")
+        val candidateSecond = arena.allocate(oldSecond.byteCount)
+            ?: error("Second candidate moment allocation failed.")
+        assertTrue(arena.upload(candidateFirst, ByteArray(candidateFirst.byteCount.toInt())))
+        assertTrue(arena.upload(candidateSecond, ByteArray(candidateSecond.byteCount.toInt())))
+
+        assertTrue(
+            state.canReplaceAll(
+                tensors = listOf(first, second),
+                expectedAllocations = listOf(oldFirst, oldSecond),
+                replacementAllocations = listOf(candidateFirst, candidateSecond)
+            )
+        )
+        arena.releaseFailure = true
+        assertTrue(
+            state.commitReplacementAfterPreflight(
+                tensors = listOf(first, second),
+                expectedAllocations = listOf(oldFirst, oldSecond),
+                replacementAllocations = listOf(candidateFirst, candidateSecond)
+            )
+        )
+
+        assertEquals(candidateFirst.nativeHandle, state.acquire(first)?.nativeHandle)
+        assertEquals(candidateSecond.nativeHandle, state.acquire(second)?.nativeHandle)
+        assertEquals(64L, state.residentByteCount())
+        arena.releaseFailure = false
+        assertTrue(state.synchronizeAll(listOf(first, second)))
+        assertEquals(32L, state.residentByteCount())
+        assertFalse(arena.contents.containsKey(oldFirst.nativeHandle))
+        assertFalse(arena.contents.containsKey(oldSecond.nativeHandle))
+    }
 }
