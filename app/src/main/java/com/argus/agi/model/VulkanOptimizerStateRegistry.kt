@@ -114,7 +114,21 @@ internal class VulkanOptimizerStateRegistry(
         tensors: List<FloatArray>,
         expectedAllocations: List<VulkanTensorAllocation>,
         replacementAllocations: List<VulkanTensorAllocation>
-    ): Boolean = validateReplacement(tensors, expectedAllocations, replacementAllocations)
+    ): Boolean {
+        if (!validateReplacement(tensors, expectedAllocations, replacementAllocations)) return false
+        val nextRetiredBytes = runCatching {
+            expectedAllocations.fold(retiredResidentBytes) { total, allocation ->
+                Math.addExact(total, allocation.byteCount)
+            }
+        }.getOrNull() ?: return false
+        if (nextRetiredBytes < retiredResidentBytes) return false
+        return runCatching {
+            retiredAllocations.ensureCapacity(
+                Math.addExact(retiredAllocations.size, expectedAllocations.size)
+            )
+            true
+        }.getOrDefault(false)
+    }
 
     /**
      * Atomically publishes a complete set of candidate moment buffers after a successful
