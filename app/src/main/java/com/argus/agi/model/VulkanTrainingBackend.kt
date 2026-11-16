@@ -790,22 +790,23 @@ internal object VulkanTrainingBackend {
     }
 
     /**
-     * A full FP16 model plus its two FP32 Adam moments requires approximately
-     * 2 + 4 + 4 bytes per parameter. Reserve one seventh for FP16 weights,
-     * four sevenths for optimizer moments, and two sevenths for activations
-     * plus transient gradient staging.
+     * One full training update needs FP16 model weights (2 B/parameter), active and
+     * candidate FP32 Adam moments (16 B/parameter total), and a transient FP32
+     * gradient buffer (4 B/parameter). Reserve those capacities in a 1:8:2 ratio:
+     * model 1/11, optimizer state 4/11 (plus an equal candidate buffer), activation/
+     * gradient staging 2/11. The reservations together fit the bounded Tensor Arena.
      */
     private fun calculateModelTensorResidencyBudgetBytes(
         capabilities: VulkanDeviceCapabilities?
-    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) / 7L
+    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) / 11L
 
     private fun calculateActivationTensorResidencyBudgetBytes(
         capabilities: VulkanDeviceCapabilities?
-    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) * 2L / 7L
+    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) * 2L / 11L
 
     private fun calculateOptimizerStateResidencyBudgetBytes(
         capabilities: VulkanDeviceCapabilities?
-    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) * 4L / 7L
+    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) * 4L / 11L
 
     /**
      * Allocates persistent Vulkan storage. New contents are undefined until uploaded
