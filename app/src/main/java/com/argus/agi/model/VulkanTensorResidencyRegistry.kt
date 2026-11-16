@@ -52,10 +52,13 @@ internal class VulkanTensorResidencyRegistry(
             val currentBytes = runCatching {
                 Math.addExact(residentBytes, retiredResidentBytes)
             }.getOrNull() ?: return null
-            val nextResidentBytes = runCatching {
-                Math.addExact(currentBytes, byteCount)
+            val nextActiveBytes = runCatching {
+                Math.addExact(residentBytes, byteCount)
             }.getOrNull() ?: return null
-            if (nextResidentBytes > maxResidentBytes().coerceAtLeast(0L)) return null
+            val nextTotalBytes = runCatching {
+                Math.addExact(nextActiveBytes, retiredResidentBytes)
+            }.getOrNull() ?: return null
+            if (nextTotalBytes > maxResidentBytes().coerceAtLeast(0L)) return null
 
             val allocation = allocate(byteCount) ?: return null
             candidate = Entry(
@@ -64,7 +67,7 @@ internal class VulkanTensorResidencyRegistry(
                 hostMirrorCurrent = false
             )
             entries[parameters] = candidate
-            residentBytes = nextResidentBytes
+            residentBytes = nextActiveBytes
         }
         val entry: Entry = candidate
 
