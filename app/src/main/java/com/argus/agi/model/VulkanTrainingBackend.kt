@@ -5160,6 +5160,7 @@ internal object VulkanTrainingBackend {
         val candidateSecondMoments = ArrayList<VulkanTensorAllocation>(parameters.size)
         var candidateParametersCommitted = false
         var candidateMomentsCommitted = false
+        var partialRegistryPublicationFailure = false
         var gradientReleased = false
         var statusReleased = false
         var dispatchAttempted = false
@@ -5323,7 +5324,7 @@ internal object VulkanTrainingBackend {
                 return false
             }
 
-            if (!tensorResidencyRegistry.replaceAll(
+            if (!tensorResidencyRegistry.commitReplacementAfterPreflight(
                     parameterInventory,
                     expectedParameterAllocations,
                     candidateParameterAllocations
@@ -5334,16 +5335,19 @@ internal object VulkanTrainingBackend {
             }
             candidateParametersCommitted = true
 
-            if (!optimizerStateResidencyRegistry.replaceAll(
+            if (!optimizerStateResidencyRegistry.commitReplacementAfterPreflight(
                     momentInventory,
                     expectedMomentAllocations,
                     candidateMomentAllocations
                 )) {
-                // This can only happen if a registry invariant changes after the preflight.
-                // Keep the runtime unavailable instead of silently continuing with mixed state.
+                // Both registries were preflighted and reserved. A remaining failure
+                // indicates a broken ownership invariant; abort training rather than
+                // falling back with a mixed model/moment revision.
+                partialRegistryPublicationFailure = true
                 teardownRequired = true
-                Log.e(TAG, "Resident AdamW could not atomically publish candidate FP32 moments.")
-                return false
+                throw IllegalStateException(
+                    "Resident AdamW could not atomically publish candidate FP32 moments."
+                )
             }
             candidateMomentsCommitted = true
             deviceCommitCompleted = true
@@ -5364,6 +5368,7 @@ internal object VulkanTrainingBackend {
             return false
         } catch (error: RuntimeException) {
             Log.e(TAG, "Resident AdamW transaction failed.", error)
+            if (partialRegistryPublicationFailure) throw error
             if (deviceCommitCompleted || candidateMomentsCommitted) {
                 teardownRequired = true
                 return true
