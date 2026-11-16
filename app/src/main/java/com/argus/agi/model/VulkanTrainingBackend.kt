@@ -5001,7 +5001,6 @@ internal object VulkanTrainingBackend {
 
         var totalActiveElements = 0L
         var totalGradientBytes = 0L
-        var totalParameterBytes = 0L
         var totalMomentBytes = 0L
         for (index in parameters.indices) {
             val parameterSize = parameters[index].size
@@ -5025,12 +5024,6 @@ internal object VulkanTrainingBackend {
                 Math.addExact(
                     totalGradientBytes,
                     Math.multiplyExact(activeSize.toLong(), Float.SIZE_BYTES.toLong())
-                )
-            }.getOrNull() ?: return false
-            totalParameterBytes = runCatching {
-                Math.addExact(
-                    totalParameterBytes,
-                    Math.multiplyExact(parameterSize.toLong(), Short.SIZE_BYTES.toLong())
                 )
             }.getOrNull() ?: return false
             totalMomentBytes = runCatching {
@@ -5072,13 +5065,10 @@ internal object VulkanTrainingBackend {
         val availableHeapBytes = runtime.freeMemory() +
             (runtime.maxMemory() - runtime.totalMemory()).coerceAtLeast(0L)
         val stagingBytes = runCatching {
-            Math.addExact(
-                totalParameterBytes,
-                Math.multiplyExact(totalGradientBytes, 2L)
-            )
+            Math.multiplyExact(totalGradientBytes, 2L)
         }.getOrNull() ?: return false
         if (stagingBytes > availableHeapBytes / 2L) {
-            Log.d(TAG, "Resident AdamW recovery mirror exceeds the safe host-heap budget.")
+            Log.d(TAG, "Resident AdamW gradient staging exceeds the safe host-heap budget.")
             return false
         }
 
@@ -5114,7 +5104,7 @@ internal object VulkanTrainingBackend {
         var statusReleased = false
         var dispatchAttempted = false
         var teardownRequired = false
-        var hostCommitCompleted = false
+        var deviceCommitCompleted = false
 
         try {
             val flattenedGradients = FloatArray(totalActiveElements.toInt())
@@ -5148,6 +5138,7 @@ internal object VulkanTrainingBackend {
             }
 
             dispatchAttempted = true
+            tensorResidencyRegistry.markDeviceMutationPending(parameters.toList())
             modelParameterMirrorReliable = false
             optimizerStateMirrorReliable = false
             val dispatched = try {
@@ -5202,23 +5193,9 @@ internal object VulkanTrainingBackend {
                 .int
             if (transactionStatus != 0) {
                 // The validation phase rejected the step. Active weights and moments
-                // were not written; only the status flag and candidate buffers were touched.
-                modelParameterMirrorReliable = true
+                // were not written; previous GPU updates may still leave host mirrors stale.
                 Log.e(TAG, "Resident AdamW rejected a non-finite or out-of-range update.")
                 return false
-            }
-
-            val parameterSnapshots = Array(parameters.size) { index ->
-                val snapshot = ByteArray(
-                    Math.multiplyExact(parameters[index].size, Short.SIZE_BYTES)
-                )
-                if (!downloadGpuTensor(residentParameters[index], snapshot)) {
-                    throw IllegalStateException(
-                        "Resident AdamW parameter readback failed before host commit."
-                    )
-                }
-                parameters[index].validateLittleEndianPrefix(snapshot, gradients[index].size)
-                snapshot
             }
 
             // Release transient staging before publishing candidate moment allocations.
@@ -5249,17 +5226,10 @@ internal object VulkanTrainingBackend {
                 return false
             }
             candidateMomentsCommitted = true
-
-            for (index in parameters.indices) {
-                parameters[index].copyPrefixFromLittleEndianByteArray(
-                    parameterSnapshots[index],
-                    gradients[index].size
-                )
-            }
-            hostCommitCompleted = true
-            modelParameterMirrorReliable = true
-            // The GPU candidate moments are now authoritative. Host moments are refreshed
-            // only at checkpoint, CPU fallback, memory pressure, or runtime teardown.
+            deviceCommitCompleted = true
+            // Resident FP16 weights and candidate FP32 moments are now authoritative.
+            // Host mirrors stay stale and are read only at explicit CPU/inference/checkpoint
+            // boundaries, never after every optimizer update.
             optimizerStateMirrorReliable = false
 
             val revisionsSynchronized = parameters.indices.all { index ->
@@ -5277,7 +5247,7 @@ internal object VulkanTrainingBackend {
             return true
         } catch (error: OutOfMemoryError) {
             Log.w(TAG, "Resident AdamW exceeded the available host memory budget.", error)
-            if (hostCommitCompleted || candidateMomentsCommitted) {
+            if (deviceCommitCompleted || candidateMomentsCommitted) {
                 teardownRequired = true
                 return true
             }
@@ -5285,7 +5255,7 @@ internal object VulkanTrainingBackend {
             return false
         } catch (error: RuntimeException) {
             Log.e(TAG, "Resident AdamW transaction failed.", error)
-            if (hostCommitCompleted || candidateMomentsCommitted) {
+            if (deviceCommitCompleted || candidateMomentsCommitted) {
                 teardownRequired = true
                 return true
             }
@@ -5326,8 +5296,8 @@ internal object VulkanTrainingBackend {
                         Log.e(TAG, "Vulkan teardown after a failed resident AdamW transaction failed.", error)
                     }
             }
-            if (hostCommitCompleted && !isRuntimeAvailable) {
-                _currentBackend = "Kotlin CPU — resident AdamW host mirror committed"
+            if (deviceCommitCompleted && !isRuntimeAvailable) {
+                _currentBackend = "Kotlin CPU — GPU AdamW committed; host mirror recovery required"
             }
         }
     }
