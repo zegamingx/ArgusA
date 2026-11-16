@@ -55,6 +55,19 @@ int main() {
         assert(extensionItem && extensionItem->offset>=originalOffset+16U);
     }
     {
+        assert(TensorArenaCore::isValidCopyRange(64U,0U,128U,32U,32U));
+        assert(TensorArenaCore::isValidCopyRange(64U,60U,64U,0U,4U));
+        assert(!TensorArenaCore::isValidCopyRange(64U,64U,64U,0U,4U));
+        assert(!TensorArenaCore::isValidCopyRange(64U,60U,64U,60U,8U));
+        assert(!TensorArenaCore::isValidCopyRange(64U,2U,64U,0U,4U));
+        assert(!TensorArenaCore::isValidCopyRange(64U,0U,64U,2U,4U));
+        assert(!TensorArenaCore::isValidCopyRange(64U,0U,64U,0U,2U));
+        assert(!TensorArenaCore::isValidCopyRange(64U,0U,64U,0U,0U));
+        const std::uint64_t max = std::numeric_limits<std::uint64_t>::max();
+        assert(!TensorArenaCore::isValidCopyRange(max,max-3U,64U,0U,8U));
+        assert(!TensorArenaCore::isValidCopyRange(64U,0U,max,max-3U,8U));
+    }
+    {
         TensorArenaCore arena;
         assert(arena.prepareCapacityExtension() && arena.extendCapacity(0U,8U));
         std::uint64_t handle=0U;

@@ -797,10 +797,9 @@ bool copyBufferSync(
     if (source == VK_NULL_HANDLE || destination == VK_NULL_HANDLE ||
         gRuntime.commandBuffer == VK_NULL_HANDLE ||
         gRuntime.cmdPipelineBarrier2 == nullptr ||
-        size == 0u ||
-        (sourceOffset & 3u) != 0u || (destinationOffset & 3u) != 0u || (size & 3u) != 0u ||
-        sourceOffset > sourceCapacity || size > sourceCapacity - sourceOffset ||
-        destinationOffset > destinationCapacity || size > destinationCapacity - destinationOffset) {
+        !argus::vulkan::TensorArenaCore::isValidCopyRange(
+            sourceCapacity, sourceOffset, destinationCapacity, destinationOffset, size
+        )) {
         logError("Vulkan buffer copy rejected: invalid handles, alignment, or buffer range.");
         return false;
     }

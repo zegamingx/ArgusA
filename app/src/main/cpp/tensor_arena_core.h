@@ -120,6 +120,21 @@ public:
         for (const Allocation& item:allocations_) if (item.active && count<UINT32_MAX) ++count;
         return count;
     }
+    static bool isValidCopyRange(std::uint64_t sourceCapacity,
+                                  std::uint64_t sourceOffset,
+                                  std::uint64_t destinationCapacity,
+                                  std::uint64_t destinationOffset,
+                                  std::uint64_t size) noexcept {
+        if (size == 0U || (sourceOffset & 3U) != 0U ||
+            (destinationOffset & 3U) != 0U || (size & 3U) != 0U) {
+            return false;
+        }
+        return sourceOffset <= sourceCapacity &&
+            size <= sourceCapacity - sourceOffset &&
+            destinationOffset <= destinationCapacity &&
+            size <= destinationCapacity - destinationOffset;
+    }
+
     static bool alignUp(std::uint64_t value,std::uint64_t alignment,std::uint64_t& output) noexcept {
         if (alignment==0U) return false;
         const std::uint64_t remainder=value%alignment;
