@@ -610,6 +610,7 @@ internal object VulkanTrainingBackend {
     private var residencyBlockedAfterFailure = false
     private var residencyRebuildPending = false
     private var runtimeRestartPending = false
+    private var residentGradientRecoveryPending = false
     private var modelParameterMirrorReliable = true
     private var optimizerStateMirrorReliable = true
 
@@ -1765,6 +1766,7 @@ internal object VulkanTrainingBackend {
         residencyBlockedAfterFailure = false
         residencyRebuildPending = false
         runtimeRestartPending = false
+        residentGradientRecoveryPending = false
         invalidateTensorResidency(releaseAllocations = false)
         _modelTensorResidencyBudgetBytes.value = 0L
         _activationTensorResidencyBudgetBytes.value = 0L
@@ -5511,12 +5513,28 @@ internal object VulkanTrainingBackend {
             }
 
             if (teardownRequired && nativeReady) {
-                // All kernel writes target candidate buffers. Active parameter and moment
-                // handles remain unchanged unless both registries publish their replacements.
-                runCatching { destroyNativeRuntime() }
-                    .onFailure { error ->
-                        Log.e(TAG, "Vulkan teardown after a failed resident AdamW transaction failed.", error)
-                    }
+                // When M4 owns the gradient allocation, keep the disabled native runtime
+                // alive long enough for the caller to recover that gradient. The wrapper
+                // then recovers model/moments, releases optimizer residency, and tears down.
+                if (residentGradient != null &&
+                    !partialRegistryPublicationFailure &&
+                    !deviceCommitCompleted) {
+                    residentGradientRecoveryPending = true
+                    disabledAfterRuntimeFailure = true
+                    residentAdamwReady = false
+                    _currentBackend = "Kotlin CPU — resident gradient recovery pending"
+                    _runtimeStatus.value =
+                        "Vulkan dispatch disabled — recovering resident M4 gradients before teardown"
+                    Log.e(
+                        TAG,
+                        "Resident AdamW dispatch failed; native teardown is postponed until the M4 gradient has been recovered."
+                    )
+                } else {
+                    runCatching { destroyNativeRuntime() }
+                        .onFailure { error ->
+                            Log.e(TAG, "Vulkan teardown after a failed resident AdamW transaction failed.", error)
+                        }
+                }
             }
             if (deviceCommitCompleted && !isRuntimeAvailable) {
                 _currentBackend = "Kotlin CPU — GPU AdamW committed; host mirror recovery required"
@@ -5635,6 +5653,12 @@ internal object VulkanTrainingBackend {
         }
         check(invalidateOptimizerStateResidency()) {
             "GPU optimizer moments could not be synchronized before the fallback update."
+        }
+        if (residentGradientRecoveryPending) {
+            check(destroyNativeRuntime()) {
+                "Vulkan runtime teardown could not complete after resident-gradient recovery."
+            }
+            residentGradientRecoveryPending = false
         }
 
         var totalElements = 0L
