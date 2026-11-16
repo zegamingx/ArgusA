@@ -494,6 +494,15 @@ internal object VulkanTrainingBackend {
         release = { allocation -> releaseGpuTensor(allocation) }
     )
 
+    private val _modelTensorResidencyReady = MutableStateFlow(false)
+    val modelTensorResidencyReady: StateFlow<Boolean> =
+        _modelTensorResidencyReady.asStateFlow()
+
+    private fun invalidateTensorResidency(releaseAllocations: Boolean) {
+        _modelTensorResidencyReady.value = false
+        tensorResidencyRegistry.invalidate(releaseAllocations)
+    }
+
     internal val hasAttemptedInitialization: Boolean
         get() = initializationAttempted
 
@@ -545,7 +554,7 @@ internal object VulkanTrainingBackend {
         try {
             nativeDestroy()
         } finally {
-            tensorResidencyRegistry.invalidate(releaseAllocations = false)
+            invalidateTensorResidency(releaseAllocations = false)
         }
     }
 
@@ -558,7 +567,7 @@ internal object VulkanTrainingBackend {
                     Log.w(TAG, "Failed to release a partially initialized Vulkan runtime.", error)
                 }
         } else {
-            tensorResidencyRegistry.invalidate(releaseAllocations = false)
+            invalidateTensorResidency(releaseAllocations = false)
         }
     }
 
@@ -643,6 +652,44 @@ internal object VulkanTrainingBackend {
         return released
     }
 
+    /**
+     * Prepares the complete model parameter inventory in persistent Tensor Arena
+     * allocations. The registry remains a read-only mirror of Kotlin-owned weights.
+     */
+    @Synchronized
+    fun synchronizeModelTensorResidency(
+        tensors: List<VulkanModelParameterTensor>
+    ): Boolean {
+        if (!isFp16ComputeAvailable) {
+            _modelTensorResidencyReady.value = false
+            return false
+        }
+
+        val synchronized = try {
+            tensorResidencyRegistry.synchronizeAll(tensors)
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Full model tensor residency exceeded available memory.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Full model tensor residency synchronization failed.", error)
+            false
+        }
+
+        if (!synchronized) {
+            invalidateTensorResidency(releaseAllocations = true)
+            Log.w(
+                TAG,
+                "Full model tensor residency is unavailable; per-operation Vulkan acquisition " +
+                    "or the existing CPU fallback remains active."
+            )
+        } else {
+            Log.i(TAG, "Resident and revision-verified ${tensors.size} model parameter tensors.")
+        }
+        refreshTensorArenaMetrics()
+        _modelTensorResidencyReady.value = synchronized
+        return synchronized
+    }
+
     @Synchronized
     fun initializeAfterModelReady(): Boolean {
         if (isRuntimeAvailable) {
@@ -670,7 +717,7 @@ internal object VulkanTrainingBackend {
         return try {
             System.loadLibrary("argus_training")
             nativeLibraryLoaded = true
-            tensorResidencyRegistry.invalidate(releaseAllocations = false)
+            invalidateTensorResidency(releaseAllocations = false)
             val initialized = nativeInitialize()
             if (initialized) {
                 detectedDriverInfo = runCatching { nativeGetDriverInfo() }
@@ -1376,7 +1423,7 @@ internal object VulkanTrainingBackend {
         if (!updated) {
             fp16DisabledAfterRuntimeFailure = true
             fp16RuntimeReady = false
-            tensorResidencyRegistry.invalidate(releaseAllocations = true)
+            invalidateTensorResidency(releaseAllocations = true)
             Log.w(TAG, "Persistent-weight FP16 dispatch failed; using the Kotlin CPU path.")
             return false
         }
@@ -1531,7 +1578,7 @@ internal object VulkanTrainingBackend {
         if (!updated) {
             fp16DisabledAfterRuntimeFailure = true
             fp16RuntimeReady = false
-            tensorResidencyRegistry.invalidate(releaseAllocations = true)
+            invalidateTensorResidency(releaseAllocations = true)
             Log.w(
                 TAG,
                 "Persistent batched FP16 dispatch failed; retaining the verified FP32 Vulkan/CPU fallback."

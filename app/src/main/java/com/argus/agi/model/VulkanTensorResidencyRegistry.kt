@@ -2,6 +2,12 @@ package com.argus.agi.model
 
 import java.util.IdentityHashMap
 
+/** A named reference to one authoritative Kotlin model-parameter tensor. */
+internal data class VulkanModelParameterTensor(
+    val name: String,
+    val parameters: Float16ParameterArray
+)
+
 /**
  * Keeps read-only GPU replicas of authoritative Kotlin FP16 model tensors.
  * Kotlin remains the source of truth; uploads occur only after mutation revisions change.
@@ -64,6 +70,64 @@ internal class VulkanTensorResidencyRegistry(
 
         if (entry.uploadedRevision == Long.MIN_VALUE) discard(parameters, entry)
         return null
+    }
+
+    /**
+     * Reconciles the full model inventory and releases tensors no longer owned by it.
+     * On failure, all entries are invalidated so partial residency is never reported ready.
+     */
+    @Synchronized
+    fun synchronizeAll(tensors: List<VulkanModelParameterTensor>): Boolean {
+        require(tensors.isNotEmpty()) {
+            "The model parameter residency inventory cannot be empty."
+        }
+
+        val desired = IdentityHashMap<Float16ParameterArray, String>()
+        val names = HashSet<String>(tensors.size)
+        for (tensor in tensors) {
+            require(tensor.name.isNotBlank()) {
+                "Model parameter tensor names cannot be blank."
+            }
+            require(names.add(tensor.name)) {
+                "Model parameter tensor names must be unique: ${tensor.name}"
+            }
+            require(desired.put(tensor.parameters, tensor.name) == null) {
+                "A model parameter array cannot be registered under multiple names."
+            }
+        }
+
+        val staleParameters = entries.keys.filter { parameters ->
+            !desired.containsKey(parameters)
+        }
+        for (parameters in staleParameters) {
+            val entry = entries[parameters] ?: continue
+            if (!release(entry.allocation)) {
+                invalidate(releaseAllocations = true)
+                return false
+            }
+            entries.remove(parameters)
+        }
+
+        for (tensor in tensors) {
+            if (acquire(tensor.parameters) == null) {
+                invalidate(releaseAllocations = true)
+                return false
+            }
+        }
+        return isSynchronizedWith(tensors)
+    }
+
+    @Synchronized
+    fun isSynchronizedWith(tensors: List<VulkanModelParameterTensor>): Boolean {
+        if (tensors.isEmpty() || entries.size != tensors.size) return false
+
+        val seen = IdentityHashMap<Float16ParameterArray, Boolean>()
+        for (tensor in tensors) {
+            if (seen.put(tensor.parameters, true) != null) return false
+            val entry = entries[tensor.parameters] ?: return false
+            if (entry.uploadedRevision != tensor.parameters.mutationVersion) return false
+        }
+        return true
     }
 
     @Synchronized

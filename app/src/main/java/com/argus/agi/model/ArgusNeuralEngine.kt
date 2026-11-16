@@ -318,9 +318,29 @@ class ArgusNeuralEngine private constructor(
         get() = VulkanTrainingBackend.deviceCapabilities
     val vulkanGpuPerformanceMetrics: StateFlow<VulkanGpuPerformanceMetrics>
         get() = VulkanTrainingBackend.gpuPerformanceMetrics
+    val vulkanModelTensorResidencyReady: StateFlow<Boolean>
+        get() = VulkanTrainingBackend.modelTensorResidencyReady
 
-    fun initializeOptionalVulkanRuntime(): Boolean =
-        VulkanTrainingBackend.initializeAfterModelReady()
+    fun initializeOptionalVulkanRuntime(): Boolean {
+        val runtimeReady = VulkanTrainingBackend.initializeAfterModelReady()
+        if (!runtimeReady) return false
+        synchronizeVulkanModelTensorResidency("model initialization")
+        return true
+    }
+
+    private fun synchronizeVulkanModelTensorResidency(reason: String) {
+        if (!VulkanTrainingBackend.isFp16ComputeAvailable) return
+        val synchronized = VulkanTrainingBackend.synchronizeModelTensorResidency(
+            currentNamedParameterTensors()
+        )
+        if (!synchronized) {
+            Log.w(
+                TAG,
+                "Complete FP16 model residency was not established after $reason; " +
+                    "eligible operations will acquire tensors individually or use fallback."
+            )
+        }
+    }
 
     val checkpointInterval: Int
         get() = CHECKPOINT_INTERVAL
@@ -911,6 +931,7 @@ class ArgusNeuralEngine private constructor(
         mHead = newMHead
         vHead = newVHead
         vocabCap = targetCap
+        synchronizeVulkanModelTensorResidency("vocabulary-capacity replacement")
     }
 
     // =====================================================================
@@ -2425,6 +2446,26 @@ class ArgusNeuralEngine private constructor(
         return if (validSteps > 0) totalLoss / validSteps else Float.NaN
     }
 
+    private fun currentNamedParameterTensors(): List<VulkanModelParameterTensor> =
+        buildList(2 + layerCount * 11) {
+            add(VulkanModelParameterTensor("token.embedding.weight", wEmbed))
+            add(VulkanModelParameterTensor("lm_head.weight", wHead))
+            for ((layerIndex, block) in blocks.withIndex()) {
+                val prefix = "layers.$layerIndex"
+                add(VulkanModelParameterTensor("$prefix.attention.query.weight", block.wQ))
+                add(VulkanModelParameterTensor("$prefix.attention.key.weight", block.wK))
+                add(VulkanModelParameterTensor("$prefix.attention.value.weight", block.wV))
+                add(VulkanModelParameterTensor("$prefix.attention.output.weight", block.wO))
+                add(VulkanModelParameterTensor("$prefix.feed_forward.gate.weight", block.wGate))
+                add(VulkanModelParameterTensor("$prefix.feed_forward.up.weight", block.wUp))
+                add(VulkanModelParameterTensor("$prefix.feed_forward.down.weight", block.wDown))
+                add(VulkanModelParameterTensor("$prefix.adapter.q.a", block.loraQa))
+                add(VulkanModelParameterTensor("$prefix.adapter.q.b", block.loraQb))
+                add(VulkanModelParameterTensor("$prefix.adapter.v.a", block.loraVa))
+                add(VulkanModelParameterTensor("$prefix.adapter.v.b", block.loraVb))
+            }
+        }
+
     private fun currentParameterArrays(): Array<Float16ParameterArray> {
         val arrays = ArrayList<Float16ParameterArray>(2 + layerCount * 11)
         arrays += wHead
@@ -2595,6 +2636,7 @@ class ArgusNeuralEngine private constructor(
                 epsilon = epsilon,
                 gradientClipFactor = gradientClipFactor
             )) {
+            synchronizeVulkanModelTensorResidency("Vulkan AdamW parameter update")
             return
         }
 
@@ -2618,6 +2660,7 @@ class ArgusNeuralEngine private constructor(
                 wd = weightDecayByGroup[index]
             )
         }
+        synchronizeVulkanModelTensorResidency("Kotlin AdamW fallback parameter update")
     }
 
     private fun normalizeGradient(grad: FloatArray, div: Float) {

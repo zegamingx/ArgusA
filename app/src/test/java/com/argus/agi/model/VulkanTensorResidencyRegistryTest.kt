@@ -2,8 +2,10 @@ package com.argus.agi.model
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VulkanTensorResidencyRegistryTest {
@@ -64,6 +66,109 @@ class VulkanTensorResidencyRegistryTest {
 
         assertEquals(4, uploadedHandles.size)
         assertEquals(3, registry.residentTensorCount())
+    }
+
+    @Test
+    fun synchronizesCompleteModelInventoryAndReleasesReplacedTensors() {
+        var nextHandle = 1L
+        var uploadCount = 0
+        val releasedHandles = mutableListOf<Long>()
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount -> VulkanTensorAllocation(nextHandle++, byteCount) },
+            upload = { _, _ -> uploadCount++; true },
+            release = { allocation -> releasedHandles += allocation.nativeHandle; true }
+        )
+
+        val embedding = Float16ParameterArray.fromFloatArray(floatArrayOf(0.1f, 0.2f))
+        val outputHead = Float16ParameterArray.fromFloatArray(floatArrayOf(0.3f, 0.4f))
+        val lora = Float16ParameterArray.fromFloatArray(floatArrayOf(0.5f, 0.6f))
+        val initialInventory = listOf(
+            VulkanModelParameterTensor("token.embedding.weight", embedding),
+            VulkanModelParameterTensor("lm_head.weight", outputHead),
+            VulkanModelParameterTensor("layers.0.adapter.q.a", lora)
+        )
+
+        assertTrue(registry.synchronizeAll(initialInventory))
+        assertTrue(registry.isSynchronizedWith(initialInventory))
+        assertEquals(3, registry.residentTensorCount())
+        assertEquals(3, uploadCount)
+
+        assertTrue(registry.synchronizeAll(initialInventory))
+        assertEquals("Unchanged tensors must not be uploaded again.", 3, uploadCount)
+
+        lora[0] = 0.9f
+        assertFalse(registry.isSynchronizedWith(initialInventory))
+        assertTrue(registry.synchronizeAll(initialInventory))
+        assertEquals("Only the mutated tensor must be refreshed.", 4, uploadCount)
+        assertTrue(registry.isSynchronizedWith(initialInventory))
+
+        val replacementHead = Float16ParameterArray.fromFloatArray(floatArrayOf(0.7f, 0.8f))
+        val replacementInventory = listOf(
+            initialInventory[0],
+            VulkanModelParameterTensor("lm_head.weight", replacementHead),
+            initialInventory[2]
+        )
+        assertTrue(registry.synchronizeAll(replacementInventory))
+        assertEquals(3, registry.residentTensorCount())
+        assertEquals(1, releasedHandles.size)
+        assertTrue(registry.isSynchronizedWith(replacementInventory))
+    }
+
+    @Test
+    fun rollsBackPartialInventoryWhenARequiredAllocationFails() {
+        var nextHandle = 1L
+        var allocationCount = 0
+        var releaseCount = 0
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount ->
+                allocationCount++
+                if (allocationCount == 2) null
+                else VulkanTensorAllocation(nextHandle++, byteCount)
+            },
+            upload = { _, _ -> true },
+            release = { releaseCount++; true }
+        )
+        val inventory = listOf(
+            VulkanModelParameterTensor(
+                "token.embedding.weight",
+                Float16ParameterArray.fromFloatArray(floatArrayOf(1f, 2f))
+            ),
+            VulkanModelParameterTensor(
+                "lm_head.weight",
+                Float16ParameterArray.fromFloatArray(floatArrayOf(3f, 4f))
+            )
+        )
+
+        assertFalse(registry.synchronizeAll(inventory))
+        assertEquals(0, registry.residentTensorCount())
+        assertEquals(1, releaseCount)
+        assertFalse(registry.isSynchronizedWith(inventory))
+    }
+
+    @Test
+    fun rejectsDuplicateTensorNamesAndDuplicateParameterIdentity() {
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount -> VulkanTensorAllocation(1L, byteCount) },
+            upload = { _, _ -> true },
+            release = { true }
+        )
+        val parameter = Float16ParameterArray.fromFloatArray(floatArrayOf(1f))
+        val duplicateIdentity = listOf(
+            VulkanModelParameterTensor("first", parameter),
+            VulkanModelParameterTensor("second", parameter)
+        )
+        val duplicateName = listOf(
+            VulkanModelParameterTensor("same", Float16ParameterArray(1)),
+            VulkanModelParameterTensor("same", Float16ParameterArray(1))
+        )
+
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            registry.synchronizeAll(duplicateIdentity)
+        }
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            registry.synchronizeAll(duplicateName)
+        }
+        assertEquals(0, registry.residentTensorCount())
     }
 
     @Test
