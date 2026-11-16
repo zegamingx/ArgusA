@@ -129,6 +129,7 @@ android {
 // for new tests and gradual migration.
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
+    // JEP 472 (JDK 24+): explicitly opt in for Conscrypt native calls in JVM tests.
     if (Runtime.version().feature() >= 24) {
         jvmArgs("--enable-native-access=ALL-UNNAMED")
     }
