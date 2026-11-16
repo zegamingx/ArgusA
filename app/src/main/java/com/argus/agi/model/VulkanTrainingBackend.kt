@@ -5277,7 +5277,7 @@ internal object VulkanTrainingBackend {
             return true
         } catch (error: OutOfMemoryError) {
             Log.w(TAG, "Resident AdamW exceeded the available host memory budget.", error)
-            if (hostCommitCompleted) {
+            if (hostCommitCompleted || candidateMomentsCommitted) {
                 teardownRequired = true
                 return true
             }
@@ -5285,7 +5285,7 @@ internal object VulkanTrainingBackend {
             return false
         } catch (error: RuntimeException) {
             Log.e(TAG, "Resident AdamW transaction failed.", error)
-            if (hostCommitCompleted) {
+            if (hostCommitCompleted || candidateMomentsCommitted) {
                 teardownRequired = true
                 return true
             }
