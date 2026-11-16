@@ -611,6 +611,12 @@ internal object VulkanTrainingBackend {
     private var runtimeRestartPending = false
 
     private fun invalidateTensorResidency(releaseAllocations: Boolean): Boolean {
+        if (releaseAllocations && nativeReady &&
+            optimizerStateResidencyRegistry.residentTensorCount() > 0 &&
+            !synchronizeOptimizerStateMirrors()) {
+            Log.e(TAG, "Tensor Arena release was refused because resident optimizer moments could not be recovered.")
+            return false
+        }
         _modelTensorResidencyReady.value = false
         val modelReleased = tensorResidencyRegistry.invalidate(releaseAllocations)
         val activationsReleased = activationTensorRegistry.invalidate(releaseAllocations)
@@ -978,6 +984,7 @@ internal object VulkanTrainingBackend {
      */
     @Synchronized
     fun releaseModelTensorResidencyForMemoryPressure(): Boolean {
+        val wasResidencyReady = _modelTensorResidencyReady.value
         residencySuspended = true
         residencyRebuildPending = false
         _modelTensorResidencyReady.value = false
@@ -989,6 +996,7 @@ internal object VulkanTrainingBackend {
 
         if (!synchronizeOptimizerStateMirrors()) {
             residencySuspended = false
+            _modelTensorResidencyReady.value = wasResidencyReady
             Log.e(TAG, "Memory-pressure release was postponed because GPU optimizer moments could not be recovered.")
             return false
         }
