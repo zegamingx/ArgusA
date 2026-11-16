@@ -5404,10 +5404,8 @@ internal object VulkanTrainingBackend {
             }
 
             if (teardownRequired && nativeReady) {
-                if (!candidateParametersCommitted && !candidateMomentsCommitted) {
-                    // All writes target candidate allocations. Active parameter and moment
-                    // buffers remain unchanged when the transaction does not commit.
-                }
+                // All kernel writes target candidate buffers. Active parameter and moment
+                // handles remain unchanged unless both registries publish their replacements.
                 runCatching { destroyNativeRuntime() }
                     .onFailure { error ->
                         Log.e(TAG, "Vulkan teardown after a failed resident AdamW transaction failed.", error)
