@@ -774,7 +774,7 @@ class VulkanTensorResidencyRegistryTest {
         assertEquals(original.nativeHandle, registry.acquire(parameters)?.nativeHandle)
         assertEquals(2, uploadCount)
         assertEquals(2L, registry.deviceRevision(parameters))
-        assertFalse(gpuBytes.containsKey(candidate.nativeHandle))
+        assertTrue(gpuBytes.remove(candidate.nativeHandle) != null)
     }
 
     @Test
