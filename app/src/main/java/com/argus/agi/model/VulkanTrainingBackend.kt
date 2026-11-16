@@ -4678,6 +4678,309 @@ internal object VulkanTrainingBackend {
     }
 
     /**
+     * Updates resident FP16 weights and FP32 AdamW moments in one Vulkan transaction.
+     * Host parameters are read back only as the recovery/inference mirror; moments remain
+     * resident and are not copied back after each update.
+     */
+    @Synchronized
+    internal fun tryApplyResidentFp16AdamWUpdate(
+        parameters: Array<Float16ParameterArray>,
+        gradients: Array<FloatArray>,
+        firstMoments: Array<FloatArray>,
+        secondMoments: Array<FloatArray>,
+        weightDecayByGroup: FloatArray,
+        learningRate: Float,
+        beta1: Float,
+        beta2: Float,
+        biasCorrection1: Float,
+        biasCorrection2: Float,
+        epsilon: Float,
+        gradientClipFactor: Float
+    ): Boolean {
+        if (!isResidentAdamWAvailable ||
+            parameters.isEmpty() ||
+            parameters.size != gradients.size ||
+            parameters.size != firstMoments.size ||
+            parameters.size != secondMoments.size ||
+            parameters.size != weightDecayByGroup.size ||
+            !learningRate.isFinite() || learningRate < 0.0f ||
+            !beta1.isFinite() || beta1 < 0.0f || beta1 >= 1.0f ||
+            !beta2.isFinite() || beta2 < 0.0f || beta2 >= 1.0f ||
+            !biasCorrection1.isFinite() || biasCorrection1 <= 0.0f ||
+            !biasCorrection2.isFinite() || biasCorrection2 <= 0.0f ||
+            !epsilon.isFinite() || epsilon <= 0.0f ||
+            !gradientClipFactor.isFinite() ||
+            gradientClipFactor < 0.0f || gradientClipFactor > 1.0f ||
+            !ensureModelTensorResidencyReady()) {
+            return false
+        }
+
+        var totalActiveElements = 0L
+        var totalGradientBytes = 0L
+        var totalParameterBytes = 0L
+        for (index in parameters.indices) {
+            val parameterSize = parameters[index].size
+            val activeSize = gradients[index].size
+            if (parameterSize <= 0 || activeSize <= 0 || activeSize > parameterSize ||
+                firstMoments[index].size != parameterSize ||
+                secondMoments[index].size != parameterSize ||
+                !weightDecayByGroup[index].isFinite() ||
+                weightDecayByGroup[index] < 0.0f ||
+                gradients[index].any { value -> !value.isFinite() } ||
+                firstMoments[index].any { value -> !value.isFinite() } ||
+                secondMoments[index].any { value -> !value.isFinite() }) {
+                return false
+            }
+            totalActiveElements = runCatching {
+                Math.addExact(totalActiveElements, activeSize.toLong())
+            }.getOrNull() ?: return false
+            totalGradientBytes = runCatching {
+                Math.addExact(
+                    totalGradientBytes,
+                    Math.multiplyExact(activeSize.toLong(), Float.SIZE_BYTES.toLong())
+                )
+            }.getOrNull() ?: return false
+            totalParameterBytes = runCatching {
+                Math.addExact(
+                    totalParameterBytes,
+                    Math.multiplyExact(parameterSize.toLong(), Short.SIZE_BYTES.toLong())
+                )
+            }.getOrNull() ?: return false
+        }
+
+        if (totalActiveElements < MIN_GPU_UPDATE_ELEMENTS ||
+            totalActiveElements > Int.MAX_VALUE.toLong() ||
+            totalGradientBytes <= 0L ||
+            totalGradientBytes > Int.MAX_VALUE.toLong()) {
+            return false
+        }
+
+        val runtime = Runtime.getRuntime()
+        val availableHeapBytes = runtime.freeMemory() +
+            (runtime.maxMemory() - runtime.totalMemory()).coerceAtLeast(0L)
+        val stagingBytes = runCatching {
+            Math.addExact(
+                totalParameterBytes,
+                Math.multiplyExact(totalGradientBytes, 2L)
+            )
+        }.getOrNull() ?: return false
+        if (stagingBytes > availableHeapBytes / 2L) {
+            Log.d(TAG, "Resident AdamW recovery mirror exceeds the safe host-heap budget.")
+            return false
+        }
+
+        val momentInventory = ArrayList<FloatArray>(parameters.size * 2)
+        momentInventory.addAll(firstMoments)
+        momentInventory.addAll(secondMoments)
+        if (!optimizerStateResidencyRegistry.synchronizeAll(momentInventory)) {
+            Log.d(TAG, "FP32 AdamW moments do not fit the current persistent residency budget.")
+            return false
+        }
+
+        val residentParameters = ArrayList<VulkanTensorAllocation>(parameters.size)
+        val residentFirstMoments = ArrayList<VulkanTensorAllocation>(parameters.size)
+        val residentSecondMoments = ArrayList<VulkanTensorAllocation>(parameters.size)
+        for (index in parameters.indices) {
+            val parameterAllocation = acquireResidentModelParameterTensor(parameters[index])
+                ?: return false
+            residentParameters.add(parameterAllocation)
+            val firstMomentAllocation = optimizerStateResidencyRegistry.acquire(firstMoments[index])
+                ?: return false
+            residentFirstMoments.add(firstMomentAllocation)
+            val secondMomentAllocation = optimizerStateResidencyRegistry.acquire(secondMoments[index])
+                ?: return false
+            residentSecondMoments.add(secondMomentAllocation)
+        }
+
+        var gradientAllocation: VulkanTensorAllocation? = null
+        var statusAllocation: VulkanTensorAllocation? = null
+        var gradientReleased = false
+        var statusReleased = false
+        var dispatchAttempted = false
+        var teardownRequired = false
+        var hostCommitCompleted = false
+
+        try {
+            val flattenedGradients = FloatArray(totalActiveElements.toInt())
+            var gradientCursor = 0
+            for (gradient in gradients) {
+                System.arraycopy(
+                    gradient, 0, flattenedGradients, gradientCursor, gradient.size
+                )
+                gradientCursor = Math.addExact(gradientCursor, gradient.size)
+            }
+
+            val gradientTensor = allocateGpuTensor(totalGradientBytes) ?: return false
+            gradientAllocation = gradientTensor
+            val statusTensor = allocateGpuTensor(Int.SIZE_BYTES.toLong()) ?: return false
+            statusAllocation = statusTensor
+            if (!uploadGpuTensor(gradientTensor, encodeFloatArray(flattenedGradients)) ||
+                !uploadGpuTensor(statusTensor, ByteArray(Int.SIZE_BYTES))) {
+                Log.w(TAG, "Resident AdamW could not stage gradients or initialize its validation flag.")
+                return false
+            }
+
+            dispatchAttempted = true
+            val dispatched = try {
+                nativeApplyResidentAdamWUpdate(
+                    parameterHandles = LongArray(residentParameters.size) { index ->
+                        residentParameters[index].nativeHandle
+                    },
+                    gradientHandle = gradientTensor.nativeHandle,
+                    firstMomentHandles = LongArray(residentFirstMoments.size) { index ->
+                        residentFirstMoments[index].nativeHandle
+                    },
+                    secondMomentHandles = LongArray(residentSecondMoments.size) { index ->
+                        residentSecondMoments[index].nativeHandle
+                    },
+                    activeElementCounts = IntArray(gradients.size) { index -> gradients[index].size },
+                    weightDecayByGroup = weightDecayByGroup,
+                    learningRate = learningRate,
+                    beta1 = beta1,
+                    beta2 = beta2,
+                    biasCorrection1 = biasCorrection1,
+                    biasCorrection2 = biasCorrection2,
+                    epsilon = epsilon,
+                    gradientClipFactor = gradientClipFactor,
+                    statusHandle = statusTensor.nativeHandle
+                )
+            } catch (error: LinkageError) {
+                Log.e(TAG, "Resident AdamW JNI entry point is unavailable.", error)
+                false
+            } catch (error: RuntimeException) {
+                Log.e(TAG, "Resident AdamW dispatch failed.", error)
+                false
+            }
+            if (!dispatched) {
+                teardownRequired = true
+                return false
+            }
+
+            val statusBytes = ByteArray(Int.SIZE_BYTES)
+            if (!downloadGpuTensor(statusTensor, statusBytes)) {
+                teardownRequired = true
+                Log.e(TAG, "Resident AdamW transaction status could not be read back.")
+                return false
+            }
+            val transactionStatus = ByteBuffer.wrap(statusBytes)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .int
+            if (transactionStatus != 0) {
+                teardownRequired = true
+                Log.e(TAG, "Resident AdamW rejected a non-finite or out-of-range update before host commit.")
+                return false
+            }
+
+            val parameterSnapshots = Array(parameters.size) { index ->
+                val snapshot = ByteArray(
+                    Math.multiplyExact(parameters[index].size, Short.SIZE_BYTES)
+                )
+                if (!downloadGpuTensor(residentParameters[index], snapshot)) {
+                    throw IllegalStateException(
+                        "Resident AdamW parameter readback failed before host commit."
+                    )
+                }
+                parameters[index].validateLittleEndianPrefix(snapshot, gradients[index].size)
+                snapshot
+            }
+
+            // Check the CPU recovery mirror before releasing any GPU transaction resources.
+            for (group in gradients.indices) {
+                for (element in gradients[group].indices) {
+                    val gradient = gradients[group][element] * gradientClipFactor
+                    val nextFirstMoment =
+                        beta1 * firstMoments[group][element] + (1.0f - beta1) * gradient
+                    val nextSecondMoment =
+                        beta2 * secondMoments[group][element] +
+                            (1.0f - beta2) * gradient * gradient
+                    if (!gradient.isFinite() ||
+                        !nextFirstMoment.isFinite() ||
+                        !nextSecondMoment.isFinite() ||
+                        nextSecondMoment < 0.0f) {
+                        teardownRequired = true
+                        return false
+                    }
+                }
+            }
+
+            // Release transient staging before committing the host recovery mirror.
+            if (!releaseGpuTensor(gradientTensor)) {
+                teardownRequired = true
+                return false
+            }
+            gradientReleased = true
+            if (!releaseGpuTensor(statusTensor)) {
+                teardownRequired = true
+                return false
+            }
+            statusReleased = true
+
+            for (index in parameters.indices) {
+                parameters[index].copyPrefixFromLittleEndianByteArray(
+                    parameterSnapshots[index],
+                    gradients[index].size
+                )
+            }
+            for (group in gradients.indices) {
+                for (element in gradients[group].indices) {
+                    val gradient = gradients[group][element] * gradientClipFactor
+                    firstMoments[group][element] =
+                        beta1 * firstMoments[group][element] + (1.0f - beta1) * gradient
+                    secondMoments[group][element] =
+                        beta2 * secondMoments[group][element] +
+                            (1.0f - beta2) * gradient * gradient
+                }
+            }
+            hostCommitCompleted = true
+
+            val revisionsSynchronized = parameters.indices.all { index ->
+                tensorResidencyRegistry.markGpuReplicaSynchronized(
+                    parameters[index], residentParameters[index]
+                )
+            }
+            if (!revisionsSynchronized) {
+                teardownRequired = true
+                Log.e(TAG, "Resident AdamW could not publish every committed model mutation revision.")
+            }
+
+            _currentBackend = "Vulkan Compute (Resident FP16 AdamW)"
+            runCatching { refreshGpuPerformanceMetrics() }
+            return true
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident AdamW exceeded the available host memory budget.", error)
+            if (dispatchAttempted) teardownRequired = true
+            return false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident AdamW transaction failed before host commit.", error)
+            if (dispatchAttempted) teardownRequired = true
+            return false
+        } finally {
+            if (!gradientReleased && gradientAllocation != null && isRuntimeAvailable) {
+                if (releaseGpuTensor(gradientAllocation)) {
+                    gradientReleased = true
+                } else {
+                    teardownRequired = true
+                }
+            }
+            if (!statusReleased && statusAllocation != null && isRuntimeAvailable) {
+                if (releaseGpuTensor(statusAllocation)) {
+                    statusReleased = true
+                } else {
+                    teardownRequired = true
+                }
+            }
+            if (teardownRequired && isRuntimeAvailable) {
+                runCatching { destroyNativeRuntime() }
+                    .onFailure { error ->
+                        Log.e(TAG, "Vulkan teardown after a failed resident AdamW transaction failed.", error)
+                    }
+            }
+            if (hostCommitCompleted && !isRuntimeAvailable) {
+                _currentBackend = "Kotlin CPU — resident AdamW host mirror committed"
+            }
+        }
+    }
+    /**
      * Adapts binary16 model parameters to the FP32 Vulkan AdamW kernel.
      *
      * Gradient accumulation and AdamW state remain FP32. Only the active
