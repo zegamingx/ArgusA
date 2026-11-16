@@ -3435,7 +3435,9 @@ internal object VulkanTrainingBackend {
         val activeElementCounts = IntArray(initialParameters.size) { index ->
             initialParameters[index].size
         }
-        val totalGradientElements = initialGradients.sumOf(FloatArray::size)
+        val totalGradientElements = initialGradients.fold(0) { total, gradient ->
+            Math.addExact(total, gradient.size)
+        }
         val flattenedGradients = FloatArray(totalGradientElements)
         var gradientCursor = 0
         for (gradient in initialGradients) {
@@ -3461,8 +3463,10 @@ internal object VulkanTrainingBackend {
             for (bytes in secondMomentBytes) {
                 secondMomentAllocations.add(allocateGpuTensor(bytes.size.toLong()) ?: return false)
             }
-            gradientAllocation = allocateGpuTensor(gradientBytes.size.toLong()) ?: return false
-            statusAllocation = allocateGpuTensor(Int.SIZE_BYTES.toLong()) ?: return false
+            val gradientTensor = allocateGpuTensor(gradientBytes.size.toLong()) ?: return false
+            gradientAllocation = gradientTensor
+            val statusTensor = allocateGpuTensor(Int.SIZE_BYTES.toLong()) ?: return false
+            statusAllocation = statusTensor
 
             for (index in parameterAllocations.indices) {
                 if (!uploadGpuTensor(parameterAllocations[index], parameterBytes[index]) ||
@@ -3471,8 +3475,8 @@ internal object VulkanTrainingBackend {
                     return false
                 }
             }
-            if (!uploadGpuTensor(gradientAllocation, gradientBytes) ||
-                !uploadGpuTensor(statusAllocation, ByteArray(Int.SIZE_BYTES))) {
+            if (!uploadGpuTensor(gradientTensor, gradientBytes) ||
+                !uploadGpuTensor(statusTensor, ByteArray(Int.SIZE_BYTES))) {
                 return false
             }
 
@@ -3488,7 +3492,7 @@ internal object VulkanTrainingBackend {
                 parameterHandles = LongArray(parameterAllocations.size) { index ->
                     parameterAllocations[index].nativeHandle
                 },
-                gradientHandle = gradientAllocation.nativeHandle,
+                gradientHandle = gradientTensor.nativeHandle,
                 firstMomentHandles = LongArray(firstMomentAllocations.size) { index ->
                     firstMomentAllocations[index].nativeHandle
                 },
@@ -3504,13 +3508,13 @@ internal object VulkanTrainingBackend {
                 biasCorrection2 = biasCorrection2,
                 epsilon = epsilon,
                 gradientClipFactor = gradientClipFactor,
-                statusHandle = statusAllocation.nativeHandle
+                statusHandle = statusTensor.nativeHandle
             )
 
             if (!dispatch()) return false
 
             val statusBytes = ByteArray(Int.SIZE_BYTES)
-            if (!downloadGpuTensor(statusAllocation, statusBytes) ||
+            if (!downloadGpuTensor(statusTensor, statusBytes) ||
                 ByteBuffer.wrap(statusBytes).order(ByteOrder.LITTLE_ENDIAN).int != 0) {
                 return false
             }
@@ -3623,13 +3627,15 @@ internal object VulkanTrainingBackend {
             Log.w(TAG, "Resident AdamW self-check exceeded the available memory budget.", error)
         } finally {
             var cleanupSucceeded = true
-            val temporary = buildList {
-                statusAllocation?.let(::add)
-                gradientAllocation?.let(::add)
-                secondMomentAllocations.asReversed().forEach(::add)
-                firstMomentAllocations.asReversed().forEach(::add)
-                parameterAllocations.asReversed().forEach(::add)
-            }
+            val temporary = ArrayList<VulkanTensorAllocation>(
+                parameterAllocations.size + firstMomentAllocations.size +
+                    secondMomentAllocations.size + 2
+            )
+            statusAllocation?.let { temporary.add(it) }
+            gradientAllocation?.let { temporary.add(it) }
+            temporary.addAll(secondMomentAllocations.asReversed())
+            temporary.addAll(firstMomentAllocations.asReversed())
+            temporary.addAll(parameterAllocations.asReversed())
             for (allocation in temporary) {
                 if (!releaseGpuTensor(allocation)) cleanupSucceeded = false
             }
