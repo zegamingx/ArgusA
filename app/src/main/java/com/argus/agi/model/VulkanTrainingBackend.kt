@@ -1136,9 +1136,8 @@ internal object VulkanTrainingBackend {
     }
 
     /**
-     * Runs the feed-forward branch as a resident Tensor Arena chain:
-     * W_gate, W_up, SwiGLU, W_down, residual addition, and LayerNorm.
-     * Backward caches are read back only after the complete chain succeeds.
+     * Runs W_gate, W_up, SwiGLU, W_down, residual addition, and LayerNorm as a
+     * resident Tensor Arena chain. Backward caches are downloaded only after success.
      */
     @Synchronized
     internal fun tryApplyResidentFeedForward(
@@ -1191,51 +1190,53 @@ internal object VulkanTrainingBackend {
         var stagedActivation: Array<FloatArray>? = null
         var stagedProjected: Array<FloatArray>? = null
         var stagedNormalized: Array<FloatArray>? = null
-        var completed = false
+        var executionSucceeded = false
         var cleanupSucceeded = true
 
         try {
-            val input = activationTensorRegistry.allocate(rowCount, inputColumns)
-                ?: return false
-            temporary.add(input)
-            val gate = activationTensorRegistry.allocate(rowCount, feedForwardColumns)
-                ?: return false
-            temporary.add(gate)
-            val up = activationTensorRegistry.allocate(rowCount, feedForwardColumns)
-                ?: return false
-            temporary.add(up)
-            val activation = activationTensorRegistry.allocate(rowCount, feedForwardColumns)
-                ?: return false
-            temporary.add(activation)
-            val down = activationTensorRegistry.allocate(rowCount, inputColumns)
-                ?: return false
-            temporary.add(down)
-            val projected = activationTensorRegistry.allocate(rowCount, inputColumns)
-                ?: return false
-            temporary.add(projected)
-            val normalized = activationTensorRegistry.allocate(rowCount, inputColumns)
-                ?: return false
-            temporary.add(normalized)
+            executionSucceeded = run feedForward@ {
+                val input = activationTensorRegistry.allocate(rowCount, inputColumns)
+                    ?: return@feedForward false
+                temporary.add(input)
+                val gate = activationTensorRegistry.allocate(rowCount, feedForwardColumns)
+                    ?: return@feedForward false
+                temporary.add(gate)
+                val up = activationTensorRegistry.allocate(rowCount, feedForwardColumns)
+                    ?: return@feedForward false
+                temporary.add(up)
+                val activation = activationTensorRegistry.allocate(rowCount, feedForwardColumns)
+                    ?: return@feedForward false
+                temporary.add(activation)
+                val down = activationTensorRegistry.allocate(rowCount, inputColumns)
+                    ?: return@feedForward false
+                temporary.add(down)
+                val projected = activationTensorRegistry.allocate(rowCount, inputColumns)
+                    ?: return@feedForward false
+                temporary.add(projected)
+                val normalized = activationTensorRegistry.allocate(rowCount, inputColumns)
+                    ?: return@feedForward false
+                temporary.add(normalized)
 
-            if (!activationTensorRegistry.upload(input, inputRows) ||
-                !activationTensorRegistry.applyLinear(input, residentGateWeights, gate) ||
-                !activationTensorRegistry.applyLinear(input, residentUpWeights, up) ||
-                !activationTensorRegistry.applySwiGlu(gate, up, activation) ||
-                !activationTensorRegistry.applyLinear(activation, residentDownWeights, down) ||
-                !activationTensorRegistry.applyResidualLayerNorm(down, input, projected, normalized)) {
-                return false
+                if (!activationTensorRegistry.upload(input, inputRows) ||
+                    !activationTensorRegistry.applyLinear(input, residentGateWeights, gate) ||
+                    !activationTensorRegistry.applyLinear(input, residentUpWeights, up) ||
+                    !activationTensorRegistry.applySwiGlu(gate, up, activation) ||
+                    !activationTensorRegistry.applyLinear(activation, residentDownWeights, down) ||
+                    !activationTensorRegistry.applyResidualLayerNorm(down, input, projected, normalized)) {
+                    return@feedForward false
+                }
+
+                stagedGate = activationTensorRegistry.download(gate)
+                stagedUp = activationTensorRegistry.download(up)
+                stagedActivation = activationTensorRegistry.download(activation)
+                stagedProjected = activationTensorRegistry.download(projected)
+                stagedNormalized = activationTensorRegistry.download(normalized)
+                stagedGate != null &&
+                    stagedUp != null &&
+                    stagedActivation != null &&
+                    stagedProjected != null &&
+                    stagedNormalized != null
             }
-
-            stagedGate = activationTensorRegistry.download(gate)
-            stagedUp = activationTensorRegistry.download(up)
-            stagedActivation = activationTensorRegistry.download(activation)
-            stagedProjected = activationTensorRegistry.download(projected)
-            stagedNormalized = activationTensorRegistry.download(normalized)
-            completed = stagedGate != null &&
-                stagedUp != null &&
-                stagedActivation != null &&
-                stagedProjected != null &&
-                stagedNormalized != null
         } catch (error: OutOfMemoryError) {
             Log.w(TAG, "Resident feed-forward workspace exceeded the activation memory budget.", error)
         } catch (error: RuntimeException) {
@@ -1252,7 +1253,7 @@ internal object VulkanTrainingBackend {
             residencyRebuildPending = lastModelParameterInventory.isNotEmpty()
             return false
         }
-        if (!completed) return false
+        if (!executionSucceeded) return false
 
         val completedGate = stagedGate ?: return false
         val completedUp = stagedUp ?: return false
@@ -2525,38 +2526,39 @@ internal object VulkanTrainingBackend {
         var residualHandle = 0L
         var projectedHandle = 0L
         var normalizedHandle = 0L
-        var verified = false
+        var operationSucceeded = false
         var cleanupSucceeded = true
         try {
-            val downBytes = encodeFloatArray(down)
-            val residualBytes = encodeFloatArray(residual)
-            val projectedBytes = ByteArray(Math.multiplyExact(elementCount, Float.SIZE_BYTES))
-            val normalizedBytes = ByteArray(Math.multiplyExact(elementCount, Float.SIZE_BYTES))
-            downHandle = nativeAllocateTensor(downBytes.size.toLong())
-            residualHandle = nativeAllocateTensor(residualBytes.size.toLong())
-            projectedHandle = nativeAllocateTensor(projectedBytes.size.toLong())
-            normalizedHandle = nativeAllocateTensor(normalizedBytes.size.toLong())
-            if (downHandle == 0L || residualHandle == 0L ||
-                projectedHandle == 0L || normalizedHandle == 0L) {
-                return false
-            }
-            if (!nativeUploadTensor(downHandle, downBytes) ||
-                !nativeUploadTensor(residualHandle, residualBytes) ||
-                !nativeRunResidentResidualLayerNorm(
-                    downHandle,
-                    residualHandle,
-                    projectedHandle,
-                    normalizedHandle,
-                    rows,
-                    columns
-                ) ||
-                !nativeDownloadTensor(projectedHandle, projectedBytes) ||
-                !nativeDownloadTensor(normalizedHandle, normalizedBytes)) {
-                return false
-            }
-            verified =
+            operationSucceeded = run selfCheck@ {
+                val downBytes = encodeFloatArray(down)
+                val residualBytes = encodeFloatArray(residual)
+                val projectedBytes = ByteArray(Math.multiplyExact(elementCount, Float.SIZE_BYTES))
+                val normalizedBytes = ByteArray(Math.multiplyExact(elementCount, Float.SIZE_BYTES))
+                downHandle = nativeAllocateTensor(downBytes.size.toLong())
+                residualHandle = nativeAllocateTensor(residualBytes.size.toLong())
+                projectedHandle = nativeAllocateTensor(projectedBytes.size.toLong())
+                normalizedHandle = nativeAllocateTensor(normalizedBytes.size.toLong())
+                if (downHandle == 0L || residualHandle == 0L ||
+                    projectedHandle == 0L || normalizedHandle == 0L) {
+                    return@selfCheck false
+                }
+                if (!nativeUploadTensor(downHandle, downBytes) ||
+                    !nativeUploadTensor(residualHandle, residualBytes) ||
+                    !nativeRunResidentResidualLayerNorm(
+                        downHandle,
+                        residualHandle,
+                        projectedHandle,
+                        normalizedHandle,
+                        rows,
+                        columns
+                    ) ||
+                    !nativeDownloadTensor(projectedHandle, projectedBytes) ||
+                    !nativeDownloadTensor(normalizedHandle, normalizedBytes)) {
+                    return@selfCheck false
+                }
                 approximatelyEqual(expectedProjected, decodeFloatArray(projectedBytes), 1.0e-4f) &&
-                approximatelyEqual(expectedNormalized, decodeFloatArray(normalizedBytes), 1.0e-4f)
+                    approximatelyEqual(expectedNormalized, decodeFloatArray(normalizedBytes), 1.0e-4f)
+            }
         } catch (error: LinkageError) {
             Log.e(TAG, "Resident residual LayerNorm self-check JNI entry point is unavailable.", error)
         } catch (error: RuntimeException) {
@@ -2585,7 +2587,7 @@ internal object VulkanTrainingBackend {
             Log.w(TAG, "Resident residual LayerNorm self-check could not release every temporary tensor.")
             runCatching { nativeClearTensorArena() }
         }
-        return verified && cleanupSucceeded
+        return operationSucceeded && cleanupSucceeded
     }
 
     private fun verifyResidentSwiGluKernel(): Boolean {
