@@ -52,7 +52,7 @@ internal class VulkanOptimizerStateRegistry(
             }.getOrNull() ?: return false
         }
 
-        releaseRetiredAllocations()
+        if (!releaseRetiredAllocations()) return false
         if (requiredBytes > maxResidentBytes().coerceAtLeast(0L)) return false
 
         val staleArrays = entries.keys.filter { tensor -> !desired.containsKey(tensor) }
@@ -257,15 +257,18 @@ internal class VulkanOptimizerStateRegistry(
         }
 
         if (entry == null) {
-            val nextBytes = runCatching {
+            val nextActiveBytes = runCatching {
                 Math.addExact(activeResidentBytes, requiredBytes)
             }.getOrNull() ?: return null
-            if (nextBytes > maxResidentBytes().coerceAtLeast(0L)) return null
+            val nextTotalBytes = runCatching {
+                Math.addExact(nextActiveBytes, retiredResidentBytes)
+            }.getOrNull() ?: return null
+            if (nextTotalBytes > maxResidentBytes().coerceAtLeast(0L)) return null
 
             val allocation = allocate(requiredBytes) ?: return null
             entry = Entry(allocation, uploaded = false)
             entries[tensor] = entry
-            activeResidentBytes = nextBytes
+            activeResidentBytes = nextActiveBytes
         }
 
         if (entry.uploaded) return entry.allocation
