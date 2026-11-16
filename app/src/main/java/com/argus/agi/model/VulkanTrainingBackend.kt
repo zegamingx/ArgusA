@@ -511,6 +511,7 @@ internal object VulkanTrainingBackend {
 
     @Volatile
     private var residentActivationLinearReady = false
+    @Volatile
     private var residentAttentionReady = false
     private val activationTensorRegistry = VulkanActivationTensorRegistry(
         allocate = { byteCount -> allocateGpuTensor(byteCount) },
@@ -1248,7 +1249,6 @@ internal object VulkanTrainingBackend {
 
     @Synchronized
     fun initializeAfterModelReady(): Boolean {
-        residentAttentionReady = false
         if (isRuntimeAvailable) {
             publishInitializationProgress(
                 status = "Vulkan runtime verified",
@@ -1260,6 +1260,8 @@ internal object VulkanTrainingBackend {
         }
         if (initializationAttempted) return false
 
+        residentActivationLinearReady = false
+        residentAttentionReady = false
         initializationAttempted = true
         _deviceCapabilities.value = null
         _runtimeStatus.value = "Preparing Vulkan after model initialization…"
