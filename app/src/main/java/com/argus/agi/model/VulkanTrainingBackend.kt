@@ -2911,6 +2911,9 @@ internal object VulkanTrainingBackend {
             )
             committed = true
             return accumulator
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident gradient accumulator JNI entry point is unavailable.", error)
+            return null
         } catch (error: OutOfMemoryError) {
             Log.w(TAG, "Resident gradient accumulator exceeded the available memory budget.", error)
             return null
@@ -3003,8 +3006,14 @@ internal object VulkanTrainingBackend {
             if (!releaseResidentGradientAccumulator(accumulator)) return false
             copyGradientTensors(values, destinationTensors, accumulator.tensorSizes)
             true
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident gradient accumulator download JNI entry point is unavailable.", error)
+            false
         } catch (error: RuntimeException) {
             Log.e(TAG, "Resident gradient accumulator recovery failed.", error)
+            false
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident gradient accumulator recovery exceeded available memory.", error)
             false
         }
     }

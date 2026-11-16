@@ -53,13 +53,13 @@ void crossEntropyBackward() {
     if (row >= parameters.rows) return;
 
     int target = int(round(uintBitsToFloat(values[parameters.input1OffsetWords + row])));
-    bool active = row >= parameters.sequenceLength &&
+    bool targetActive = row >= parameters.sequenceLength &&
         row + 1u < parameters.rows &&
         target >= 0 &&
         uint(target) < parameters.columns;
 
     float localMaximum = -3.402823466e+38;
-    if (active) {
+    if (targetActive) {
         for (uint column = lane; column < parameters.columns; column += 64u) {
             float logit = uintBitsToFloat(
                 values[parameters.input0OffsetWords + row * parameters.columns + column]
@@ -70,7 +70,7 @@ void crossEntropyBackward() {
     float maximum = reduceSharedMax(localMaximum);
 
     float localExponentialSum = 0.0;
-    if (active) {
+    if (targetActive) {
         for (uint column = lane; column < parameters.columns; column += 64u) {
             float logit = uintBitsToFloat(
                 values[parameters.input0OffsetWords + row * parameters.columns + column]
@@ -81,7 +81,7 @@ void crossEntropyBackward() {
     float exponentialSum = reduceSharedSum(localExponentialSum);
     float safeSum = max(exponentialSum, 1.0e-30);
 
-    if (active) {
+    if (targetActive) {
         for (uint column = lane; column < parameters.columns; column += 64u) {
             float logit = uintBitsToFloat(
                 values[parameters.input0OffsetWords + row * parameters.columns + column]
@@ -101,7 +101,7 @@ void crossEntropyBackward() {
     if (lane == 0u) {
         float loss = 0.0;
         float count = 0.0;
-        if (active) {
+        if (targetActive) {
             float targetLogit = uintBitsToFloat(
                 values[parameters.input0OffsetWords + row * parameters.columns + uint(target)]
             );
