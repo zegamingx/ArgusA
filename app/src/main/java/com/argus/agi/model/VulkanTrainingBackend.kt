@@ -3384,11 +3384,18 @@ internal object VulkanTrainingBackend {
                 return false
             }
 
-            val resultBytes = ByteArray(Math.multiplyExact(accumulator.elementCount, Float.SIZE_BYTES))
-            if (!downloadGpuTensor(accumulator.spare, resultBytes)) return false
-            val result = decodeFloatArray(resultBytes)
-            if (result.any { !it.isFinite() }) return false
-            stagedResult = result
+            // Resident AdamW validates every consumed gradient in its first GPU pass.
+            // Keep the normalized/clipped tensor resident instead of reading the complete
+            // gradient inventory back to Kotlin when the optimizer will consume it on GPU.
+            if (!retainResidentBuffer) {
+                val resultBytes = ByteArray(
+                    Math.multiplyExact(accumulator.elementCount, Float.SIZE_BYTES)
+                )
+                if (!downloadGpuTensor(accumulator.spare, resultBytes)) return false
+                val result = decodeFloatArray(resultBytes)
+                if (result.any { !it.isFinite() }) return false
+                stagedResult = result
+            }
             completed = true
         } catch (error: LinkageError) {
             Log.e(TAG, "Resident gradient finalization JNI entry point is unavailable.", error)
@@ -3420,6 +3427,7 @@ internal object VulkanTrainingBackend {
             }
         }
         if (!completed || !cleanupSucceeded) return false
+        if (retainResidentBuffer) return true
         val result = stagedResult ?: return false
         copyGradientTensors(result, destinationTensors, accumulator.tensorSizes)
         return true
@@ -5111,7 +5119,8 @@ internal object VulkanTrainingBackend {
                 secondMoments[index].size != parameterSize ||
                 !weightDecayByGroup[index].isFinite() ||
                 weightDecayByGroup[index] < 0.0f ||
-                gradients[index].any { value -> !value.isFinite() } ||
+                (residentGradient == null &&
+                    gradients[index].any { value -> !value.isFinite() }) ||
                 (optimizerStateMirrorReliable &&
                     (firstMoments[index].any { value -> !value.isFinite() } ||
                         secondMoments[index].any { value -> !value.isFinite() }))) {
@@ -5585,6 +5594,38 @@ internal object VulkanTrainingBackend {
             )
         ) {
             return true
+        }
+
+        // The resident transaction can be rejected before commit. If M4 supplied a
+        // GPU-resident gradient accumulator, recover its normalized/clipped values before
+        // either staged Vulkan or CPU AdamW reads the host gradient arrays.
+        if (residentGradient != null) {
+            val expectedGradientElements = gradients.fold(0L) { total, gradient ->
+                Math.addExact(total, gradient.size.toLong())
+            }
+            val expectedGradientBytes = Math.multiplyExact(
+                expectedGradientElements,
+                Float.SIZE_BYTES.toLong()
+            )
+            check(expectedGradientBytes == residentGradient.byteCount) {
+                "Resident M4 gradient size does not match the active optimizer tensor inventory."
+            }
+            check(expectedGradientBytes <= Int.MAX_VALUE.toLong()) {
+                "Resident M4 gradient exceeds the host recovery array limit."
+            }
+            val gradientBytes = ByteArray(expectedGradientBytes.toInt())
+            check(downloadGpuTensor(residentGradient, gradientBytes)) {
+                "Resident M4 gradient could not be recovered for the optimizer fallback."
+            }
+            val recoveredGradients = decodeFloatArray(gradientBytes)
+            check(recoveredGradients.all { value -> value.isFinite() }) {
+                "Resident M4 gradient contains a non-finite value."
+            }
+            copyGradientTensors(
+                recoveredGradients,
+                gradients,
+                IntArray(gradients.size) { index -> gradients[index].size }
+            )
         }
 
         // The resident transaction can be rejected before commit while previous GPU
