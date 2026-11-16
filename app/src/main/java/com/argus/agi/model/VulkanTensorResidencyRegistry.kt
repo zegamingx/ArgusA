@@ -115,6 +115,7 @@ internal class VulkanTensorResidencyRegistry(
      */
     @Synchronized
     fun synchronizeAll(tensors: List<VulkanModelParameterTensor>): Boolean {
+        preparedReplacement = null
         if (!releaseRetiredAllocations()) return false
         require(tensors.isNotEmpty()) {
             "The model parameter residency inventory cannot be empty."
@@ -186,6 +187,7 @@ internal class VulkanTensorResidencyRegistry(
      */
     @Synchronized
     fun invalidate(releaseAllocations: Boolean): Boolean {
+        preparedReplacement = null
         if (!releaseAllocations) {
             entries.clear()
             retiredAllocations.clear()
