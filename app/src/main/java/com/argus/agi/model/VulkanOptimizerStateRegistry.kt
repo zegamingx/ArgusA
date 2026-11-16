@@ -206,6 +206,20 @@ internal class VulkanOptimizerStateRegistry(
         return true
     }
 
+    /** Convenience transaction for registry unit tests and non-paired maintenance paths. */
+    @Synchronized
+    fun replaceAll(
+        tensors: List<FloatArray>,
+        expectedAllocations: List<VulkanTensorAllocation>,
+        replacementAllocations: List<VulkanTensorAllocation>
+    ): Boolean {
+        if (!canReplaceAll(tensors, expectedAllocations, replacementAllocations)) return false
+        if (!commitReplacementAfterPreflight(tensors, expectedAllocations, replacementAllocations)) {
+            return false
+        }
+        return finishReplacementAfterPreflight()
+    }
+
     /** Releases old moment buffers after the paired parameter registry has committed. */
     @Synchronized
     internal fun finishReplacementAfterPreflight(): Boolean =
