@@ -15,6 +15,7 @@ internal class VulkanOptimizerStateRegistry(
     private val allocate: (Long) -> VulkanTensorAllocation?,
     private val upload: (VulkanTensorAllocation, ByteArray) -> Boolean,
     private val release: (VulkanTensorAllocation) -> Boolean,
+    private val download: ((VulkanTensorAllocation, ByteArray) -> Boolean)? = null,
     private val maxResidentBytes: () -> Long = { Long.MAX_VALUE }
 ) {
     private data class Entry(
@@ -74,6 +75,36 @@ internal class VulkanOptimizerStateRegistry(
     @Synchronized
     fun acquire(tensor: FloatArray): VulkanTensorAllocation? = acquireInternal(tensor)
 
+    /**
+     * Refreshes the engine-owned recovery mirror from persistent GPU moments.
+     * The operation stages every tensor first, then commits all host arrays together.
+     */
+    @Synchronized
+    fun synchronizeHostMirrors(): Boolean {
+        if (entries.isEmpty()) return true
+        val readback = download ?: return false
+        val staged = ArrayList<Pair<FloatArray, FloatArray>>(entries.size)
+        for ((tensor, entry) in entries) {
+            if (!entry.uploaded) return false
+            val requiredBytes = byteCount(tensor) ?: return false
+            if (requiredBytes > Int.MAX_VALUE.toLong()) return false
+            val bytes = try {
+                ByteArray(requiredBytes.toInt())
+            } catch (_: OutOfMemoryError) {
+                return false
+            }
+            if (!readback(entry.allocation, bytes)) return false
+            if (bytes.size % Float.SIZE_BYTES != 0) return false
+            val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            val values = FloatArray(bytes.size / Float.SIZE_BYTES) { buffer.float }
+            if (values.any { value -> !value.isFinite() }) return false
+            staged.add(tensor to values)
+        }
+        for ((tensor, values) in staged) {
+            System.arraycopy(values, 0, tensor, 0, tensor.size)
+        }
+        return true
+    }
     @Synchronized
     fun invalidate(releaseAllocations: Boolean): Boolean {
         if (!releaseAllocations) {
