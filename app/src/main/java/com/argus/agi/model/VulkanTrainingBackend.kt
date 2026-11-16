@@ -523,6 +523,8 @@ internal object VulkanTrainingBackend {
     internal val activationTensorResidencyBudgetBytes: StateFlow<Long> =
         _activationTensorResidencyBudgetBytes.asStateFlow()
 
+    private val _optimizerStateResidencyBudgetBytes = MutableStateFlow(0L)
+
     private val tensorResidencyRegistry = VulkanTensorResidencyRegistry(
         allocate = { byteCount -> allocateGpuTensor(byteCount) },
         upload = { allocation, bytes -> uploadGpuTensor(allocation, bytes) },
@@ -534,7 +536,8 @@ internal object VulkanTrainingBackend {
         allocate = { byteCount -> allocateGpuTensor(byteCount) },
         upload = { allocation, bytes -> uploadGpuTensor(allocation, bytes) },
         release = { allocation -> releaseGpuTensor(allocation) },
-        maxResidentBytes = { _activationTensorResidencyBudgetBytes.value }
+        download = { allocation, bytes -> downloadGpuTensor(allocation, bytes) },
+        maxResidentBytes = { _optimizerStateResidencyBudgetBytes.value }
     )
 
     private val _modelTensorResidencyReady = MutableStateFlow(false)
@@ -770,13 +773,23 @@ internal object VulkanTrainingBackend {
         return minOf(appBudget, gpuBudget, descriptorRange).coerceAtLeast(0L)
     }
 
+    /**
+     * A full FP16 model plus its two FP32 Adam moments requires approximately
+     * 2 + 4 + 4 bytes per parameter. Reserve one seventh for FP16 weights,
+     * four sevenths for optimizer moments, and two sevenths for activations
+     * plus transient gradient staging.
+     */
     private fun calculateModelTensorResidencyBudgetBytes(
         capabilities: VulkanDeviceCapabilities?
-    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) * 3L / 4L
+    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) / 7L
 
     private fun calculateActivationTensorResidencyBudgetBytes(
         capabilities: VulkanDeviceCapabilities?
-    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) / 4L
+    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) * 2L / 7L
+
+    private fun calculateOptimizerStateResidencyBudgetBytes(
+        capabilities: VulkanDeviceCapabilities?
+    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) * 4L / 7L
 
     /**
      * Allocates persistent Vulkan storage. New contents are undefined until uploaded
@@ -876,6 +889,8 @@ internal object VulkanTrainingBackend {
                 calculateModelTensorResidencyBudgetBytes(capabilities)
             _activationTensorResidencyBudgetBytes.value =
                 calculateActivationTensorResidencyBudgetBytes(capabilities)
+            _optimizerStateResidencyBudgetBytes.value =
+                calculateOptimizerStateResidencyBudgetBytes(capabilities)
             Log.i(
                 TAG,
                 "Refreshed FP16 model-residency budget: " +
@@ -1560,6 +1575,8 @@ internal object VulkanTrainingBackend {
         runtimeRestartPending = false
         invalidateTensorResidency(releaseAllocations = false)
         _modelTensorResidencyBudgetBytes.value = 0L
+        _activationTensorResidencyBudgetBytes.value = 0L
+        _optimizerStateResidencyBudgetBytes.value = 0L
         _deviceCapabilities.value = null
         _gpuPerformanceMetrics.value = VulkanGpuPerformanceMetrics()
         _tensorArenaMetrics.value = VulkanTensorArenaMetrics()
@@ -1621,6 +1638,8 @@ internal object VulkanTrainingBackend {
                     calculateModelTensorResidencyBudgetBytes(detectedCapabilities)
                 _activationTensorResidencyBudgetBytes.value =
                     calculateActivationTensorResidencyBudgetBytes(detectedCapabilities)
+                _optimizerStateResidencyBudgetBytes.value =
+                    calculateOptimizerStateResidencyBudgetBytes(detectedCapabilities)
                 Log.i(
                     TAG,
                     "FP16 model-residency budget: ${_modelTensorResidencyBudgetBytes.value} bytes."
