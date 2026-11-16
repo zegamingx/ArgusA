@@ -43,7 +43,7 @@ internal class VulkanOptimizerStateRegistry(
             }
             val existing = entries[tensor]
             if (existing == null || existing.hostMirrorCurrent) {
-                require(tensor.all(Float::isFinite)) {
+                require(tensor.all { value -> value.isFinite() }) {
                     "AdamW optimizer-state tensors must contain only finite values."
                 }
             }
