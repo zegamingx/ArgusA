@@ -3535,6 +3535,9 @@ class ArgusNeuralEngine private constructor(
     fun saveCheckpoint(): Boolean {
         return try {
             synchronized(modelLock) {
+                check(VulkanTrainingBackend.synchronizeOptimizerStateMirrors()) {
+                    "GPU optimizer moments could not be recovered before checkpoint serialization."
+                }
                 writeArg4Checkpoint()
             }
             val file = File(context.filesDir, "argus_model_weights.bin")
