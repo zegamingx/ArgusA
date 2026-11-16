@@ -3247,7 +3247,8 @@ internal object VulkanTrainingBackend {
         accumulator: VulkanResidentGradientAccumulator,
         destinationTensors: Array<FloatArray>,
         targetCount: Int,
-        maximumGradientNorm: Float
+        maximumGradientNorm: Float,
+        retainResidentBuffer: Boolean = false
     ): Boolean {
         if (!isResidentBackwardAvailable ||
             accumulator.released ||
@@ -3346,9 +3347,14 @@ internal object VulkanTrainingBackend {
                 accumulator.pendingReleaseAllocations.add(normToRelease)
                 cleanupSucceeded = false
             }
-            if (completed && cleanupSucceeded &&
-                !releaseResidentGradientAccumulator(accumulator)) {
-                cleanupSucceeded = false
+            if (completed && cleanupSucceeded) {
+                if (retainResidentBuffer) {
+                    val previousActive = accumulator.active
+                    accumulator.active = accumulator.spare
+                    accumulator.spare = previousActive
+                } else if (!releaseResidentGradientAccumulator(accumulator)) {
+                    cleanupSucceeded = false
+                }
             }
         }
         if (!completed || !cleanupSucceeded) return false
