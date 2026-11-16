@@ -2956,8 +2956,8 @@ class ArgusNeuralEngine private constructor(
     }
 
     /**
-     * Executes one logical AdamW update. Vulkan stages FP16 weights through the
-     * existing FP32 optimizer kernel; Kotlin remains the authoritative fallback.
+     * Executes one logical AdamW update. The preferred Vulkan path updates resident
+     * FP16 weights and FP32 moments in place; staged Vulkan and Kotlin remain fallbacks.
      */
     private fun applyAdamWUpdate(
         parameters: Array<Float16ParameterArray>,
