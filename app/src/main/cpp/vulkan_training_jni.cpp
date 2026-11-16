@@ -7111,7 +7111,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     }
 
     const uint64_t maximumWorkGroups =
-        gRuntime.physicalDeviceProperties.limits.maxComputeWorkGroupCountX;
+        gRuntime.maxComputeWorkGroupCountX;
     if (maximumWorkGroups == 0u) return JNI_FALSE;
 
     VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
