@@ -846,7 +846,7 @@ internal object VulkanTrainingBackend {
 
     @Synchronized
     fun downloadGpuTensor(allocation: VulkanTensorAllocation, destination: ByteArray): Boolean {
-        if (!isRuntimeAvailable || destination.size.toLong() != allocation.byteCount) return false
+        if (!nativeReady || destination.size.toLong() != allocation.byteCount) return false
         val downloaded = try {
             nativeDownloadTensor(allocation.nativeHandle, destination)
         } catch (error: LinkageError) {
@@ -862,7 +862,7 @@ internal object VulkanTrainingBackend {
 
     @Synchronized
     fun releaseGpuTensor(allocation: VulkanTensorAllocation): Boolean {
-        if (!isRuntimeAvailable) return false
+        if (!nativeReady) return false
         val released = try {
             nativeReleaseTensor(allocation.nativeHandle)
         } catch (error: LinkageError) {
@@ -880,7 +880,7 @@ internal object VulkanTrainingBackend {
     @Synchronized
     internal fun synchronizeModelParameterMirrors(): Boolean {
         if (modelParameterMirrorReliable) return true
-        if (!isRuntimeAvailable) return false
+        if (!nativeReady) return false
         return try {
             val synchronized = tensorResidencyRegistry.synchronizeHostMirrors()
             if (synchronized) modelParameterMirrorReliable = true
@@ -898,7 +898,7 @@ internal object VulkanTrainingBackend {
     @Synchronized
     internal fun synchronizeOptimizerStateMirrors(): Boolean {
         if (optimizerStateMirrorReliable) return true
-        if (!isRuntimeAvailable) return false
+        if (!nativeReady) return false
         return try {
             val synchronized = optimizerStateResidencyRegistry.synchronizeHostMirrors()
             if (synchronized) optimizerStateMirrorReliable = true
@@ -929,9 +929,9 @@ internal object VulkanTrainingBackend {
             return false
         }
         val released = optimizerStateResidencyRegistry.invalidate(
-            releaseAllocations = isRuntimeAvailable
+            releaseAllocations = nativeReady
         )
-        if (!released && isRuntimeAvailable) {
+        if (!released && nativeReady) {
             Log.w(TAG, "Optimizer-state release failed; rebuilding the optional Vulkan runtime.")
             runCatching { destroyNativeRuntime() }
                 .onFailure { error ->
