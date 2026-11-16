@@ -717,16 +717,26 @@ internal object VulkanTrainingBackend {
         }
     }
 
-    private fun destroyNativeRuntime() {
+    private fun destroyNativeRuntime(): Boolean {
         if (nativeReady && !synchronizeTrainingStateMirrors()) {
+            disabledAfterRuntimeFailure = true
+            _currentBackend = "Vulkan disabled — GPU training state recovery pending"
+            _runtimeStatus.value =
+                "GPU model/optimizer state could not be read back; Vulkan memory is retained for recovery"
+            publishInitializationProgress(
+                status = "GPU state recovery required",
+                driverInfo = _initializationProgress.value.driverInfo,
+                isInitializing = false,
+                isCpuFallback = false
+            )
             Log.e(
                 TAG,
-                "Vulkan runtime teardown is discarding GPU state that could not be synchronized to the host mirror."
+                "Vulkan teardown was postponed because model or optimizer state could not be recovered."
             )
+            return false
         }
-        try {
+        return try {
             nativeDestroy()
-        } finally {
             nativeReady = false
             fp16RuntimeReady = false
             residentActivationLinearReady = false
@@ -747,6 +757,11 @@ internal object VulkanTrainingBackend {
             )
             invalidateTensorResidency(releaseAllocations = false)
             _tensorArenaMetrics.value = VulkanTensorArenaMetrics()
+        }
+        true
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Vulkan native runtime destruction failed.", error)
+            false
         }
     }
 
