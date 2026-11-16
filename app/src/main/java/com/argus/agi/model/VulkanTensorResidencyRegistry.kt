@@ -32,6 +32,15 @@ internal class VulkanTensorResidencyRegistry(
         var hostMirrorCurrent: Boolean
     )
 
+    private data class PreparedReplacement(
+        val tensors: List<Float16ParameterArray>,
+        val expectedAllocations: List<VulkanTensorAllocation>,
+        val replacementAllocations: List<VulkanTensorAllocation>,
+        val retiredBytesAfterCommit: Long
+    )
+
+    private var preparedReplacement: PreparedReplacement? = null
+
     private val entries = IdentityHashMap<Float16ParameterArray, Entry>()
     private val retiredAllocations = ArrayList<VulkanTensorAllocation>()
     private var residentBytes: Long = 0L
@@ -307,99 +316,75 @@ internal class VulkanTensorResidencyRegistry(
         expectedAllocations: List<VulkanTensorAllocation>,
         replacementAllocations: List<VulkanTensorAllocation>
     ): Boolean {
+        preparedReplacement = null
         if (!validateReplacement(tensors, expectedAllocations, replacementAllocations)) return false
+
         val nextRetiredBytes = runCatching {
             expectedAllocations.fold(retiredResidentBytes) { total, allocation ->
                 Math.addExact(total, allocation.byteCount)
             }
         }.getOrNull() ?: return false
-        if (nextRetiredBytes < retiredResidentBytes) return false
+        val preparedTensors = tensors.toList()
+        val preparedExpected = expectedAllocations.toList()
+        val preparedReplacements = replacementAllocations.toList()
         return runCatching {
             retiredAllocations.ensureCapacity(
-                Math.addExact(retiredAllocations.size, expectedAllocations.size)
+                Math.addExact(retiredAllocations.size, preparedExpected.size)
+            )
+            preparedReplacement = PreparedReplacement(
+                tensors = preparedTensors,
+                expectedAllocations = preparedExpected,
+                replacementAllocations = preparedReplacements,
+                retiredBytesAfterCommit = nextRetiredBytes
             )
             true
         }.getOrDefault(false)
     }
 
     /**
-     * Swaps every resident parameter handle as one registry transaction. GPU candidate
-     * buffers are already fully initialized; host mirrors remain stale until requested.
-     * Old handles are retained for deferred release if Vulkan refuses an individual free.
+     * Publishes the prepared replacement without creating host-side collections.
+     * The backend holds its optimizer transaction lock between preflight and commit.
      */
-    @Synchronized
-    fun replaceAll(
-        tensors: List<Float16ParameterArray>,
-        expectedAllocations: List<VulkanTensorAllocation>,
-        replacementAllocations: List<VulkanTensorAllocation>
-    ): Boolean {
-        if (!validateReplacement(tensors, expectedAllocations, replacementAllocations)) return false
-
-        var nextRetiredBytes = retiredResidentBytes
-        for (allocation in expectedAllocations) {
-            nextRetiredBytes = runCatching {
-                Math.addExact(nextRetiredBytes, allocation.byteCount)
-            }.getOrNull() ?: return false
-        }
-
-        for (index in tensors.indices) {
-            val tensor = tensors[index]
-            val entry = entries[tensor] ?: return false
-            val previous = entry.allocation
-            entry.allocation = replacementAllocations[index]
-            entry.uploadedRevision = tensor.mutationVersion
-            entry.hostMirrorCurrent = false
-            retiredAllocations.add(previous)
-        }
-        retiredResidentBytes = nextRetiredBytes
-        releaseRetiredAllocations()
-        return true
-    }
-
-    /** Commits a replacement that was successfully preflighted under the backend lock. */
     @Synchronized
     internal fun commitReplacementAfterPreflight(
         tensors: List<Float16ParameterArray>,
         expectedAllocations: List<VulkanTensorAllocation>,
         replacementAllocations: List<VulkanTensorAllocation>
     ): Boolean {
-        if (tensors.isEmpty() ||
-            tensors.size != expectedAllocations.size ||
-            tensors.size != replacementAllocations.size ||
-            entries.size != tensors.size) {
+        val prepared = preparedReplacement ?: return false
+        if (tensors.size != prepared.tensors.size ||
+            expectedAllocations.size != prepared.expectedAllocations.size ||
+            replacementAllocations.size != prepared.replacementAllocations.size) {
             return false
         }
-        var nextRetiredBytes = retiredResidentBytes
-        for (index in tensors.indices) {
-            val entry = entries[tensors[index]] ?: return false
-            val expected = expectedAllocations[index]
-            val replacement = replacementAllocations[index]
+
+        for (index in prepared.tensors.indices) {
+            if (prepared.tensors[index] !== tensors[index] ||
+                prepared.expectedAllocations[index].nativeHandle != expectedAllocations[index].nativeHandle ||
+                prepared.replacementAllocations[index].nativeHandle != replacementAllocations[index].nativeHandle) {
+                return false
+            }
+            val entry = entries[prepared.tensors[index]] ?: return false
+            val expected = prepared.expectedAllocations[index]
+            val replacement = prepared.replacementAllocations[index]
             if (entry.allocation.nativeHandle != expected.nativeHandle ||
                 entry.allocation.byteCount != expected.byteCount ||
                 replacement.byteCount != expected.byteCount) {
                 return false
             }
-            nextRetiredBytes = runCatching {
-                Math.addExact(nextRetiredBytes, expected.byteCount)
-            }.getOrNull() ?: return false
         }
-        if (runCatching {
-                retiredAllocations.ensureCapacity(
-                    Math.addExact(retiredAllocations.size, tensors.size)
-                )
-            }.isFailure) {
-            return false
-        }
-        for (index in tensors.indices) {
-            val tensor = tensors[index]
+
+        for (index in prepared.tensors.indices) {
+            val tensor = prepared.tensors[index]
             val entry = entries[tensor] ?: return false
             val previous = entry.allocation
-            entry.allocation = replacementAllocations[index]
+            entry.allocation = prepared.replacementAllocations[index]
             entry.uploadedRevision = tensor.mutationVersion
             entry.hostMirrorCurrent = false
             retiredAllocations.add(previous)
         }
-        retiredResidentBytes = nextRetiredBytes
+        retiredResidentBytes = prepared.retiredBytesAfterCommit
+        preparedReplacement = null
         return true
     }
 
