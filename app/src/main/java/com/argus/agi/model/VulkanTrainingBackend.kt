@@ -3727,8 +3727,8 @@ internal object VulkanTrainingBackend {
                     !rejectedCandidateParameters.contentEquals(parameterBytes[group]) ||
                     !rejectedFirstMoments.contentEquals(firstMomentBytes[group]) ||
                     !rejectedSecondMoments.contentEquals(secondMomentBytes[group]) ||
-                    !rejectedCandidateFirst.contentEquals(validCandidateFirstBytes[group]) ||
-                    !rejectedCandidateSecond.contentEquals(validCandidateSecondBytes[group])) {
+                    !rejectedCandidateFirst.contentEquals(firstMomentBytes[group]) ||
+                    !rejectedCandidateSecond.contentEquals(secondMomentBytes[group])) {
                     return false
                 }
             }
