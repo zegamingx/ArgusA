@@ -842,14 +842,22 @@ void destroyTensorArena() {
 bool copyBufferSync(
     VkBuffer source,
     VkBuffer destination,
+    VkDeviceSize sourceCapacity,
+    VkDeviceSize destinationCapacity,
     VkDeviceSize sourceOffset,
     VkDeviceSize destinationOffset,
     VkDeviceSize size,
     bool sourceHostWritten,
     bool destinationHostReadable
 ) {
-    if (source == VK_NULL_HANDLE || destination == VK_NULL_HANDLE || size == 0u ||
-        (sourceOffset & 3u) != 0u || (destinationOffset & 3u) != 0u || (size & 3u) != 0u) {
+    if (source == VK_NULL_HANDLE || destination == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        size == 0u ||
+        (sourceOffset & 3u) != 0u || (destinationOffset & 3u) != 0u || (size & 3u) != 0u ||
+        sourceOffset > sourceCapacity || size > sourceCapacity - sourceOffset ||
+        destinationOffset > destinationCapacity || size > destinationCapacity - destinationOffset) {
+        logError("Vulkan buffer copy rejected: invalid handles, alignment, or buffer range.");
         return false;
     }
     VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0);
@@ -1079,7 +1087,9 @@ bool growTensorArena(VkDeviceSize additionalBytes) {
             return false;
         }
         if (!copyBufferSync(
-                gRuntime.tensorArenaBuffer, nextBuffer, 0u, 0u, oldCapacity, false, false
+                gRuntime.tensorArenaBuffer, nextBuffer,
+                oldCapacity, createdCapacity,
+                0u, 0u, oldCapacity, false, false
             )) {
             vkDestroyBuffer(gRuntime.device, nextBuffer, nullptr);
             vkFreeMemory(gRuntime.device, nextMemory, nullptr);
@@ -1261,11 +1271,13 @@ bool transferTensorBytes(
             if (!syncStagingMemory(false) ||
                 !copyBufferSync(
                     gRuntime.storageBuffer, gRuntime.tensorArenaBuffer,
+                    gRuntime.storageCapacity, gRuntime.tensorArenaCapacity,
                     0u, allocation.offset + cursor, chunk, true, false
                 )) return false;
         } else {
             if (!copyBufferSync(
                     gRuntime.tensorArenaBuffer, gRuntime.storageBuffer,
+                    gRuntime.tensorArenaCapacity, gRuntime.storageCapacity,
                     allocation.offset + cursor, 0u, chunk, false, true
                 ) || !syncStagingMemory(true)) return false;
             if (actual > 0u) {
