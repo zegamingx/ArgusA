@@ -860,9 +860,29 @@ internal object VulkanTrainingBackend {
         return released
     }
 
-    /** Drops GPU moment replicas before a CPU optimizer path changes their host mirrors. */
+    /** Synchronizes persistent FP32 moments into the checkpoint/CPU recovery mirror. */
     @Synchronized
-    internal fun invalidateOptimizerStateResidency() {
+    internal fun synchronizeOptimizerStateMirrors(): Boolean {
+        if (optimizerStateResidencyRegistry.residentTensorCount() == 0) return true
+        if (!isRuntimeAvailable) return false
+        return try {
+            optimizerStateResidencyRegistry.synchronizeHostMirrors()
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Optimizer-state recovery readback exceeded the available heap.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Optimizer-state recovery readback failed.", error)
+            false
+        }
+    }
+
+    /** Drops optimizer replicas only after the exact GPU moments have been recovered. */
+    @Synchronized
+    internal fun invalidateOptimizerStateResidency(): Boolean {
+        if (isRuntimeAvailable && !synchronizeOptimizerStateMirrors()) {
+            Log.e(TAG, "Cannot invalidate GPU optimizer moments because host recovery was not verified.")
+            return false
+        }
         val released = optimizerStateResidencyRegistry.invalidate(
             releaseAllocations = isRuntimeAvailable
         )
@@ -872,7 +892,9 @@ internal object VulkanTrainingBackend {
                 .onFailure { error ->
                     Log.e(TAG, "Vulkan teardown after optimizer-state release failure failed.", error)
                 }
+            return false
         }
+        return true
     }
 
     /**
@@ -962,6 +984,12 @@ internal object VulkanTrainingBackend {
 
         if (!isRuntimeAvailable) {
             invalidateTensorResidency(releaseAllocations = false)
+            return false
+        }
+
+        if (!synchronizeOptimizerStateMirrors()) {
+            residencySuspended = false
+            Log.e(TAG, "Memory-pressure release was postponed because GPU optimizer moments could not be recovered.")
             return false
         }
 
@@ -1551,6 +1579,10 @@ internal object VulkanTrainingBackend {
     /** Reset failed native state before the user explicitly retries Vulkan initialization. */
     @Synchronized
     fun resetRuntimeForRetry() {
+        if (isRuntimeAvailable && !synchronizeOptimizerStateMirrors()) {
+            Log.e(TAG, "Vulkan retry was postponed because optimizer moments could not be recovered.")
+            return
+        }
         if (initializationAttempted) {
             runCatching { nativeDestroy() }
                 .onFailure { error ->
@@ -5070,7 +5102,9 @@ internal object VulkanTrainingBackend {
         }
 
         // The persistent moment replica must never survive into a CPU or staged update.
-        invalidateOptimizerStateResidency()
+        check(invalidateOptimizerStateResidency()) {
+            "GPU optimizer moments could not be synchronized before the fallback update."
+        }
 
         var totalElements = 0L
         var stagingElements = 0L
