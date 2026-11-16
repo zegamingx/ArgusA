@@ -161,6 +161,51 @@ internal class VulkanOptimizerStateRegistry(
         return true
     }
 
+    /** Commits a replacement that was successfully preflighted under the backend lock. */
+    @Synchronized
+    internal fun commitReplacementAfterPreflight(
+        tensors: List<FloatArray>,
+        expectedAllocations: List<VulkanTensorAllocation>,
+        replacementAllocations: List<VulkanTensorAllocation>
+    ): Boolean {
+        if (tensors.isEmpty() ||
+            tensors.size != expectedAllocations.size ||
+            tensors.size != replacementAllocations.size ||
+            entries.size != tensors.size) {
+            return false
+        }
+        var nextRetiredBytes = retiredResidentBytes
+        for (index in tensors.indices) {
+            val entry = entries[tensors[index]] ?: return false
+            val expected = expectedAllocations[index]
+            val replacement = replacementAllocations[index]
+            if (entry.allocation.nativeHandle != expected.nativeHandle ||
+                entry.allocation.byteCount != expected.byteCount ||
+                replacement.byteCount != expected.byteCount) {
+                return false
+            }
+            nextRetiredBytes = runCatching {
+                Math.addExact(nextRetiredBytes, expected.byteCount)
+            }.getOrNull() ?: return false
+        }
+        if (runCatching {
+                retiredAllocations.ensureCapacity(
+                    Math.addExact(retiredAllocations.size, tensors.size)
+                )
+            }.isFailure) {
+            return false
+        }
+        for (index in tensors.indices) {
+            val entry = entries[tensors[index]] ?: return false
+            val previous = entry.allocation
+            entry.allocation = replacementAllocations[index]
+            entry.uploaded = true
+            retiredAllocations.add(previous)
+        }
+        retiredResidentBytes = nextRetiredBytes
+        releaseRetiredAllocations()
+        return true
+    }
     private fun validateReplacement(
         tensors: List<FloatArray>,
         expectedAllocations: List<VulkanTensorAllocation>,
