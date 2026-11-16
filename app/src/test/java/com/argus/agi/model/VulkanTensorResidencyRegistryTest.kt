@@ -300,13 +300,11 @@ class VulkanTensorResidencyRegistryTest {
                 true
             },
             download = { allocation, destination ->
-                if (allocation.nativeHandle == failedHandle) {
-                    false
-                } else {
-                    val source = gpuBytes[allocation.nativeHandle] ?: return@VulkanTensorResidencyRegistry false
-                    if (source.size != destination.size) {
-                        false
-                    } else {
+                val source = gpuBytes[allocation.nativeHandle]
+                when {
+                    allocation.nativeHandle == failedHandle -> false
+                    source == null || source.size != destination.size -> false
+                    else -> {
                         source.copyInto(destination)
                         true
                     }
