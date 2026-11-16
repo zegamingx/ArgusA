@@ -1377,8 +1377,11 @@ internal object VulkanTrainingBackend {
             if (verified) {
                 refreshGpuPerformanceMetrics()
                 _currentBackend = "Kotlin CPU"
-                _runtimeStatus.value =
-                    "Vulkan runtime verified — eligible operations can use the GPU"
+                _runtimeStatus.value = if (residentAttentionReady) {
+                    "Vulkan runtime verified — resident attention and post-attention LayerNorm passed self-check"
+                } else {
+                    "Vulkan runtime verified — resident attention/LayerNorm unavailable; this path uses Kotlin fallback"
+                }
                 publishInitializationProgress(
                     status = "Vulkan runtime verified",
                     driverInfo = detectedDriverInfo,
@@ -1939,8 +1942,12 @@ internal object VulkanTrainingBackend {
         }
         if (applied) {
             refreshGpuPerformanceMetrics()
+            _currentBackend = "Vulkan Compute (Resident attention + LayerNorm)"
         } else {
             residentAttentionReady = false
+            _currentBackend = "Kotlin CPU (Resident attention + LayerNorm fallback)"
+            _runtimeStatus.value =
+                "Vulkan runtime verified — resident attention/LayerNorm dispatch failed; this path uses Kotlin fallback"
             Log.w(TAG, "Resident Vulkan attention/LayerNorm dispatch failed; M3B–M3E fall back to Kotlin.")
         }
         return applied
