@@ -7042,10 +7042,12 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             parameterAllocation->allocatedSize < packedParameterBytes ||
             candidateParameterAllocation->logicalSize != parameterAllocation->logicalSize ||
             candidateParameterAllocation->allocatedSize != parameterAllocation->allocatedSize ||
-            firstMomentAllocation->logicalSize < momentBytes ||
-            secondMomentAllocation->logicalSize < momentBytes ||
-            candidateFirstMomentAllocation->logicalSize < momentBytes ||
-            candidateSecondMomentAllocation->logicalSize < momentBytes ||
+            firstMomentAllocation->logicalSize != momentBytes ||
+            secondMomentAllocation->logicalSize != momentBytes ||
+            candidateFirstMomentAllocation->logicalSize != momentBytes ||
+            candidateSecondMomentAllocation->logicalSize != momentBytes ||
+            candidateFirstMomentAllocation->allocatedSize != firstMomentAllocation->allocatedSize ||
+            candidateSecondMomentAllocation->allocatedSize != secondMomentAllocation->allocatedSize ||
             (parameterAllocation->offset & 3u) != 0u ||
             (candidateParameterAllocation->offset & 3u) != 0u ||
             (firstMomentAllocation->offset & 3u) != 0u ||
