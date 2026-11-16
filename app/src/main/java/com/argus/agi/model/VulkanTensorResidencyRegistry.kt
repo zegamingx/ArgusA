@@ -24,7 +24,8 @@ internal class VulkanTensorResidencyRegistry(
 ) {
     private data class Entry(
         val allocation: VulkanTensorAllocation,
-        var uploadedRevision: Long
+        var uploadedRevision: Long,
+        var hostMirrorCurrent: Boolean
     )
 
     private val entries = IdentityHashMap<Float16ParameterArray, Entry>()
@@ -48,7 +49,11 @@ internal class VulkanTensorResidencyRegistry(
             if (nextResidentBytes > maxResidentBytes().coerceAtLeast(0L)) return null
 
             val allocation = allocate(byteCount) ?: return null
-            candidate = Entry(allocation, uploadedRevision = Long.MIN_VALUE)
+            candidate = Entry(
+                allocation = allocation,
+                uploadedRevision = Long.MIN_VALUE,
+                hostMirrorCurrent = false
+            )
             entries[parameters] = candidate
             residentBytes = nextResidentBytes
         }
@@ -74,6 +79,7 @@ internal class VulkanTensorResidencyRegistry(
             val revisionAfterUpload = parameters.mutationVersion
             if (revisionAfterUpload == revisionAfterSnapshot) {
                 entry.uploadedRevision = revisionAfterUpload
+                entry.hostMirrorCurrent = true
                 return entry.allocation
             }
         }
@@ -177,16 +183,46 @@ internal class VulkanTensorResidencyRegistry(
     }
 
 
+    /** Synchronizes one host tensor only when its resident GPU copy has changed. */
+    @Synchronized
+    fun synchronizeHostMirror(parameters: Float16ParameterArray): Boolean {
+        val entry = entries[parameters] ?: return true
+        if (entry.hostMirrorCurrent) return true
+        if (entry.uploadedRevision == Long.MIN_VALUE) return false
+        val readback = download ?: return false
+        val byteCount = parameterByteCount(parameters) ?: return false
+        if (byteCount != entry.allocation.byteCount || byteCount > Int.MAX_VALUE.toLong()) {
+            return false
+        }
+        val snapshot = try {
+            ByteArray(byteCount.toInt())
+        } catch (_: OutOfMemoryError) {
+            return false
+        }
+        if (!readback(entry.allocation, snapshot)) return false
+        try {
+            parameters.validateLittleEndianPrefix(snapshot, parameters.size)
+        } catch (_: IllegalArgumentException) {
+            return false
+        }
+        parameters.copyPrefixFromLittleEndianByteArray(snapshot, parameters.size)
+        entry.uploadedRevision = parameters.mutationVersion
+        entry.hostMirrorCurrent = true
+        return true
+    }
+
     /**
-     * Stages every resident parameter tensor from GPU before committing any host mirror.
-     * This is required before CPU fallback, native runtime teardown, or checkpoint writing.
+     * Stages all stale resident parameter tensors from GPU before committing any host mirror.
+     * This is used before CPU fallback, runtime teardown, or checkpoint serialization.
      */
     @Synchronized
     fun synchronizeHostMirrors(): Boolean {
         if (entries.isEmpty()) return true
+        val staleEntries = entries.entries.filter { (_, entry) -> !entry.hostMirrorCurrent }
+        if (staleEntries.isEmpty()) return true
         val readback = download ?: return false
-        val staged = ArrayList<Pair<Float16ParameterArray, ByteArray>>(entries.size)
-        for ((parameters, entry) in entries) {
+        val staged = ArrayList<Pair<Float16ParameterArray, ByteArray>>(staleEntries.size)
+        for ((parameters, entry) in staleEntries) {
             if (entry.uploadedRevision == Long.MIN_VALUE) return false
             val byteCount = parameterByteCount(parameters) ?: return false
             if (byteCount != entry.allocation.byteCount || byteCount > Int.MAX_VALUE.toLong()) {
@@ -210,9 +246,14 @@ internal class VulkanTensorResidencyRegistry(
             parameters.copyPrefixFromLittleEndianByteArray(snapshot, parameters.size)
             val entry = entries[parameters] ?: return false
             entry.uploadedRevision = parameters.mutationVersion
+            entry.hostMirrorCurrent = true
         }
         return true
     }
+
+    @Synchronized
+    fun areHostMirrorsCurrent(): Boolean =
+        entries.values.all { entry -> entry.hostMirrorCurrent }
 
     /**
      * Records a completed device-side parameter update without scheduling a redundant
@@ -230,6 +271,7 @@ internal class VulkanTensorResidencyRegistry(
             return false
         }
         entry.uploadedRevision = parameters.mutationVersion
+        entry.hostMirrorCurrent = false
         return true
     }
 
