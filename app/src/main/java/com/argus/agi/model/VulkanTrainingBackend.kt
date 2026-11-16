@@ -3509,14 +3509,16 @@ internal object VulkanTrainingBackend {
         val activeElementCounts = IntArray(initialGradients.size) { index ->
             initialGradients[index].size
         }
-        val totalGradientElements = initialGradients.fold(0) { total, gradient ->
-            Math.addExact(total, gradient.size)
+        val totalGradientElements = initialParameters.fold(0) { total, parameter ->
+            Math.addExact(total, parameter.size)
         }
         val flattenedGradients = FloatArray(totalGradientElements)
         var gradientCursor = 0
-        for (gradient in initialGradients) {
+        for (group in initialGradients.indices) {
+            val gradient = initialGradients[group]
             System.arraycopy(gradient, 0, flattenedGradients, gradientCursor, gradient.size)
-            gradientCursor = Math.addExact(gradientCursor, gradient.size)
+            // Match the M4 accumulator layout: one padded segment per full parameter tensor.
+            gradientCursor = Math.addExact(gradientCursor, initialParameters[group].size)
         }
         val gradientBytes = encodeFloatArray(flattenedGradients)
 
