@@ -7003,6 +7003,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         totalGradientElements > std::numeric_limits<uint64_t>::max() / sizeof(float) ||
         totalGradientElements * sizeof(float) > gradientAllocation->logicalSize ||
         totalGradientElements * sizeof(float) > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange ||
+        gradientOffsetWords > kMaximumShaderIndex ||
+        totalGradientElements - 1u > kMaximumShaderIndex - gradientOffsetWords ||
         allocatedPairCount == 0u) {
         logError("Resident AdamW gradient staging allocation is too small or exceeds device limits.");
         return JNI_FALSE;
@@ -7158,7 +7160,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     afterUpdate.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
     afterUpdate.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
     VkDependencyInfoKHR afterUpdateDependency{};
-    afterUpdateDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_2_KHR;
+    afterUpdateDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
     afterUpdateDependency.memoryBarrierCount = 1u;
     afterUpdateDependency.pMemoryBarriers = &afterUpdate;
     gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &afterUpdateDependency);
