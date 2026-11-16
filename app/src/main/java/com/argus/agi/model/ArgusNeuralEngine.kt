@@ -1719,6 +1719,12 @@ class ArgusNeuralEngine private constructor(
         val hostDirectParameters = ArrayList<Float16ParameterArray>(1 + layerCount * 4)
         hostDirectParameters.add(wEmbed)
         for (block in blocks) {
+            // The batched backward path forms effective Q/K/V input projections on
+            // the host. Keep only these directly-read matrices plus LoRA synchronized;
+            // the remaining dense matrices stay GPU-resident and are not read back.
+            hostDirectParameters.add(block.wQ)
+            hostDirectParameters.add(block.wK)
+            hostDirectParameters.add(block.wV)
             if (block.loraQa.size > 0) hostDirectParameters.add(block.loraQa)
             if (block.loraQb.size > 0) hostDirectParameters.add(block.loraQb)
             if (block.loraVa.size > 0) hostDirectParameters.add(block.loraVa)
