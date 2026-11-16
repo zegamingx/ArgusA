@@ -2999,18 +2999,26 @@ class ArgusNeuralEngine private constructor(
         gradientClipFactor: Float,
         residentGradient: VulkanTensorAllocation? = null
     ) {
-        applyAdamWUpdateTransaction(
-            parameters = parameters,
-            gradients = gradients,
-            firstMoments = firstMoments,
-            secondMoments = secondMoments,
-            weightDecayByGroup = weightDecayByGroup,
-            learningRate = learningRate,
-            biasCorrection1 = biasCorrection1,
-            biasCorrection2 = biasCorrection2,
-            gradientClipFactor = gradientClipFactor,
-            residentGradient = residentGradient
-        )
+        try {
+            applyAdamWUpdateTransaction(
+                parameters = parameters,
+                gradients = gradients,
+                firstMoments = firstMoments,
+                secondMoments = secondMoments,
+                weightDecayByGroup = weightDecayByGroup,
+                learningRate = learningRate,
+                biasCorrection1 = biasCorrection1,
+                biasCorrection2 = biasCorrection2,
+                gradientClipFactor = gradientClipFactor,
+                residentGradient = residentGradient
+            )
+        } catch (error: RuntimeException) {
+            adamStep = (adamStep - 1).coerceAtLeast(0)
+            throw error
+        } catch (error: OutOfMemoryError) {
+            adamStep = (adamStep - 1).coerceAtLeast(0)
+            throw error
+        }
     }
 
     private fun applyAdamWUpdateTransaction(
