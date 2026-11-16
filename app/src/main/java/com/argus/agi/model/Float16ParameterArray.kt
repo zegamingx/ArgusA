@@ -89,6 +89,40 @@ class Float16ParameterArray(size: Int) {
         }
     }
 
+    /** Validates a GPU readback before changing the authoritative host parameter array. */
+    internal fun validateLittleEndianPrefix(source: ByteArray, elementCount: Int) {
+        require(elementCount in 0..storage.size) {
+            "FP16 readback prefix exceeds the parameter-array capacity."
+        }
+        val requiredBytes = Math.multiplyExact(elementCount, Short.SIZE_BYTES)
+        require(source.size >= requiredBytes) {
+            "FP16 readback does not contain the complete active parameter prefix."
+        }
+        for (index in 0 until elementCount) {
+            val byteOffset = index * Short.SIZE_BYTES
+            val encoded = (
+                (source[byteOffset].toInt() and 0xFF) or
+                    ((source[byteOffset + 1].toInt() and 0xFF) shl 8)
+                ).toShort()
+            require(Float16Codec.toFloat(encoded).isFinite()) {
+                "GPU AdamW returned a non-finite FP16 parameter at index $index."
+            }
+        }
+    }
+
+    /** Commits one validated GPU readback and advances the model mutation revision once. */
+    internal fun copyPrefixFromLittleEndianByteArray(source: ByteArray, elementCount: Int) {
+        validateLittleEndianPrefix(source, elementCount)
+        for (index in 0 until elementCount) {
+            val byteOffset = index * Short.SIZE_BYTES
+            storage[index] = (
+                (source[byteOffset].toInt() and 0xFF) or
+                    ((source[byteOffset + 1].toInt() and 0xFF) shl 8)
+                ).toShort()
+        }
+        if (elementCount > 0) markModified()
+    }
+
     companion object {
         fun fromFloatArray(values: FloatArray): Float16ParameterArray =
             Float16ParameterArray(values.size).also { result ->
