@@ -3636,7 +3636,19 @@ internal object VulkanTrainingBackend {
             if (!cleanupSucceeded) {
                 verified = false
                 Log.e(TAG, "Resident AdamW self-check could not release all temporary tensors.")
-                runCatching { nativeClearTensorArena() }
+                val arenaCleared = runCatching { nativeClearTensorArena() }.getOrDefault(false)
+                if (arenaCleared) {
+                    tensorResidencyRegistry.invalidate(releaseAllocations = false)
+                    activationTensorRegistry.invalidate(releaseAllocations = false)
+                    optimizerStateResidencyRegistry.invalidate(releaseAllocations = false)
+                    refreshTensorArenaMetrics()
+                } else {
+                    Log.e(TAG, "Vulkan arena cleanup failed after the resident AdamW self-check.")
+                    runCatching { destroyNativeRuntime() }
+                        .onFailure { error ->
+                            Log.e(TAG, "Vulkan teardown after AdamW self-check cleanup failure failed.", error)
+                        }
+                }
             }
         }
         return verified
