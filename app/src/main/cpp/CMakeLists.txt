@@ -155,6 +155,14 @@ argus_compile_shader(
     "kArgusResidentBackwardShaderSpvSize"
 )
 
+argus_compile_shader(
+    "${CMAKE_CURRENT_SOURCE_DIR}/adamw_resident.comp"
+    "adamw_resident.comp.spv"
+    "adamw_resident_shader_spv.h"
+    "kArgusResidentAdamwShaderSpv"
+    "kArgusResidentAdamwShaderSpvSize"
+)
+
 get_property(
     ARGUS_SHADER_HEADERS
     GLOBAL
