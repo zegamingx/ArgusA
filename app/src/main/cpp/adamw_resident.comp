@@ -15,6 +15,8 @@ layout(push_constant) uniform ResidentAdamWParameters {
     uint gradientElementOffset;
     uint firstMomentOffsetWords;
     uint secondMomentOffsetWords;
+    uint candidateFirstMomentOffsetWords;
+    uint candidateSecondMomentOffsetWords;
     uint statusOffsetWords;
     float learningRate;
     float beta1;
@@ -134,15 +136,15 @@ void main() {
             atomicOr(values[parameters.statusOffsetWords], 1u);
         } else if (parameters.operation == 1u) {
             if (firstElement < parameters.elementCount) {
-                values[parameters.firstMomentOffsetWords + firstElement] =
+                values[parameters.candidateFirstMomentOffsetWords + firstElement] =
                     floatBitsToUint(updatedFirstMoment0);
-                values[parameters.secondMomentOffsetWords + firstElement] =
+                values[parameters.candidateSecondMomentOffsetWords + firstElement] =
                     floatBitsToUint(updatedSecondMoment0);
             }
             if (firstElement + 1u < parameters.elementCount) {
-                values[parameters.firstMomentOffsetWords + firstElement + 1u] =
+                values[parameters.candidateFirstMomentOffsetWords + firstElement + 1u] =
                     floatBitsToUint(updatedFirstMoment1);
-                values[parameters.secondMomentOffsetWords + firstElement + 1u] =
+                values[parameters.candidateSecondMomentOffsetWords + firstElement + 1u] =
                     floatBitsToUint(updatedSecondMoment1);
             }
             values[parameters.parameterOffsetWords + pairIndex] =
