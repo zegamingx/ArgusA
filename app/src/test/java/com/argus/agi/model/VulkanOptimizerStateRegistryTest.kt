@@ -6,6 +6,8 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class VulkanOptimizerStateRegistryTest {
 
@@ -30,6 +32,13 @@ class VulkanOptimizerStateRegistryTest {
             return true
         }
 
+        fun download(allocation: VulkanTensorAllocation, destination: ByteArray): Boolean {
+            val source = contents[allocation.nativeHandle] ?: return false
+            if (source.size != destination.size) return false
+            source.copyInto(destination)
+            return true
+        }
+
         fun release(allocation: VulkanTensorAllocation): Boolean {
             if (releaseFailure) return false
             return contents.remove(allocation.nativeHandle) != null
@@ -43,6 +52,7 @@ class VulkanOptimizerStateRegistryTest {
         allocate = arena::allocate,
         upload = arena::upload,
         release = arena::release,
+        download = arena::download,
         maxResidentBytes = maxBytes
     )
 
@@ -119,5 +129,27 @@ class VulkanOptimizerStateRegistryTest {
         assertTrue(first.contentEquals(before))
         assertTrue(state.synchronizeAll(listOf(first)))
         assertEquals(2, arena.uploadCount)
+    }
+    @Test
+    fun downloadsGpuMomentsOnlyWhenHostRecoveryIsRequested() {
+        val arena = FakeArena()
+        val state = registry(arena)
+        val first = floatArrayOf(0.1f, 0.2f, 0.3f)
+        assertTrue(state.synchronizeAll(listOf(first)))
+        val allocation = state.acquire(first)
+        assertNotNull(allocation)
+        val gpuBytes = ByteBuffer.allocate(first.size * Float.SIZE_BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .putFloat(0.75f)
+            .putFloat(-0.5f)
+            .putFloat(1.25f)
+            .array()
+        val handle = requireNotNull(allocation)
+        gpuBytes.copyInto(requireNotNull(arena.contents[handle.nativeHandle]))
+        first.fill(9.0f)
+
+        assertTrue(state.synchronizeHostMirrors())
+        assertTrue(first.contentEquals(floatArrayOf(0.75f, -0.5f, 1.25f)))
+        assertEquals(1, arena.uploadCount)
     }
 }
