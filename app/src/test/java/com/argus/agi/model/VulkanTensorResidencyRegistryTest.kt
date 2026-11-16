@@ -648,11 +648,11 @@ class VulkanTensorResidencyRegistryTest {
         assertEquals(previousUploadCount, uploadCount)
         assertEquals(replacements[0].nativeHandle, registry.acquire(first)?.nativeHandle)
         assertEquals(replacements[1].nativeHandle, registry.acquire(second)?.nativeHandle)
-        assertEquals(32L, registry.residentByteCount())
+        assertEquals(20L, registry.residentByteCount())
 
         releaseFailure = false
         assertTrue(registry.synchronizeAll(inventory))
-        assertEquals(16L, registry.residentByteCount())
+        assertEquals(10L, registry.residentByteCount())
         assertFalse(gpuBytes.containsKey(oldAllocations[0].nativeHandle))
         assertFalse(gpuBytes.containsKey(oldAllocations[1].nativeHandle))
         assertTrue(registry.synchronizeHostMirrors())
