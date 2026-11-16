@@ -495,4 +495,84 @@ class VulkanTensorResidencyRegistryTest {
     }
 
 
+    @Test
+    fun preservesRetiredParameterAllocationsInBudgetUntilReleaseSucceeds() {
+        var nextHandle = 1L
+        var releaseFailure = false
+        val gpuBytes = LinkedHashMap<Long, ByteArray>()
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount ->
+                VulkanTensorAllocation(nextHandle++, byteCount).also { allocation ->
+                    gpuBytes[allocation.nativeHandle] = ByteArray(byteCount.toInt())
+                }
+            },
+            upload = { allocation, bytes ->
+                val destination = gpuBytes[allocation.nativeHandle]
+                if (destination == null || destination.size != bytes.size) {
+                    false
+                } else {
+                    bytes.copyInto(destination)
+                    true
+                }
+            },
+            release = { allocation ->
+                if (releaseFailure) false else gpuBytes.remove(allocation.nativeHandle) != null
+            },
+            download = { allocation, destination ->
+                val source = gpuBytes[allocation.nativeHandle]
+                if (source == null || source.size != destination.size) {
+                    false
+                } else {
+                    source.copyInto(destination)
+                    true
+                }
+            },
+            maxResidentBytes = { 64L }
+        )
+        val first = Float16ParameterArray.fromFloatArray(floatArrayOf(0.25f, -0.5f))
+        val second = Float16ParameterArray.fromFloatArray(floatArrayOf(0.75f, -1.0f))
+        val inventory = listOf(
+            VulkanModelParameterTensor("first", first),
+            VulkanModelParameterTensor("second", second)
+        )
+        assertTrue(registry.synchronizeAll(inventory))
+        val oldAllocations = listOf(
+            registry.acquire(first) ?: error("First active model tensor is missing."),
+            registry.acquire(second) ?: error("Second active model tensor is missing.")
+        )
+        val replacements = listOf(
+            Float16ParameterArray.fromFloatArray(floatArrayOf(1.0f, 1.5f)),
+            Float16ParameterArray.fromFloatArray(floatArrayOf(-1.25f, 0.5f))
+        ).mapIndexed { index, parameters ->
+            val allocation = VulkanTensorAllocation(
+                nextHandle++,
+                oldAllocations[index].byteCount
+            )
+            gpuBytes[allocation.nativeHandle] = parameters.toLittleEndianByteArray()
+            allocation
+        }
+
+        releaseFailure = true
+        assertTrue(registry.canReplaceAll(
+            listOf(first, second),
+            oldAllocations,
+            replacements
+        ))
+        assertTrue(registry.replaceAll(
+            listOf(first, second),
+            oldAllocations,
+            replacements
+        ))
+        assertEquals(32L, registry.residentByteCount())
+        assertEquals(replacements[0].nativeHandle, registry.acquire(first)?.nativeHandle)
+        assertEquals(replacements[1].nativeHandle, registry.acquire(second)?.nativeHandle)
+
+        releaseFailure = false
+        assertTrue(registry.synchronizeAll(inventory))
+        assertEquals(16L, registry.residentByteCount())
+        assertFalse(gpuBytes.containsKey(oldAllocations[0].nativeHandle))
+        assertFalse(gpuBytes.containsKey(oldAllocations[1].nativeHandle))
+    }
+
+
 }
