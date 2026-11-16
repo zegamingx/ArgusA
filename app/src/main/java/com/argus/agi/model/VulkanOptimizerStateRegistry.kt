@@ -20,7 +20,8 @@ internal class VulkanOptimizerStateRegistry(
 ) {
     private data class Entry(
         var allocation: VulkanTensorAllocation,
-        var uploaded: Boolean
+        var uploaded: Boolean,
+        var hostMirrorCurrent: Boolean
     )
 
     private val entries = IdentityHashMap<FloatArray, Entry>()
@@ -40,8 +41,11 @@ internal class VulkanOptimizerStateRegistry(
             require(tensor.isNotEmpty()) {
                 "AdamW optimizer-state tensors cannot be empty."
             }
-            require(tensor.all(Float::isFinite)) {
-                "AdamW optimizer-state tensors must contain only finite values."
+            val existing = entries[tensor]
+            if (existing == null || existing.hostMirrorCurrent) {
+                require(tensor.all(Float::isFinite)) {
+                    "AdamW optimizer-state tensors must contain only finite values."
+                }
             }
             require(desired.put(tensor, true) == null) {
                 "An AdamW state array cannot be registered more than once."
@@ -85,9 +89,11 @@ internal class VulkanOptimizerStateRegistry(
     @Synchronized
     fun synchronizeHostMirrors(): Boolean {
         if (entries.isEmpty()) return true
+        val staleEntries = entries.entries.filter { (_, entry) -> !entry.hostMirrorCurrent }
+        if (staleEntries.isEmpty()) return true
         val readback = download ?: return false
-        val staged = ArrayList<Pair<FloatArray, FloatArray>>(entries.size)
-        for ((tensor, entry) in entries) {
+        val staged = ArrayList<Pair<FloatArray, FloatArray>>(staleEntries.size)
+        for ((tensor, entry) in staleEntries) {
             if (!entry.uploaded) return false
             val requiredBytes = byteCount(tensor) ?: return false
             if (requiredBytes > Int.MAX_VALUE.toLong()) return false
@@ -105,9 +111,15 @@ internal class VulkanOptimizerStateRegistry(
         }
         for ((tensor, values) in staged) {
             System.arraycopy(values, 0, tensor, 0, tensor.size)
+            val entry = entries[tensor] ?: return false
+            entry.hostMirrorCurrent = true
         }
         return true
     }
+
+    @Synchronized
+    fun areHostMirrorsCurrent(): Boolean =
+        entries.values.all { entry -> entry.hostMirrorCurrent }
     /** Checks a complete candidate replacement without changing active optimizer state. */
     @Synchronized
     fun canReplaceAll(
@@ -154,6 +166,7 @@ internal class VulkanOptimizerStateRegistry(
             val previous = entry.allocation
             entry.allocation = replacementAllocations[index]
             entry.uploaded = true
+            entry.hostMirrorCurrent = false
             retiredAllocations.add(previous)
         }
         retiredResidentBytes = nextRetiredBytes
@@ -200,6 +213,7 @@ internal class VulkanOptimizerStateRegistry(
             val previous = entry.allocation
             entry.allocation = replacementAllocations[index]
             entry.uploaded = true
+            entry.hostMirrorCurrent = false
             retiredAllocations.add(previous)
         }
         retiredResidentBytes = nextRetiredBytes
@@ -311,7 +325,11 @@ internal class VulkanOptimizerStateRegistry(
             if (nextTotalBytes > maxResidentBytes().coerceAtLeast(0L)) return null
 
             val allocation = allocate(requiredBytes) ?: return null
-            entry = Entry(allocation, uploaded = false)
+            entry = Entry(
+                allocation = allocation,
+                uploaded = false,
+                hostMirrorCurrent = true
+            )
             entries[tensor] = entry
             activeResidentBytes = nextActiveBytes
         }
@@ -331,6 +349,7 @@ internal class VulkanOptimizerStateRegistry(
         }
 
         entry.uploaded = true
+        entry.hostMirrorCurrent = true
         return entry.allocation
     }
 
