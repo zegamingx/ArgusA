@@ -1,0 +1,21 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) buffer TensorArena { uint values[]; };
+
+layout(push_constant) uniform ResidentSwiGluParameters {
+    uint totalElementCount;
+    uint gateOffsetWords;
+    uint upOffsetWords;
+    uint outputOffsetWords;
+} parameters;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.totalElementCount) return;
+    const float gate = uintBitsToFloat(values[parameters.gateOffsetWords + index]);
+    const float up = uintBitsToFloat(values[parameters.upOffsetWords + index]);
+    const float sigmoid = 1.0 / (1.0 + exp(-gate));
+    const float activation = (gate * sigmoid) * up;
+    values[parameters.outputOffsetWords + index] = floatBitsToUint(activation);
+}

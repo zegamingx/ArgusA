@@ -51,7 +51,7 @@ internal class VulkanTensorResidencyRegistry(
             entries[parameters] = candidate
             residentBytes = nextResidentBytes
         }
-        val entry: Entry = candidate ?: return null
+        val entry: Entry = candidate
 
         repeat(MAX_SNAPSHOT_ATTEMPTS) {
             val revisionBefore = parameters.mutationVersion

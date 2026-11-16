@@ -46,7 +46,14 @@ internal class VulkanActivationTensorRegistry(
         Int,
         Int,
         Int
-    ) -> Boolean = { _, _, _, _, _, _, _, _, _, _, _ -> false }
+    ) -> Boolean = { _, _, _, _, _, _, _, _, _, _, _ -> false },
+    private val dispatchSwiGlu: (
+        VulkanTensorAllocation,
+        VulkanTensorAllocation,
+        VulkanTensorAllocation,
+        Int,
+        Int
+    ) -> Boolean = { _, _, _, _, _ -> false }
 ) {
     private val active = IdentityHashMap<VulkanActivationTensor, VulkanTensorAllocation>()
     private var residentBytes = 0L
@@ -291,6 +298,48 @@ internal class VulkanActivationTensorRegistry(
             modelWidth,
             headCount,
             headDimension
+        )
+    }
+
+    /**
+     * Executes element-wise SwiGLU on distinct resident Tensor Arena allocations.
+     * Shape and allocation validation completes before native dispatch.
+     */
+    @Synchronized
+    fun applySwiGlu(
+        gate: VulkanActivationTensor,
+        up: VulkanActivationTensor,
+        output: VulkanActivationTensor
+    ): Boolean {
+        val gateAllocation = active[gate] ?: return false
+        val upAllocation = active[up] ?: return false
+        val outputAllocation = active[output] ?: return false
+        if (gate === up || gate === output || up === output ||
+            gate.rows <= 0 || gate.columns <= 0 ||
+            gate.rows != up.rows || gate.columns != up.columns ||
+            gate.rows != output.rows || gate.columns != output.columns) {
+            return false
+        }
+
+        val handles = longArrayOf(
+            gateAllocation.nativeHandle,
+            upAllocation.nativeHandle,
+            outputAllocation.nativeHandle
+        )
+        if (handles.any { it <= 0L } || handles.toSet().size != handles.size) return false
+
+        val expectedBytes = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(gate.rows.toLong(), gate.columns.toLong()),
+                Float.SIZE_BYTES.toLong()
+            )
+        }.getOrNull() ?: return false
+        if (gateAllocation.byteCount != expectedBytes ||
+            upAllocation.byteCount != expectedBytes ||
+            outputAllocation.byteCount != expectedBytes) return false
+
+        return dispatchSwiGlu(
+            gateAllocation, upAllocation, outputAllocation, gate.rows, gate.columns
         )
     }
 

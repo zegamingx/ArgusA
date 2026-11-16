@@ -1812,10 +1812,17 @@ class ArgusNeuralEngine private constructor(
 
             computeLinearBatch(lf.h1, b.wGate, dModel, dFf, lf.gate)
             computeLinearBatch(lf.h1, b.wUp, dModel, dFf, lf.up)
-            for (t in 0 until seqLen) {
-                for (d in 0 until dFf) {
-                    val sig = 1.0f / (1.0f + exp(-lf.gate[t][d]))
-                    lf.act[t][d] = (lf.gate[t][d] * sig) * lf.up[t][d]
+            val residentSwiGluCompleted = VulkanTrainingBackend.tryApplyResidentSwiGlu(
+                gateRows = lf.gate,
+                upRows = lf.up,
+                outputRows = lf.act
+            )
+            if (!residentSwiGluCompleted) {
+                for (t in 0 until seqLen) {
+                    for (d in 0 until dFf) {
+                        val sigmoid = 1.0f / (1.0f + exp(-lf.gate[t][d]))
+                        lf.act[t][d] = (lf.gate[t][d] * sigmoid) * lf.up[t][d]
+                    }
                 }
             }
 

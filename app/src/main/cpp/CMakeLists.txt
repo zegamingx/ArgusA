@@ -139,6 +139,14 @@ argus_compile_shader(
     "kArgusResidentAttentionShaderSpvSize"
 )
 
+argus_compile_shader(
+    "${CMAKE_CURRENT_SOURCE_DIR}/swiglu_resident.comp"
+    "swiglu_resident.comp.spv"
+    "swiglu_resident_shader_spv.h"
+    "kArgusResidentSwiGluShaderSpv"
+    "kArgusResidentSwiGluShaderSpvSize"
+)
+
 get_property(
     ARGUS_SHADER_HEADERS
     GLOBAL

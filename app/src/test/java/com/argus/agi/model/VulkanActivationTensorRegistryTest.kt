@@ -275,6 +275,62 @@ class VulkanActivationTensorRegistryTest {
     }
 
     @Test
+    fun dispatchesSwiGluForDistinctMatchingActivationTensors() {
+        var nextHandle = 1L
+        var dispatchCount = 0
+        var dispatchedRows = 0
+        var dispatchedColumns = 0
+        val registry = VulkanActivationTensorRegistry(
+            allocate = { byteCount -> VulkanTensorAllocation(nextHandle++, byteCount) },
+            upload = { _, _ -> true },
+            download = { _, _ -> true },
+            release = { true },
+            dispatch = { _, _, _, _, _, _, _ -> false },
+            maxResidentBytes = { 4096L },
+            dispatchSwiGlu = { gate, up, output, rows, columns ->
+                dispatchCount++
+                dispatchedRows = rows
+                dispatchedColumns = columns
+                gate.nativeHandle != up.nativeHandle &&
+                    gate.nativeHandle != output.nativeHandle &&
+                    up.nativeHandle != output.nativeHandle
+            }
+        )
+        val gate = requireNotNull(registry.allocate(3, 65))
+        val up = requireNotNull(registry.allocate(3, 65))
+        val output = requireNotNull(registry.allocate(3, 65))
+
+        assertTrue(registry.applySwiGlu(gate, up, output))
+        assertEquals(1, dispatchCount)
+        assertEquals(3, dispatchedRows)
+        assertEquals(65, dispatchedColumns)
+    }
+
+    @Test
+    fun refusesSwiGluShapeMismatchBeforeNativeDispatch() {
+        var dispatchCount = 0
+        var nextHandle = 1L
+        val registry = VulkanActivationTensorRegistry(
+            allocate = { byteCount -> VulkanTensorAllocation(nextHandle++, byteCount) },
+            upload = { _, _ -> true },
+            download = { _, _ -> true },
+            release = { true },
+            dispatch = { _, _, _, _, _, _, _ -> false },
+            maxResidentBytes = { 4096L },
+            dispatchSwiGlu = { _, _, _, _, _ ->
+                dispatchCount++
+                true
+            }
+        )
+        val gate = requireNotNull(registry.allocate(3, 64))
+        val up = requireNotNull(registry.allocate(3, 65))
+        val output = requireNotNull(registry.allocate(3, 64))
+
+        assertFalse(registry.applySwiGlu(gate, up, output))
+        assertEquals(0, dispatchCount)
+    }
+
+    @Test
     fun rejectsShapeMismatchAndNonFiniteActivationInput() {
         var allocationCount = 0
         val registry = VulkanActivationTensorRegistry(

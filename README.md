@@ -88,8 +88,10 @@ CPU fallback. The backend does not issue legacy Synchronization 1 queue-submit,
 pipeline-barrier, or timestamp commands. Buffer copies use the Synchronization 2
 `COPY` stage and storage-buffer-specific access masks; timestamp placement does
 not use deprecated top-of-pipe or bottom-of-pipe pseudo-stages.
-It uses the NDK-bundled glslc compiler to
-compile the AdamW (`adamw.comp`), batched-linear (`linear.comp`), and Vulkan 1.2 FP16-weight linear (`linear_fp16.comp`) compute shaders to SPIR-V during the native build.
+It uses the NDK-bundled glslc compiler to compile the AdamW (`adamw.comp`),
+batched-linear (`linear.comp`), resident attention (`attention_resident.comp`),
+resident SwiGLU (`swiglu_resident.comp`), and Vulkan 1.2 FP16-weight linear
+(`linear_fp16.comp`) compute shaders to SPIR-V during the native build.
 
 When a compatible Vulkan GPU and compute queue are available, sufficiently large
 matrix products in batched Q/K/V projections, attention output projection, SwiGLU,
@@ -100,10 +102,11 @@ accumulation when GPU FP16 arithmetic passes post-model runtime self-checks, or 
 embedding backpropagation are also batched through Vulkan. The fused AdamW update
 runs on Vulkan for workloads with at least 49,152 optimizer elements. Attention
 causal score generation, stable softmax, weighted V reduction, W_O plus residual,
-and the post-attention LayerNorm now run in the batched training forward graph on
-Vulkan. The post-SwiGLU LayerNorm and autoregressive generation LayerNorm remain
-in Kotlin, as do the softmax-Jacobian reduction, LayerNorm backward, low-rank LoRA
-gradient accumulation, token-ID embedding scatter, and global gradient-norm reduction. This is an incremental GPU training
+and the post-attention LayerNorm, plus the element-wise SwiGLU activation, now run
+in the batched training forward graph on Vulkan after independent native self-checks.
+The post-SwiGLU LayerNorm and autoregressive generation LayerNorm remain in Kotlin,
+as do the softmax-Jacobian reduction, LayerNorm backward, low-rank LoRA gradient
+accumulation, token-ID embedding scatter, and global gradient-norm reduction. This is an incremental GPU training
 path, not a fully GPU-resident training graph.
 
 Vulkan is prepared asynchronously only after the local model has been constructed

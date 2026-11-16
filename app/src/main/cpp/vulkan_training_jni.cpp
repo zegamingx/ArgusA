@@ -11,6 +11,7 @@
 #include "linear_fp16_shader_spv.h"
 #include "linear_resident_shader_spv.h"
 #include "attention_resident_shader_spv.h"
+#include "swiglu_resident_shader_spv.h"
 #include "tensor_arena_core.h"
 
 #include <algorithm>
@@ -109,6 +110,16 @@ static_assert(offsetof(ResidentAttentionPushConstants, qkvOffsetWords) == 20);
 static_assert(offsetof(ResidentAttentionPushConstants, outputWeightOffsetHalf) == 40);
 static_assert(offsetof(ResidentAttentionPushConstants, normalizedOutputOffsetWords) == 44);
 
+struct ResidentSwiGluPushConstants {
+    uint32_t totalElementCount;
+    uint32_t gateOffsetWords;
+    uint32_t upOffsetWords;
+    uint32_t outputOffsetWords;
+};
+
+static_assert(sizeof(ResidentSwiGluPushConstants) == 16);
+static_assert(offsetof(ResidentSwiGluPushConstants, outputOffsetWords) == 12);
+
 struct CooperativeMatrixCapability {
     uint32_t mSize = 0;
     uint32_t nSize = 0;
@@ -177,6 +188,7 @@ struct VulkanRuntime {
     VkPipeline fp16LinearPipeline = VK_NULL_HANDLE;
     VkPipeline residentLinearPipeline = VK_NULL_HANDLE;
     VkPipeline residentAttentionPipeline = VK_NULL_HANDLE;
+    VkPipeline residentSwiGluPipeline = VK_NULL_HANDLE;
 
     uint32_t instanceApiVersion = VK_API_VERSION_1_0;
     bool supportsFp16Compute = false;
@@ -429,6 +441,9 @@ void destroyRuntime() {
         destroyTensorArena();
         destroyStorageBuffer();
 
+        if (gRuntime.residentSwiGluPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(gRuntime.device, gRuntime.residentSwiGluPipeline, nullptr);
+        }
         if (gRuntime.residentAttentionPipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(gRuntime.device, gRuntime.residentAttentionPipeline, nullptr);
         }
@@ -2581,6 +2596,37 @@ bool initializeRuntime() {
         );
     }
 
+    VkShaderModuleCreateInfo swigluShaderInfo{};
+    swigluShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    swigluShaderInfo.codeSize = kArgusResidentSwiGluShaderSpvSize;
+    swigluShaderInfo.pCode = reinterpret_cast<const uint32_t*>(kArgusResidentSwiGluShaderSpv);
+    VkShaderModule swigluShaderModule = VK_NULL_HANDLE;
+    VkResult swigluResult = vkCreateShaderModule(
+        gRuntime.device, &swigluShaderInfo, nullptr, &swigluShaderModule
+    );
+    if (swigluResult == VK_SUCCESS) {
+        VkPipelineShaderStageCreateInfo swigluShaderStage{};
+        swigluShaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        swigluShaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        swigluShaderStage.module = swigluShaderModule;
+        swigluShaderStage.pName = "main";
+        VkComputePipelineCreateInfo swigluPipelineInfo{};
+        swigluPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        swigluPipelineInfo.stage = swigluShaderStage;
+        swigluPipelineInfo.layout = gRuntime.pipelineLayout;
+        swigluResult = vkCreateComputePipelines(
+            gRuntime.device, VK_NULL_HANDLE, 1u, &swigluPipelineInfo,
+            nullptr, &gRuntime.residentSwiGluPipeline
+        );
+    }
+    if (swigluShaderModule != VK_NULL_HANDLE) vkDestroyShaderModule(gRuntime.device, swigluShaderModule, nullptr);
+    if (swigluResult != VK_SUCCESS) {
+        gRuntime.residentSwiGluPipeline = VK_NULL_HANDLE;
+        logError(
+            "Resident SwiGLU pipeline is unavailable; the Kotlin activation fallback remains active.",
+            swigluResult
+        );
+    }
 
     if (gRuntime.supportsFp16Compute) {
         VkShaderModuleCreateInfo fp16ShaderInfo{};
@@ -5460,6 +5506,136 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinearBatch(
 
 
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentSwiGlu(
+    JNIEnv*, jobject, jlong gateHandle, jlong upHandle, jlong outputHandle, jint rows, jint columns
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.device == VK_NULL_HANDLE || gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE || gRuntime.residentSwiGluPipeline == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE || gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr || gateHandle <= 0 || upHandle <= 0 || outputHandle <= 0 ||
+        rows <= 0 || columns <= 0 || gateHandle == upHandle || gateHandle == outputHandle || upHandle == outputHandle) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t rowCount = static_cast<uint64_t>(rows);
+    const uint64_t columnCount = static_cast<uint64_t>(columns);
+    constexpr uint64_t kMaximumShaderIndex = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    if (rowCount > std::numeric_limits<uint64_t>::max() / columnCount) return JNI_FALSE;
+    const uint64_t elementCount = rowCount * columnCount;
+    if (elementCount == 0u || elementCount > kMaximumShaderIndex) {
+        logError("Resident SwiGLU dimensions exceed 32-bit shader indexing.");
+        return JNI_FALSE;
+    }
+    const VkDeviceSize tensorByteCount = static_cast<VkDeviceSize>(elementCount * sizeof(float));
+    if (tensorByteCount > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange) {
+        logError("Resident SwiGLU tensors exceed maxStorageBufferRange.");
+        return JNI_FALSE;
+    }
+
+    TensorArenaAllocation* gateAllocation = findArenaAllocation(static_cast<uint64_t>(gateHandle));
+    TensorArenaAllocation* upAllocation = findArenaAllocation(static_cast<uint64_t>(upHandle));
+    TensorArenaAllocation* outputAllocation = findArenaAllocation(static_cast<uint64_t>(outputHandle));
+    if (gateAllocation == nullptr || upAllocation == nullptr || outputAllocation == nullptr) {
+        logError("Resident SwiGLU references an unknown Tensor Arena allocation.");
+        return JNI_FALSE;
+    }
+    if (gateAllocation->logicalSize < tensorByteCount || upAllocation->logicalSize < tensorByteCount ||
+        outputAllocation->logicalSize < tensorByteCount) {
+        logError("Resident SwiGLU allocation sizes do not match the requested tensor shape.");
+        return JNI_FALSE;
+    }
+
+    const TensorArenaAllocation* allocations[] = {gateAllocation, upAllocation, outputAllocation};
+    for (const TensorArenaAllocation* allocation : allocations) {
+        if ((allocation->offset & 3u) != 0u || allocation->offset > gRuntime.tensorArenaCapacity ||
+            tensorByteCount > gRuntime.tensorArenaCapacity - allocation->offset) {
+            logError("Resident SwiGLU FP32 tensor is misaligned or outside Tensor Arena.");
+            return JNI_FALSE;
+        }
+    }
+
+    const uint64_t gateOffsetWords = gateAllocation->offset / sizeof(uint32_t);
+    const uint64_t upOffsetWords = upAllocation->offset / sizeof(uint32_t);
+    const uint64_t outputOffsetWords = outputAllocation->offset / sizeof(uint32_t);
+    if (gateOffsetWords > kMaximumShaderIndex || upOffsetWords > kMaximumShaderIndex ||
+        outputOffsetWords > kMaximumShaderIndex || elementCount - 1u > kMaximumShaderIndex - gateOffsetWords ||
+        elementCount - 1u > kMaximumShaderIndex - upOffsetWords ||
+        elementCount - 1u > kMaximumShaderIndex - outputOffsetWords) {
+        logError("Resident SwiGLU offsets exceed 32-bit shader addressability.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t requiredGroupCount = 1u + (elementCount - 1u) / kLocalWorkGroupSize;
+    if (requiredGroupCount == 0u || requiredGroupCount > gRuntime.maxComputeWorkGroupCountX) {
+        logError("Resident SwiGLU dimensions exceed the device workgroup-count limit.");
+        return JNI_FALSE;
+    }
+    const uint32_t groupCount = static_cast<uint32_t>(requiredGroupCount);
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) { logError("Failed to reset resident SwiGLU command buffer.", result); return JNI_FALSE; }
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) { logError("Failed to begin resident SwiGLU command buffer.", result); return JNI_FALSE; }
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR;
+    VkDependencyInfoKHR beforeDependency{};
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeDependency.memoryBarrierCount = 1u;
+    beforeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
+
+    vkCmdBindPipeline(gRuntime.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, gRuntime.residentSwiGluPipeline);
+    vkCmdBindDescriptorSets(gRuntime.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, gRuntime.pipelineLayout,
+        0u, 1u, &gRuntime.tensorArenaDescriptorSet, 0u, nullptr);
+    const ResidentSwiGluPushConstants parameters{static_cast<uint32_t>(elementCount),
+        static_cast<uint32_t>(gateOffsetWords), static_cast<uint32_t>(upOffsetWords),
+        static_cast<uint32_t>(outputOffsetWords)};
+    vkCmdPushConstants(gRuntime.commandBuffer, gRuntime.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+        0u, sizeof(ResidentSwiGluPushConstants), &parameters);
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    vkCmdDispatch(gRuntime.commandBuffer, groupCount, 1u, 1u);
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    VkBufferMemoryBarrier2KHR outputBarrier{};
+    outputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    outputBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    outputBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    outputBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    outputBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+    outputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputBarrier.buffer = gRuntime.tensorArenaBuffer;
+    outputBarrier.offset = outputAllocation->offset;
+    outputBarrier.size = tensorByteCount;
+    VkDependencyInfoKHR outputDependency{};
+    outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    outputDependency.bufferMemoryBarrierCount = 1u;
+    outputDependency.pBufferMemoryBarriers = &outputBarrier;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) { logError("Failed to finish resident SwiGLU command buffer.", result); return JNI_FALSE; }
+    if (!submitAndWait("Resident SwiGLU submission or fence wait failed.")) return JNI_FALSE;
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastLinearGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
+}
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
     JNIEnv*,

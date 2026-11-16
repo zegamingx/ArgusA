@@ -513,6 +513,8 @@ internal object VulkanTrainingBackend {
     private var residentActivationLinearReady = false
     @Volatile
     private var residentAttentionReady = false
+    @Volatile
+    private var residentSwiGluReady = false
     private val activationTensorRegistry = VulkanActivationTensorRegistry(
         allocate = { byteCount -> allocateGpuTensor(byteCount) },
         upload = { allocation, bytes -> uploadGpuTensor(allocation, bytes) },
@@ -541,6 +543,9 @@ internal object VulkanTrainingBackend {
                 qkv, scores, attentionOutput, projectedOutput, normalizedOutput, residual,
                 outputWeights, sequenceLength, modelWidth, headCount, headDimension
             )
+        },
+        dispatchSwiGlu = { gate, up, output, rows, columns ->
+            dispatchResidentSwiGlu(gate, up, output, rows, columns)
         }
     )
     internal val residentActivations: VulkanActivationTensorRegistry
@@ -600,6 +605,9 @@ internal object VulkanTrainingBackend {
     internal val isResidentAttentionAvailable: Boolean
         get() = isRuntimeAvailable && residentActivationLinearReady && residentAttentionReady
 
+    internal val isResidentSwiGluAvailable: Boolean
+        get() = isRuntimeAvailable && residentSwiGluReady
+
     /**
      * Initialize Vulkan only after ArgusNeuralEngine has constructed or restored its tensors.
      * Driver verification is isolated from application cold-start; failure keeps Kotlin CPU active.
@@ -639,6 +647,7 @@ internal object VulkanTrainingBackend {
             fp16RuntimeReady = false
             residentActivationLinearReady = false
             residentAttentionReady = false
+            residentSwiGluReady = false
             invalidateTensorResidency(releaseAllocations = false)
             _tensorArenaMetrics.value = VulkanTensorArenaMetrics()
         }
@@ -1049,6 +1058,71 @@ internal object VulkanTrainingBackend {
 
 
     /**
+     * Executes element-wise SwiGLU on resident Vulkan activations.
+     * Gate, up, and output remain host-visible for the current backward pass.
+     */
+    @Synchronized
+    internal fun tryApplyResidentSwiGlu(
+        gateRows: Array<FloatArray>,
+        upRows: Array<FloatArray>,
+        outputRows: Array<FloatArray>
+    ): Boolean {
+        if (!isResidentSwiGluAvailable) return false
+        val rowCount = gateRows.size
+        if (rowCount <= 0 || upRows.size != rowCount || outputRows.size != rowCount) return false
+        val columnCount = gateRows[0].size
+        if (columnCount <= 0 || gateRows.any { it.size != columnCount } ||
+            upRows.any { it.size != columnCount } || outputRows.any { it.size != columnCount }) {
+            return false
+        }
+
+        val temporary = ArrayList<VulkanActivationTensor>(3)
+        var stagedOutput: Array<FloatArray>? = null
+        var cleanupSucceeded = true
+        try {
+            val gate = activationTensorRegistry.allocate(rowCount, columnCount)
+            if (gate != null) {
+                temporary.add(gate)
+                val up = activationTensorRegistry.allocate(rowCount, columnCount)
+                if (up != null) {
+                    temporary.add(up)
+                    val output = activationTensorRegistry.allocate(rowCount, columnCount)
+                    if (output != null) {
+                        temporary.add(output)
+                        if (activationTensorRegistry.upload(gate, gateRows) &&
+                            activationTensorRegistry.upload(up, upRows) &&
+                            activationTensorRegistry.applySwiGlu(gate, up, output)) {
+                            stagedOutput = activationTensorRegistry.download(output)
+                        }
+                    }
+                }
+            }
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident SwiGLU workspace exceeded the activation memory budget.", error)
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident SwiGLU failed before host-output commit.", error)
+        } finally {
+            for (tensor in temporary.asReversed()) {
+                if (!activationTensorRegistry.release(tensor)) cleanupSucceeded = false
+            }
+        }
+
+        if (!cleanupSucceeded) {
+            Log.w(TAG, "Resident SwiGLU tensor release failed; rebuilding Tensor Arena residency.")
+            invalidateTensorResidency(releaseAllocations = true)
+            residencyRebuildPending = lastModelParameterInventory.isNotEmpty()
+            return false
+        }
+        val completedOutput = stagedOutput ?: return false
+        for (row in outputRows.indices) {
+            System.arraycopy(completedOutput[row], 0, outputRows[row], 0, columnCount)
+        }
+        refreshGpuPerformanceMetrics()
+        _currentBackend = "Vulkan Compute (Resident SwiGLU)"
+        return true
+    }
+
+    /**
      * Executes M3B–M3D as one resident Vulkan attention graph.
      * Q/K/V are packed into one upload; score, causal softmax, weighted V,
      * W_O projection and residual run in one command buffer. Probabilities and
@@ -1276,6 +1350,7 @@ internal object VulkanTrainingBackend {
 
         residentActivationLinearReady = false
         residentAttentionReady = false
+        residentSwiGluReady = false
         initializationAttempted = true
         _deviceCapabilities.value = null
         _runtimeStatus.value = "Preparing Vulkan after model initialization…"
@@ -1332,6 +1407,7 @@ internal object VulkanTrainingBackend {
             }.getOrDefault(false)
 
             residentAttentionReady = false
+            residentSwiGluReady = false
             residentActivationLinearReady = verified && runCatching {
                 verifyResidentActivationLinearKernel() &&
                     verifyResidentActivationLinearBatchKernel()
@@ -1339,6 +1415,15 @@ internal object VulkanTrainingBackend {
             residentAttentionReady = verified && residentActivationLinearReady && runCatching {
                 verifyResidentAttentionKernel()
             }.getOrDefault(false)
+            residentSwiGluReady = verified && runCatching {
+                verifyResidentSwiGluKernel()
+            }.getOrDefault(false)
+            if (verified && !residentSwiGluReady) {
+                Log.w(
+                    TAG,
+                    "Resident SwiGLU self-check failed; the Kotlin activation fallback remains active."
+                )
+            }
             if (verified && !residentAttentionReady) {
                 Log.w(
                     TAG,
@@ -1377,10 +1462,15 @@ internal object VulkanTrainingBackend {
             if (verified) {
                 refreshGpuPerformanceMetrics()
                 _currentBackend = "Kotlin CPU"
-                _runtimeStatus.value = if (residentAttentionReady) {
-                    "Vulkan runtime verified — resident attention and post-attention LayerNorm passed self-check"
-                } else {
-                    "Vulkan runtime verified — resident attention/LayerNorm unavailable; this path uses Kotlin fallback"
+                _runtimeStatus.value = when {
+                    residentAttentionReady && residentSwiGluReady ->
+                        "Vulkan runtime verified — resident attention/LayerNorm and SwiGLU passed self-check"
+                    residentAttentionReady ->
+                        "Vulkan runtime verified — resident attention/LayerNorm passed; SwiGLU uses Kotlin fallback"
+                    residentSwiGluReady ->
+                        "Vulkan runtime verified — resident SwiGLU passed; attention/LayerNorm use Kotlin fallback"
+                    else ->
+                        "Vulkan runtime verified — resident attention/LayerNorm and SwiGLU use Kotlin fallback"
                 }
                 publishInitializationProgress(
                     status = "Vulkan runtime verified",
@@ -1866,6 +1956,34 @@ internal object VulkanTrainingBackend {
     }
 
 
+    private fun dispatchResidentSwiGlu(
+        gate: VulkanTensorAllocation,
+        up: VulkanTensorAllocation,
+        output: VulkanTensorAllocation,
+        rows: Int,
+        columns: Int
+    ): Boolean {
+        if (!isRuntimeAvailable || !residentSwiGluReady || rows <= 0 || columns <= 0) return false
+        val applied = try {
+            nativeRunResidentSwiGlu(
+                gate.nativeHandle, up.nativeHandle, output.nativeHandle, rows, columns
+            )
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident Vulkan SwiGLU JNI entry point is unavailable.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident Vulkan SwiGLU dispatch failed.", error)
+            false
+        }
+        if (!applied) {
+            residentSwiGluReady = false
+            _runtimeStatus.value =
+                "Vulkan runtime verified — resident SwiGLU dispatch failed; this operation uses Kotlin fallback"
+            Log.w(TAG, "Resident Vulkan SwiGLU dispatch failed; Kotlin activation fallback remains active.")
+        }
+        return applied
+    }
+
     private fun tryApplyResidentAttention(
         qkv: VulkanTensorAllocation,
         scores: VulkanTensorAllocation,
@@ -2149,6 +2267,48 @@ internal object VulkanTrainingBackend {
             if (scoreHandle != 0L) runCatching { nativeReleaseTensor(scoreHandle) }
             if (qkvHandle != 0L) runCatching { nativeReleaseTensor(qkvHandle) }
         }
+    }
+
+    private fun verifyResidentSwiGluKernel(): Boolean {
+        val rows = 3
+        val columns = 73
+        val elementCount = Math.multiplyExact(rows, columns)
+        val gate = FloatArray(elementCount) { index -> (((index * 7) % 31) - 15) * 0.25f }
+        val up = FloatArray(elementCount) { index -> (((index * 11) % 23) - 11) * 0.125f }
+        val expected = FloatArray(elementCount) { index ->
+            val sigmoid = 1.0f / (1.0f + kotlin.math.exp(-gate[index]))
+            (gate[index] * sigmoid) * up[index]
+        }
+        var gateHandle = 0L
+        var upHandle = 0L
+        var outputHandle = 0L
+        var verified = false
+        var cleanupSucceeded = true
+        try {
+            val gateBytes = encodeFloatArray(gate)
+            val upBytes = encodeFloatArray(up)
+            val outputBytes = ByteArray(Math.multiplyExact(elementCount, Float.SIZE_BYTES))
+            gateHandle = nativeAllocateTensor(gateBytes.size.toLong())
+            upHandle = nativeAllocateTensor(upBytes.size.toLong())
+            outputHandle = nativeAllocateTensor(outputBytes.size.toLong())
+            if (gateHandle == 0L || upHandle == 0L || outputHandle == 0L) return false
+            if (!nativeUploadTensor(gateHandle, gateBytes) || !nativeUploadTensor(upHandle, upBytes) ||
+                !nativeRunResidentSwiGlu(gateHandle, upHandle, outputHandle, rows, columns) ||
+                !nativeDownloadTensor(outputHandle, outputBytes)) return false
+            verified = approximatelyEqual(expected, decodeFloatArray(outputBytes), 1.0e-4f)
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident SwiGLU self-check entry point is unavailable.", error)
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident SwiGLU self-check failed.", error)
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident SwiGLU self-check exceeded available memory.", error)
+        } finally {
+            if (outputHandle != 0L && !runCatching { nativeReleaseTensor(outputHandle) }.getOrDefault(false)) cleanupSucceeded = false
+            if (upHandle != 0L && !runCatching { nativeReleaseTensor(upHandle) }.getOrDefault(false)) cleanupSucceeded = false
+            if (gateHandle != 0L && !runCatching { nativeReleaseTensor(gateHandle) }.getOrDefault(false)) cleanupSucceeded = false
+        }
+        if (!cleanupSucceeded) Log.w(TAG, "Resident SwiGLU self-check could not release every temporary tensor.")
+        return verified && cleanupSucceeded
     }
 
     private fun encodeFloatArray(values: FloatArray): ByteArray {
@@ -3404,6 +3564,14 @@ internal object VulkanTrainingBackend {
         inputColumns: Int,
         outputColumns: Int,
         transposeWeights: Boolean
+    ): Boolean
+
+    private external fun nativeRunResidentSwiGlu(
+        gateHandle: Long,
+        upHandle: Long,
+        outputHandle: Long,
+        rows: Int,
+        columns: Int
     ): Boolean
 
     private external fun nativeRunResidentAttention(
