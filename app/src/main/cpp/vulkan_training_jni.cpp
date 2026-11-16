@@ -9,6 +9,7 @@
 #include "adamw_shader_spv.h"
 #include "linear_shader_spv.h"
 #include "linear_fp16_shader_spv.h"
+#include "linear_resident_shader_spv.h"
 #include "tensor_arena_core.h"
 
 #include <algorithm>
@@ -135,6 +136,7 @@ struct VulkanRuntime {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipeline linearPipeline = VK_NULL_HANDLE;
     VkPipeline fp16LinearPipeline = VK_NULL_HANDLE;
+    VkPipeline residentLinearPipeline = VK_NULL_HANDLE;
 
     uint32_t instanceApiVersion = VK_API_VERSION_1_0;
     bool supportsFp16Compute = false;
@@ -387,6 +389,9 @@ void destroyRuntime() {
         destroyTensorArena();
         destroyStorageBuffer();
 
+        if (gRuntime.residentLinearPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(gRuntime.device, gRuntime.residentLinearPipeline, nullptr);
+        }
         if (gRuntime.fp16LinearPipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(gRuntime.device, gRuntime.fp16LinearPipeline, nullptr);
         }
@@ -2442,6 +2447,53 @@ bool initializeRuntime() {
     if (result != VK_SUCCESS) {
         logError("Vulkan linear compute-pipeline creation failed.", result);
         return false;
+    }
+
+    // This kernel uses packed uint loads and unpackHalf2x16. It therefore supports
+    // FP16 model storage without requiring the optional shaderFloat16 device feature.
+    VkShaderModuleCreateInfo residentShaderInfo{};
+    residentShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    residentShaderInfo.codeSize = kArgusResidentLinearShaderSpvSize;
+    residentShaderInfo.pCode =
+        reinterpret_cast<const uint32_t*>(kArgusResidentLinearShaderSpv);
+
+    VkShaderModule residentShaderModule = VK_NULL_HANDLE;
+    VkResult residentResult = vkCreateShaderModule(
+        gRuntime.device,
+        &residentShaderInfo,
+        nullptr,
+        &residentShaderModule
+    );
+    if (residentResult == VK_SUCCESS) {
+        VkPipelineShaderStageCreateInfo residentShaderStage{};
+        residentShaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        residentShaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        residentShaderStage.module = residentShaderModule;
+        residentShaderStage.pName = "main";
+
+        VkComputePipelineCreateInfo residentPipelineInfo{};
+        residentPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        residentPipelineInfo.stage = residentShaderStage;
+        residentPipelineInfo.layout = gRuntime.pipelineLayout;
+
+        residentResult = vkCreateComputePipelines(
+            gRuntime.device,
+            VK_NULL_HANDLE,
+            1u,
+            &residentPipelineInfo,
+            nullptr,
+            &gRuntime.residentLinearPipeline
+        );
+    }
+    if (residentShaderModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(gRuntime.device, residentShaderModule, nullptr);
+    }
+    if (residentResult != VK_SUCCESS) {
+        gRuntime.residentLinearPipeline = VK_NULL_HANDLE;
+        logError(
+            "Resident activation-linear pipeline is unavailable; existing Vulkan paths remain active.",
+            residentResult
+        );
     }
 
     if (gRuntime.supportsFp16Compute) {
@@ -4721,6 +4773,229 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeClearTensorArena(
     updateTensorArenaDescriptorSet(gRuntime.storageBuffer, fallbackRange);
     destroyTensorArena();
     refreshMemoryBudget();
+    return JNI_TRUE;
+}
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinear(
+    JNIEnv*,
+    jobject,
+    jlong inputHandle,
+    jlong weightHandle,
+    jlong outputHandle,
+    jint rowCount,
+    jint inputColumns,
+    jint outputColumns,
+    jboolean transposeWeights
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.residentLinearPipeline == VK_NULL_HANDLE ||
+        inputHandle <= 0 ||
+        weightHandle <= 0 ||
+        outputHandle <= 0 ||
+        inputHandle == weightHandle ||
+        inputHandle == outputHandle ||
+        weightHandle == outputHandle ||
+        rowCount <= 0 ||
+        inputColumns <= 0 ||
+        outputColumns <= 0 ||
+        (transposeWeights != JNI_TRUE && transposeWeights != JNI_FALSE)) {
+        return JNI_FALSE;
+    }
+
+    TensorArenaAllocation* inputAllocation = findArenaAllocation(inputHandle);
+    TensorArenaAllocation* weightAllocation = findArenaAllocation(weightHandle);
+    TensorArenaAllocation* outputAllocation = findArenaAllocation(outputHandle);
+    if (inputAllocation == nullptr ||
+        weightAllocation == nullptr ||
+        outputAllocation == nullptr) {
+        logError("Resident linear dispatch references an unknown Tensor Arena allocation.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t rows = static_cast<uint64_t>(rowCount);
+    const uint64_t inputWidth = static_cast<uint64_t>(inputColumns);
+    const uint64_t outputWidth = static_cast<uint64_t>(outputColumns);
+    if (rows > std::numeric_limits<uint64_t>::max() / inputWidth ||
+        rows > std::numeric_limits<uint64_t>::max() / outputWidth ||
+        inputWidth > std::numeric_limits<uint64_t>::max() / outputWidth) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t inputElements = rows * inputWidth;
+    const uint64_t outputElements = rows * outputWidth;
+    const uint64_t weightElements = inputWidth * outputWidth;
+    constexpr uint64_t kMaximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    if (inputElements == 0u ||
+        outputElements == 0u ||
+        weightElements == 0u ||
+        inputElements > kMaximumShaderIndex ||
+        outputElements > kMaximumShaderIndex ||
+        weightElements > kMaximumShaderIndex) {
+        logError("Resident linear tensor dimensions exceed 32-bit shader indexing.");
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize inputByteCount =
+        static_cast<VkDeviceSize>(inputElements * sizeof(float));
+    const VkDeviceSize outputByteCount =
+        static_cast<VkDeviceSize>(outputElements * sizeof(float));
+    const VkDeviceSize weightByteCount =
+        static_cast<VkDeviceSize>(weightElements * sizeof(uint16_t));
+
+    if (inputAllocation->logicalSize < inputByteCount ||
+        weightAllocation->logicalSize < weightByteCount ||
+        outputAllocation->logicalSize < outputByteCount ||
+        (inputAllocation->offset & 3u) != 0u ||
+        (outputAllocation->offset & 3u) != 0u ||
+        (weightAllocation->offset & 1u) != 0u ||
+        inputAllocation->offset > gRuntime.tensorArenaCapacity ||
+        weightAllocation->offset > gRuntime.tensorArenaCapacity ||
+        outputAllocation->offset > gRuntime.tensorArenaCapacity ||
+        inputByteCount > gRuntime.tensorArenaCapacity - inputAllocation->offset ||
+        weightByteCount > gRuntime.tensorArenaCapacity - weightAllocation->offset ||
+        outputByteCount > gRuntime.tensorArenaCapacity - outputAllocation->offset) {
+        logError("Resident linear tensor allocation is undersized, misaligned, or outside the arena.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t inputOffsetWords = inputAllocation->offset / sizeof(uint32_t);
+    const uint64_t weightOffsetHalf = weightAllocation->offset / sizeof(uint16_t);
+    const uint64_t outputOffsetWords = outputAllocation->offset / sizeof(uint32_t);
+    if (inputOffsetWords > kMaximumShaderIndex ||
+        weightOffsetHalf > kMaximumShaderIndex ||
+        outputOffsetWords > kMaximumShaderIndex ||
+        inputElements - 1u > kMaximumShaderIndex - inputOffsetWords ||
+        weightElements - 1u > kMaximumShaderIndex - weightOffsetHalf ||
+        outputElements - 1u > kMaximumShaderIndex - outputOffsetWords) {
+        logError("Resident linear tensor ranges exceed 32-bit shader addressability.");
+        return JNI_FALSE;
+    }
+
+    constexpr uint64_t kTileRows = 8u;
+    constexpr uint64_t kTileColumns = 16u;
+    const uint64_t tileRows = 1u + (rows - 1u) / kTileRows;
+    const uint64_t tileColumns = 1u + (outputWidth - 1u) / kTileColumns;
+    if (tileRows > std::numeric_limits<uint64_t>::max() / tileColumns) {
+        return JNI_FALSE;
+    }
+    const uint64_t totalTileCount = tileRows * tileColumns;
+    const uint32_t workGroupCount = calculateDispatchGroupCount(totalTileCount);
+    if (workGroupCount == 0u) {
+        logError("Resident linear dispatch has no available workgroups.");
+        return JNI_FALSE;
+    }
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset resident linear command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin resident linear command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+
+    VkDependencyInfoKHR beforeDependency{};
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeDependency.memoryBarrierCount = 1u;
+    beforeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.residentLinearPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0u,
+        1u,
+        &gRuntime.tensorArenaDescriptorSet,
+        0u,
+        nullptr
+    );
+
+    const LinearPushConstants pushConstants{
+        static_cast<uint32_t>(rowCount),
+        1u,
+        static_cast<uint32_t>(rowCount),
+        static_cast<uint32_t>(inputColumns),
+        static_cast<uint32_t>(outputColumns),
+        static_cast<uint32_t>(inputOffsetWords),
+        static_cast<uint32_t>(weightOffsetHalf),
+        static_cast<uint32_t>(outputOffsetWords),
+        transposeWeights == JNI_TRUE ? 1u : 0u,
+        std::numeric_limits<uint32_t>::max()
+    };
+    vkCmdPushConstants(
+        gRuntime.commandBuffer,
+        gRuntime.pipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(LinearPushConstants),
+        &pushConstants
+    );
+    vkCmdDispatch(gRuntime.commandBuffer, workGroupCount, 1u, 1u);
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    // Make the FP32 output available to the next resident compute dispatch.
+    VkMemoryBarrier2KHR afterCompute{};
+    afterCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    afterCompute.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    afterCompute.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    afterCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    afterCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR afterDependency{};
+    afterDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    afterDependency.memoryBarrierCount = 1u;
+    afterDependency.pMemoryBarriers = &afterCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &afterDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish resident linear command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Resident Vulkan linear dispatch failed.")) {
+        return JNI_FALSE;
+    }
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastLinearGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
     return JNI_TRUE;
 }
 

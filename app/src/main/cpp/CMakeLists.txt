@@ -123,6 +123,14 @@ argus_compile_shader(
     "vulkan1.2"
 )
 
+argus_compile_shader(
+    "${CMAKE_CURRENT_SOURCE_DIR}/linear_resident.comp"
+    "linear_resident.comp.spv"
+    "linear_resident_shader_spv.h"
+    "kArgusResidentLinearShaderSpv"
+    "kArgusResidentLinearShaderSpvSize"
+)
+
 get_property(
     ARGUS_SHADER_HEADERS
     GLOBAL

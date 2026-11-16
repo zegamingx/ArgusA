@@ -1,6 +1,8 @@
 package com.argus.agi.model
 
 import android.util.Log
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -492,6 +494,10 @@ internal object VulkanTrainingBackend {
     val modelTensorResidencyBudgetBytes: StateFlow<Long> =
         _modelTensorResidencyBudgetBytes.asStateFlow()
 
+    private val _activationTensorResidencyBudgetBytes = MutableStateFlow(0L)
+    internal val activationTensorResidencyBudgetBytes: StateFlow<Long> =
+        _activationTensorResidencyBudgetBytes.asStateFlow()
+
     private val tensorResidencyRegistry = VulkanTensorResidencyRegistry(
         allocate = { byteCount -> allocateGpuTensor(byteCount) },
         upload = { allocation, bytes -> uploadGpuTensor(allocation, bytes) },
@@ -503,6 +509,22 @@ internal object VulkanTrainingBackend {
     val modelTensorResidencyReady: StateFlow<Boolean> =
         _modelTensorResidencyReady.asStateFlow()
 
+    private var residentActivationLinearReady = false
+    private val activationTensorRegistry = VulkanActivationTensorRegistry(
+        allocate = { byteCount -> allocateGpuTensor(byteCount) },
+        upload = { allocation, bytes -> uploadGpuTensor(allocation, bytes) },
+        download = { allocation, bytes -> downloadGpuTensor(allocation, bytes) },
+        release = { allocation -> releaseGpuTensor(allocation) },
+        dispatch = { input, weights, output, rows, inputColumns, outputColumns, transposeWeights ->
+            tryApplyResidentLinear(
+                input, weights, output, rows, inputColumns, outputColumns, transposeWeights
+            )
+        },
+        maxResidentBytes = { _activationTensorResidencyBudgetBytes.value }
+    )
+    internal val residentActivations: VulkanActivationTensorRegistry
+        get() = activationTensorRegistry
+
     private var lastModelParameterInventory: List<VulkanModelParameterTensor> = emptyList()
     private var residencySuspended = false
     private var residencyBlockedAfterFailure = false
@@ -511,11 +533,14 @@ internal object VulkanTrainingBackend {
 
     private fun invalidateTensorResidency(releaseAllocations: Boolean): Boolean {
         _modelTensorResidencyReady.value = false
-        val released = tensorResidencyRegistry.invalidate(releaseAllocations)
+        val modelReleased = tensorResidencyRegistry.invalidate(releaseAllocations)
+        val activationsReleased = activationTensorRegistry.invalidate(releaseAllocations)
+        val released = modelReleased && activationsReleased
         if (!released && releaseAllocations && nativeReady) {
             val arenaCleared = runCatching { nativeClearTensorArena() }.getOrDefault(false)
             if (arenaCleared) {
                 tensorResidencyRegistry.invalidate(releaseAllocations = false)
+                activationTensorRegistry.invalidate(releaseAllocations = false)
                 refreshTensorArenaMetrics()
                 return true
             }
@@ -547,6 +572,9 @@ internal object VulkanTrainingBackend {
 
     val isFp16ComputeAvailable: Boolean
         get() = isRuntimeAvailable && fp16RuntimeReady && !fp16DisabledAfterRuntimeFailure
+
+    internal val isResidentActivationLinearAvailable: Boolean
+        get() = isRuntimeAvailable && residentActivationLinearReady
 
     /**
      * Initialize Vulkan only after ArgusNeuralEngine has constructed or restored its tensors.
@@ -615,7 +643,7 @@ internal object VulkanTrainingBackend {
         }
     }
 
-    private fun calculateModelTensorResidencyBudgetBytes(
+    private fun calculateTotalTensorResidencyBudgetBytes(
         capabilities: VulkanDeviceCapabilities?
     ): Long {
         val maximumAppHeap = Runtime.getRuntime().maxMemory().coerceAtLeast(0L)
@@ -628,6 +656,14 @@ internal object VulkanTrainingBackend {
             ?.takeIf { it > 0L } ?: Long.MAX_VALUE
         return minOf(appBudget, gpuBudget, descriptorRange).coerceAtLeast(0L)
     }
+
+    private fun calculateModelTensorResidencyBudgetBytes(
+        capabilities: VulkanDeviceCapabilities?
+    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) * 3L / 4L
+
+    private fun calculateActivationTensorResidencyBudgetBytes(
+        capabilities: VulkanDeviceCapabilities?
+    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) / 4L
 
     /**
      * Allocates persistent Vulkan storage. New contents are undefined until uploaded
@@ -710,6 +746,8 @@ internal object VulkanTrainingBackend {
             _deviceCapabilities.value = capabilities
             _modelTensorResidencyBudgetBytes.value =
                 calculateModelTensorResidencyBudgetBytes(capabilities)
+            _activationTensorResidencyBudgetBytes.value =
+                calculateActivationTensorResidencyBudgetBytes(capabilities)
             Log.i(
                 TAG,
                 "Refreshed FP16 model-residency budget: " +
@@ -917,6 +955,8 @@ internal object VulkanTrainingBackend {
                 _deviceCapabilities.value = detectedCapabilities
                 _modelTensorResidencyBudgetBytes.value =
                     calculateModelTensorResidencyBudgetBytes(detectedCapabilities)
+                _activationTensorResidencyBudgetBytes.value =
+                    calculateActivationTensorResidencyBudgetBytes(detectedCapabilities)
                 Log.i(
                     TAG,
                     "FP16 model-residency budget: ${_modelTensorResidencyBudgetBytes.value} bytes."
@@ -942,6 +982,16 @@ internal object VulkanTrainingBackend {
             val verified = initialized && runCatching {
                 verifyNativeKernels()
             }.getOrDefault(false)
+
+            residentActivationLinearReady = verified && runCatching {
+                verifyResidentActivationLinearKernel()
+            }.getOrDefault(false)
+            if (verified && !residentActivationLinearReady) {
+                Log.w(
+                    TAG,
+                    "Resident activation-linear kernel self-check failed; existing verified Vulkan/CPU paths remain active."
+                )
+            }
 
             if (verified && runCatching { nativeSupportsFp16() }.getOrDefault(false)) {
                 publishInitializationProgress(
@@ -1191,6 +1241,146 @@ internal object VulkanTrainingBackend {
             }
         }
         return true
+    }
+
+
+    /**
+     * Verifies the first M3 resident activation operation against an FP32 Kotlin reference.
+     * Activations remain FP32 in the arena; only the authoritative model matrix is FP16.
+     */
+    private fun verifyResidentActivationLinearKernel(): Boolean {
+        val rows = 9
+        val inputColumns = 19
+        val outputColumns = 17
+        val input = FloatArray(rows * inputColumns) { index ->
+            ((index % 23) - 11) * 0.03125f
+        }
+        val fullPrecisionWeights = FloatArray(inputColumns * outputColumns) { index ->
+            ((index % 19) - 9) * 0.0625f
+        }
+        val fp16Weights = Float16ParameterArray.fromFloatArray(fullPrecisionWeights)
+        val normalWeights = fp16Weights.toShortArray()
+        val transposedWeights = ShortArray(normalWeights.size)
+        for (inner in 0 until inputColumns) {
+            for (column in 0 until outputColumns) {
+                transposedWeights[column * inputColumns + inner] =
+                    normalWeights[inner * outputColumns + column]
+            }
+        }
+
+        fun expected(weights: ShortArray, transpose: Boolean): FloatArray {
+            val result = FloatArray(rows * outputColumns)
+            for (row in 0 until rows) {
+                for (column in 0 until outputColumns) {
+                    var sum = 0f
+                    for (inner in 0 until inputColumns) {
+                        val weightIndex = if (transpose) {
+                            column * inputColumns + inner
+                        } else {
+                            inner * outputColumns + column
+                        }
+                        sum += input[row * inputColumns + inner] *
+                            Float16Codec.toFloat(weights[weightIndex])
+                    }
+                    result[row * outputColumns + column] = sum
+                }
+            }
+            return result
+        }
+
+        var inputHandle = 0L
+        var weightHandle = 0L
+        var outputHandle = 0L
+        try {
+            val inputBytes = encodeFloatArray(input)
+            val inputByteCount = inputBytes.size.toLong()
+            val weightBytes = fp16Weights.toLittleEndianByteArray()
+            val outputByteCount = Math.multiplyExact(
+                (rows * outputColumns).toLong(),
+                Float.SIZE_BYTES.toLong()
+            )
+            inputHandle = nativeAllocateTensor(inputByteCount)
+            weightHandle = nativeAllocateTensor(weightBytes.size.toLong())
+            outputHandle = nativeAllocateTensor(outputByteCount)
+            if (inputHandle == 0L || weightHandle == 0L || outputHandle == 0L) {
+                return false
+            }
+            if (!nativeUploadTensor(inputHandle, inputBytes) ||
+                !nativeUploadTensor(weightHandle, weightBytes)) {
+                return false
+            }
+
+            fun verify(weights: ShortArray, transpose: Boolean): Boolean {
+                if (transpose) {
+                    val transposedParameterBytes = ByteArray(
+                        Math.multiplyExact(weights.size, Short.SIZE_BYTES)
+                    )
+                    val transposedBuffer = ByteBuffer.wrap(transposedParameterBytes)
+                        .order(ByteOrder.LITTLE_ENDIAN)
+                    for (value in weights) transposedBuffer.putShort(value)
+                    if (!nativeUploadTensor(weightHandle, transposedParameterBytes)) return false
+                } else if (!nativeUploadTensor(weightHandle, fp16Weights.toLittleEndianByteArray())) {
+                    return false
+                }
+
+                if (!nativeApplyResidentLinear(
+                        inputHandle,
+                        weightHandle,
+                        outputHandle,
+                        rows,
+                        inputColumns,
+                        outputColumns,
+                        transpose
+                    )) {
+                    return false
+                }
+                val outputBytes = ByteArray(outputByteCount.toInt())
+                if (!nativeDownloadTensor(outputHandle, outputBytes)) return false
+                return approximatelyEqual(
+                    decodeFloatArray(outputBytes),
+                    expected(weights, transpose),
+                    1e-4f
+                )
+            }
+
+            return verify(normalWeights, transpose = false) &&
+                verify(transposedWeights, transpose = true)
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident activation-linear self-check entry point is unavailable.", error)
+            return false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident activation-linear self-check failed.", error)
+            return false
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident activation-linear self-check exceeded available memory.", error)
+            return false
+        } finally {
+            if (outputHandle != 0L) runCatching { nativeReleaseTensor(outputHandle) }
+            if (weightHandle != 0L) runCatching { nativeReleaseTensor(weightHandle) }
+            if (inputHandle != 0L) runCatching { nativeReleaseTensor(inputHandle) }
+        }
+    }
+
+    private fun encodeFloatArray(values: FloatArray): ByteArray {
+        val byteCount = Math.multiplyExact(values.size, Float.SIZE_BYTES)
+        val buffer = ByteBuffer.allocate(byteCount).order(ByteOrder.LITTLE_ENDIAN)
+        for (value in values) {
+            if (!value.isFinite()) {
+                throw IllegalArgumentException("Resident activation inputs must be finite.")
+            }
+            buffer.putFloat(value)
+        }
+        return buffer.array()
+    }
+
+    private fun decodeFloatArray(bytes: ByteArray): FloatArray {
+        require(bytes.size % Float.SIZE_BYTES == 0) {
+            "Resident activation output must contain complete FP32 elements."
+        }
+        val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        return FloatArray(bytes.size / Float.SIZE_BYTES) {
+            buffer.float
+        }
     }
 
     /**
@@ -1531,6 +1721,75 @@ internal object VulkanTrainingBackend {
      * Uses a persistent GPU replica for a single FP16 model matrix. Kotlin remains
      * authoritative; the registry uploads only after the model tensor is mutated.
      */
+
+    @Synchronized
+    internal fun tryApplyResidentLinear(
+        input: VulkanTensorAllocation,
+        weights: VulkanTensorAllocation,
+        output: VulkanTensorAllocation,
+        rows: Int,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean = false
+    ): Boolean {
+        if (!isRuntimeAvailable ||
+            !residentActivationLinearReady ||
+            rows <= 0 ||
+            inputColumns <= 0 ||
+            outputColumns <= 0) {
+            return false
+        }
+
+        val requiredInputBytes = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(rows.toLong(), inputColumns.toLong()),
+                Float.SIZE_BYTES.toLong()
+            )
+        }.getOrNull() ?: return false
+        val requiredOutputBytes = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(rows.toLong(), outputColumns.toLong()),
+                Float.SIZE_BYTES.toLong()
+            )
+        }.getOrNull() ?: return false
+        val requiredWeightBytes = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(inputColumns.toLong(), outputColumns.toLong()),
+                Short.SIZE_BYTES.toLong()
+            )
+        }.getOrNull() ?: return false
+        if (input.byteCount < requiredInputBytes ||
+            weights.byteCount < requiredWeightBytes ||
+            output.byteCount < requiredOutputBytes) {
+            return false
+        }
+
+        val applied = try {
+            nativeApplyResidentLinear(
+                input.nativeHandle,
+                weights.nativeHandle,
+                output.nativeHandle,
+                rows,
+                inputColumns,
+                outputColumns,
+                transposeWeights
+            )
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident Vulkan linear JNI entry point is unavailable.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident Vulkan linear dispatch failed.", error)
+            false
+        }
+        if (applied) {
+            refreshGpuPerformanceMetrics()
+        } else {
+            residentActivationLinearReady = false
+            Log.w(TAG, "Resident activation-linear dispatch failed; this M3 path is disabled for this runtime.")
+        }
+        return applied
+    }
+
     @Synchronized
     fun tryApplyFp16Linear(
         inputRows: Array<FloatArray>,
@@ -2259,6 +2518,16 @@ internal object VulkanTrainingBackend {
         rows: Int,
         batchCount: Int,
         rowsPerBatch: Int,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean
+    ): Boolean
+
+    private external fun nativeApplyResidentLinear(
+        inputHandle: Long,
+        weightHandle: Long,
+        outputHandle: Long,
+        rows: Int,
         inputColumns: Int,
         outputColumns: Int,
         transposeWeights: Boolean
