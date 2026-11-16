@@ -3027,7 +3027,7 @@ class ArgusNeuralEngine private constructor(
         gradients: Array<FloatArray>,
         firstMoments: Array<FloatArray>,
         secondMoments: Array<FloatArray>,
-        weightDecayByGroup: Float,
+        weightDecayByGroup: FloatArray,
         learningRate: Float,
         biasCorrection1: Float,
         biasCorrection2: Float,
@@ -3046,8 +3046,7 @@ class ArgusNeuralEngine private constructor(
             "AdamW tensor and weight-decay group counts must match."
         }
 
-        val gpuOrStagedUpdateCompleted = try {
-            VulkanTrainingBackend.tryApplyFp16AdamWUpdate(
+        val gpuOrStagedUpdateCompleted = VulkanTrainingBackend.tryApplyFp16AdamWUpdate(
                 parameters = parameters,
                 gradients = gradients,
                 firstMoments = firstMoments,
@@ -3062,7 +3061,6 @@ class ArgusNeuralEngine private constructor(
                 gradientClipFactor = gradientClipFactor,
                 residentGradient = residentGradient
             )
-        }
         if (gpuOrStagedUpdateCompleted) {
             synchronizeVulkanModelTensorResidency("Vulkan AdamW parameter update")
             return
