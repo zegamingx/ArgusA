@@ -53,7 +53,15 @@ internal class VulkanActivationTensorRegistry(
         VulkanTensorAllocation,
         Int,
         Int
-    ) -> Boolean = { _, _, _, _, _ -> false }
+    ) -> Boolean = { _, _, _, _, _ -> false },
+    private val dispatchResidualLayerNorm: (
+        VulkanTensorAllocation,
+        VulkanTensorAllocation,
+        VulkanTensorAllocation,
+        VulkanTensorAllocation,
+        Int,
+        Int
+    ) -> Boolean = { _, _, _, _, _, _ -> false }
 ) {
     private val active = IdentityHashMap<VulkanActivationTensor, VulkanTensorAllocation>()
     private var residentBytes = 0L
@@ -340,6 +348,70 @@ internal class VulkanActivationTensorRegistry(
 
         return dispatchSwiGlu(
             gateAllocation, upAllocation, outputAllocation, gate.rows, gate.columns
+        )
+    }
+
+    /**
+     * Applies the feed-forward residual and post-block LayerNorm while every
+     * intermediate remains resident in the Tensor Arena.
+     */
+    @Synchronized
+    fun applyResidualLayerNorm(
+        downProjection: VulkanActivationTensor,
+        residual: VulkanActivationTensor,
+        projectedOutput: VulkanActivationTensor,
+        normalizedOutput: VulkanActivationTensor
+    ): Boolean {
+        val downAllocation = active[downProjection] ?: return false
+        val residualAllocation = active[residual] ?: return false
+        val projectedAllocation = active[projectedOutput] ?: return false
+        val normalizedAllocation = active[normalizedOutput] ?: return false
+
+        if (downProjection === residual ||
+            downProjection === projectedOutput ||
+            downProjection === normalizedOutput ||
+            residual === projectedOutput ||
+            residual === normalizedOutput ||
+            projectedOutput === normalizedOutput ||
+            downProjection.rows <= 0 ||
+            downProjection.columns <= 0 ||
+            downProjection.rows != residual.rows ||
+            downProjection.columns != residual.columns ||
+            downProjection.rows != projectedOutput.rows ||
+            downProjection.columns != projectedOutput.columns ||
+            downProjection.rows != normalizedOutput.rows ||
+            downProjection.columns != normalizedOutput.columns) {
+            return false
+        }
+
+        val handles = longArrayOf(
+            downAllocation.nativeHandle,
+            residualAllocation.nativeHandle,
+            projectedAllocation.nativeHandle,
+            normalizedAllocation.nativeHandle
+        )
+        if (handles.any { it <= 0L } || handles.toSet().size != handles.size) return false
+
+        val expectedBytes = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(downProjection.rows.toLong(), downProjection.columns.toLong()),
+                Float.SIZE_BYTES.toLong()
+            )
+        }.getOrNull() ?: return false
+        if (downAllocation.byteCount != expectedBytes ||
+            residualAllocation.byteCount != expectedBytes ||
+            projectedAllocation.byteCount != expectedBytes ||
+            normalizedAllocation.byteCount != expectedBytes) {
+            return false
+        }
+
+        return dispatchResidualLayerNorm(
+            downAllocation,
+            residualAllocation,
+            projectedAllocation,
+            normalizedAllocation,
+            downProjection.rows,
+            downProjection.columns
         )
     }
 

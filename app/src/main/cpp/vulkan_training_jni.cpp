@@ -5971,6 +5971,224 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
     return JNI_TRUE;
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentResidualLayerNorm(
+    JNIEnv*,
+    jobject,
+    jlong downHandle,
+    jlong residualHandle,
+    jlong projectedHandle,
+    jlong normalizedHandle,
+    jint rows,
+    jint columns
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.residentAttentionPipeline == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        downHandle <= 0 || residualHandle <= 0 ||
+        projectedHandle <= 0 || normalizedHandle <= 0 ||
+        rows <= 0 || columns <= 0) {
+        return JNI_FALSE;
+    }
+
+    const jlong handles[] = {
+        downHandle, residualHandle, projectedHandle, normalizedHandle
+    };
+    for (size_t index = 0u; index < 4u; ++index) {
+        for (size_t previous = 0u; previous < index; ++previous) {
+            if (handles[index] == handles[previous]) {
+                logError("Resident residual LayerNorm requires four distinct tensor allocations.");
+                return JNI_FALSE;
+            }
+        }
+    }
+
+    const uint64_t rowCount = static_cast<uint64_t>(rows);
+    const uint64_t columnCount = static_cast<uint64_t>(columns);
+    constexpr uint64_t kMaximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    if (rowCount > std::numeric_limits<uint64_t>::max() / columnCount) {
+        return JNI_FALSE;
+    }
+    const uint64_t elementCount = rowCount * columnCount;
+    if (elementCount == 0u || elementCount > kMaximumShaderIndex ||
+        rowCount > static_cast<uint64_t>(gRuntime.maxComputeWorkGroupCountX)) {
+        logError("Resident residual LayerNorm dimensions exceed Vulkan dispatch limits.");
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize tensorByteCount =
+        static_cast<VkDeviceSize>(elementCount * sizeof(float));
+    if (tensorByteCount > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange) {
+        logError("Resident residual LayerNorm tensors exceed maxStorageBufferRange.");
+        return JNI_FALSE;
+    }
+
+    TensorArenaAllocation* downAllocation =
+        findArenaAllocation(static_cast<uint64_t>(downHandle));
+    TensorArenaAllocation* residualAllocation =
+        findArenaAllocation(static_cast<uint64_t>(residualHandle));
+    TensorArenaAllocation* projectedAllocation =
+        findArenaAllocation(static_cast<uint64_t>(projectedHandle));
+    TensorArenaAllocation* normalizedAllocation =
+        findArenaAllocation(static_cast<uint64_t>(normalizedHandle));
+    if (downAllocation == nullptr || residualAllocation == nullptr ||
+        projectedAllocation == nullptr || normalizedAllocation == nullptr) {
+        logError("Resident residual LayerNorm references an unknown Tensor Arena allocation.");
+        return JNI_FALSE;
+    }
+
+    const TensorArenaAllocation* allocations[] = {
+        downAllocation, residualAllocation, projectedAllocation, normalizedAllocation
+    };
+    for (const TensorArenaAllocation* allocation : allocations) {
+        if (allocation->logicalSize < tensorByteCount ||
+            (allocation->offset & 3u) != 0u ||
+            allocation->offset > gRuntime.tensorArenaCapacity ||
+            tensorByteCount > gRuntime.tensorArenaCapacity - allocation->offset) {
+            logError("Resident residual LayerNorm tensor size, alignment, or arena range is invalid.");
+            return JNI_FALSE;
+        }
+    }
+
+    const uint64_t downOffsetWords = downAllocation->offset / sizeof(uint32_t);
+    const uint64_t residualOffsetWords = residualAllocation->offset / sizeof(uint32_t);
+    const uint64_t projectedOffsetWords = projectedAllocation->offset / sizeof(uint32_t);
+    const uint64_t normalizedOffsetWords = normalizedAllocation->offset / sizeof(uint32_t);
+    if (downOffsetWords > kMaximumShaderIndex ||
+        residualOffsetWords > kMaximumShaderIndex ||
+        projectedOffsetWords > kMaximumShaderIndex ||
+        normalizedOffsetWords > kMaximumShaderIndex ||
+        elementCount - 1u > kMaximumShaderIndex - downOffsetWords ||
+        elementCount - 1u > kMaximumShaderIndex - residualOffsetWords ||
+        elementCount - 1u > kMaximumShaderIndex - projectedOffsetWords ||
+        elementCount - 1u > kMaximumShaderIndex - normalizedOffsetWords) {
+        logError("Resident residual LayerNorm offsets exceed 32-bit shader addressability.");
+        return JNI_FALSE;
+    }
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset resident residual LayerNorm command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin resident residual LayerNorm command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR beforeDependency{};
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeDependency.memoryBarrierCount = 1u;
+    beforeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
+
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.residentAttentionPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0u,
+        1u,
+        &gRuntime.tensorArenaDescriptorSet,
+        0u,
+        nullptr
+    );
+
+    const ResidentAttentionPushConstants parameters{
+        5u,
+        static_cast<uint32_t>(rowCount),
+        static_cast<uint32_t>(columnCount),
+        1u,
+        1u,
+        0u,
+        0u,
+        static_cast<uint32_t>(downOffsetWords),
+        static_cast<uint32_t>(projectedOffsetWords),
+        static_cast<uint32_t>(residualOffsetWords),
+        0u,
+        static_cast<uint32_t>(normalizedOffsetWords)
+    };
+    vkCmdPushConstants(
+        gRuntime.commandBuffer,
+        gRuntime.pipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(ResidentAttentionPushConstants),
+        &parameters
+    );
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    vkCmdDispatch(gRuntime.commandBuffer, static_cast<uint32_t>(rowCount), 1u, 1u);
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    VkBufferMemoryBarrier2KHR outputBarriers[2]{};
+    const TensorArenaAllocation* outputAllocations[] = {
+        projectedAllocation, normalizedAllocation
+    };
+    for (size_t index = 0u; index < 2u; ++index) {
+        outputBarriers[index].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+        outputBarriers[index].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        outputBarriers[index].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+        outputBarriers[index].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+        outputBarriers[index].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+        outputBarriers[index].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outputBarriers[index].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outputBarriers[index].buffer = gRuntime.tensorArenaBuffer;
+        outputBarriers[index].offset = outputAllocations[index]->offset;
+        outputBarriers[index].size = tensorByteCount;
+    }
+    VkDependencyInfoKHR outputDependency{};
+    outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    outputDependency.bufferMemoryBarrierCount = 2u;
+    outputDependency.pBufferMemoryBarriers = outputBarriers;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish resident residual LayerNorm command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Resident residual LayerNorm submission or fence wait failed.")) {
+        return JNI_FALSE;
+    }
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastLinearGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
+}
+
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_argus_agi_model_VulkanTrainingBackend_nativeAllocateTensor(
     JNIEnv*, jobject, jlong byteCount

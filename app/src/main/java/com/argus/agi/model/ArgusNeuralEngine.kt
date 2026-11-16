@@ -1810,27 +1810,41 @@ class ArgusNeuralEngine private constructor(
                 }
             }
 
-            computeLinearBatch(lf.h1, b.wGate, dModel, dFf, lf.gate)
-            computeLinearBatch(lf.h1, b.wUp, dModel, dFf, lf.up)
-            val residentSwiGluCompleted = VulkanTrainingBackend.tryApplyResidentSwiGlu(
-                gateRows = lf.gate,
-                upRows = lf.up,
-                outputRows = lf.act
-            )
-            if (!residentSwiGluCompleted) {
-                for (t in 0 until seqLen) {
-                    for (d in 0 until dFf) {
-                        val sigmoid = 1.0f / (1.0f + exp(-lf.gate[t][d]))
-                        lf.act[t][d] = (lf.gate[t][d] * sigmoid) * lf.up[t][d]
+            val residentFeedForwardCompleted =
+                VulkanTrainingBackend.tryApplyResidentFeedForward(
+                    inputRows = lf.h1,
+                    gateWeights = b.wGate,
+                    upWeights = b.wUp,
+                    downWeights = b.wDown,
+                    gateRows = lf.gate,
+                    upRows = lf.up,
+                    activationRows = lf.act,
+                    projectedOutputRows = lf.h2PreLN,
+                    normalizedOutputRows = lf.h2
+                )
+            if (!residentFeedForwardCompleted) {
+                computeLinearBatch(lf.h1, b.wGate, dModel, dFf, lf.gate)
+                computeLinearBatch(lf.h1, b.wUp, dModel, dFf, lf.up)
+                val residentSwiGluCompleted = VulkanTrainingBackend.tryApplyResidentSwiGlu(
+                    gateRows = lf.gate,
+                    upRows = lf.up,
+                    outputRows = lf.act
+                )
+                if (!residentSwiGluCompleted) {
+                    for (t in 0 until seqLen) {
+                        for (d in 0 until dFf) {
+                            val sigmoid = 1.0f / (1.0f + exp(-lf.gate[t][d]))
+                            lf.act[t][d] = (lf.gate[t][d] * sigmoid) * lf.up[t][d]
+                        }
                     }
                 }
-            }
 
-            computeLinearBatch(lf.act, b.wDown, dFf, dModel, lf.h2PreLN)
-            for (t in 0 until seqLen) {
-                for (d in 0 until dModel) lf.h2PreLN[t][d] += lf.h1[t][d]
-                System.arraycopy(lf.h2PreLN[t], 0, lf.h2[t], 0, dModel)
-                layerNormInPlace(lf.h2[t], dModel)
+                computeLinearBatch(lf.act, b.wDown, dFf, dModel, lf.h2PreLN)
+                for (t in 0 until seqLen) {
+                    for (d in 0 until dModel) lf.h2PreLN[t][d] += lf.h1[t][d]
+                    System.arraycopy(lf.h2PreLN[t], 0, lf.h2[t], 0, dModel)
+                    layerNormInPlace(lf.h2[t], dModel)
+                }
             }
         }
 

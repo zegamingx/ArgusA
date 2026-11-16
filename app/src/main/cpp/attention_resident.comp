@@ -199,11 +199,76 @@ void runLayerNorm() {
     }
 }
 
+void runResidualLayerNorm() {
+    const uint row = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    if (row >= parameters.sequenceLength) return;
+
+    const uint downBase =
+        parameters.attentionOutputOffsetWords + row * parameters.modelWidth;
+    const uint residualBase =
+        parameters.residualOffsetWords + row * parameters.modelWidth;
+    const uint projectedBase =
+        parameters.projectedOutputOffsetWords + row * parameters.modelWidth;
+
+    float partialSum = 0.0;
+    for (uint column = lane; column < parameters.modelWidth; column += gl_WorkGroupSize.x) {
+        partialSum +=
+            uintBitsToFloat(values[downBase + column]) +
+            uintBitsToFloat(values[residualBase + column]);
+    }
+    layerNormReduction[lane] = partialSum;
+    barrier();
+
+    for (uint offset = gl_WorkGroupSize.x >> 1u; offset > 0u; offset >>= 1u) {
+        if (lane < offset) {
+            layerNormReduction[lane] += layerNormReduction[lane + offset];
+        }
+        barrier();
+    }
+
+    const float mean = layerNormReduction[0] / float(parameters.modelWidth);
+    barrier();
+
+    float partialVariance = 0.0;
+    for (uint column = lane; column < parameters.modelWidth; column += gl_WorkGroupSize.x) {
+        const float value =
+            uintBitsToFloat(values[downBase + column]) +
+            uintBitsToFloat(values[residualBase + column]);
+        const float difference = value - mean;
+        partialVariance = fma(difference, difference, partialVariance);
+    }
+    layerNormReduction[lane] = partialVariance;
+    barrier();
+
+    for (uint offset = gl_WorkGroupSize.x >> 1u; offset > 0u; offset >>= 1u) {
+        if (lane < offset) {
+            layerNormReduction[lane] += layerNormReduction[lane + offset];
+        }
+        barrier();
+    }
+
+    const float variance = layerNormReduction[0] / float(parameters.modelWidth);
+    const float inverseStandardDeviation = inversesqrt(variance + 1.0e-5);
+    for (uint column = lane; column < parameters.modelWidth; column += gl_WorkGroupSize.x) {
+        const float value =
+            uintBitsToFloat(values[downBase + column]) +
+            uintBitsToFloat(values[residualBase + column]);
+        values[projectedBase + column] = floatBitsToUint(value);
+        values[parameters.normalizedOutputOffsetWords + row * parameters.modelWidth + column] =
+            floatBitsToUint((value - mean) * inverseStandardDeviation);
+    }
+}
+
 void main() {
     const uint invocation = gl_GlobalInvocationID.x;
     const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
     if (parameters.operation == 4u) {
         runLayerNorm();
+        return;
+    }
+    if (parameters.operation == 5u) {
+        runResidualLayerNorm();
         return;
     }
     if (stride == 0u) return;

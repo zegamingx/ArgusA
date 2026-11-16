@@ -331,6 +331,69 @@ class VulkanActivationTensorRegistryTest {
     }
 
     @Test
+    fun dispatchesResidualLayerNormForFourDistinctMatchingTensors() {
+        var nextHandle = 1L
+        var dispatchCount = 0
+        var dispatchedRows = 0
+        var dispatchedColumns = 0
+        val registry = VulkanActivationTensorRegistry(
+            allocate = { byteCount -> VulkanTensorAllocation(nextHandle++, byteCount) },
+            upload = { _, _ -> true },
+            download = { _, _ -> true },
+            release = { true },
+            dispatch = { _, _, _, _, _, _, _ -> false },
+            maxResidentBytes = { 16_384L },
+            dispatchResidualLayerNorm = { down, residual, projected, normalized, rows, columns ->
+                dispatchCount++
+                dispatchedRows = rows
+                dispatchedColumns = columns
+                val handles = longArrayOf(
+                    down.nativeHandle,
+                    residual.nativeHandle,
+                    projected.nativeHandle,
+                    normalized.nativeHandle
+                )
+                handles.all { it > 0L } && handles.toSet().size == handles.size
+            }
+        )
+        val down = requireNotNull(registry.allocate(3, 73))
+        val residual = requireNotNull(registry.allocate(3, 73))
+        val projected = requireNotNull(registry.allocate(3, 73))
+        val normalized = requireNotNull(registry.allocate(3, 73))
+
+        assertTrue(registry.applyResidualLayerNorm(down, residual, projected, normalized))
+        assertEquals(1, dispatchCount)
+        assertEquals(3, dispatchedRows)
+        assertEquals(73, dispatchedColumns)
+    }
+
+    @Test
+    fun rejectsResidualLayerNormAliasingAndShapeMismatchBeforeDispatch() {
+        var dispatchCount = 0
+        var nextHandle = 1L
+        val registry = VulkanActivationTensorRegistry(
+            allocate = { byteCount -> VulkanTensorAllocation(nextHandle++, byteCount) },
+            upload = { _, _ -> true },
+            download = { _, _ -> true },
+            release = { true },
+            dispatch = { _, _, _, _, _, _, _ -> false },
+            maxResidentBytes = { 16_384L },
+            dispatchResidualLayerNorm = { _, _, _, _, _, _ ->
+                dispatchCount++
+                true
+            }
+        )
+        val down = requireNotNull(registry.allocate(3, 73))
+        val residual = requireNotNull(registry.allocate(3, 73))
+        val projected = requireNotNull(registry.allocate(3, 73))
+        val normalized = requireNotNull(registry.allocate(3, 72))
+
+        assertFalse(registry.applyResidualLayerNorm(down, residual, projected, projected))
+        assertFalse(registry.applyResidualLayerNorm(down, residual, projected, normalized))
+        assertEquals(0, dispatchCount)
+    }
+
+    @Test
     fun rejectsShapeMismatchAndNonFiniteActivationInput() {
         var allocationCount = 0
         val registry = VulkanActivationTensorRegistry(
