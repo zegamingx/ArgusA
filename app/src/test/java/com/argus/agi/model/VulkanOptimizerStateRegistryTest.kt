@@ -16,6 +16,7 @@ class VulkanOptimizerStateRegistryTest {
         val contents = LinkedHashMap<Long, ByteArray>()
         var uploadCount = 0
         var releaseFailure = false
+        var downloadFailureHandle: Long? = null
 
         fun allocate(byteCount: Long): VulkanTensorAllocation? {
             if (byteCount <= 0L || byteCount > Int.MAX_VALUE.toLong()) return null
@@ -33,6 +34,14 @@ class VulkanOptimizerStateRegistryTest {
         }
 
         fun download(allocation: VulkanTensorAllocation, destination: ByteArray): Boolean {
+            val source = contents[allocation.nativeHandle] ?: return false
+            if (source.size != destination.size) return false
+            source.copyInto(destination)
+            return true
+        }
+
+        fun download(allocation: VulkanTensorAllocation, destination: ByteArray): Boolean {
+            if (allocation.nativeHandle == downloadFailureHandle) return false
             val source = contents[allocation.nativeHandle] ?: return false
             if (source.size != destination.size) return false
             source.copyInto(destination)
@@ -152,4 +161,44 @@ class VulkanOptimizerStateRegistryTest {
         assertTrue(first.contentEquals(floatArrayOf(0.75f, -0.5f, 1.25f)))
         assertEquals(1, arena.uploadCount)
     }
+    @Test
+    fun commitsNoHostMomentUntilEveryGpuMomentReadbackSucceeds() {
+        val arena = FakeArena()
+        val state = registry(arena)
+        val first = floatArrayOf(0.1f, 0.2f, 0.3f)
+        val second = floatArrayOf(-0.1f, -0.2f, -0.3f)
+        assertTrue(state.synchronizeAll(listOf(first, second)))
+
+        val firstAllocation = state.acquire(first) ?: error("First optimizer-state allocation is missing.")
+        val secondAllocation = state.acquire(second) ?: error("Second optimizer-state allocation is missing.")
+        val firstGpuState = ByteBuffer.allocate(first.size * Float.SIZE_BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .putFloat(0.75f)
+            .putFloat(-0.5f)
+            .putFloat(1.25f)
+            .array()
+        val secondGpuState = ByteBuffer.allocate(second.size * Float.SIZE_BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .putFloat(-0.25f)
+            .putFloat(0.5f)
+            .putFloat(-0.75f)
+            .array()
+        firstGpuState.copyInto(requireNotNull(arena.contents[firstAllocation.nativeHandle]))
+        secondGpuState.copyInto(requireNotNull(arena.contents[secondAllocation.nativeHandle]))
+        first.fill(9.0f)
+        second.fill(8.0f)
+        val hostFirstBeforeFailure = first.copyOf()
+        val hostSecondBeforeFailure = second.copyOf()
+
+        arena.downloadFailureHandle = secondAllocation.nativeHandle
+        assertFalse(state.synchronizeHostMirrors())
+        assertTrue(first.contentEquals(hostFirstBeforeFailure))
+        assertTrue(second.contentEquals(hostSecondBeforeFailure))
+
+        arena.downloadFailureHandle = null
+        assertTrue(state.synchronizeHostMirrors())
+        assertTrue(first.contentEquals(floatArrayOf(0.75f, -0.5f, 1.25f)))
+        assertTrue(second.contentEquals(floatArrayOf(-0.25f, 0.5f, -0.75f)))
+    }
+
 }
