@@ -12,6 +12,7 @@
 #include "linear_resident_shader_spv.h"
 #include "attention_resident_shader_spv.h"
 #include "swiglu_resident_shader_spv.h"
+#include "backward_resident_shader_spv.h"
 #include "tensor_arena_core.h"
 
 #include <algorithm>
@@ -120,6 +121,26 @@ struct ResidentSwiGluPushConstants {
 static_assert(sizeof(ResidentSwiGluPushConstants) == 16);
 static_assert(offsetof(ResidentSwiGluPushConstants, outputOffsetWords) == 12);
 
+struct ResidentBackwardPushConstants {
+    uint32_t operation;
+    uint32_t rows;
+    uint32_t columns;
+    uint32_t sequenceLength;
+    uint32_t input0OffsetWords;
+    uint32_t input1OffsetWords;
+    uint32_t input2OffsetWords;
+    uint32_t output0OffsetWords;
+    uint32_t output1OffsetWords;
+    float scale;
+    float epsilon;
+};
+
+static_assert(sizeof(ResidentBackwardPushConstants) == 44);
+static_assert(offsetof(ResidentBackwardPushConstants, input0OffsetWords) == 16);
+static_assert(offsetof(ResidentBackwardPushConstants, output0OffsetWords) == 28);
+static_assert(offsetof(ResidentBackwardPushConstants, scale) == 36);
+static_assert(offsetof(ResidentBackwardPushConstants, epsilon) == 40);
+
 struct CooperativeMatrixCapability {
     uint32_t mSize = 0;
     uint32_t nSize = 0;
@@ -189,6 +210,7 @@ struct VulkanRuntime {
     VkPipeline residentLinearPipeline = VK_NULL_HANDLE;
     VkPipeline residentAttentionPipeline = VK_NULL_HANDLE;
     VkPipeline residentSwiGluPipeline = VK_NULL_HANDLE;
+    VkPipeline residentBackwardPipeline = VK_NULL_HANDLE;
 
     uint32_t instanceApiVersion = VK_API_VERSION_1_0;
     bool supportsFp16Compute = false;
@@ -441,6 +463,9 @@ void destroyRuntime() {
         destroyTensorArena();
         destroyStorageBuffer();
 
+        if (gRuntime.residentBackwardPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(gRuntime.device, gRuntime.residentBackwardPipeline, nullptr);
+        }
         if (gRuntime.residentSwiGluPipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(gRuntime.device, gRuntime.residentSwiGluPipeline, nullptr);
         }
@@ -2399,7 +2424,8 @@ bool initializeRuntime() {
         std::max({
             sizeof(AdamwPushConstants),
             sizeof(LinearPushConstants),
-            sizeof(ResidentAttentionPushConstants)
+            sizeof(ResidentAttentionPushConstants),
+            sizeof(ResidentBackwardPushConstants)
         })
     );
 
@@ -2625,6 +2651,42 @@ bool initializeRuntime() {
         logError(
             "Resident SwiGLU pipeline is unavailable; the Kotlin activation fallback remains active.",
             swigluResult
+        );
+    }
+
+    VkShaderModuleCreateInfo backwardShaderInfo{};
+    backwardShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    backwardShaderInfo.codeSize = kArgusResidentBackwardShaderSpvSize;
+    backwardShaderInfo.pCode =
+        reinterpret_cast<const uint32_t*>(kArgusResidentBackwardShaderSpv);
+    VkShaderModule backwardShaderModule = VK_NULL_HANDLE;
+    VkResult backwardResult = vkCreateShaderModule(
+        gRuntime.device, &backwardShaderInfo, nullptr, &backwardShaderModule
+    );
+    if (backwardResult == VK_SUCCESS) {
+        VkPipelineShaderStageCreateInfo backwardShaderStage{};
+        backwardShaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        backwardShaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        backwardShaderStage.module = backwardShaderModule;
+        backwardShaderStage.pName = "main";
+
+        VkComputePipelineCreateInfo backwardPipelineInfo{};
+        backwardPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        backwardPipelineInfo.stage = backwardShaderStage;
+        backwardPipelineInfo.layout = gRuntime.pipelineLayout;
+        backwardResult = vkCreateComputePipelines(
+            gRuntime.device, VK_NULL_HANDLE, 1u, &backwardPipelineInfo,
+            nullptr, &gRuntime.residentBackwardPipeline
+        );
+    }
+    if (backwardShaderModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(gRuntime.device, backwardShaderModule, nullptr);
+    }
+    if (backwardResult != VK_SUCCESS) {
+        gRuntime.residentBackwardPipeline = VK_NULL_HANDLE;
+        logError(
+            "Resident backward pipeline is unavailable; Kotlin backward fallback remains active.",
+            backwardResult
         );
     }
 
@@ -6177,6 +6239,401 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentResidualLayerNor
         return JNI_FALSE;
     }
     if (!submitAndWait("Resident residual LayerNorm submission or fence wait failed.")) {
+        return JNI_FALSE;
+    }
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastLinearGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
+}
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentBackward(
+    JNIEnv*,
+    jobject,
+    jint operation,
+    jlong input0Handle,
+    jlong input1Handle,
+    jlong input2Handle,
+    jlong output0Handle,
+    jlong output1Handle,
+    jint rows,
+    jint columns,
+    jint sequenceLength,
+    jfloat scale,
+    jfloat epsilon
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.residentBackwardPipeline == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        rows <= 0 || columns <= 0 ||
+        !std::isfinite(scale) || !std::isfinite(epsilon) || epsilon <= 0.0f) {
+        return JNI_FALSE;
+    }
+
+    constexpr jint kCrossEntropyBackward = 0;
+    constexpr jint kSwiGluBackward = 1;
+    constexpr jint kLayerNormBackward = 2;
+    constexpr jint kCausalSoftmaxBackward = 3;
+    constexpr jint kEmbeddingGradient = 4;
+    constexpr jint kAccumulateGradient = 5;
+    constexpr jint kScaleGradient = 6;
+    constexpr jint kGradientNormPartial = 7;
+    constexpr jint kGradientNormFinal = 8;
+    constexpr jint kNormalizeAndClipGradient = 10;
+
+    const uint64_t rowCount = static_cast<uint64_t>(rows);
+    const uint64_t columnCount = static_cast<uint64_t>(columns);
+    constexpr uint64_t kMaximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    if (rowCount > std::numeric_limits<uint64_t>::max() / columnCount) {
+        return JNI_FALSE;
+    }
+    const uint64_t matrixElements = rowCount * columnCount;
+    if (matrixElements == 0u || matrixElements > kMaximumShaderIndex) {
+        logError("Resident backward dimensions exceed 32-bit shader indexing.");
+        return JNI_FALSE;
+    }
+
+    uint64_t input0Elements = 0u;
+    uint64_t input1Elements = 0u;
+    uint64_t input2Elements = 0u;
+    uint64_t output0Elements = 0u;
+    uint64_t output1Elements = 0u;
+    uint64_t firstDispatchGroups = 0u;
+    uint64_t secondDispatchGroups = 0u;
+    bool embeddingTwoPass = false;
+
+    switch (operation) {
+        case kCrossEntropyBackward:
+            if (sequenceLength < 0 ||
+                static_cast<uint64_t>(sequenceLength) + 1u >= rowCount) {
+                return JNI_FALSE;
+            }
+            input0Elements = matrixElements;
+            input1Elements = rowCount;
+            output0Elements = matrixElements;
+            output1Elements = rowCount * 2u;
+            firstDispatchGroups = rowCount;
+            break;
+        case kSwiGluBackward:
+            input0Elements = matrixElements;
+            input1Elements = matrixElements;
+            input2Elements = matrixElements;
+            output0Elements = matrixElements;
+            output1Elements = matrixElements;
+            firstDispatchGroups = 1u + (matrixElements - 1u) / kLocalWorkGroupSize;
+            break;
+        case kLayerNormBackward:
+            input0Elements = matrixElements;
+            input1Elements = matrixElements;
+            output0Elements = matrixElements;
+            firstDispatchGroups = rowCount;
+            break;
+        case kCausalSoftmaxBackward:
+            if (sequenceLength <= 1 ||
+                columnCount != static_cast<uint64_t>(sequenceLength)) {
+                return JNI_FALSE;
+            }
+            input0Elements = matrixElements;
+            input1Elements = matrixElements;
+            output0Elements = matrixElements;
+            firstDispatchGroups = rowCount;
+            break;
+        case kEmbeddingGradient:
+            if (sequenceLength <= 0 ||
+                static_cast<uint64_t>(sequenceLength) > kMaximumShaderIndex ||
+                static_cast<uint64_t>(sequenceLength) >
+                    std::numeric_limits<uint64_t>::max() / columnCount) {
+                return JNI_FALSE;
+            }
+            input0Elements = static_cast<uint64_t>(sequenceLength);
+            input1Elements = static_cast<uint64_t>(sequenceLength) * columnCount;
+            output0Elements = matrixElements;
+            firstDispatchGroups = 1u + (matrixElements - 1u) / kLocalWorkGroupSize;
+            secondDispatchGroups = 1u +
+                (input1Elements - 1u) / kLocalWorkGroupSize;
+            embeddingTwoPass = true;
+            break;
+        case kAccumulateGradient:
+            if (columnCount != 1u) return JNI_FALSE;
+            input0Elements = rowCount;
+            input1Elements = rowCount;
+            output0Elements = rowCount;
+            firstDispatchGroups = 1u + (rowCount - 1u) / kLocalWorkGroupSize;
+            break;
+        case kScaleGradient:
+            if (columnCount != 1u) return JNI_FALSE;
+            input0Elements = rowCount;
+            output0Elements = rowCount;
+            firstDispatchGroups = 1u + (rowCount - 1u) / kLocalWorkGroupSize;
+            break;
+        case kGradientNormPartial:
+            if (columnCount != 1u) return JNI_FALSE;
+            input0Elements = rowCount;
+            output0Elements = 1u + (rowCount - 1u) / 4096u;
+            firstDispatchGroups = output0Elements;
+            break;
+        case kGradientNormFinal:
+            if (columnCount != 1u) return JNI_FALSE;
+            input0Elements = rowCount;
+            output0Elements = 1u;
+            firstDispatchGroups = 1u;
+            break;
+        case kNormalizeAndClipGradient:
+            if (columnCount != 1u) return JNI_FALSE;
+            input0Elements = rowCount;
+            input1Elements = 1u;
+            output0Elements = rowCount;
+            firstDispatchGroups = 1u + (rowCount - 1u) / kLocalWorkGroupSize;
+            break;
+        default:
+            return JNI_FALSE;
+    }
+
+    const auto validateTensor = [&](jlong handle, uint64_t elementCount) -> TensorArenaAllocation* {
+        if (handle <= 0 || elementCount == 0u ||
+            elementCount > kMaximumShaderIndex ||
+            elementCount > std::numeric_limits<VkDeviceSize>::max() / sizeof(float)) {
+            return nullptr;
+        }
+        TensorArenaAllocation* allocation =
+            findArenaAllocation(static_cast<uint64_t>(handle));
+        if (allocation == nullptr) return nullptr;
+
+        const VkDeviceSize requiredBytes =
+            static_cast<VkDeviceSize>(elementCount * sizeof(float));
+        if (requiredBytes > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange ||
+            allocation->logicalSize < requiredBytes ||
+            (allocation->offset & 3u) != 0u ||
+            allocation->offset > gRuntime.tensorArenaCapacity ||
+            requiredBytes > gRuntime.tensorArenaCapacity - allocation->offset) {
+            return nullptr;
+        }
+
+        const uint64_t offsetWords = allocation->offset / sizeof(uint32_t);
+        if (offsetWords > kMaximumShaderIndex ||
+            elementCount - 1u > kMaximumShaderIndex - offsetWords) {
+            return nullptr;
+        }
+        return allocation;
+    };
+
+    TensorArenaAllocation* input0Allocation = validateTensor(input0Handle, input0Elements);
+    TensorArenaAllocation* input1Allocation =
+        input1Elements == 0u ? nullptr : validateTensor(input1Handle, input1Elements);
+    TensorArenaAllocation* input2Allocation =
+        input2Elements == 0u ? nullptr : validateTensor(input2Handle, input2Elements);
+    TensorArenaAllocation* output0Allocation = validateTensor(output0Handle, output0Elements);
+    TensorArenaAllocation* output1Allocation =
+        output1Elements == 0u ? nullptr : validateTensor(output1Handle, output1Elements);
+
+    if (input0Allocation == nullptr ||
+        (input1Elements > 0u && input1Allocation == nullptr) ||
+        (input2Elements > 0u && input2Allocation == nullptr) ||
+        output0Allocation == nullptr ||
+        (output1Elements > 0u && output1Allocation == nullptr)) {
+        logError("Resident backward dispatch references an invalid or undersized Tensor Arena allocation.");
+        return JNI_FALSE;
+    }
+
+    const jlong handles[] = {
+        input0Handle,
+        input1Elements > 0u ? input1Handle : 0,
+        input2Elements > 0u ? input2Handle : 0,
+        output0Handle,
+        output1Elements > 0u ? output1Handle : 0
+    };
+    for (size_t index = 0u; index < 5u; ++index) {
+        if (handles[index] == 0) continue;
+        for (size_t previous = 0u; previous < index; ++previous) {
+            if (handles[index] == handles[previous]) {
+                logError("Resident backward inputs and outputs must use distinct allocations.");
+                return JNI_FALSE;
+            }
+        }
+    }
+
+    if (firstDispatchGroups == 0u ||
+        firstDispatchGroups > gRuntime.maxComputeWorkGroupCountX ||
+        (embeddingTwoPass &&
+            (secondDispatchGroups == 0u ||
+             secondDispatchGroups > gRuntime.maxComputeWorkGroupCountX))) {
+        logError("Resident backward dispatch exceeds the device workgroup-count limit.");
+        return JNI_FALSE;
+    }
+
+    const auto offsetWords = [](const TensorArenaAllocation* allocation) -> uint32_t {
+        return allocation == nullptr
+            ? 0u
+            : static_cast<uint32_t>(allocation->offset / sizeof(uint32_t));
+    };
+
+    const ResidentBackwardPushConstants parameters{
+        static_cast<uint32_t>(operation),
+        static_cast<uint32_t>(rowCount),
+        static_cast<uint32_t>(columnCount),
+        static_cast<uint32_t>(sequenceLength),
+        offsetWords(input0Allocation),
+        offsetWords(input1Allocation),
+        offsetWords(input2Allocation),
+        offsetWords(output0Allocation),
+        offsetWords(output1Allocation),
+        scale,
+        epsilon
+    };
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset resident backward command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin resident backward command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR beforeDependency{};
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeDependency.memoryBarrierCount = 1u;
+    beforeDependency.pMemoryBarriers = &beforeCompute;
+
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.residentBackwardPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0u,
+        1u,
+        &gRuntime.tensorArenaDescriptorSet,
+        0u,
+        nullptr
+    );
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    if (embeddingTwoPass) {
+        ResidentBackwardPushConstants clearParameters = parameters;
+        clearParameters.operation = 4u;
+        vkCmdPushConstants(
+            gRuntime.commandBuffer, gRuntime.pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+            sizeof(ResidentBackwardPushConstants), &clearParameters
+        );
+        vkCmdDispatch(
+            gRuntime.commandBuffer,
+            static_cast<uint32_t>(firstDispatchGroups), 1u, 1u
+        );
+
+        VkMemoryBarrier2KHR clearBarrier{};
+        clearBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+        clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        clearBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+        clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        clearBarrier.dstAccessMask =
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+        VkDependencyInfoKHR clearDependency{};
+        clearDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+        clearDependency.memoryBarrierCount = 1u;
+        clearDependency.pMemoryBarriers = &clearBarrier;
+        gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &clearDependency);
+
+        ResidentBackwardPushConstants scatterParameters = parameters;
+        scatterParameters.operation = 9u;
+        vkCmdPushConstants(
+            gRuntime.commandBuffer, gRuntime.pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+            sizeof(ResidentBackwardPushConstants), &scatterParameters
+        );
+        vkCmdDispatch(
+            gRuntime.commandBuffer,
+            static_cast<uint32_t>(secondDispatchGroups), 1u, 1u
+        );
+    } else {
+        vkCmdPushConstants(
+            gRuntime.commandBuffer,
+            gRuntime.pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0u,
+            sizeof(ResidentBackwardPushConstants),
+            &parameters
+        );
+        vkCmdDispatch(
+            gRuntime.commandBuffer,
+            static_cast<uint32_t>(firstDispatchGroups),
+            1u,
+            1u
+        );
+    }
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    VkBufferMemoryBarrier2KHR outputBarriers[2]{};
+    uint32_t outputBarrierCount = 1u;
+    const TensorArenaAllocation* outputAllocations[] = {
+        output0Allocation, output1Allocation
+    };
+    const uint64_t outputElements[] = {
+        output0Elements, output1Elements
+    };
+    if (output1Allocation != nullptr) outputBarrierCount = 2u;
+    for (uint32_t index = 0u; index < outputBarrierCount; ++index) {
+        outputBarriers[index].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+        outputBarriers[index].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        outputBarriers[index].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+        outputBarriers[index].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+        outputBarriers[index].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+        outputBarriers[index].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outputBarriers[index].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outputBarriers[index].buffer = gRuntime.tensorArenaBuffer;
+        outputBarriers[index].offset = outputAllocations[index]->offset;
+        outputBarriers[index].size =
+            static_cast<VkDeviceSize>(outputElements[index] * sizeof(float));
+    }
+    VkDependencyInfoKHR outputDependency{};
+    outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    outputDependency.bufferMemoryBarrierCount = outputBarrierCount;
+    outputDependency.pBufferMemoryBarriers = outputBarriers;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish resident backward command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Resident backward submission or fence wait failed.")) {
         return JNI_FALSE;
     }
 

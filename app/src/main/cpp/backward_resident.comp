@@ -1,0 +1,337 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) coherent buffer TensorArena {
+    uint values[];
+};
+
+layout(push_constant) uniform ResidentBackwardParameters {
+    uint operation;
+    uint rows;
+    uint columns;
+    uint sequenceLength;
+    uint input0OffsetWords;
+    uint input1OffsetWords;
+    uint input2OffsetWords;
+    uint output0OffsetWords;
+    uint output1OffsetWords;
+    float scale;
+    float epsilon;
+} parameters;
+
+shared float reductionValues[64];
+
+float reduceSharedSum(float value) {
+    uint lane = gl_LocalInvocationID.x;
+    reductionValues[lane] = value;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            reductionValues[lane] += reductionValues[lane + stride];
+        }
+        barrier();
+    }
+    return reductionValues[0];
+}
+
+float reduceSharedMax(float value) {
+    uint lane = gl_LocalInvocationID.x;
+    reductionValues[lane] = value;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            reductionValues[lane] = max(reductionValues[lane], reductionValues[lane + stride]);
+        }
+        barrier();
+    }
+    return reductionValues[0];
+}
+
+void crossEntropyBackward() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (row >= parameters.rows) return;
+
+    int target = int(round(uintBitsToFloat(values[parameters.input1OffsetWords + row])));
+    bool active = row >= parameters.sequenceLength &&
+        row + 1u < parameters.rows &&
+        target >= 0 &&
+        uint(target) < parameters.columns;
+
+    float localMaximum = -3.402823466e+38;
+    if (active) {
+        for (uint column = lane; column < parameters.columns; column += 64u) {
+            float logit = uintBitsToFloat(
+                values[parameters.input0OffsetWords + row * parameters.columns + column]
+            );
+            localMaximum = max(localMaximum, logit);
+        }
+    }
+    float maximum = reduceSharedMax(localMaximum);
+
+    float localExponentialSum = 0.0;
+    if (active) {
+        for (uint column = lane; column < parameters.columns; column += 64u) {
+            float logit = uintBitsToFloat(
+                values[parameters.input0OffsetWords + row * parameters.columns + column]
+            );
+            localExponentialSum += exp(logit - maximum);
+        }
+    }
+    float exponentialSum = reduceSharedSum(localExponentialSum);
+    float safeSum = max(exponentialSum, 1.0e-30);
+
+    if (active) {
+        for (uint column = lane; column < parameters.columns; column += 64u) {
+            float logit = uintBitsToFloat(
+                values[parameters.input0OffsetWords + row * parameters.columns + column]
+            );
+            float probability = exp(logit - maximum) / safeSum;
+            float gradient = probability - (column == uint(target) ? 1.0 : 0.0);
+            values[parameters.output0OffsetWords + row * parameters.columns + column] =
+                floatBitsToUint(gradient);
+        }
+    } else {
+        for (uint column = lane; column < parameters.columns; column += 64u) {
+            values[parameters.output0OffsetWords + row * parameters.columns + column] =
+                floatBitsToUint(0.0);
+        }
+    }
+
+    if (lane == 0u) {
+        float loss = 0.0;
+        float count = 0.0;
+        if (active) {
+            float targetLogit = uintBitsToFloat(
+                values[parameters.input0OffsetWords + row * parameters.columns + uint(target)]
+            );
+            loss = maximum + log(safeSum) - targetLogit;
+            count = 1.0;
+        }
+        values[parameters.output1OffsetWords + row * 2u] = floatBitsToUint(loss);
+        values[parameters.output1OffsetWords + row * 2u + 1u] = floatBitsToUint(count);
+    }
+}
+
+void swigluBackward() {
+    uint index = gl_GlobalInvocationID.x;
+    uint elementCount = parameters.rows * parameters.columns;
+    if (index >= elementCount) return;
+
+    float gate = uintBitsToFloat(values[parameters.input0OffsetWords + index]);
+    float up = uintBitsToFloat(values[parameters.input1OffsetWords + index]);
+    float activationGradient = uintBitsToFloat(values[parameters.input2OffsetWords + index]);
+    float sigmoid = 1.0 / (1.0 + exp(-gate));
+    float swish = gate * sigmoid;
+
+    float gateGradient = activationGradient * up *
+        sigmoid * (1.0 + gate * (1.0 - sigmoid));
+    float upGradient = activationGradient * swish;
+
+    values[parameters.output0OffsetWords + index] = floatBitsToUint(gateGradient);
+    values[parameters.output1OffsetWords + index] = floatBitsToUint(upGradient);
+}
+
+void layerNormBackward() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (row >= parameters.rows) return;
+
+    uint rowOffset = row * parameters.columns;
+    float localSum = 0.0;
+    for (uint column = lane; column < parameters.columns; column += 64u) {
+        localSum += uintBitsToFloat(values[parameters.input1OffsetWords + rowOffset + column]);
+    }
+    float mean = reduceSharedSum(localSum) / float(parameters.columns);
+
+    float localVariance = 0.0;
+    for (uint column = lane; column < parameters.columns; column += 64u) {
+        float difference =
+            uintBitsToFloat(values[parameters.input1OffsetWords + rowOffset + column]) - mean;
+        localVariance += difference * difference;
+    }
+    float variance = reduceSharedSum(localVariance) / float(parameters.columns);
+    float inverseStandardDeviation = inversesqrt(variance + parameters.epsilon);
+
+    float localSumGradient = 0.0;
+    float localSumNormalizedGradient = 0.0;
+    for (uint column = lane; column < parameters.columns; column += 64u) {
+        float normalized =
+            (uintBitsToFloat(values[parameters.input1OffsetWords + rowOffset + column]) - mean) *
+            inverseStandardDeviation;
+        float gradient = uintBitsToFloat(values[parameters.input0OffsetWords + rowOffset + column]);
+        localSumGradient += gradient;
+        localSumNormalizedGradient += gradient * normalized;
+    }
+    float sumGradient = reduceSharedSum(localSumGradient);
+    float sumNormalizedGradient = reduceSharedSum(localSumNormalizedGradient);
+    float inverseColumns = 1.0 / float(parameters.columns);
+
+    for (uint column = lane; column < parameters.columns; column += 64u) {
+        float normalized =
+            (uintBitsToFloat(values[parameters.input1OffsetWords + rowOffset + column]) - mean) *
+            inverseStandardDeviation;
+        float gradient = uintBitsToFloat(values[parameters.input0OffsetWords + rowOffset + column]);
+        float inputGradient = inverseStandardDeviation *
+            (gradient - sumGradient * inverseColumns -
+                normalized * sumNormalizedGradient * inverseColumns);
+        values[parameters.output0OffsetWords + rowOffset + column] =
+            floatBitsToUint(inputGradient);
+    }
+}
+
+void causalSoftmaxBackward() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (row >= parameters.rows || parameters.sequenceLength <= 1u) return;
+
+    // One head stores seqLen - 1 causal query rows; the final row has no next-token loss.
+    uint queryIndex = row % (parameters.sequenceLength - 1u);
+    uint rowOffset = row * parameters.columns;
+    float localWeightedGradient = 0.0;
+    for (uint keyIndex = lane; keyIndex < parameters.columns; keyIndex += 64u) {
+        if (keyIndex > queryIndex) continue;
+        float probability = uintBitsToFloat(values[parameters.input0OffsetWords + rowOffset + keyIndex]);
+        float probabilityGradient = uintBitsToFloat(values[parameters.input1OffsetWords + rowOffset + keyIndex]);
+        localWeightedGradient += probability * probabilityGradient;
+    }
+    float weightedGradient = reduceSharedSum(localWeightedGradient);
+
+    for (uint keyIndex = lane; keyIndex < parameters.columns; keyIndex += 64u) {
+        float gradient = 0.0;
+        if (keyIndex <= queryIndex) {
+            float probability = uintBitsToFloat(values[parameters.input0OffsetWords + rowOffset + keyIndex]);
+            float probabilityGradient = uintBitsToFloat(values[parameters.input1OffsetWords + rowOffset + keyIndex]);
+            gradient = probability * (probabilityGradient - weightedGradient) * parameters.scale;
+        }
+        values[parameters.output0OffsetWords + rowOffset + keyIndex] = floatBitsToUint(gradient);
+    }
+}
+
+void clearEmbeddingGradient() {
+    uint index = gl_GlobalInvocationID.x;
+    uint elementCount = parameters.rows * parameters.columns;
+    if (index < elementCount) {
+        values[parameters.output0OffsetWords + index] = floatBitsToUint(0.0);
+    }
+}
+
+void atomicAddFloat(uint index, float increment) {
+    uint observed = values[index];
+    while (true) {
+        uint expected = observed;
+        float currentValue = uintBitsToFloat(expected);
+        uint desired = floatBitsToUint(currentValue + increment);
+        observed = atomicCompSwap(values[index], expected, desired);
+        if (observed == expected) return;
+    }
+}
+
+void scatterEmbeddingGradient() {
+    uint index = gl_GlobalInvocationID.x;
+    uint elementCount = parameters.sequenceLength * parameters.columns;
+    if (index >= elementCount) return;
+
+    uint tokenIndex = index / parameters.columns;
+    uint dimension = index - tokenIndex * parameters.columns;
+    int token = int(round(uintBitsToFloat(values[parameters.input0OffsetWords + tokenIndex])));
+    if (token < 0 || uint(token) >= parameters.rows) return;
+
+    float gradient = uintBitsToFloat(
+        values[parameters.input1OffsetWords + tokenIndex * parameters.columns + dimension]
+    ) * parameters.scale;
+    uint outputIndex = parameters.output0OffsetWords +
+        uint(token) * parameters.columns + dimension;
+    atomicAddFloat(outputIndex, gradient);
+}
+
+void accumulateGradient() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.rows) return;
+    float source = uintBitsToFloat(values[parameters.input0OffsetWords + index]);
+    float accumulated = uintBitsToFloat(values[parameters.input1OffsetWords + index]);
+    values[parameters.output0OffsetWords + index] =
+        floatBitsToUint(accumulated + source * parameters.scale);
+}
+
+void scaleGradient() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.rows) return;
+    float gradient = uintBitsToFloat(values[parameters.input0OffsetWords + index]);
+    values[parameters.output0OffsetWords + index] =
+        floatBitsToUint(gradient * parameters.scale);
+}
+
+void reduceGradientNormPartial() {
+    uint lane = gl_LocalInvocationID.x;
+    uint groupBase = gl_WorkGroupID.x * 4096u;
+    uint groupEnd = min(groupBase + 4096u, parameters.rows);
+    float localSum = 0.0;
+    for (uint index = groupBase + lane; index < groupEnd; index += 64u) {
+        float gradient = uintBitsToFloat(values[parameters.input0OffsetWords + index]);
+        localSum += gradient * gradient;
+    }
+    float groupSum = reduceSharedSum(localSum);
+    if (lane == 0u) {
+        values[parameters.output0OffsetWords + gl_WorkGroupID.x] = floatBitsToUint(groupSum);
+    }
+}
+
+void normalizeAndClipGradient() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.rows) return;
+
+    // input0 contains accumulated gradients; input1 contains the GPU-reduced squared L2 norm.
+    // scale is 1 / targetCount and epsilon carries the maximum permitted gradient norm.
+    float squaredNorm = uintBitsToFloat(values[parameters.input1OffsetWords]);
+    if (isnan(squaredNorm) || isinf(squaredNorm) || squaredNorm < 0.0) {
+        values[parameters.output0OffsetWords + index] = uintBitsToFloat(0x7fc00000u);
+        return;
+    }
+
+    float meanNorm = sqrt(squaredNorm) * parameters.scale;
+    float clipFactor = meanNorm > parameters.epsilon
+        ? parameters.epsilon / (meanNorm + 1.0e-6)
+        : 1.0;
+    float gradient = uintBitsToFloat(values[parameters.input0OffsetWords + index]);
+    values[parameters.output0OffsetWords + index] =
+        floatBitsToUint(gradient * parameters.scale * clipFactor);
+}
+
+void reduceGradientNormFinal() {
+    uint lane = gl_LocalInvocationID.x;
+    float localSum = 0.0;
+    for (uint index = lane; index < parameters.rows; index += 64u) {
+        localSum += uintBitsToFloat(values[parameters.input0OffsetWords + index]);
+    }
+    float sumSquares = reduceSharedSum(localSum);
+    if (lane == 0u) {
+        values[parameters.output0OffsetWords] = floatBitsToUint(sumSquares);
+    }
+}
+
+void main() {
+    if (parameters.operation == 0u) {
+        crossEntropyBackward();
+    } else if (parameters.operation == 1u) {
+        swigluBackward();
+    } else if (parameters.operation == 2u) {
+        layerNormBackward();
+    } else if (parameters.operation == 3u) {
+        causalSoftmaxBackward();
+    } else if (parameters.operation == 4u) {
+        clearEmbeddingGradient();
+    } else if (parameters.operation == 5u) {
+        accumulateGradient();
+    } else if (parameters.operation == 6u) {
+        scaleGradient();
+    } else if (parameters.operation == 7u) {
+        reduceGradientNormPartial();
+    } else if (parameters.operation == 8u) {
+        reduceGradientNormFinal();
+    } else if (parameters.operation == 9u) {
+        scatterEmbeddingGradient();
+    } else if (parameters.operation == 10u) {
+        normalizeAndClipGradient();
+    }
+}

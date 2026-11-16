@@ -476,7 +476,8 @@ class ArgusNeuralEngine private constructor(
     private val modelLock = Any()
 
     private class BatchGradientAccumulator(
-        val gradients: Array<FloatArray>
+        val gradients: Array<FloatArray>,
+        var resident: VulkanResidentGradientAccumulator? = null
     ) {
         var targetCount: Int = 0
     }
@@ -1432,88 +1433,96 @@ class ArgusNeuralEngine private constructor(
             val accumulator = createBatchGradientAccumulator()
             val sampleResults = ArrayList<NeuralTrainingStepResult>(texts.size)
 
-            for (text in texts) {
-                val tokens = tokenizer.encode(text, autoRegister = false)
-                if (tokens.size < 2) {
-                    sampleResults += NeuralTrainingStepResult(
-                        loss = Float.NaN,
-                        inputTokenCount = tokens.size,
-                        predictionTargetCount = 0,
-                        contextWindowCount = 0,
-                        optimizerUpdateCount = 0,
-                        vocabularySize = tokenizer.vocabSize
-                    )
-                    continue
-                }
-
-                ensureVocabCapacity(tokenizer.vocabSize)
-                val currentVocab = tokenizer.vocabSize
-                var contextWindowCount = 0
-                var predictionTargetCount = 0
-                var weightedLoss = 0f
-                var trainedTargets = 0
-
-                if (tokens.size <= maxSeqLen) {
-                    val windowLoss = trainSingleWindow(
-                        seq = tokens,
-                        currentVocab = currentVocab,
-                        gradientAccumulator = accumulator
-                    )
-                    if (windowLoss.isFinite()) {
-                        contextWindowCount = 1
-                        predictionTargetCount = tokens.size - 1
-                        trainedTargets = tokens.size - 1
-                        weightedLoss = windowLoss * (tokens.size - 1)
+            try {
+                for (text in texts) {
+                    val tokens = tokenizer.encode(text, autoRegister = false)
+                    if (tokens.size < 2) {
+                        sampleResults += NeuralTrainingStepResult(
+                            loss = Float.NaN,
+                            inputTokenCount = tokens.size,
+                            predictionTargetCount = 0,
+                            contextWindowCount = 0,
+                            optimizerUpdateCount = 0,
+                            vocabularySize = tokenizer.vocabSize
+                        )
+                        continue
                     }
-                } else {
-                    val overlapTokens = min(24, maxSeqLen - 1)
-                    val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
-                    var start = 0
 
-                    while (start < tokens.size - 1) {
-                        val end = min(start + maxSeqLen, tokens.size)
-                        val windowSequence = tokens.subList(start, end)
-                        if (windowSequence.size >= 2) {
-                            val firstTargetIndex =
-                                if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
-                            val targetCount =
-                                (windowSequence.size - 1 - firstTargetIndex).coerceAtLeast(0)
-                            if (targetCount > 0) {
-                                val windowLoss = trainSingleWindow(
-                                    seq = windowSequence,
-                                    currentVocab = currentVocab,
-                                    firstTargetIndex = firstTargetIndex,
-                                    gradientAccumulator = accumulator
-                                )
-                                if (windowLoss.isFinite()) {
-                                    contextWindowCount++
-                                    weightedLoss += windowLoss * targetCount
-                                    trainedTargets += targetCount
-                                    predictionTargetCount += targetCount
+                    ensureVocabCapacity(tokenizer.vocabSize)
+                    val currentVocab = tokenizer.vocabSize
+                    var contextWindowCount = 0
+                    var predictionTargetCount = 0
+                    var weightedLoss = 0f
+                    var trainedTargets = 0
+
+                    if (tokens.size <= maxSeqLen) {
+                        val windowLoss = trainSingleWindow(
+                            seq = tokens,
+                            currentVocab = currentVocab,
+                            gradientAccumulator = accumulator
+                        )
+                        if (windowLoss.isFinite()) {
+                            contextWindowCount = 1
+                            predictionTargetCount = tokens.size - 1
+                            trainedTargets = tokens.size - 1
+                            weightedLoss = windowLoss * (tokens.size - 1)
+                        }
+                    } else {
+                        val overlapTokens = min(24, maxSeqLen - 1)
+                        val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
+                        var start = 0
+
+                        while (start < tokens.size - 1) {
+                            val end = min(start + maxSeqLen, tokens.size)
+                            val windowSequence = tokens.subList(start, end)
+                            if (windowSequence.size >= 2) {
+                                val firstTargetIndex =
+                                    if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
+                                val targetCount =
+                                    (windowSequence.size - 1 - firstTargetIndex).coerceAtLeast(0)
+                                if (targetCount > 0) {
+                                    val windowLoss = trainSingleWindow(
+                                        seq = windowSequence,
+                                        currentVocab = currentVocab,
+                                        firstTargetIndex = firstTargetIndex,
+                                        gradientAccumulator = accumulator
+                                    )
+                                    if (windowLoss.isFinite()) {
+                                        contextWindowCount++
+                                        weightedLoss += windowLoss * targetCount
+                                        trainedTargets += targetCount
+                                        predictionTargetCount += targetCount
+                                    }
                                 }
                             }
+                            if (end >= tokens.size) break
+                            start += stride
                         }
-                        if (end >= tokens.size) break
-                        start += stride
                     }
+
+                    sampleResults += NeuralTrainingStepResult(
+                        loss = if (trainedTargets > 0) {
+                            weightedLoss / trainedTargets
+                        } else {
+                            Float.NaN
+                        },
+                        inputTokenCount = tokens.size,
+                        predictionTargetCount = predictionTargetCount,
+                        contextWindowCount = contextWindowCount,
+                        optimizerUpdateCount = 0,
+                        vocabularySize = currentVocab
+                    )
                 }
 
-                sampleResults += NeuralTrainingStepResult(
-                    loss = if (trainedTargets > 0) {
-                        weightedLoss / trainedTargets
-                    } else {
-                        Float.NaN
-                    },
-                    inputTokenCount = tokens.size,
-                    predictionTargetCount = predictionTargetCount,
-                    contextWindowCount = contextWindowCount,
-                    optimizerUpdateCount = 0,
-                    vocabularySize = currentVocab
-                )
-            }
-
-            if (accumulator.targetCount > 0) {
-                applyAccumulatedGradients(accumulator)
+                if (accumulator.targetCount > 0) {
+                    applyAccumulatedGradients(accumulator)
+                }
+            } finally {
+                val remainingResident = accumulator.resident
+                if (remainingResident != null) {
+                    VulkanTrainingBackend.discardResidentGradientAccumulator(remainingResident)
+                    accumulator.resident = null
+                }
             }
 
             val optimizerUpdates = (adamStep - initialAdamStep).coerceAtLeast(0)
@@ -1894,35 +1903,65 @@ class ArgusNeuralEngine private constructor(
 
         val dLogits = Array(seqLen) { FloatArray(currentVocab) }
 
-        // (1) Cross-Entropy & Gradient Accumulation for Output Head
-        for (t in firstTargetIndex until seqLen - 1) {
-            val target = seq[t + 1]
-            if (target !in 0 until currentVocab) continue
-
-            val logitRow = logits[t]
-            var maxLogit = -Float.MAX_VALUE
-            for (vocabIndex in 0 until currentVocab) {
-                if (logitRow[vocabIndex] > maxLogit) maxLogit = logitRow[vocabIndex]
+        // (1) Fused causal cross-entropy and output-head gradient.
+        val targetRows = FloatArray(seqLen) { row ->
+            if (row + 1 < seqLen) seq[row + 1].toFloat() else 0.0f
+        }
+        val stagedLogitGradient = FloatArray(Math.multiplyExact(seqLen, currentVocab))
+        val rowLossStatistics = FloatArray(Math.multiplyExact(seqLen, 2))
+        val crossEntropyOnGpu = VulkanTrainingBackend.isResidentBackwardAvailable &&
+            VulkanTrainingBackend.tryRunResidentBackward(
+                operation = VulkanTrainingBackend.BACKWARD_CROSS_ENTROPY,
+                rows = seqLen,
+                columns = currentVocab,
+                sequenceLength = firstTargetIndex,
+                inputs = arrayOf(flattenRows(logits), targetRows, null),
+                outputs = arrayOf(stagedLogitGradient, rowLossStatistics)
+            )
+        if (crossEntropyOnGpu) {
+            for (time in 0 until seqLen) {
+                System.arraycopy(
+                    stagedLogitGradient,
+                    time * currentVocab,
+                    dLogits[time],
+                    0,
+                    currentVocab
+                )
+                val statisticOffset = time * 2
+                totalLoss += rowLossStatistics[statisticOffset]
+                validSteps += rowLossStatistics[statisticOffset + 1].toInt()
             }
+        } else {
+            // Numerically equivalent fallback for unsupported or failed Vulkan dispatch.
+            for (t in firstTargetIndex until seqLen - 1) {
+                val target = seq[t + 1]
+                if (target !in 0 until currentVocab) continue
 
-            var sumExp = 0f
-            for (vocabIndex in 0 until currentVocab) {
-                sumExp += exp(logitRow[vocabIndex] - maxLogit)
-            }
+                val logitRow = logits[t]
+                var maxLogit = -Float.MAX_VALUE
+                for (vocabIndex in 0 until currentVocab) {
+                    if (logitRow[vocabIndex] > maxLogit) maxLogit = logitRow[vocabIndex]
+                }
 
-            val logProbability =
-                (logitRow[target] - maxLogit) - ln(max(sumExp, 1e-9f))
-            val loss = -logProbability
-            if (loss.isFinite()) {
-                totalLoss += loss
-                validSteps++
-            }
+                var sumExp = 0f
+                for (vocabIndex in 0 until currentVocab) {
+                    sumExp += exp(logitRow[vocabIndex] - maxLogit)
+                }
 
-            val inverseSumExp = 1f / max(sumExp, 1e-9f)
-            for (vocabIndex in 0 until currentVocab) {
-                val probability = exp(logitRow[vocabIndex] - maxLogit) * inverseSumExp
-                val gradient = if (vocabIndex == target) probability - 1f else probability
-                dLogits[t][vocabIndex] = gradient
+                val logProbability =
+                    (logitRow[target] - maxLogit) - ln(max(sumExp, 1e-9f))
+                val loss = -logProbability
+                if (loss.isFinite()) {
+                    totalLoss += loss
+                    validSteps++
+                }
+
+                val inverseSumExp = 1f / max(sumExp, 1e-9f)
+                for (vocabIndex in 0 until currentVocab) {
+                    val probability = exp(logitRow[vocabIndex] - maxLogit) * inverseSumExp
+                    val gradient = if (vocabIndex == target) probability - 1f else probability
+                    dLogits[t][vocabIndex] = gradient
+                }
             }
         }
 
@@ -1974,9 +2013,12 @@ class ArgusNeuralEngine private constructor(
             val dK = Array(seqLen) { FloatArray(dModel) }
             val dV = Array(seqLen) { FloatArray(dModel) }
 
-            for (t in 0 until seqLen - 1) {
-                layerNormBackward(incomingGrad[t], lf.h2PreLN[t], dL_dh2PreLN[t], dModel)
-            }
+            layerNormBackwardBatch(
+                incomingGradients = incomingGrad,
+                preLayerNormRows = lf.h2PreLN,
+                outputGradients = dL_dh2PreLN,
+                rowCount = seqLen - 1
+            )
 
             val dActRows = Array(seqLen) { FloatArray(dFf) }
             computeLinearBatch(
@@ -1990,15 +2032,39 @@ class ArgusNeuralEngine private constructor(
 
             val dUpRows = Array(seqLen) { FloatArray(dFf) }
             val dGateRows = Array(seqLen) { FloatArray(dFf) }
-            for (t in 0 until seqLen - 1) {
-                for (dimension in 0 until dFf) {
-                    val sigmoid = 1.0f / (1.0f + exp(-lf.gate[t][dimension]))
-                    val swish = lf.gate[t][dimension] * sigmoid
-                    val dActValue = dActRows[t][dimension]
-                    dUpRows[t][dimension] = dActValue * swish
-                    val dSwish = dActValue * lf.up[t][dimension]
-                    dGateRows[t][dimension] =
-                        dSwish * (sigmoid * (1f + lf.gate[t][dimension] * (1f - sigmoid)))
+            val backwardRows = seqLen - 1
+            val swigluElementCount = Math.multiplyExact(backwardRows, dFf)
+            val stagedGateGradient = FloatArray(swigluElementCount)
+            val stagedUpGradient = FloatArray(swigluElementCount)
+            val swigluBackwardOnGpu = VulkanTrainingBackend.isResidentBackwardAvailable &&
+                VulkanTrainingBackend.tryRunResidentBackward(
+                    operation = VulkanTrainingBackend.BACKWARD_SWIGLU,
+                    rows = backwardRows,
+                    columns = dFf,
+                    sequenceLength = 0,
+                    inputs = arrayOf(
+                        flattenRows(Array(backwardRows) { row -> lf.gate[row] }),
+                        flattenRows(Array(backwardRows) { row -> lf.up[row] }),
+                        flattenRows(Array(backwardRows) { row -> dActRows[row] })
+                    ),
+                    outputs = arrayOf(stagedGateGradient, stagedUpGradient)
+                )
+            if (swigluBackwardOnGpu) {
+                for (row in 0 until backwardRows) {
+                    System.arraycopy(stagedGateGradient, row * dFf, dGateRows[row], 0, dFf)
+                    System.arraycopy(stagedUpGradient, row * dFf, dUpRows[row], 0, dFf)
+                }
+            } else {
+                for (t in 0 until backwardRows) {
+                    for (dimension in 0 until dFf) {
+                        val sigmoid = 1.0f / (1.0f + exp(-lf.gate[t][dimension]))
+                        val swish = lf.gate[t][dimension] * sigmoid
+                        val dActValue = dActRows[t][dimension]
+                        dUpRows[t][dimension] = dActValue * swish
+                        val dSwish = dActValue * lf.up[t][dimension]
+                        dGateRows[t][dimension] =
+                            dSwish * (sigmoid * (1f + lf.gate[t][dimension] * (1f - sigmoid)))
+                    }
                 }
             }
 
@@ -2067,8 +2133,13 @@ class ArgusNeuralEngine private constructor(
                         dHiddenFromUp[t][dimension] +
                         dL_dh2PreLN[t][dimension]
                 }
-                layerNormBackward(dL_dh1PostLN[t], lf.h1PreLN[t], dL_dh1PreLN[t], dModel)
             }
+            layerNormBackwardBatch(
+                incomingGradients = dL_dh1PostLN,
+                preLayerNormRows = lf.h1PreLN,
+                outputGradients = dL_dh1PreLN,
+                rowCount = seqLen - 1
+            )
 
             val attentionBackwardRows = seqLen - 1
             val attentionOutputRows = Array(attentionBackwardRows) { row -> lf.attnOut[row] }
@@ -2163,19 +2234,73 @@ class ArgusNeuralEngine private constructor(
             )
 
             val dScoreByHead = Array(nHeads) { Array(seqLen) { FloatArray(seqLen) } }
+            val softmaxBackwardRows = Math.multiplyExact(nHeads, attentionBackwardRows)
+            val flattenedProbabilities = FloatArray(
+                Math.multiplyExact(softmaxBackwardRows, seqLen)
+            )
+            val flattenedProbabilityGradients = FloatArray(flattenedProbabilities.size)
             for (head in 0 until nHeads) {
-                for (queryIndex in 0 until seqLen) {
-                    var weightedGradient = 0f
-                    for (keyIndex in 0..queryIndex) {
-                        weightedGradient +=
-                            lf.attnWeights[head][queryIndex][keyIndex] *
-                            dWeightsByHead[head][queryIndex][keyIndex]
+                for (query in 0 until attentionBackwardRows) {
+                    val flatRow = head * attentionBackwardRows + query
+                    System.arraycopy(
+                        lf.attnWeights[head][query],
+                        0,
+                        flattenedProbabilities,
+                        flatRow * seqLen,
+                        seqLen
+                    )
+                    System.arraycopy(
+                        dWeightsByHead[head][query],
+                        0,
+                        flattenedProbabilityGradients,
+                        flatRow * seqLen,
+                        seqLen
+                    )
+                }
+            }
+            val flattenedScoreGradients = FloatArray(flattenedProbabilities.size)
+            val softmaxBackwardOnGpu = VulkanTrainingBackend.isResidentBackwardAvailable &&
+                VulkanTrainingBackend.tryRunResidentBackward(
+                    operation = VulkanTrainingBackend.BACKWARD_CAUSAL_SOFTMAX,
+                    rows = softmaxBackwardRows,
+                    columns = seqLen,
+                    sequenceLength = seqLen,
+                    inputs = arrayOf(
+                        flattenedProbabilities,
+                        flattenedProbabilityGradients,
+                        null
+                    ),
+                    outputs = arrayOf(flattenedScoreGradients),
+                    scale = scale
+                )
+            if (softmaxBackwardOnGpu) {
+                for (head in 0 until nHeads) {
+                    for (query in 0 until attentionBackwardRows) {
+                        val flatRow = (head * attentionBackwardRows + query) * seqLen
+                        System.arraycopy(
+                            flattenedScoreGradients,
+                            flatRow,
+                            dScoreByHead[head][query],
+                            0,
+                            seqLen
+                        )
                     }
-                    for (keyIndex in 0..queryIndex) {
-                        dScoreByHead[head][queryIndex][keyIndex] =
-                            lf.attnWeights[head][queryIndex][keyIndex] *
-                            (dWeightsByHead[head][queryIndex][keyIndex] - weightedGradient) *
-                            scale
+                }
+            } else {
+                for (head in 0 until nHeads) {
+                    for (queryIndex in 0 until seqLen) {
+                        var weightedGradient = 0f
+                        for (keyIndex in 0..queryIndex) {
+                            weightedGradient +=
+                                lf.attnWeights[head][queryIndex][keyIndex] *
+                                dWeightsByHead[head][queryIndex][keyIndex]
+                        }
+                        for (keyIndex in 0..queryIndex) {
+                            dScoreByHead[head][queryIndex][keyIndex] =
+                                lf.attnWeights[head][queryIndex][keyIndex] *
+                                (dWeightsByHead[head][queryIndex][keyIndex] - weightedGradient) *
+                                scale
+                        }
                     }
                 }
             }
@@ -2232,57 +2357,94 @@ class ArgusNeuralEngine private constructor(
             System.arraycopy(flattenRows(qkvGradientOutputs[1]), 0, lg.gradWK, 0, lg.gradWK.size)
             System.arraycopy(flattenRows(qkvGradientOutputs[2]), 0, lg.gradWV, 0, lg.gradWV.size)
 
-            for (time in 0 until attentionBackwardRows) {
-                for (rankIndex in 0 until loraRank) {
-                    val queryMidValue = lf.mQ[time][rankIndex]
-                    val valueMidValue = lf.mV[time][rankIndex]
-                    val queryGradientOffset = rankIndex * dModel
-                    for (dimension in 0 until dModel) {
-                        lg.gradLoraQb[queryGradientOffset + dimension] +=
-                            queryMidValue * dQ[time][dimension]
-                        lg.gradLoraVb[queryGradientOffset + dimension] +=
-                            valueMidValue * dV[time][dimension]
-                    }
-                }
-                for (rankIndex in 0 until loraRank) {
-                    var queryBackProjection = 0f
-                    var valueBackProjection = 0f
-                    val queryWeightOffset = rankIndex * dModel
-                    for (dimension in 0 until dModel) {
-                        queryBackProjection +=
-                            dQ[time][dimension] * b.loraQb[queryWeightOffset + dimension]
-                        valueBackProjection +=
-                            dV[time][dimension] * b.loraVb[queryWeightOffset + dimension]
-                    }
-                    for (dimension in 0 until dModel) {
-                        lg.gradLoraQa[dimension * loraRank + rankIndex] +=
-                            layerInput[time][dimension] * queryBackProjection
-                        lg.gradLoraVa[dimension * loraRank + rankIndex] +=
-                            layerInput[time][dimension] * valueBackProjection
-                    }
-                }
-            }
+            // LoRA B gradients: M^T × dProjection.
+            val queryMidRows = Array(attentionBackwardRows) { row -> lf.mQ[row] }
+            val valueMidRows = Array(attentionBackwardRows) { row -> lf.mV[row] }
+            val queryMidGradientB = Array(loraRank) { FloatArray(dModel) }
+            val valueMidGradientB = Array(loraRank) { FloatArray(dModel) }
+            computeLinearBatch(
+                inputs = transposeRows(queryMidRows),
+                weights = flattenRows(queryGradientRows),
+                inputColumns = attentionBackwardRows,
+                outputColumns = dModel,
+                outputs = queryMidGradientB
+            )
+            computeLinearBatch(
+                inputs = transposeRows(valueMidRows),
+                weights = flattenRows(valueGradientRows),
+                inputColumns = attentionBackwardRows,
+                outputColumns = dModel,
+                outputs = valueMidGradientB
+            )
+            System.arraycopy(flattenRows(queryMidGradientB), 0, lg.gradLoraQb, 0, lg.gradLoraQb.size)
+            System.arraycopy(flattenRows(valueMidGradientB), 0, lg.gradLoraVb, 0, lg.gradLoraVb.size)
 
-            val wQEff = FloatArray(dModel * dModel)
-            val wVEff = FloatArray(dModel * dModel)
-            for (i in 0 until dModel) {
-                for (j in 0 until dModel) {
-                    var qSum = b.wQ[i * dModel + j]
-                    var vSum = b.wV[i * dModel + j]
-                    for (r in 0 until loraRank) {
-                        qSum += b.loraQa[i * loraRank + r] * b.loraQb[r * dModel + j]
-                        vSum += b.loraVa[i * loraRank + r] * b.loraVb[r * dModel + j]
-                    }
-                    wQEff[i * dModel + j] = qSum
-                    wVEff[i * dModel + j] = vSum
-                }
-            }
+            // LoRA A gradients and the low-rank contribution to dLayerInput.
+            val queryRankGradients = Array(attentionBackwardRows) { FloatArray(loraRank) }
+            val valueRankGradients = Array(attentionBackwardRows) { FloatArray(loraRank) }
+            computeLinearBatch(
+                inputs = queryGradientRows,
+                weights = b.loraQb,
+                inputColumns = dModel,
+                outputColumns = loraRank,
+                outputs = queryRankGradients,
+                transposeWeights = true
+            )
+            computeLinearBatch(
+                inputs = valueGradientRows,
+                weights = b.loraVb,
+                inputColumns = dModel,
+                outputColumns = loraRank,
+                outputs = valueRankGradients,
+                transposeWeights = true
+            )
 
+            val layerInputTranspose = transposeRows(inputRowsForGradient)
+            val queryGradientA = Array(dModel) { FloatArray(loraRank) }
+            val valueGradientA = Array(dModel) { FloatArray(loraRank) }
+            computeLinearBatch(
+                inputs = layerInputTranspose,
+                weights = flattenRows(queryRankGradients),
+                inputColumns = attentionBackwardRows,
+                outputColumns = loraRank,
+                outputs = queryGradientA
+            )
+            computeLinearBatch(
+                inputs = layerInputTranspose,
+                weights = flattenRows(valueRankGradients),
+                inputColumns = attentionBackwardRows,
+                outputColumns = loraRank,
+                outputs = valueGradientA
+            )
+            System.arraycopy(flattenRows(queryGradientA), 0, lg.gradLoraQa, 0, lg.gradLoraQa.size)
+            System.arraycopy(flattenRows(valueGradientA), 0, lg.gradLoraVa, 0, lg.gradLoraVa.size)
+
+            val queryLoRaInputGradient = Array(attentionBackwardRows) { FloatArray(dModel) }
+            val valueLoRaInputGradient = Array(attentionBackwardRows) { FloatArray(dModel) }
+            computeLinearBatch(
+                inputs = queryRankGradients,
+                weights = b.loraQa,
+                inputColumns = loraRank,
+                outputColumns = dModel,
+                outputs = queryLoRaInputGradient,
+                transposeWeights = true
+            )
+            computeLinearBatch(
+                inputs = valueRankGradients,
+                weights = b.loraVa,
+                inputColumns = loraRank,
+                outputColumns = dModel,
+                outputs = valueLoRaInputGradient,
+                transposeWeights = true
+            )
+
+            // Base Q/K/V and LoRA input gradients are dispatched as separate Vulkan
+            // products. This avoids materializing effective Q/V matrices on the host.
             val inputGradientByProjection =
                 Array(3) { Array(attentionBackwardRows) { FloatArray(dModel) } }
             computeBatchedLinear(
                 inputs = arrayOf(queryGradientRows, keyGradientRows, valueGradientRows),
-                weights = arrayOf(wQEff, b.wK.toFloatArray(), wVEff),
+                weights = arrayOf(b.wQ, b.wK, b.wV),
                 outputs = inputGradientByProjection,
                 inputColumns = dModel,
                 outputColumns = dModel,
@@ -2299,19 +2461,44 @@ class ArgusNeuralEngine private constructor(
                         dL_dh1PreLN[time][dimension] +
                         queryInputGradient[dimension] +
                         keyInputGradient[dimension] +
-                        valueInputGradient[dimension]
+                        valueInputGradient[dimension] +
+                        queryLoRaInputGradient[time][dimension] +
+                        valueLoRaInputGradient[time][dimension]
                 }
             }
 
             if (layer > 0) {
                 incomingGrad = dLayerInput
             } else {
-                for (time in 0 until attentionBackwardRows) {
-                    val token = seq[time]
-                    if (token !in 0 until vocabCap) continue
-                    val embeddingOffset = token * dModel
-                    for (dimension in 0 until dModel) {
-                        gradWEmbed[embeddingOffset + dimension] += dLayerInput[time][dimension] * embedScale
+                val embeddingBackwardTokens = FloatArray(attentionBackwardRows) { row ->
+                    seq[row].toFloat()
+                }
+                val embeddingInputGradients = flattenRows(
+                    Array(attentionBackwardRows) { row -> dLayerInput[row] }
+                )
+                val embeddingGradientOnGpu = VulkanTrainingBackend.isResidentBackwardAvailable &&
+                    VulkanTrainingBackend.tryRunResidentBackward(
+                        operation = VulkanTrainingBackend.BACKWARD_EMBEDDING_GRADIENT,
+                        rows = vocabCap,
+                        columns = dModel,
+                        sequenceLength = attentionBackwardRows,
+                        inputs = arrayOf(
+                            embeddingBackwardTokens,
+                            embeddingInputGradients,
+                            null
+                        ),
+                        outputs = arrayOf(gradWEmbed),
+                        scale = embedScale
+                    )
+                if (!embeddingGradientOnGpu) {
+                    for (time in 0 until attentionBackwardRows) {
+                        val token = seq[time]
+                        if (token !in 0 until vocabCap) continue
+                        val embeddingOffset = token * dModel
+                        for (dimension in 0 until dModel) {
+                            gradWEmbed[embeddingOffset + dimension] +=
+                                dLayerInput[time][dimension] * embedScale
+                        }
                     }
                 }
             }
@@ -2417,11 +2604,44 @@ class ArgusNeuralEngine private constructor(
                     "Gradient accumulator tensor count does not match the active architecture."
                 }
                 for (tensorIndex in sampleGradients.indices) {
-                    val source = sampleGradients[tensorIndex]
-                    val destination = gradientAccumulator.gradients[tensorIndex]
-                    require(source.size <= destination.size) {
+                    require(sampleGradients[tensorIndex].size <= gradientAccumulator.gradients[tensorIndex].size) {
                         "Sample gradient exceeds the resident model tensor."
                     }
+                }
+
+                val residentAccumulator = gradientAccumulator.resident
+                if (residentAccumulator != null &&
+                    VulkanTrainingBackend.accumulateResidentGradients(
+                        residentAccumulator,
+                        sampleGradients.toTypedArray(),
+                        validSteps
+                    )) {
+                    gradientAccumulator.targetCount = Math.addExact(
+                        gradientAccumulator.targetCount,
+                        validSteps
+                    )
+                    return totalLoss / validSteps
+                }
+
+                if (residentAccumulator != null) {
+                    // Failed dispatches do not swap active/spare; recover the committed
+                    // prefix before appending this sample with the CPU fallback.
+                    if (!VulkanTrainingBackend.downloadResidentGradientAccumulator(
+                            residentAccumulator,
+                            gradientAccumulator.gradients
+                        )) {
+                        VulkanTrainingBackend.discardResidentGradientAccumulator(residentAccumulator)
+                        gradientAccumulator.resident = null
+                        throw IllegalStateException(
+                            "Vulkan gradient accumulation failed and its committed sums could not be recovered."
+                        )
+                    }
+                    gradientAccumulator.resident = null
+                }
+
+                for (tensorIndex in sampleGradients.indices) {
+                    val source = sampleGradients[tensorIndex]
+                    val destination = gradientAccumulator.gradients[tensorIndex]
                     for (elementIndex in source.indices) {
                         destination[elementIndex] += source[elementIndex] * validSteps
                     }
@@ -2433,27 +2653,6 @@ class ArgusNeuralEngine private constructor(
             }
             return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
-
-        var sumSquares = 0f
-        sumSquares += computeSumSquares(gradWHead)
-        sumSquares += computeSumSquares(gradWEmbed)
-        for (lg in layerGrads) {
-            sumSquares += computeSumSquares(lg.gradWDown)
-            sumSquares += computeSumSquares(lg.gradWUp)
-            sumSquares += computeSumSquares(lg.gradWGate)
-            sumSquares += computeSumSquares(lg.gradWO)
-            sumSquares += computeSumSquares(lg.gradWQ)
-            sumSquares += computeSumSquares(lg.gradWK)
-            sumSquares += computeSumSquares(lg.gradWV)
-            sumSquares += computeSumSquares(lg.gradLoraQa)
-            sumSquares += computeSumSquares(lg.gradLoraQb)
-            sumSquares += computeSumSquares(lg.gradLoraVa)
-            sumSquares += computeSumSquares(lg.gradLoraVb)
-        }
-
-        val totalNorm = sqrt(sumSquares)
-        if (!totalNorm.isFinite()) { adamStep--; return Float.NaN }
-        val clipFactor = if (totalNorm > maxGradNorm) maxGradNorm / (totalNorm + 1e-6f) else 1.0f
 
         val beta1Pow = Math.pow(beta1.toDouble(), adamStep.toDouble()).toFloat()
         val beta2Pow = Math.pow(beta2.toDouble(), adamStep.toDouble()).toFloat()
@@ -2487,9 +2686,35 @@ class ArgusNeuralEngine private constructor(
             parameterList.add(b.loraVb); gradientList.add(lg.gradLoraVb); firstMomentList.add(b.mLoraVb); secondMomentList.add(b.vLoraVb); weightDecayList.add(0f)
         }
 
+        val gradientGroups = gradientList.toTypedArray()
+        val clippedOnGpu = try {
+            tryNormalizeAndClipGradientsOnVulkan(gradientGroups, maxGradNorm)
+        } catch (error: RuntimeException) {
+            adamStep--
+            throw error
+        }
+        val clipFactor = if (clippedOnGpu) {
+            1.0f
+        } else {
+            var sumSquares = 0f
+            for (gradient in gradientGroups) {
+                sumSquares += computeSumSquares(gradient)
+            }
+            val totalNorm = sqrt(sumSquares)
+            if (!totalNorm.isFinite()) {
+                adamStep--
+                return Float.NaN
+            }
+            if (totalNorm > maxGradNorm) {
+                maxGradNorm / (totalNorm + 1e-6f)
+            } else {
+                1.0f
+            }
+        }
+
         applyAdamWUpdate(
             parameters = parameterList.toTypedArray(),
-            gradients = gradientList.toTypedArray(),
+            gradients = gradientGroups,
             firstMoments = firstMomentList.toTypedArray(),
             secondMoments = secondMomentList.toTypedArray(),
             weightDecayByGroup = weightDecayList.toFloatArray(),
@@ -2582,12 +2807,58 @@ class ArgusNeuralEngine private constructor(
         return arrays.toTypedArray()
     }
 
+    private fun tryNormalizeAndClipGradientsOnVulkan(
+        gradients: Array<FloatArray>,
+        maximumGradientNorm: Float
+    ): Boolean {
+        if (!VulkanTrainingBackend.isResidentGradientAccumulatorAvailable) return false
+        val accumulator = VulkanTrainingBackend.createResidentGradientAccumulator(gradients)
+            ?: return false
+        try {
+            if (!VulkanTrainingBackend.accumulateResidentGradients(
+                    accumulator,
+                    gradients,
+                    targetWeight = 1
+                )) {
+                return false
+            }
+            if (VulkanTrainingBackend.finalizeResidentGradientAccumulator(
+                    accumulator,
+                    gradients,
+                    targetCount = 1,
+                    maximumGradientNorm = maximumGradientNorm
+                )) {
+                return true
+            }
+            if (!VulkanTrainingBackend.downloadResidentGradientAccumulator(
+                    accumulator,
+                    gradients
+                )) {
+                throw IllegalStateException(
+                    "Vulkan gradient clipping failed and its original gradients could not be recovered."
+                )
+            }
+            return false
+        } finally {
+            if (!accumulator.released) {
+                VulkanTrainingBackend.discardResidentGradientAccumulator(accumulator)
+            }
+        }
+    }
+
     private fun createBatchGradientAccumulator(): BatchGradientAccumulator {
         val parameters = currentParameterArrays()
+        val gradients = Array(parameters.size) { index ->
+            FloatArray(parameters[index].size)
+        }
+        val resident = if (VulkanTrainingBackend.isResidentGradientAccumulatorAvailable) {
+            VulkanTrainingBackend.createResidentGradientAccumulator(gradients)
+        } else {
+            null
+        }
         return BatchGradientAccumulator(
-            gradients = Array(parameters.size) { index ->
-                FloatArray(parameters[index].size)
-            }
+            gradients = gradients,
+            resident = resident
         )
     }
 
@@ -2607,23 +2878,56 @@ class ArgusNeuralEngine private constructor(
                 parameters.size == secondMoments.size
         ) { "Optimizer tensor groups do not match the active architecture." }
 
-        var sumSquares = 0f
         for (index in gradients.indices) {
             require(
                 gradients[index].size <= parameters[index].size &&
                     parameters[index].size == firstMoments[index].size &&
                     parameters[index].size == secondMoments[index].size
             ) { "Optimizer tensor shape mismatch at index $index." }
-            normalizeGradient(gradients[index], accumulator.targetCount.toFloat())
-            sumSquares += computeSumSquares(gradients[index])
         }
 
-        val totalNorm = sqrt(sumSquares)
-        if (!totalNorm.isFinite()) {
+        var clippedOnGpu = false
+        val residentAccumulator = accumulator.resident
+        if (residentAccumulator != null) {
+            clippedOnGpu = VulkanTrainingBackend.finalizeResidentGradientAccumulator(
+                residentAccumulator,
+                gradients,
+                accumulator.targetCount,
+                maxGradNorm
+            )
+            if (!clippedOnGpu &&
+                !VulkanTrainingBackend.downloadResidentGradientAccumulator(
+                    residentAccumulator,
+                    gradients
+                )) {
+                VulkanTrainingBackend.discardResidentGradientAccumulator(residentAccumulator)
+                accumulator.resident = null
+                throw IllegalStateException(
+                    "Vulkan gradient norm/clipping failed and its committed sums could not be recovered."
+                )
+            }
+            accumulator.resident = null
+        }
+
+        var sumSquares = 0f
+        if (!clippedOnGpu) {
+            for (gradient in gradients) {
+                normalizeGradient(gradient, accumulator.targetCount.toFloat())
+                sumSquares += computeSumSquares(gradient)
+            }
+        }
+
+        val totalNorm = if (clippedOnGpu) 0.0f else sqrt(sumSquares)
+        if (!clippedOnGpu && !totalNorm.isFinite()) {
             throw IllegalStateException("Accumulated gradient norm is not finite.")
         }
-        val clipFactor =
-            if (totalNorm > maxGradNorm) maxGradNorm / (totalNorm + 1e-6f) else 1.0f
+        val clipFactor = if (clippedOnGpu) {
+            1.0f
+        } else if (totalNorm > maxGradNorm) {
+            maxGradNorm / (totalNorm + 1e-6f)
+        } else {
+            1.0f
+        }
 
         adamStep++
         val learningRate = baseLearningRate / (1f + 0.0002f * adamStep)
@@ -3097,6 +3401,67 @@ class ArgusNeuralEngine private constructor(
         variance /= dim
         val invStd = 1.0f / sqrt(variance + 1e-5f)
         for (i in 0 until dim) vec[i] = (vec[i] - mean) * invStd
+    }
+
+    private fun layerNormBackwardBatch(
+        incomingGradients: Array<FloatArray>,
+        preLayerNormRows: Array<FloatArray>,
+        outputGradients: Array<FloatArray>,
+        rowCount: Int
+    ) {
+        require(rowCount in 1..incomingGradients.size &&
+            rowCount <= preLayerNormRows.size &&
+            rowCount <= outputGradients.size) {
+            "LayerNorm backward batch dimensions are invalid."
+        }
+        require(
+            (0 until rowCount).all { row ->
+                incomingGradients[row].size == dModel &&
+                    preLayerNormRows[row].size == dModel &&
+                    outputGradients[row].size == dModel
+            }
+        ) {
+            "LayerNorm backward tensors must match the active model width."
+        }
+
+        val flattenedIncoming = flattenRows(
+            Array(rowCount) { row -> incomingGradients[row] }
+        )
+        val flattenedInputs = flattenRows(
+            Array(rowCount) { row -> preLayerNormRows[row] }
+        )
+        val flattenedOutput = FloatArray(Math.multiplyExact(rowCount, dModel))
+        val appliedOnGpu = VulkanTrainingBackend.isResidentBackwardAvailable &&
+            VulkanTrainingBackend.tryRunResidentBackward(
+                operation = VulkanTrainingBackend.BACKWARD_LAYER_NORM,
+                rows = rowCount,
+                columns = dModel,
+                sequenceLength = 0,
+                inputs = arrayOf(flattenedIncoming, flattenedInputs, null),
+                outputs = arrayOf(flattenedOutput),
+                epsilon = 1.0e-5f
+            )
+
+        if (appliedOnGpu) {
+            for (row in 0 until rowCount) {
+                System.arraycopy(
+                    flattenedOutput,
+                    row * dModel,
+                    outputGradients[row],
+                    0,
+                    dModel
+                )
+            }
+        } else {
+            for (row in 0 until rowCount) {
+                layerNormBackward(
+                    incomingGradients[row],
+                    preLayerNormRows[row],
+                    outputGradients[row],
+                    dModel
+                )
+            }
+        }
     }
 
     private fun layerNormBackward(dY: FloatArray, xPreLN: FloatArray, dX: FloatArray, dim: Int) {

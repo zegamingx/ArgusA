@@ -45,6 +45,20 @@ internal class VulkanTensorAllocation internal constructor(
     val byteCount: Long
 )
 
+internal class VulkanResidentGradientAccumulator internal constructor(
+    internal var active: VulkanTensorAllocation,
+    internal var spare: VulkanTensorAllocation,
+    internal val staging: VulkanTensorAllocation,
+    val elementCount: Int,
+    internal val tensorSizes: IntArray
+) {
+    internal val pendingReleaseAllocations = ArrayList<VulkanTensorAllocation>()
+    internal var activeReleased: Boolean = false
+    internal var spareReleased: Boolean = false
+    internal var stagingReleased: Boolean = false
+    internal var released: Boolean = false
+}
+
 internal data class VulkanTensorArenaMetrics(
     val capacityBytes: Long = 0L,
     val allocatedBytes: Long = 0L,
@@ -452,6 +466,17 @@ internal object VulkanTrainingBackend {
     private const val MIN_GPU_UPDATE_ELEMENTS = 49_152L
     private const val MIN_LINEAR_OPERATION_COUNT = 262_144L
 
+    internal const val BACKWARD_CROSS_ENTROPY = 0
+    internal const val BACKWARD_SWIGLU = 1
+    internal const val BACKWARD_LAYER_NORM = 2
+    internal const val BACKWARD_CAUSAL_SOFTMAX = 3
+    internal const val BACKWARD_EMBEDDING_GRADIENT = 4
+    internal const val BACKWARD_GRADIENT_ACCUMULATE = 5
+    internal const val BACKWARD_GRADIENT_SCALE = 6
+    internal const val BACKWARD_GRADIENT_NORM_PARTIAL = 7
+    internal const val BACKWARD_GRADIENT_NORM_FINAL = 8
+    internal const val BACKWARD_GRADIENT_NORMALIZE_CLIP = 10
+
     @Volatile
     private var disabledAfterRuntimeFailure = false
 
@@ -517,6 +542,11 @@ internal object VulkanTrainingBackend {
     private var residentSwiGluReady = false
     @Volatile
     private var residentResidualLayerNormReady = false
+
+    @Volatile
+    private var residentBackwardReady = false
+    @Volatile
+    private var residentGradientAccumulatorReady = false
     private val activationTensorRegistry = VulkanActivationTensorRegistry(
         allocate = { byteCount -> allocateGpuTensor(byteCount) },
         upload = { allocation, bytes -> uploadGpuTensor(allocation, bytes) },
@@ -621,6 +651,12 @@ internal object VulkanTrainingBackend {
             residentSwiGluReady &&
             residentResidualLayerNormReady
 
+    internal val isResidentBackwardAvailable: Boolean
+        get() = isRuntimeAvailable && residentBackwardReady
+
+    internal val isResidentGradientAccumulatorAvailable: Boolean
+        get() = isResidentBackwardAvailable && residentGradientAccumulatorReady
+
     /**
      * Initialize Vulkan only after ArgusNeuralEngine has constructed or restored its tensors.
      * Driver verification is isolated from application cold-start; failure keeps Kotlin CPU active.
@@ -661,6 +697,18 @@ internal object VulkanTrainingBackend {
             residentActivationLinearReady = false
             residentAttentionReady = false
             residentSwiGluReady = false
+            residentResidualLayerNormReady = false
+            residentBackwardReady = false
+            residentGradientAccumulatorReady = false
+            disabledAfterRuntimeFailure = true
+            _currentBackend = "Kotlin CPU"
+            _runtimeStatus.value = "Kotlin CPU fallback — Vulkan runtime is no longer available"
+            publishInitializationProgress(
+                status = "Vulkan unavailable — CPU fallback",
+                driverInfo = _initializationProgress.value.driverInfo,
+                isInitializing = false,
+                isCpuFallback = true
+            )
             invalidateTensorResidency(releaseAllocations = false)
             _tensorArenaMetrics.value = VulkanTensorArenaMetrics()
         }
@@ -1506,6 +1554,8 @@ internal object VulkanTrainingBackend {
         residentAttentionReady = false
         residentSwiGluReady = false
         residentResidualLayerNormReady = false
+        residentBackwardReady = false
+        residentGradientAccumulatorReady = false
         initializationAttempted = true
         _deviceCapabilities.value = null
         _runtimeStatus.value = "Preparing Vulkan after model initialization…"
@@ -1560,6 +1610,7 @@ internal object VulkanTrainingBackend {
             val verified = initialized && runCatching {
                 verifyNativeKernels()
             }.getOrDefault(false)
+            nativeReady = verified
 
             residentAttentionReady = false
             residentSwiGluReady = false
@@ -1578,6 +1629,19 @@ internal object VulkanTrainingBackend {
                 verified && residentAttentionReady && runCatching {
                     verifyResidentResidualLayerNormKernel()
                 }.getOrDefault(false)
+
+            residentBackwardReady = verified && runCatching {
+                verifyResidentBackwardKernels()
+            }.getOrDefault(false)
+            residentGradientAccumulatorReady = verified && residentBackwardReady && runCatching {
+                verifyResidentGradientAccumulator()
+            }.getOrDefault(false)
+            if (verified && residentBackwardReady && !residentGradientAccumulatorReady) {
+                Log.w(
+                    TAG,
+                    "Resident gradient accumulation/norm/clipping self-check failed; the Kotlin accumulation fallback remains active."
+                )
+            }
             if (verified && residentAttentionReady && !residentResidualLayerNormReady) {
                 Log.w(
                     TAG,
@@ -1603,7 +1667,14 @@ internal object VulkanTrainingBackend {
                 )
             }
 
-            if (verified && runCatching { nativeSupportsFp16() }.getOrDefault(false)) {
+            if (verified && !residentBackwardReady) {
+                Log.w(
+                    TAG,
+                    "Resident backward numerical self-check failed; the verified Kotlin backward path remains active."
+                )
+            }
+
+            if (nativeReady && runCatching { nativeSupportsFp16() }.getOrDefault(false)) {
                 publishInitializationProgress(
                     status = "Verifying FP16 acceleration",
                     driverInfo = detectedDriverInfo,
@@ -1620,12 +1691,15 @@ internal object VulkanTrainingBackend {
                 }
             }
 
-            if (!verified) {
+            // Optional kernel checks can tear down the native device when a temporary
+            // allocation cannot be released. Never republish a destroyed runtime.
+            val runtimeIntact = verified && nativeReady
+            if (!runtimeIntact) {
                 releaseNativeRuntimeAfterFailure(nativeLibraryLoaded)
             }
 
-            nativeReady = verified
-            if (verified) {
+            nativeReady = runtimeIntact
+            if (runtimeIntact) {
                 refreshGpuPerformanceMetrics()
                 _currentBackend = "Kotlin CPU"
                 _runtimeStatus.value = when {
@@ -1660,7 +1734,7 @@ internal object VulkanTrainingBackend {
                 )
                 Log.w(TAG, "Vulkan is unavailable or failed verification; Kotlin CPU remains active.")
             }
-            verified
+            runtimeIntact
         } catch (error: LinkageError) {
             releaseNativeRuntimeAfterFailure(nativeLibraryLoaded)
             disabledAfterRuntimeFailure = true
@@ -2652,6 +2726,803 @@ internal object VulkanTrainingBackend {
         return FloatArray(bytes.size / Float.SIZE_BYTES) {
             buffer.float
         }
+    }
+
+    /**
+     * Dispatches one verified FP32 backward kernel. Every input and output gets an
+     * isolated arena allocation; caller-owned arrays are committed only after all
+     * readbacks are finite and every temporary allocation has been released.
+     */
+    @Synchronized
+    internal fun tryRunResidentBackward(
+        operation: Int,
+        rows: Int,
+        columns: Int,
+        sequenceLength: Int,
+        inputs: Array<FloatArray?>,
+        outputs: Array<FloatArray>,
+        scale: Float = 1.0f,
+        epsilon: Float = 1.0e-5f
+    ): Boolean {
+        if (!isRuntimeAvailable ||
+            inputs.size != 3 ||
+            outputs.isEmpty() ||
+            outputs.size > 2 ||
+            rows <= 0 ||
+            columns <= 0 ||
+            !scale.isFinite() ||
+            !epsilon.isFinite() ||
+            epsilon <= 0.0f ||
+            inputs[0] == null) {
+            return false
+        }
+
+        val temporary = ArrayList<VulkanTensorAllocation>(inputs.count { it != null } + outputs.size)
+        val outputBytes = ArrayList<ByteArray>(outputs.size)
+        var dispatched = false
+        var cleanupSucceeded = true
+        val stagedOutputs = arrayOfNulls<FloatArray>(outputs.size)
+
+        try {
+            var requiredBytes = 0L
+            for (input in inputs) {
+                if (input != null) {
+                    requiredBytes = Math.addExact(
+                        requiredBytes,
+                        Math.multiplyExact(input.size.toLong(), Float.SIZE_BYTES.toLong())
+                    )
+                }
+            }
+            for (output in outputs) {
+                requiredBytes = Math.addExact(
+                    requiredBytes,
+                    Math.multiplyExact(output.size.toLong(), Float.SIZE_BYTES.toLong())
+                )
+            }
+            val budget = _activationTensorResidencyBudgetBytes.value
+            if (budget > 0L && requiredBytes > budget) return false
+
+            val inputAllocations = arrayOfNulls<VulkanTensorAllocation>(3)
+            for (index in inputs.indices) {
+                val values = inputs[index] ?: continue
+                if (values.isEmpty()) return false
+                val bytes = encodeFloatArray(values)
+                val allocation = allocateGpuTensor(bytes.size.toLong()) ?: return false
+                temporary.add(allocation)
+                if (!uploadGpuTensor(allocation, bytes)) return false
+                inputAllocations[index] = allocation
+            }
+
+            val outputAllocations = ArrayList<VulkanTensorAllocation>(outputs.size)
+            for (output in outputs) {
+                if (output.isEmpty()) return false
+                val byteCount = Math.multiplyExact(output.size, Float.SIZE_BYTES)
+                val allocation = allocateGpuTensor(byteCount.toLong()) ?: return false
+                temporary.add(allocation)
+                outputAllocations.add(allocation)
+                outputBytes.add(ByteArray(byteCount))
+            }
+
+            val input0 = inputAllocations[0] ?: return false
+            dispatched = nativeRunResidentBackward(
+                operation = operation,
+                input0Handle = input0.nativeHandle,
+                input1Handle = inputAllocations[1]?.nativeHandle ?: 0L,
+                input2Handle = inputAllocations[2]?.nativeHandle ?: 0L,
+                output0Handle = outputAllocations[0].nativeHandle,
+                output1Handle = outputAllocations.getOrNull(1)?.nativeHandle ?: 0L,
+                rows = rows,
+                columns = columns,
+                sequenceLength = sequenceLength,
+                scale = scale,
+                epsilon = epsilon
+            )
+            if (!dispatched) return false
+
+            for (index in outputAllocations.indices) {
+                if (!downloadGpuTensor(outputAllocations[index], outputBytes[index])) {
+                    return false
+                }
+                val values = decodeFloatArray(outputBytes[index])
+                if (values.any { !it.isFinite() } || values.size != outputs[index].size) {
+                    Log.w(TAG, "Resident backward kernel returned invalid FP32 output.")
+                    return false
+                }
+                stagedOutputs[index] = values
+            }
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident backward JNI entry point is unavailable.", error)
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident backward dispatch failed validation or execution.", error)
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident backward workspace exceeded the available activation budget.", error)
+        } finally {
+            for (allocation in temporary.asReversed()) {
+                if (!runCatching { releaseGpuTensor(allocation) }.getOrDefault(false)) {
+                    cleanupSucceeded = false
+                }
+            }
+        }
+
+        if (!cleanupSucceeded) {
+            Log.w(TAG, "Resident backward dispatch could not release every temporary tensor.")
+            runCatching { destroyNativeRuntime() }
+                .onFailure { error ->
+                    Log.e(TAG, "Failed to tear down Vulkan after a backward workspace leak.", error)
+                }
+            return false
+        }
+        if (!dispatched) return false
+
+        for (index in outputs.indices) {
+            val result = stagedOutputs[index] ?: return false
+            System.arraycopy(result, 0, outputs[index], 0, result.size)
+        }
+        refreshGpuPerformanceMetrics()
+        _currentBackend = "Vulkan Compute (resident backward)"
+        return true
+    }
+
+    @Synchronized
+    internal fun createResidentGradientAccumulator(
+        gradientTensors: Array<FloatArray>
+    ): VulkanResidentGradientAccumulator? {
+        if (!isResidentBackwardAvailable || gradientTensors.isEmpty() ||
+            gradientTensors.any { it.isEmpty() }) {
+            return null
+        }
+
+        var active: VulkanTensorAllocation? = null
+        var spare: VulkanTensorAllocation? = null
+        var staging: VulkanTensorAllocation? = null
+        var committed = false
+        try {
+            val elementCount = gradientTensors.fold(0L) { total, tensor ->
+                Math.addExact(total, tensor.size.toLong())
+            }
+            if (elementCount <= 0L || elementCount > Int.MAX_VALUE.toLong()) return null
+            val byteCount = Math.multiplyExact(elementCount, Float.SIZE_BYTES.toLong())
+            if (byteCount > Int.MAX_VALUE.toLong()) return null
+
+            val budget = _activationTensorResidencyBudgetBytes.value
+            if (budget > 0L && byteCount > budget / 3L) return null
+
+            val activeAllocation = allocateGpuTensor(byteCount) ?: return null
+            active = activeAllocation
+            val spareAllocation = allocateGpuTensor(byteCount) ?: return null
+            spare = spareAllocation
+            val stagingAllocation = allocateGpuTensor(byteCount) ?: return null
+            staging = stagingAllocation
+
+            val zeros = ByteArray(byteCount.toInt())
+            if (!uploadGpuTensor(activeAllocation, zeros) ||
+                !uploadGpuTensor(spareAllocation, zeros)) {
+                return null
+            }
+
+            val accumulator = VulkanResidentGradientAccumulator(
+                active = activeAllocation,
+                spare = spareAllocation,
+                staging = stagingAllocation,
+                elementCount = elementCount.toInt(),
+                tensorSizes = IntArray(gradientTensors.size) { index ->
+                    gradientTensors[index].size
+                }
+            )
+            committed = true
+            return accumulator
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident gradient accumulator exceeded the available memory budget.", error)
+            return null
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident gradient accumulator allocation failed.", error)
+            return null
+        } finally {
+            if (!committed) {
+                var cleanupSucceeded = true
+                val stagingToRelease = staging
+                if (stagingToRelease != null && !releaseGpuTensor(stagingToRelease)) {
+                    cleanupSucceeded = false
+                }
+                val spareToRelease = spare
+                if (spareToRelease != null && !releaseGpuTensor(spareToRelease)) {
+                    cleanupSucceeded = false
+                }
+                val activeToRelease = active
+                if (activeToRelease != null && !releaseGpuTensor(activeToRelease)) {
+                    cleanupSucceeded = false
+                }
+                if (!cleanupSucceeded && isRuntimeAvailable) {
+                    Log.e(TAG, "Partial gradient accumulator cleanup failed; disabling the optional Vulkan runtime.")
+                    runCatching { destroyNativeRuntime() }
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    internal fun accumulateResidentGradients(
+        accumulator: VulkanResidentGradientAccumulator,
+        gradientTensors: Array<FloatArray>,
+        targetWeight: Int
+    ): Boolean {
+        if (!isResidentBackwardAvailable ||
+            accumulator.released ||
+            targetWeight <= 0) {
+            return false
+        }
+        val flattened = flattenGradientTensors(gradientTensors, accumulator.tensorSizes) ?: return false
+        if (flattened.size != accumulator.elementCount) return false
+
+        return try {
+            val inputBytes = encodeFloatArray(flattened)
+            if (!uploadGpuTensor(accumulator.staging, inputBytes)) return false
+            val updated = nativeRunResidentBackward(
+                operation = BACKWARD_GRADIENT_ACCUMULATE,
+                input0Handle = accumulator.staging.nativeHandle,
+                input1Handle = accumulator.active.nativeHandle,
+                input2Handle = 0L,
+                output0Handle = accumulator.spare.nativeHandle,
+                output1Handle = 0L,
+                rows = accumulator.elementCount,
+                columns = 1,
+                sequenceLength = 0,
+                scale = targetWeight.toFloat(),
+                epsilon = 1.0e-5f
+            )
+            if (!updated) return false
+            val previous = accumulator.active
+            accumulator.active = accumulator.spare
+            accumulator.spare = previous
+            refreshGpuPerformanceMetrics()
+            true
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident gradient-accumulation JNI entry point is unavailable.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident gradient accumulation failed.", error)
+            false
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident gradient accumulation exceeded available memory.", error)
+            false
+        }
+    }
+
+    @Synchronized
+    internal fun downloadResidentGradientAccumulator(
+        accumulator: VulkanResidentGradientAccumulator,
+        destinationTensors: Array<FloatArray>
+    ): Boolean {
+        if (accumulator.released) return false
+        return try {
+            val bytes = ByteArray(Math.multiplyExact(accumulator.elementCount, Float.SIZE_BYTES))
+            if (!downloadGpuTensor(accumulator.active, bytes)) return false
+            val values = decodeFloatArray(bytes)
+            if (values.any { !it.isFinite() }) return false
+            if (!hasGradientTensorShapes(destinationTensors, accumulator.tensorSizes)) return false
+            if (!releaseResidentGradientAccumulator(accumulator)) return false
+            copyGradientTensors(values, destinationTensors, accumulator.tensorSizes)
+            true
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident gradient accumulator recovery failed.", error)
+            false
+        }
+    }
+
+    @Synchronized
+    internal fun discardResidentGradientAccumulator(
+        accumulator: VulkanResidentGradientAccumulator
+    ) {
+        if (!releaseResidentGradientAccumulator(accumulator) && isRuntimeAvailable) {
+            Log.w(TAG, "Resident gradient accumulator cleanup failed; disabling the optional Vulkan runtime.")
+            runCatching { destroyNativeRuntime() }
+                .onFailure { error ->
+                    Log.e(TAG, "Vulkan teardown after accumulator cleanup failure failed.", error)
+                }
+            accumulator.activeReleased = true
+            accumulator.spareReleased = true
+            accumulator.stagingReleased = true
+            accumulator.pendingReleaseAllocations.clear()
+            accumulator.released = true
+        }
+    }
+
+    @Synchronized
+    internal fun finalizeResidentGradientAccumulator(
+        accumulator: VulkanResidentGradientAccumulator,
+        destinationTensors: Array<FloatArray>,
+        targetCount: Int,
+        maximumGradientNorm: Float
+    ): Boolean {
+        if (!isResidentBackwardAvailable ||
+            accumulator.released ||
+            targetCount <= 0 ||
+            !maximumGradientNorm.isFinite() ||
+            maximumGradientNorm <= 0.0f ||
+            !hasGradientTensorShapes(destinationTensors, accumulator.tensorSizes)) {
+            return false
+        }
+
+        var partial: VulkanTensorAllocation? = null
+        var norm: VulkanTensorAllocation? = null
+        var stagedResult: FloatArray? = null
+        var completed = false
+        var cleanupSucceeded = true
+        try {
+            val partialCount = 1 + (accumulator.elementCount - 1) / 4096
+            val partialAllocation = allocateGpuTensor(
+                Math.multiplyExact(partialCount, Float.SIZE_BYTES).toLong()
+            ) ?: return false
+            partial = partialAllocation
+            val normAllocation = allocateGpuTensor(Float.SIZE_BYTES.toLong()) ?: return false
+            norm = normAllocation
+
+            if (!nativeRunResidentBackward(
+                    operation = BACKWARD_GRADIENT_NORM_PARTIAL,
+                    input0Handle = accumulator.active.nativeHandle,
+                    input1Handle = 0L,
+                    input2Handle = 0L,
+                    output0Handle = partialAllocation.nativeHandle,
+                    output1Handle = 0L,
+                    rows = accumulator.elementCount,
+                    columns = 1,
+                    sequenceLength = 0,
+                    scale = 1.0f,
+                    epsilon = 1.0e-5f
+                )) {
+                return false
+            }
+            if (!nativeRunResidentBackward(
+                    operation = BACKWARD_GRADIENT_NORM_FINAL,
+                    input0Handle = partialAllocation.nativeHandle,
+                    input1Handle = 0L,
+                    input2Handle = 0L,
+                    output0Handle = normAllocation.nativeHandle,
+                    output1Handle = 0L,
+                    rows = partialCount,
+                    columns = 1,
+                    sequenceLength = 0,
+                    scale = 1.0f,
+                    epsilon = 1.0e-5f
+                )) {
+                return false
+            }
+
+            // The final shader reads the GPU-reduced squared norm and computes
+            // global clipping without transferring norm state to Kotlin.
+            if (!nativeRunResidentBackward(
+                    operation = BACKWARD_GRADIENT_NORMALIZE_CLIP,
+                    input0Handle = accumulator.active.nativeHandle,
+                    input1Handle = normAllocation.nativeHandle,
+                    input2Handle = 0L,
+                    output0Handle = accumulator.spare.nativeHandle,
+                    output1Handle = 0L,
+                    rows = accumulator.elementCount,
+                    columns = 1,
+                    sequenceLength = 0,
+                    scale = 1.0f / targetCount.toFloat(),
+                    epsilon = maximumGradientNorm
+                )) {
+                return false
+            }
+
+            val resultBytes = ByteArray(Math.multiplyExact(accumulator.elementCount, Float.SIZE_BYTES))
+            if (!downloadGpuTensor(accumulator.spare, resultBytes)) return false
+            val result = decodeFloatArray(resultBytes)
+            if (result.any { !it.isFinite() }) return false
+            stagedResult = result
+            completed = true
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident gradient finalization JNI entry point is unavailable.", error)
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident gradient finalization failed.", error)
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident gradient finalization exceeded available memory.", error)
+        } finally {
+            val partialToRelease = partial
+            if (partialToRelease != null &&
+                !runCatching { releaseGpuTensor(partialToRelease) }.getOrDefault(false)) {
+                accumulator.pendingReleaseAllocations.add(partialToRelease)
+                cleanupSucceeded = false
+            }
+            val normToRelease = norm
+            if (normToRelease != null &&
+                !runCatching { releaseGpuTensor(normToRelease) }.getOrDefault(false)) {
+                accumulator.pendingReleaseAllocations.add(normToRelease)
+                cleanupSucceeded = false
+            }
+            if (completed && cleanupSucceeded &&
+                !releaseResidentGradientAccumulator(accumulator)) {
+                cleanupSucceeded = false
+            }
+        }
+        if (!completed || !cleanupSucceeded) return false
+        val result = stagedResult ?: return false
+        copyGradientTensors(result, destinationTensors, accumulator.tensorSizes)
+        return true
+    }
+
+    private fun flattenGradientTensors(
+        tensors: Array<FloatArray>,
+        expectedSizes: IntArray
+    ): FloatArray? {
+        if (tensors.size != expectedSizes.size) return null
+        val elementCount = expectedSizes.fold(0L) { total, size ->
+            if (size <= 0) return null
+            Math.addExact(total, size.toLong())
+        }
+        if (elementCount > Int.MAX_VALUE.toLong()) return null
+        return try {
+            FloatArray(elementCount.toInt()).also { result ->
+                var offset = 0
+                for (index in tensors.indices) {
+                    val tensor = tensors[index]
+                    val expectedSize = expectedSizes[index]
+                    if (tensor.isEmpty() || tensor.size > expectedSize ||
+                        tensor.any { !it.isFinite() }) {
+                        return null
+                    }
+                    // A growing vocabulary may leave the active output-head gradient
+                    // shorter than its persistent optimizer capacity. Pad the unused suffix.
+                    System.arraycopy(tensor, 0, result, offset, tensor.size)
+                    offset += expectedSize
+                }
+            }
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Could not flatten gradient tensors for Vulkan accumulation.", error)
+            null
+        }
+    }
+
+    private fun hasGradientTensorShapes(
+        tensors: Array<FloatArray>,
+        expectedSizes: IntArray
+    ): Boolean =
+        tensors.size == expectedSizes.size &&
+            tensors.indices.all { index -> tensors[index].size == expectedSizes[index] }
+
+    private fun copyGradientTensors(
+         values: FloatArray,
+        destinations: Array<FloatArray>,
+        expectedSizes: IntArray
+    ) {
+        require(destinations.size == expectedSizes.size) {
+            "Gradient destination tensor count does not match the resident accumulator."
+        }
+        val expectedCount = expectedSizes.fold(0L) { total, size ->
+            Math.addExact(total, size.toLong())
+        }
+        require(expectedCount == values.size.toLong()) {
+            "Gradient destination element count does not match the resident accumulator."
+        }
+        var offset = 0
+        for (index in destinations.indices) {
+            val destination = destinations[index]
+            require(destination.size == expectedSizes[index]) {
+                "Gradient destination shape does not match the resident accumulator at index $index."
+            }
+            System.arraycopy(values, offset, destination, 0, destination.size)
+            offset += destination.size
+        }
+    }
+
+    private fun releaseResidentGradientAccumulator(
+        accumulator: VulkanResidentGradientAccumulator
+    ): Boolean {
+        if (accumulator.released) return true
+
+        while (accumulator.pendingReleaseAllocations.isNotEmpty()) {
+            val pending = accumulator.pendingReleaseAllocations.first()
+            if (!releaseGpuTensor(pending)) return false
+            accumulator.pendingReleaseAllocations.removeAt(0)
+        }
+
+        if (!accumulator.stagingReleased) {
+            accumulator.stagingReleased = releaseGpuTensor(accumulator.staging)
+            if (!accumulator.stagingReleased) return false
+        }
+        if (!accumulator.spareReleased) {
+            accumulator.spareReleased = releaseGpuTensor(accumulator.spare)
+            if (!accumulator.spareReleased) return false
+        }
+        if (!accumulator.activeReleased) {
+            accumulator.activeReleased = releaseGpuTensor(accumulator.active)
+            if (!accumulator.activeReleased) return false
+        }
+
+        accumulator.released = true
+        return true
+    }
+
+    private fun verifyResidentBackwardKernels(): Boolean {
+        val rows = 5
+        val vocabulary = 19
+        val logits = FloatArray(rows * vocabulary) { index ->
+            (((index * 13) % 37) - 18) * 0.03125f
+        }
+        val targets = floatArrayOf(2f, 7f, 3f, 16f, 0f)
+        val gradients = FloatArray(logits.size)
+        val rowStatistics = FloatArray(rows * 2)
+        if (!tryRunResidentBackward(
+                operation = BACKWARD_CROSS_ENTROPY,
+                rows = rows,
+                columns = vocabulary,
+                sequenceLength = 1,
+                inputs = arrayOf(logits, targets, null),
+                outputs = arrayOf(gradients, rowStatistics)
+            )) {
+            return false
+        }
+
+        val expectedGradients = FloatArray(logits.size)
+        val expectedStatistics = FloatArray(rows * 2)
+        for (row in 1 until rows - 1) {
+            var maximum = -Float.MAX_VALUE
+            for (column in 0 until vocabulary) {
+                maximum = maxOf(maximum, logits[row * vocabulary + column])
+            }
+            var sum = 0.0
+            for (column in 0 until vocabulary) {
+                sum += kotlin.math.exp((logits[row * vocabulary + column] - maximum).toDouble())
+            }
+            val logSumExp = maximum + kotlin.math.ln(sum).toFloat()
+            expectedStatistics[row * 2] =
+                logSumExp - logits[row * vocabulary + targets[row].toInt()]
+            expectedStatistics[row * 2 + 1] = 1.0f
+            for (column in 0 until vocabulary) {
+                val probability = kotlin.math.exp(
+                    (logits[row * vocabulary + column] - maximum).toDouble()
+                ).toFloat() / sum.toFloat()
+                expectedGradients[row * vocabulary + column] =
+                    probability - if (column == targets[row].toInt()) 1.0f else 0.0f
+            }
+        }
+        if (!approximatelyEqual(gradients, expectedGradients, 2.0e-4f) ||
+            !approximatelyEqual(rowStatistics, expectedStatistics, 2.0e-4f)) {
+            return false
+        }
+
+        val activationRows = 3
+        val activationColumns = 73
+        val count = activationRows * activationColumns
+        val gate = FloatArray(count) { index -> (((index * 7) % 31) - 15) * 0.125f }
+        val up = FloatArray(count) { index -> (((index * 5) % 29) - 14) * 0.0625f }
+        val activationGradient = FloatArray(count) { index -> (((index * 3) % 19) - 9) * 0.125f }
+        val gateGradient = FloatArray(count)
+        val upGradient = FloatArray(count)
+        if (!tryRunResidentBackward(
+                operation = BACKWARD_SWIGLU,
+                rows = activationRows,
+                columns = activationColumns,
+                sequenceLength = 0,
+                inputs = arrayOf(gate, up, activationGradient),
+                outputs = arrayOf(gateGradient, upGradient)
+            )) {
+            return false
+        }
+        val expectedGateGradient = FloatArray(count)
+        val expectedUpGradient = FloatArray(count)
+        for (index in 0 until count) {
+            val sigmoid = 1.0f / (1.0f + kotlin.math.exp(-gate[index]))
+            val swish = gate[index] * sigmoid
+            expectedGateGradient[index] = activationGradient[index] * up[index] *
+                sigmoid * (1.0f + gate[index] * (1.0f - sigmoid))
+            expectedUpGradient[index] = activationGradient[index] * swish
+        }
+        if (!approximatelyEqual(gateGradient, expectedGateGradient, 2.0e-4f) ||
+            !approximatelyEqual(upGradient, expectedUpGradient, 2.0e-4f)) {
+            return false
+        }
+
+        val normRows = 4
+        val normColumns = 73
+        val normCount = normRows * normColumns
+        val normInputs = FloatArray(normCount) { index -> (((index * 11) % 47) - 23) * 0.0625f }
+        val normIncoming = FloatArray(normCount) { index -> (((index * 5) % 31) - 15) * 0.125f }
+        val normOutput = FloatArray(normCount)
+        if (!tryRunResidentBackward(
+                operation = BACKWARD_LAYER_NORM,
+                rows = normRows,
+                columns = normColumns,
+                sequenceLength = 0,
+                inputs = arrayOf(normIncoming, normInputs, null),
+                outputs = arrayOf(normOutput)
+            )) {
+            return false
+        }
+        val expectedNormOutput = FloatArray(normCount)
+        for (row in 0 until normRows) {
+            var mean = 0.0
+            for (column in 0 until normColumns) {
+                mean += normInputs[row * normColumns + column]
+            }
+            mean /= normColumns
+            var variance = 0.0
+            for (column in 0 until normColumns) {
+                val difference = normInputs[row * normColumns + column] - mean
+                variance += difference * difference
+            }
+            variance /= normColumns
+            val inverse = 1.0 / kotlin.math.sqrt(variance + 1.0e-5)
+            var sumGradient = 0.0
+            var sumNormalizedGradient = 0.0
+            for (column in 0 until normColumns) {
+                val normalized = (normInputs[row * normColumns + column] - mean) * inverse
+                val incoming = normIncoming[row * normColumns + column]
+                sumGradient += incoming
+                sumNormalizedGradient += incoming * normalized
+            }
+            for (column in 0 until normColumns) {
+                val index = row * normColumns + column
+                val normalized = (normInputs[index] - mean) * inverse
+                expectedNormOutput[index] = (inverse * (
+                    normIncoming[index] - sumGradient / normColumns -
+                        normalized * sumNormalizedGradient / normColumns
+                    )).toFloat()
+            }
+        }
+        if (!approximatelyEqual(normOutput, expectedNormOutput, 3.0e-4f)) return false
+
+        val sequenceLength = 5
+        val headCount = 2
+        val softmaxRows = headCount * (sequenceLength - 1)
+        val probabilities = FloatArray(softmaxRows * sequenceLength)
+        val probabilityGradients = FloatArray(probabilities.size)
+        for (row in 0 until softmaxRows) {
+            val query = row % (sequenceLength - 1)
+            var normalizer = 0.0f
+            for (key in 0..query) {
+                val value = ((row * 5 + key * 3) % 13 + 1).toFloat()
+                probabilities[row * sequenceLength + key] = value
+                normalizer += value
+            }
+            for (key in 0..query) {
+                val index = row * sequenceLength + key
+                probabilities[index] /= normalizer
+            }
+            for (key in 0 until sequenceLength) {
+                probabilityGradients[row * sequenceLength + key] =
+                    (((row * 7 + key * 11) % 17) - 8) * 0.0625f
+            }
+        }
+        val scoreGradients = FloatArray(probabilities.size)
+        val attentionScale = 0.5f
+        if (!tryRunResidentBackward(
+                operation = BACKWARD_CAUSAL_SOFTMAX,
+                rows = softmaxRows,
+                columns = sequenceLength,
+                sequenceLength = sequenceLength,
+                inputs = arrayOf(probabilities, probabilityGradients, null),
+                outputs = arrayOf(scoreGradients),
+                scale = attentionScale
+            )) {
+            return false
+        }
+        val expectedScoreGradients = FloatArray(probabilities.size)
+        for (row in 0 until softmaxRows) {
+            val query = row % (sequenceLength - 1)
+            var weighted = 0.0f
+            for (key in 0..query) {
+                val index = row * sequenceLength + key
+                weighted += probabilities[index] * probabilityGradients[index]
+            }
+            for (key in 0..query) {
+                val index = row * sequenceLength + key
+                expectedScoreGradients[index] =
+                    probabilities[index] * (probabilityGradients[index] - weighted) * attentionScale
+            }
+        }
+        if (!approximatelyEqual(scoreGradients, expectedScoreGradients, 3.0e-4f)) return false
+
+        val vocabularySize = 17
+        val modelWidth = 13
+        val tokenIds = floatArrayOf(3f, 3f, 11f, 1f, 3f)
+        val embeddingInput = FloatArray(tokenIds.size * modelWidth) { index ->
+            (((index * 7) % 23) - 11) * 0.03125f
+        }
+        val embeddingGradient = FloatArray(vocabularySize * modelWidth)
+        if (!tryRunResidentBackward(
+                operation = BACKWARD_EMBEDDING_GRADIENT,
+                rows = vocabularySize,
+                columns = modelWidth,
+                sequenceLength = tokenIds.size,
+                inputs = arrayOf(tokenIds, embeddingInput, null),
+                outputs = arrayOf(embeddingGradient),
+                scale = 1.75f
+            )) {
+            return false
+        }
+        val expectedEmbeddingGradient = FloatArray(embeddingGradient.size)
+        for (tokenIndex in tokenIds.indices) {
+            val token = tokenIds[tokenIndex].toInt()
+            for (dimension in 0 until modelWidth) {
+                expectedEmbeddingGradient[token * modelWidth + dimension] +=
+                    embeddingInput[tokenIndex * modelWidth + dimension] * 1.75f
+            }
+        }
+        return approximatelyEqual(embeddingGradient, expectedEmbeddingGradient, 3.0e-4f)
+    }
+
+    private fun verifyResidentGradientAccumulator(): Boolean {
+        val capacityA = 4_100
+        val capacityB = 103
+        val firstA = FloatArray(4_096) { index ->
+            (((index * 17) % 29) - 14) * 0.0078125f
+        }
+        val firstB = FloatArray(101) { index ->
+            (((index * 11) % 19) - 9) * 0.015625f
+        }
+        val secondA = FloatArray(capacityA) { index ->
+            (((index * 7) % 23) - 11) * 0.00390625f
+        }
+        val secondB = FloatArray(capacityB) { index ->
+            (((index * 5) % 17) - 8) * 0.0078125f
+        }
+        val shapes = arrayOf(FloatArray(capacityA), FloatArray(capacityB))
+        val accumulator = createResidentGradientAccumulator(shapes) ?: return false
+
+        var verified = false
+        var cleanupSucceeded = false
+        try {
+            val output = Array(shapes.size) { index -> FloatArray(shapes[index].size) }
+            val operationsSucceeded =
+                accumulateResidentGradients(accumulator, arrayOf(firstA, firstB), 2) &&
+                    accumulateResidentGradients(accumulator, arrayOf(secondA, secondB), 1) &&
+                    finalizeResidentGradientAccumulator(
+                        accumulator,
+                        output,
+                        targetCount = 3,
+                        maximumGradientNorm = 0.5f
+                    )
+
+            if (operationsSucceeded) {
+                var squaredNorm = 0.0
+                val expected = arrayOf(
+                    FloatArray(capacityA),
+                    FloatArray(capacityB)
+                )
+                for (index in 0 until capacityA) {
+                    val first = if (index < firstA.size) firstA[index] else 0.0f
+                    val mean = (first * 2.0f + secondA[index]) / 3.0f
+                    expected[0][index] = mean
+                    squaredNorm += mean.toDouble() * mean.toDouble()
+                }
+                for (index in 0 until capacityB) {
+                    val first = if (index < firstB.size) firstB[index] else 0.0f
+                    val mean = (first * 2.0f + secondB[index]) / 3.0f
+                    expected[1][index] = mean
+                    squaredNorm += mean.toDouble() * mean.toDouble()
+                }
+
+                val norm = kotlin.math.sqrt(squaredNorm)
+                val clipFactor = if (norm > 0.5) 0.5 / (norm + 1.0e-6) else 1.0
+                for (tensorIndex in expected.indices) {
+                    for (elementIndex in expected[tensorIndex].indices) {
+                        expected[tensorIndex][elementIndex] =
+                            (expected[tensorIndex][elementIndex] * clipFactor).toFloat()
+                    }
+                }
+                verified = approximatelyEqual(output[0], expected[0], 4.0e-4f) &&
+                    approximatelyEqual(output[1], expected[1], 4.0e-4f)
+            }
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident gradient accumulator self-check JNI entry point is unavailable.", error)
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident gradient accumulator numerical self-check failed.", error)
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident gradient accumulator self-check exceeded available memory.", error)
+        } finally {
+            cleanupSucceeded = accumulator.released ||
+                releaseResidentGradientAccumulator(accumulator)
+            if (!cleanupSucceeded && isRuntimeAvailable) {
+                Log.e(TAG, "Resident gradient accumulator self-check could not release all Vulkan buffers.")
+                runCatching { destroyNativeRuntime() }
+                    .onFailure { error ->
+                        Log.e(TAG, "Vulkan teardown after gradient self-check cleanup failure failed.", error)
+                    }
+            }
+        }
+        return verified && cleanupSucceeded
     }
 
     /**
@@ -3893,6 +4764,20 @@ internal object VulkanTrainingBackend {
         outputHandle: Long,
         rows: Int,
         columns: Int
+    ): Boolean
+
+    private external fun nativeRunResidentBackward(
+        operation: Int,
+        input0Handle: Long,
+        input1Handle: Long,
+        input2Handle: Long,
+        output0Handle: Long,
+        output1Handle: Long,
+        rows: Int,
+        columns: Int,
+        sequenceLength: Int,
+        scale: Float,
+        epsilon: Float
     ): Boolean
 
     private external fun nativeRunResidentResidualLayerNorm(

@@ -147,6 +147,14 @@ argus_compile_shader(
     "kArgusResidentSwiGluShaderSpvSize"
 )
 
+argus_compile_shader(
+    "${CMAKE_CURRENT_SOURCE_DIR}/backward_resident.comp"
+    "backward_resident.comp.spv"
+    "backward_resident_shader_spv.h"
+    "kArgusResidentBackwardShaderSpv"
+    "kArgusResidentBackwardShaderSpvSize"
+)
+
 get_property(
     ARGUS_SHADER_HEADERS
     GLOBAL
