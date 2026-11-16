@@ -1125,11 +1125,14 @@ internal object VulkanTrainingBackend {
                     refreshTensorArenaMetrics()
                     return true
                 }
-                residencySuspended = false
-                _modelTensorResidencyReady.value = wasResidencyReady
+                residencySuspended = true
+                residencyBlockedAfterFailure = true
+                residencyRebuildPending = false
+                runtimeRestartPending = true
+                _modelTensorResidencyReady.value = false
                 Log.e(
                     TAG,
-                    "Memory-pressure release was postponed because the disabled Vulkan arena could not be safely cleared or destroyed."
+                    "Memory-pressure release was postponed; recovered host state is safe, but Vulkan teardown must be retried before residency resumes."
                 )
                 return false
             }
