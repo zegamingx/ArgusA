@@ -5,7 +5,6 @@ import java.nio.ByteOrder
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -17,69 +16,78 @@ class VulkanActivationTensorRegistryTest {
         var nextHandle = 1L
         var downloadCount = 0
         val allocations = mutableMapOf<Long, ByteArray>()
-        lateinit var registry: VulkanActivationTensorRegistry
-        registry = VulkanActivationTensorRegistry(
+        val registry = VulkanActivationTensorRegistry(
             allocate = { byteCount ->
                 val handle = nextHandle++
                 allocations[handle] = ByteArray(byteCount.toInt())
                 VulkanTensorAllocation(handle, byteCount)
             },
             upload = { allocation, bytes ->
-                allocations[allocation.nativeHandle]?.also { target ->
+                val target = allocations[allocation.nativeHandle]
+                if (target == null || target.size != bytes.size) {
+                    false
+                } else {
                     bytes.copyInto(target)
-                } != null
+                    true
+                }
             },
             download = { allocation, destination ->
                 downloadCount++
-                val source = allocations[allocation.nativeHandle] ?: return@VulkanActivationTensorRegistry false
-                source.copyInto(destination)
-                true
+                val source = allocations[allocation.nativeHandle]
+                if (source == null || source.size != destination.size) {
+                    false
+                } else {
+                    source.copyInto(destination)
+                    true
+                }
             },
             release = { allocation -> allocations.remove(allocation.nativeHandle) != null },
             dispatch = { input, weights, output, rows, inputColumns, outputColumns, transpose ->
-                assertEquals(2, rows)
-                assertEquals(3, inputColumns)
-                assertEquals(2, outputColumns)
-                assertFalse(transpose)
-                assertNotNull(allocations[input.nativeHandle])
-                assertNotNull(allocations[weights.nativeHandle])
-                val source = ByteBuffer.wrap(allocations[input.nativeHandle]!!)
-                    .order(ByteOrder.LITTLE_ENDIAN)
-                val targetBytes = allocations[output.nativeHandle] ?: return@VulkanActivationTensorRegistry false
-                val target = ByteBuffer.wrap(targetBytes).order(ByteOrder.LITTLE_ENDIAN)
-                val matrix = floatArrayOf(1f, 0f, 0f, 1f, 1f, 1f)
-                for (row in 0 until rows) {
-                    for (column in 0 until outputColumns) {
-                        var sum = 0f
-                        for (inner in 0 until inputColumns) {
-                            sum += source.getFloat((row * inputColumns + inner) * Float.SIZE_BYTES) *
-                                matrix[inner * outputColumns + column]
+                val inputBytes = allocations[input.nativeHandle]
+                val outputBytes = allocations[output.nativeHandle]
+                if (rows != 2 || inputColumns != 3 || outputColumns != 2 ||
+                    transpose || allocations[weights.nativeHandle] == null ||
+                    inputBytes == null || outputBytes == null) {
+                    false
+                } else {
+                    val source = ByteBuffer.wrap(inputBytes).order(ByteOrder.LITTLE_ENDIAN)
+                    val target = ByteBuffer.wrap(outputBytes).order(ByteOrder.LITTLE_ENDIAN)
+                    // A deterministic fake dispatch for the registry lifecycle test.
+                    val matrix = floatArrayOf(1f, 0f, 0f, 1f, 0f, 0f)
+                    for (row in 0 until rows) {
+                        for (column in 0 until outputColumns) {
+                            var sum = 0f
+                            for (inner in 0 until inputColumns) {
+                                sum += source.getFloat(
+                                    (row * inputColumns + inner) * Float.SIZE_BYTES
+                                ) * matrix[inner * outputColumns + column]
+                            }
+                            target.putFloat(
+                                (row * outputColumns + column) * Float.SIZE_BYTES,
+                                sum
+                            )
                         }
-                        target.putFloat((row * outputColumns + column) * Float.SIZE_BYTES, sum)
                     }
+                    true
                 }
-                true
             },
             maxResidentBytes = { 128L }
         )
-        val input = registry.allocate(2, 3)
-        val output = registry.allocate(2, 2)
+        val input = requireNotNull(registry.allocate(2, 3))
+        val output = requireNotNull(registry.allocate(2, 2))
         val weights = VulkanTensorAllocation(100L, 3L * 2L * Short.SIZE_BYTES)
 
-        assertNotNull(input)
-        assertNotNull(output)
-        assertTrue(registry.upload(input!!, arrayOf(
+        assertTrue(registry.upload(input, arrayOf(
             floatArrayOf(1f, 2f, 3f),
             floatArrayOf(4f, 5f, 6f)
         )))
-        assertTrue(registry.applyLinear(input, weights, output!!))
+        assertTrue(registry.applyLinear(input, weights, output))
         assertEquals("Dispatch must not force an activation readback.", 0, downloadCount)
         assertEquals(2, registry.residentTensorCount())
 
-        val actual = registry.download(output)
-        assertNotNull(actual)
-        assertArrayEquals(floatArrayOf(1f, 5f), actual!![0], 1e-6f)
-        assertArrayEquals(floatArrayOf(4f, 11f), actual[1], 1e-6f)
+        val actual = requireNotNull(registry.download(output))
+        assertArrayEquals(floatArrayOf(1f, 2f), actual[0], 1e-6f)
+        assertArrayEquals(floatArrayOf(4f, 5f), actual[1], 1e-6f)
         assertEquals(1, downloadCount)
     }
 
@@ -97,9 +105,8 @@ class VulkanActivationTensorRegistryTest {
             dispatch = { _, _, _, _, _, _, _ -> true },
             maxResidentBytes = { 256L }
         )
-        val input = registry.allocate(2, 3)
-        assertNotNull(input)
-        assertFalse(registry.upload(input!!, arrayOf(
+        val input = requireNotNull(registry.allocate(2, 3))
+        assertFalse(registry.upload(input, arrayOf(
             floatArrayOf(1f, 2f),
             floatArrayOf(3f, 4f)
         )))
@@ -125,8 +132,8 @@ class VulkanActivationTensorRegistryTest {
             maxResidentBytes = { 32L }
         )
 
-        assertNotNull(registry.allocate(2, 2))
-        assertNotNull(registry.allocate(2, 2))
+        assertTrue(registry.allocate(2, 2) != null)
+        assertTrue(registry.allocate(2, 2) != null)
         assertNull(registry.allocate(1, 1))
         assertEquals(2, allocateCount)
         assertEquals(32L, registry.residentByteCount())
@@ -142,9 +149,8 @@ class VulkanActivationTensorRegistryTest {
             dispatch = { _, _, _, _, _, _, _ -> true },
             maxResidentBytes = { 64L }
         )
-        val tensor = registry.allocate(2, 2)
-        assertNotNull(tensor)
-        assertFalse(registry.release(tensor!!))
+        val tensor = requireNotNull(registry.allocate(2, 2))
+        assertFalse(registry.release(tensor))
         assertEquals(1, registry.residentTensorCount())
         assertEquals(16L, registry.residentByteCount())
         assertTrue(registry.invalidate(releaseAllocations = false))

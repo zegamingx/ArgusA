@@ -142,13 +142,15 @@ internal class VulkanActivationTensorRegistry(
         if (!download(allocation, bytes)) return null
 
         val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        return Array(tensor.rows) {
-            FloatArray(tensor.columns) {
+        val result = Array(tensor.rows) { FloatArray(tensor.columns) }
+        for (row in result.indices) {
+            for (column in result[row].indices) {
                 val value = buffer.float
                 if (!value.isFinite()) return null
-                value
+                result[row][column] = value
             }
         }
+        return result
     }
 
     @Synchronized
