@@ -2706,11 +2706,8 @@ class ArgusNeuralEngine private constructor(
         }
 
         val gradientGroups = gradientList.toTypedArray()
-        val clippedOnGpu = try {
+        val clippedOnGpu =
             tryNormalizeAndClipGradientsOnVulkan(gradientGroups, maxGradNorm)
-        } catch (error: RuntimeException) {
-            throw error
-        }
         val clipFactor = if (clippedOnGpu) {
             1.0f
         } else {
