@@ -95,7 +95,8 @@ class VulkanOptimizerStateRegistryTest {
         val arena = FakeArena()
         val state = registry(arena) { 31L }
 
-        assertFalse(state.synchronizeAll(listOf(FloatArray(4))))
+        // Eight FP32 values require 32 bytes, which exceeds the configured 31-byte budget.
+        assertFalse(state.synchronizeAll(listOf(FloatArray(8))))
         assertEquals(0, arena.contents.size)
         assertEquals(0, arena.uploadCount)
     }
@@ -107,16 +108,22 @@ class VulkanOptimizerStateRegistryTest {
         val first = FloatArray(4)
 
         assertTrue(state.synchronizeAll(listOf(first)))
+        val originalAllocation = state.acquire(first)
+            ?: error("The optimizer-state allocation is missing.")
+        val originalHandle = originalAllocation.nativeHandle
         arena.releaseFailure = true
 
         assertFalse(state.invalidate(releaseAllocations = true))
         assertEquals(1, state.residentTensorCount())
         assertNotNull(state.acquire(first))
+        assertTrue(arena.contents.containsKey(originalHandle))
 
         arena.releaseFailure = false
         assertTrue(state.invalidate(releaseAllocations = true))
         assertEquals(0, state.residentTensorCount())
-        assertNull(state.acquire(first))
+        // acquire() allocates on demand; inspect the registry directly after invalidation.
+        assertNull(state.deviceRevision(first))
+        assertFalse(arena.contents.containsKey(originalHandle))
     }
 
     @Test

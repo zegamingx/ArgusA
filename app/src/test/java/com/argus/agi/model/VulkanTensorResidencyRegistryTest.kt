@@ -583,7 +583,7 @@ class VulkanTensorResidencyRegistryTest {
                     true
                 }
             },
-            maxResidentBytes = { 64L }
+            maxResidentBytes = { 16L }
         )
         val first = Float16ParameterArray.fromFloatArray(floatArrayOf(0.25f, -0.5f))
         val second = Float16ParameterArray.fromFloatArray(floatArrayOf(0.75f, -1.0f))
@@ -619,15 +619,22 @@ class VulkanTensorResidencyRegistryTest {
             oldAllocations,
             replacements
         ))
-        assertEquals(32L, registry.residentByteCount())
+        // Each two-element FP16 tensor occupies 4 bytes. The active replacements
+        // and the two retired allocations therefore consume 16 bytes together.
+        assertEquals(16L, registry.residentByteCount())
         assertEquals(replacements[0].nativeHandle, registry.acquire(first)?.nativeHandle)
         assertEquals(replacements[1].nativeHandle, registry.acquire(second)?.nativeHandle)
 
+        val third = Float16ParameterArray.fromFloatArray(floatArrayOf(0.5f, -0.25f))
+        assertNull(registry.acquire(third))
+
         releaseFailure = false
         assertTrue(registry.synchronizeAll(inventory))
-        assertEquals(16L, registry.residentByteCount())
+        assertEquals(8L, registry.residentByteCount())
         assertFalse(gpuBytes.containsKey(oldAllocations[0].nativeHandle))
         assertFalse(gpuBytes.containsKey(oldAllocations[1].nativeHandle))
+        assertNotNull(registry.acquire(third))
+        assertEquals(12L, registry.residentByteCount())
     }
 
 
