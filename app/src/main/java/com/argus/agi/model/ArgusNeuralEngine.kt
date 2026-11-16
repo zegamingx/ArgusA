@@ -2906,15 +2906,20 @@ class ArgusNeuralEngine private constructor(
 
         var clippedOnGpu = false
         val residentAccumulator = accumulator.resident
+        var residentGradient: VulkanTensorAllocation? = null
         if (residentAccumulator != null) {
             clippedOnGpu = VulkanTrainingBackend.finalizeResidentGradientAccumulator(
-                residentAccumulator,
-                gradients,
-                accumulator.targetCount,
-                maxGradNorm
+                accumulator = residentAccumulator,
+                destinationTensors = gradients,
+                targetCount = accumulator.targetCount,
+                maximumGradientNorm = maxGradNorm,
+                retainResidentBuffer = true
             )
-            if (!clippedOnGpu &&
-                !VulkanTrainingBackend.downloadResidentGradientAccumulator(
+            if (clippedOnGpu) {
+                // The finalizer swaps the normalized/clipped result into the active
+                // allocation; keep it alive so AdamW can consume it without re-upload.
+                residentGradient = residentAccumulator.active
+            } else if (!VulkanTrainingBackend.downloadResidentGradientAccumulator(
                     residentAccumulator,
                     gradients
                 )) {
@@ -2927,50 +2932,57 @@ class ArgusNeuralEngine private constructor(
             accumulator.resident = null
         }
 
-        var sumSquares = 0f
-        if (!clippedOnGpu) {
-            for (gradient in gradients) {
-                normalizeGradient(gradient, accumulator.targetCount.toFloat())
-                sumSquares += computeSumSquares(gradient)
+        try {
+            var sumSquares = 0f
+            if (!clippedOnGpu) {
+                for (gradient in gradients) {
+                    normalizeGradient(gradient, accumulator.targetCount.toFloat())
+                    sumSquares += computeSumSquares(gradient)
+                }
+            }
+
+            val totalNorm = if (clippedOnGpu) 0.0f else sqrt(sumSquares)
+            if (!clippedOnGpu && !totalNorm.isFinite()) {
+                throw IllegalStateException("Accumulated gradient norm is not finite.")
+            }
+            val clipFactor = if (clippedOnGpu) {
+                1.0f
+            } else if (totalNorm > maxGradNorm) {
+                maxGradNorm / (totalNorm + 1e-6f)
+            } else {
+                1.0f
+            }
+
+            adamStep++
+            val learningRate = baseLearningRate / (1f + 0.0002f * adamStep)
+            val biasCorrection1 = 1f -
+                Math.pow(beta1.toDouble(), adamStep.toDouble()).toFloat()
+            val biasCorrection2 = 1f -
+                Math.pow(beta2.toDouble(), adamStep.toDouble()).toFloat()
+            val weightDecayByGroup = FloatArray(parameters.size).also { values ->
+                for (layer in 0 until layerCount) {
+                    val offset = 2 + layer * 11
+                    for (index in 0 until 7) values[offset + index] = weightDecay
+                }
+            }
+
+            applyAdamWUpdate(
+                parameters = parameters,
+                gradients = gradients,
+                firstMoments = firstMoments,
+                secondMoments = secondMoments,
+                weightDecayByGroup = weightDecayByGroup,
+                learningRate = learningRate,
+                biasCorrection1 = biasCorrection1,
+                biasCorrection2 = biasCorrection2,
+                gradientClipFactor = clipFactor,
+                residentGradient = residentGradient
+            )
+        } finally {
+            residentAccumulator?.let { value ->
+                VulkanTrainingBackend.discardResidentGradientAccumulator(value)
             }
         }
-
-        val totalNorm = if (clippedOnGpu) 0.0f else sqrt(sumSquares)
-        if (!clippedOnGpu && !totalNorm.isFinite()) {
-            throw IllegalStateException("Accumulated gradient norm is not finite.")
-        }
-        val clipFactor = if (clippedOnGpu) {
-            1.0f
-        } else if (totalNorm > maxGradNorm) {
-            maxGradNorm / (totalNorm + 1e-6f)
-        } else {
-            1.0f
-        }
-
-        adamStep++
-        val learningRate = baseLearningRate / (1f + 0.0002f * adamStep)
-        val biasCorrection1 = 1f -
-            Math.pow(beta1.toDouble(), adamStep.toDouble()).toFloat()
-        val biasCorrection2 = 1f -
-            Math.pow(beta2.toDouble(), adamStep.toDouble()).toFloat()
-        val weightDecayByGroup = FloatArray(parameters.size).also { values ->
-            for (layer in 0 until layerCount) {
-                val offset = 2 + layer * 11
-                for (index in 0 until 7) values[offset + index] = weightDecay
-            }
-        }
-
-        applyAdamWUpdate(
-            parameters = parameters,
-            gradients = gradients,
-            firstMoments = firstMoments,
-            secondMoments = secondMoments,
-            weightDecayByGroup = weightDecayByGroup,
-            learningRate = learningRate,
-            biasCorrection1 = biasCorrection1,
-            biasCorrection2 = biasCorrection2,
-            gradientClipFactor = clipFactor
-        )
     }
 
     /**
@@ -2986,7 +2998,8 @@ class ArgusNeuralEngine private constructor(
         learningRate: Float,
         biasCorrection1: Float,
         biasCorrection2: Float,
-        gradientClipFactor: Float
+        gradientClipFactor: Float,
+        residentGradient: VulkanTensorAllocation? = null
     ) {
         require(parameters.isNotEmpty()) {
             "AdamW requires at least one parameter group."
@@ -3013,7 +3026,8 @@ class ArgusNeuralEngine private constructor(
                 biasCorrection1 = biasCorrection1,
                 biasCorrection2 = biasCorrection2,
                 epsilon = epsilon,
-                gradientClipFactor = gradientClipFactor
+                gradientClipFactor = gradientClipFactor,
+                residentGradient = residentGradient
             )
         } catch (error: RuntimeException) {
             // The caller incremented the logical optimizer step before dispatch.
