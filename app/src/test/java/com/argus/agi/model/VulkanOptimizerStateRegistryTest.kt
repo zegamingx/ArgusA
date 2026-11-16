@@ -1,0 +1,123 @@
+package com.argus.agi.model
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class VulkanOptimizerStateRegistryTest {
+
+    private class FakeArena {
+        private var nextHandle = 1L
+        val contents = LinkedHashMap<Long, ByteArray>()
+        var uploadCount = 0
+        var releaseFailure = false
+
+        fun allocate(byteCount: Long): VulkanTensorAllocation? {
+            if (byteCount <= 0L || byteCount > Int.MAX_VALUE.toLong()) return null
+            val handle = nextHandle++
+            contents[handle] = ByteArray(byteCount.toInt())
+            return VulkanTensorAllocation(handle, byteCount)
+        }
+
+        fun upload(allocation: VulkanTensorAllocation, bytes: ByteArray): Boolean {
+            val target = contents[allocation.nativeHandle] ?: return false
+            if (target.size != bytes.size) return false
+            bytes.copyInto(target)
+            uploadCount++
+            return true
+        }
+
+        fun release(allocation: VulkanTensorAllocation): Boolean {
+            if (releaseFailure) return false
+            return contents.remove(allocation.nativeHandle) != null
+        }
+    }
+
+    private fun registry(
+        arena: FakeArena,
+        maxBytes: () -> Long = { Long.MAX_VALUE }
+    ): VulkanOptimizerStateRegistry = VulkanOptimizerStateRegistry(
+        allocate = arena::allocate,
+        upload = arena::upload,
+        release = arena::release,
+        maxResidentBytes = maxBytes
+    )
+
+    @Test
+    fun keepsMomentArraysResidentWithoutRepeatedUploads() {
+        val arena = FakeArena()
+        val state = registry(arena)
+        val first = FloatArray(8) { it * 0.1f }
+        val second = FloatArray(8) { it * 0.2f }
+
+        assertTrue(state.synchronizeAll(listOf(first, second)))
+        assertEquals(2, arena.uploadCount)
+        assertEquals(2, state.residentTensorCount())
+
+        assertTrue(state.synchronizeAll(listOf(first, second)))
+        assertEquals(2, arena.uploadCount)
+        assertEquals(64L, state.residentByteCount())
+    }
+
+    @Test
+    fun releasesArraysRemovedFromTheOptimizerInventory() {
+        val arena = FakeArena()
+        val state = registry(arena)
+        val first = FloatArray(4)
+        val second = FloatArray(6)
+
+        assertTrue(state.synchronizeAll(listOf(first, second)))
+        assertTrue(state.synchronizeAll(listOf(second)))
+
+        assertEquals(1, state.residentTensorCount())
+        assertEquals(24L, state.residentByteCount())
+    }
+
+    @Test
+    fun rejectsAnInventoryThatExceedsItsMemoryBudgetBeforeAllocation() {
+        val arena = FakeArena()
+        val state = registry(arena) { 31L }
+
+        assertFalse(state.synchronizeAll(listOf(FloatArray(4))))
+        assertEquals(0, arena.contents.size)
+        assertEquals(0, arena.uploadCount)
+    }
+
+    @Test
+    fun failedReleaseKeepsTheHandleTrackedForRetry() {
+        val arena = FakeArena()
+        val state = registry(arena)
+        val first = FloatArray(4)
+
+        assertTrue(state.synchronizeAll(listOf(first)))
+        arena.releaseFailure = true
+
+        assertFalse(state.invalidate(releaseAllocations = true))
+        assertEquals(1, state.residentTensorCount())
+        assertNotNull(state.acquire(first))
+
+        arena.releaseFailure = false
+        assertTrue(state.invalidate(releaseAllocations = true))
+        assertEquals(0, state.residentTensorCount())
+        assertNull(state.acquire(first))
+    }
+
+    @Test
+    fun invalidationDropsGpuHandlesWithoutChangingHostMomentArrays() {
+        val arena = FakeArena()
+        val state = registry(arena)
+        val first = floatArrayOf(0.25f, -0.5f, 0.75f)
+        val before = first.copyOf()
+
+        assertTrue(state.synchronizeAll(listOf(first)))
+        assertTrue(state.invalidate(releaseAllocations = false))
+
+        assertEquals(0, state.residentTensorCount())
+        assertTrue(first.contentEquals(before))
+        assertTrue(state.synchronizeAll(listOf(first)))
+        assertEquals(2, arena.uploadCount)
+    }
+}
