@@ -138,22 +138,33 @@ class VulkanOptimizerStateRegistryTest {
         val state = registry(arena)
         val first = floatArrayOf(0.1f, 0.2f, 0.3f)
         assertTrue(state.synchronizeAll(listOf(first)))
-        val allocation = state.acquire(first)
-        assertNotNull(allocation)
+        val previous = state.acquire(first)
+            ?: error("The active optimizer-state allocation is missing.")
+        val candidate = arena.allocate(previous.byteCount)
+            ?: error("The candidate optimizer-state allocation is missing.")
         val gpuBytes = ByteBuffer.allocate(first.size * Float.SIZE_BYTES)
             .order(ByteOrder.LITTLE_ENDIAN)
             .putFloat(0.75f)
             .putFloat(-0.5f)
             .putFloat(1.25f)
             .array()
-        val handle = requireNotNull(allocation)
-        gpuBytes.copyInto(requireNotNull(arena.contents[handle.nativeHandle]))
+        gpuBytes.copyInto(requireNotNull(arena.contents[candidate.nativeHandle]))
+        assertTrue(
+            state.replaceAll(
+                tensors = listOf(first),
+                expectedAllocations = listOf(previous),
+                replacementAllocations = listOf(candidate)
+            )
+        )
         first.fill(9.0f)
 
+        assertFalse(state.areHostMirrorsCurrent())
         assertTrue(state.synchronizeHostMirrors())
         assertTrue(first.contentEquals(floatArrayOf(0.75f, -0.5f, 1.25f)))
+        assertTrue(state.areHostMirrorsCurrent())
         assertEquals(1, arena.uploadCount)
     }
+
     @Test
     fun commitsNoHostMomentUntilEveryGpuMomentReadbackSucceeds() {
         val arena = FakeArena()
@@ -162,8 +173,14 @@ class VulkanOptimizerStateRegistryTest {
         val second = floatArrayOf(-0.1f, -0.2f, -0.3f)
         assertTrue(state.synchronizeAll(listOf(first, second)))
 
-        val firstAllocation = state.acquire(first) ?: error("First optimizer-state allocation is missing.")
-        val secondAllocation = state.acquire(second) ?: error("Second optimizer-state allocation is missing.")
+        val previousFirst = state.acquire(first)
+            ?: error("First optimizer-state allocation is missing.")
+        val previousSecond = state.acquire(second)
+            ?: error("Second optimizer-state allocation is missing.")
+        val candidateFirst = arena.allocate(previousFirst.byteCount)
+            ?: error("First candidate optimizer-state allocation is missing.")
+        val candidateSecond = arena.allocate(previousSecond.byteCount)
+            ?: error("Second candidate optimizer-state allocation is missing.")
         val firstGpuState = ByteBuffer.allocate(first.size * Float.SIZE_BYTES)
             .order(ByteOrder.LITTLE_ENDIAN)
             .putFloat(0.75f)
@@ -176,24 +193,34 @@ class VulkanOptimizerStateRegistryTest {
             .putFloat(0.5f)
             .putFloat(-0.75f)
             .array()
-        firstGpuState.copyInto(requireNotNull(arena.contents[firstAllocation.nativeHandle]))
-        secondGpuState.copyInto(requireNotNull(arena.contents[secondAllocation.nativeHandle]))
+        firstGpuState.copyInto(requireNotNull(arena.contents[candidateFirst.nativeHandle]))
+        secondGpuState.copyInto(requireNotNull(arena.contents[candidateSecond.nativeHandle]))
+        arena.releaseFailure = true
+        assertTrue(
+            state.replaceAll(
+                tensors = listOf(first, second),
+                expectedAllocations = listOf(previousFirst, previousSecond),
+                replacementAllocations = listOf(candidateFirst, candidateSecond)
+            )
+        )
+
         first.fill(9.0f)
         second.fill(8.0f)
         val hostFirstBeforeFailure = first.copyOf()
         val hostSecondBeforeFailure = second.copyOf()
 
-        arena.downloadFailureHandle = secondAllocation.nativeHandle
+        arena.downloadFailureHandle = candidateSecond.nativeHandle
         assertFalse(state.synchronizeHostMirrors())
         assertTrue(first.contentEquals(hostFirstBeforeFailure))
         assertTrue(second.contentEquals(hostSecondBeforeFailure))
+        assertFalse(state.areHostMirrorsCurrent())
 
         arena.downloadFailureHandle = null
         assertTrue(state.synchronizeHostMirrors())
         assertTrue(first.contentEquals(floatArrayOf(0.75f, -0.5f, 1.25f)))
         assertTrue(second.contentEquals(floatArrayOf(-0.25f, 0.5f, -0.75f)))
+        assertTrue(state.areHostMirrorsCurrent())
     }
-
 
     @Test
     fun swapsAllMomentBuffersOnlyAfterEveryReplacementIsValid() {
