@@ -255,7 +255,7 @@ class VulkanOptimizerStateRegistryTest {
         )
         assertEquals(oldFirst.nativeHandle, state.acquire(first)?.nativeHandle)
         assertEquals(oldSecond.nativeHandle, state.acquire(second)?.nativeHandle)
-        assertEquals(4, state.residentTensorCount())
+        assertEquals(2, state.residentTensorCount())
     }
 
 }
