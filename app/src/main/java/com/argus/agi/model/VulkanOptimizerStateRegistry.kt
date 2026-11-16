@@ -108,12 +108,46 @@ internal class VulkanOptimizerStateRegistry(
         }
         return true
     }
+    /** Checks a complete candidate replacement without changing active optimizer state. */
+    @Synchronized
+    fun canReplaceAll(
+        tensors: List<FloatArray>,
+        expectedAllocations: List<VulkanTensorAllocation>,
+        replacementAllocations: List<VulkanTensorAllocation>
+    ): Boolean = validateReplacement(tensors, expectedAllocations, replacementAllocations)
+
     /**
      * Atomically publishes a complete set of candidate moment buffers after a successful
      * GPU optimizer dispatch. Old allocations remain tracked until their release succeeds.
      */
     @Synchronized
     fun replaceAll(
+        tensors: List<FloatArray>,
+        expectedAllocations: List<VulkanTensorAllocation>,
+        replacementAllocations: List<VulkanTensorAllocation>
+    ): Boolean {
+        if (!validateReplacement(tensors, expectedAllocations, replacementAllocations)) return false
+
+        var nextRetiredBytes = retiredResidentBytes
+        for (allocation in expectedAllocations) {
+            nextRetiredBytes = runCatching {
+                Math.addExact(nextRetiredBytes, allocation.byteCount)
+            }.getOrNull() ?: return false
+        }
+
+        for (index in tensors.indices) {
+            val entry = entries[tensors[index]] ?: return false
+            val previous = entry.allocation
+            entry.allocation = replacementAllocations[index]
+            entry.uploaded = true
+            retiredAllocations.add(previous)
+        }
+        retiredResidentBytes = nextRetiredBytes
+        releaseRetiredAllocations()
+        return true
+    }
+
+    private fun validateReplacement(
         tensors: List<FloatArray>,
         expectedAllocations: List<VulkanTensorAllocation>,
         replacementAllocations: List<VulkanTensorAllocation>
@@ -127,7 +161,6 @@ internal class VulkanOptimizerStateRegistry(
 
         val seenTensors = IdentityHashMap<FloatArray, Boolean>()
         val seenReplacementHandles = HashSet<Long>()
-        val replacements = ArrayList<Pair<Entry, VulkanTensorAllocation>>(tensors.size)
         for (index in tensors.indices) {
             val tensor = tensors[index]
             if (seenTensors.put(tensor, true) != null) return false
@@ -141,22 +174,15 @@ internal class VulkanOptimizerStateRegistry(
                 !seenReplacementHandles.add(replacement.nativeHandle)) {
                 return false
             }
-            if (entries.values.any { existing ->
-                    existing.allocation.nativeHandle == replacement.nativeHandle
+            if (entries.values.any { active ->
+                    active.allocation.nativeHandle == replacement.nativeHandle
+                } ||
+                retiredAllocations.any { retired ->
+                    retired.nativeHandle == replacement.nativeHandle
                 }) {
                 return false
             }
-            replacements.add(entry to replacement)
         }
-
-        for ((entry, replacement) in replacements) {
-            val retired = entry.allocation
-            entry.allocation = replacement
-            entry.uploaded = true
-            retiredAllocations.add(retired)
-            retiredResidentBytes = Math.addExact(retiredResidentBytes, retired.byteCount)
-        }
-        releaseRetiredAllocations()
         return true
     }
 
