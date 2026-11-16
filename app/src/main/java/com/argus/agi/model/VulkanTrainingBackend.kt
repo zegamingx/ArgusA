@@ -5062,6 +5062,22 @@ internal object VulkanTrainingBackend {
         gradientClipFactor: Float
     ): Boolean
 
+    private external fun nativeApplyResidentAdamWUpdate(
+        parameterHandles: LongArray,
+        gradientHandle: Long,
+        firstMomentHandles: LongArray,
+        secondMomentHandles: LongArray,
+        activeElementCounts: IntArray,
+        weightDecayByGroup: FloatArray,
+        learningRate: Float,
+        beta1: Float,
+        beta2: Float,
+        biasCorrection1: Float,
+        biasCorrection2: Float,
+        epsilon: Float,
+        gradientClipFactor: Float,
+        statusHandle: Long
+    ): Boolean
     private external fun nativeAllocateTensor(byteCount: Long): Long
 
     private external fun nativeUploadTensor(tensorHandle: Long, source: ByteArray): Boolean
