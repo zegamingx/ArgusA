@@ -33,7 +33,19 @@ internal class VulkanActivationTensorRegistry(
         Int,
         Int,
         Boolean
-    ) -> Boolean = { _, _, _, _, _, _, _ -> false }
+    ) -> Boolean = { _, _, _, _, _, _, _ -> false },
+    private val dispatchAttention: (
+        VulkanTensorAllocation,
+        VulkanTensorAllocation,
+        VulkanTensorAllocation,
+        VulkanTensorAllocation,
+        VulkanTensorAllocation,
+        VulkanTensorAllocation,
+        Int,
+        Int,
+        Int,
+        Int
+    ) -> Boolean = { _, _, _, _, _, _, _, _, _, _ -> false }
 ) {
     private val active = IdentityHashMap<VulkanActivationTensor, VulkanTensorAllocation>()
     private var residentBytes = 0L
@@ -190,6 +202,88 @@ internal class VulkanActivationTensorRegistry(
             input.columns,
             output.columns,
             transposeWeights
+        )
+    }
+
+
+    /**
+     * Dispatches causal multi-head attention and W_O + residual between distinct
+     * resident allocations. Shape validation is performed before entering native code.
+     */
+    @Synchronized
+    fun applyAttention(
+        qkv: VulkanActivationTensor,
+        scores: VulkanActivationTensor,
+        attentionOutput: VulkanActivationTensor,
+        projectedOutput: VulkanActivationTensor,
+        residual: VulkanActivationTensor,
+        outputWeights: VulkanTensorAllocation,
+        sequenceLength: Int,
+        modelWidth: Int,
+        headCount: Int,
+        headDimension: Int
+    ): Boolean {
+        val qkvAllocation = active[qkv] ?: return false
+        val scoreAllocation = active[scores] ?: return false
+        val attentionOutputAllocation = active[attentionOutput] ?: return false
+        val projectedOutputAllocation = active[projectedOutput] ?: return false
+        val residualAllocation = active[residual] ?: return false
+
+        if (sequenceLength <= 0 ||
+            modelWidth <= 0 ||
+            headCount <= 0 ||
+            headDimension <= 0 ||
+            headCount.toLong() * headDimension.toLong() != modelWidth.toLong()) {
+            return false
+        }
+
+        val qkvRows = runCatching { Math.multiplyExact(sequenceLength, 3) }.getOrNull()
+            ?: return false
+        val scoreRows = runCatching { Math.multiplyExact(sequenceLength, headCount) }.getOrNull()
+            ?: return false
+        val outputWeightBytes = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(modelWidth.toLong(), modelWidth.toLong()),
+                Short.SIZE_BYTES.toLong()
+            )
+        }.getOrNull() ?: return false
+
+        if (qkv.rows != qkvRows ||
+            qkv.columns != modelWidth ||
+            scores.rows != scoreRows ||
+            scores.columns != sequenceLength ||
+            attentionOutput.rows != sequenceLength ||
+            attentionOutput.columns != modelWidth ||
+            projectedOutput.rows != sequenceLength ||
+            projectedOutput.columns != modelWidth ||
+            residual.rows != sequenceLength ||
+            residual.columns != modelWidth ||
+            outputWeights.nativeHandle <= 0L ||
+            outputWeights.byteCount < outputWeightBytes) {
+            return false
+        }
+
+        val allocations = listOf(
+            qkvAllocation,
+            scoreAllocation,
+            attentionOutputAllocation,
+            projectedOutputAllocation,
+            residualAllocation
+        )
+        val handles = allocations.map { it.nativeHandle } + outputWeights.nativeHandle
+        if (handles.any { it <= 0L } || handles.toSet().size != handles.size) return false
+
+        return dispatchAttention(
+            qkvAllocation,
+            scoreAllocation,
+            attentionOutputAllocation,
+            projectedOutputAllocation,
+            residualAllocation,
+            outputWeights,
+            sequenceLength,
+            modelWidth,
+            headCount,
+            headDimension
         )
     }
 

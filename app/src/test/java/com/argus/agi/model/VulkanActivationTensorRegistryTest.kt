@@ -202,6 +202,75 @@ class VulkanActivationTensorRegistryTest {
         assertEquals(1, downloadCount)
     }
 
+
+    @Test
+    fun dispatchesAttentionOnlyForCompleteDistinctResidentTensorSet() {
+        var nextHandle = 1L
+        var dispatched = false
+        val registry = VulkanActivationTensorRegistry(
+            allocate = { byteCount -> VulkanTensorAllocation(nextHandle++, byteCount) },
+            upload = { _, _ -> true },
+            download = { _, _ -> true },
+            release = { true },
+            dispatch = { _, _, _, _, _, _, _ -> false },
+            maxResidentBytes = { 4096L },
+            dispatchAttention = { qkv, scores, attentionOutput, projectedOutput, residual, weights,
+                sequenceLength, modelWidth, headCount, headDimension ->
+                dispatched = true
+                qkv.nativeHandle > 0L && scores.nativeHandle > 0L &&
+                    attentionOutput.nativeHandle > 0L && projectedOutput.nativeHandle > 0L &&
+                    residual.nativeHandle > 0L && weights.nativeHandle == 100L &&
+                    sequenceLength == 4 && modelWidth == 8 && headCount == 2 && headDimension == 4
+            }
+        )
+        val qkv = requireNotNull(registry.allocate(12, 8))
+        val scores = requireNotNull(registry.allocate(8, 4))
+        val attentionOutput = requireNotNull(registry.allocate(4, 8))
+        val projectedOutput = requireNotNull(registry.allocate(4, 8))
+        val residual = requireNotNull(registry.allocate(4, 8))
+        val weights = VulkanTensorAllocation(100L, 8L * 8L * Short.SIZE_BYTES)
+
+        assertTrue(
+            registry.applyAttention(
+                qkv, scores, attentionOutput, projectedOutput, residual,
+                weights, sequenceLength = 4, modelWidth = 8, headCount = 2, headDimension = 4
+            )
+        )
+        assertTrue(dispatched)
+    }
+
+    @Test
+    fun refusesAttentionShapeMismatchBeforeNativeDispatch() {
+        var dispatchCount = 0
+        var nextHandle = 1L
+        val registry = VulkanActivationTensorRegistry(
+            allocate = { byteCount -> VulkanTensorAllocation(nextHandle++, byteCount) },
+            upload = { _, _ -> true },
+            download = { _, _ -> true },
+            release = { true },
+            dispatch = { _, _, _, _, _, _, _ -> false },
+            maxResidentBytes = { 4096L },
+            dispatchAttention = { _, _, _, _, _, _, _, _, _, _ ->
+                dispatchCount++
+                true
+            }
+        )
+        val qkv = requireNotNull(registry.allocate(11, 8))
+        val scores = requireNotNull(registry.allocate(8, 4))
+        val attentionOutput = requireNotNull(registry.allocate(4, 8))
+        val projectedOutput = requireNotNull(registry.allocate(4, 8))
+        val residual = requireNotNull(registry.allocate(4, 8))
+        val weights = VulkanTensorAllocation(100L, 8L * 8L * Short.SIZE_BYTES)
+
+        assertFalse(
+            registry.applyAttention(
+                qkv, scores, attentionOutput, projectedOutput, residual,
+                weights, sequenceLength = 4, modelWidth = 8, headCount = 2, headDimension = 4
+            )
+        )
+        assertEquals(0, dispatchCount)
+    }
+
     @Test
     fun rejectsShapeMismatchAndNonFiniteActivationInput() {
         var allocationCount = 0

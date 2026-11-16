@@ -511,6 +511,7 @@ internal object VulkanTrainingBackend {
 
     @Volatile
     private var residentActivationLinearReady = false
+    private var residentAttentionReady = false
     private val activationTensorRegistry = VulkanActivationTensorRegistry(
         allocate = { byteCount -> allocateGpuTensor(byteCount) },
         upload = { allocation, bytes -> uploadGpuTensor(allocation, bytes) },
@@ -531,6 +532,13 @@ internal object VulkanTrainingBackend {
                 inputColumns,
                 outputColumns,
                 transposeWeights
+            )
+        },
+        dispatchAttention = { qkv, scores, attentionOutput, projectedOutput, residual, outputWeights,
+            sequenceLength, modelWidth, headCount, headDimension ->
+            tryApplyResidentAttention(
+                qkv, scores, attentionOutput, projectedOutput, residual, outputWeights,
+                sequenceLength, modelWidth, headCount, headDimension
             )
         }
     )
@@ -588,6 +596,9 @@ internal object VulkanTrainingBackend {
     internal val isResidentActivationLinearAvailable: Boolean
         get() = isRuntimeAvailable && residentActivationLinearReady
 
+    internal val isResidentAttentionAvailable: Boolean
+        get() = isRuntimeAvailable && residentActivationLinearReady && residentAttentionReady
+
     /**
      * Initialize Vulkan only after ArgusNeuralEngine has constructed or restored its tensors.
      * Driver verification is isolated from application cold-start; failure keeps Kotlin CPU active.
@@ -625,6 +636,8 @@ internal object VulkanTrainingBackend {
         } finally {
             nativeReady = false
             fp16RuntimeReady = false
+            residentActivationLinearReady = false
+            residentAttentionReady = false
             invalidateTensorResidency(releaseAllocations = false)
             _tensorArenaMetrics.value = VulkanTensorArenaMetrics()
         }
@@ -1033,6 +1046,174 @@ internal object VulkanTrainingBackend {
         return true
     }
 
+
+    /**
+     * Executes M3B–M3D as one resident Vulkan attention graph.
+     * Q/K/V are packed into one upload; score, causal softmax, weighted V,
+     * W_O projection and residual run in one command buffer. Probabilities and
+     * attention outputs remain available as caches for the existing backward pass.
+     * Host arrays are committed only after every dispatch, readback and release succeeds.
+     */
+    @Synchronized
+    internal fun tryApplyResidentAttention(
+        queryRows: Array<FloatArray>,
+        keyRows: Array<FloatArray>,
+        valueRows: Array<FloatArray>,
+        residualRows: Array<FloatArray>,
+        outputWeights: Float16ParameterArray,
+        attentionWeights: Array<Array<FloatArray>>,
+        attentionOutputRows: Array<FloatArray>,
+        projectedOutputRows: Array<FloatArray>,
+        modelWidth: Int,
+        headCount: Int
+    ): Boolean {
+        val sequenceLength = queryRows.size
+        if (!isResidentAttentionAvailable ||
+            sequenceLength <= 0 ||
+            modelWidth <= 0 ||
+            headCount <= 0 ||
+            modelWidth % headCount != 0 ||
+            keyRows.size != sequenceLength ||
+            valueRows.size != sequenceLength ||
+            residualRows.size != sequenceLength ||
+            attentionOutputRows.size != sequenceLength ||
+            projectedOutputRows.size != sequenceLength ||
+            attentionWeights.size != headCount ||
+            queryRows.any { it.size != modelWidth } ||
+            keyRows.any { it.size != modelWidth } ||
+            valueRows.any { it.size != modelWidth } ||
+            residualRows.any { it.size != modelWidth } ||
+            attentionOutputRows.any { it.size != modelWidth } ||
+            projectedOutputRows.any { it.size != modelWidth } ||
+            attentionWeights.any { head ->
+                head.size != sequenceLength || head.any { it.size != sequenceLength }
+            }) {
+            return false
+        }
+
+        val weightElementCount = runCatching {
+            Math.multiplyExact(modelWidth, modelWidth)
+        }.getOrNull() ?: return false
+        if (outputWeights.size != weightElementCount || !ensureModelTensorResidencyReady()) {
+            return false
+        }
+        val residentWeights = acquireResidentModelParameterTensor(outputWeights) ?: return false
+
+        val packedQkvRows = try {
+            Array(Math.multiplyExact(sequenceLength, 3)) { index ->
+                when {
+                    index < sequenceLength -> queryRows[index]
+                    index < sequenceLength * 2 -> keyRows[index - sequenceLength]
+                    else -> valueRows[index - sequenceLength * 2]
+                }
+            }
+        } catch (error: ArithmeticException) {
+            return false
+        } catch (error: OutOfMemoryError) {
+            return false
+        }
+
+        val temporary = ArrayList<VulkanActivationTensor>(5)
+        var stagedScores: Array<FloatArray>? = null
+        var stagedAttention: Array<FloatArray>? = null
+        var stagedProjected: Array<FloatArray>? = null
+        var completed = false
+        var cleanupSucceeded = true
+
+        try {
+            val qkv = activationTensorRegistry.allocate(packedQkvRows.size, modelWidth)
+            if (qkv != null) {
+                temporary.add(qkv)
+                val residual = activationTensorRegistry.allocate(sequenceLength, modelWidth)
+                if (residual != null) {
+                    temporary.add(residual)
+                    val scoreRows = runCatching {
+                        Math.multiplyExact(sequenceLength, headCount)
+                    }.getOrNull()
+                    val scores = scoreRows?.let { rows ->
+                        activationTensorRegistry.allocate(rows, sequenceLength)
+                    }
+                    if (scores != null) {
+                        temporary.add(scores)
+                        val attention = activationTensorRegistry.allocate(sequenceLength, modelWidth)
+                        if (attention != null) {
+                            temporary.add(attention)
+                            val projected = activationTensorRegistry.allocate(sequenceLength, modelWidth)
+                            if (projected != null) {
+                                temporary.add(projected)
+                                if (activationTensorRegistry.upload(qkv, packedQkvRows) &&
+                                    activationTensorRegistry.upload(residual, residualRows) &&
+                                    activationTensorRegistry.applyAttention(
+                                        qkv = qkv,
+                                        scores = scores,
+                                        attentionOutput = attention,
+                                        projectedOutput = projected,
+                                        residual = residual,
+                                        outputWeights = residentWeights,
+                                        sequenceLength = sequenceLength,
+                                        modelWidth = modelWidth,
+                                        headCount = headCount,
+                                        headDimension = modelWidth / headCount
+                                    )
+                                ) {
+                                    stagedScores = activationTensorRegistry.download(scores)
+                                    stagedAttention = activationTensorRegistry.download(attention)
+                                    stagedProjected = activationTensorRegistry.download(projected)
+                                    completed =
+                                        stagedScores != null &&
+                                        stagedAttention != null &&
+                                        stagedProjected != null
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident attention workspace exceeded the activation memory budget.", error)
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident attention graph failed before host-output commit.", error)
+        } finally {
+            for (tensor in temporary.asReversed()) {
+                if (!activationTensorRegistry.release(tensor)) cleanupSucceeded = false
+            }
+        }
+
+        if (!cleanupSucceeded) {
+            Log.w(TAG, "Resident attention tensor release failed; rebuilding residency before retry.")
+            invalidateTensorResidency(releaseAllocations = true)
+            residencyRebuildPending = lastModelParameterInventory.isNotEmpty()
+            return false
+        }
+        if (!completed) return false
+
+        val scores = stagedScores ?: return false
+        val attention = stagedAttention ?: return false
+        val projected = stagedProjected ?: return false
+        if (scores.size != headCount * sequenceLength ||
+            attention.size != sequenceLength ||
+            projected.size != sequenceLength) {
+            return false
+        }
+
+        for (head in 0 until headCount) {
+            for (query in 0 until sequenceLength) {
+                System.arraycopy(
+                    scores[head * sequenceLength + query],
+                    0,
+                    attentionWeights[head][query],
+                    0,
+                    sequenceLength
+                )
+            }
+        }
+        for (row in 0 until sequenceLength) {
+            System.arraycopy(attention[row], 0, attentionOutputRows[row], 0, modelWidth)
+            System.arraycopy(projected[row], 0, projectedOutputRows[row], 0, modelWidth)
+        }
+        return true
+    }
+
     /** Reset failed native state before the user explicitly retries Vulkan initialization. */
     @Synchronized
     fun resetRuntimeForRetry() {
@@ -1067,6 +1248,7 @@ internal object VulkanTrainingBackend {
 
     @Synchronized
     fun initializeAfterModelReady(): Boolean {
+        residentAttentionReady = false
         if (isRuntimeAvailable) {
             publishInitializationProgress(
                 status = "Vulkan runtime verified",
@@ -1133,10 +1315,20 @@ internal object VulkanTrainingBackend {
                 verifyNativeKernels()
             }.getOrDefault(false)
 
+            residentAttentionReady = false
             residentActivationLinearReady = verified && runCatching {
                 verifyResidentActivationLinearKernel() &&
                     verifyResidentActivationLinearBatchKernel()
             }.getOrDefault(false)
+            residentAttentionReady = verified && residentActivationLinearReady && runCatching {
+                verifyResidentAttentionKernel()
+            }.getOrDefault(false)
+            if (verified && !residentAttentionReady) {
+                Log.w(
+                    TAG,
+                    "Resident causal-attention self-check failed; the existing Kotlin attention fallback remains active."
+                )
+            }
             if (verified && !residentActivationLinearReady) {
                 Log.w(
                     TAG,
@@ -1651,6 +1843,258 @@ internal object VulkanTrainingBackend {
             }
             if (outputHandle != 0L) runCatching { nativeReleaseTensor(outputHandle) }
             if (inputHandle != 0L) runCatching { nativeReleaseTensor(inputHandle) }
+        }
+    }
+
+
+    private fun tryApplyResidentAttention(
+        qkv: VulkanTensorAllocation,
+        scores: VulkanTensorAllocation,
+        attentionOutput: VulkanTensorAllocation,
+        projectedOutput: VulkanTensorAllocation,
+        residual: VulkanTensorAllocation,
+        outputWeights: VulkanTensorAllocation,
+        sequenceLength: Int,
+        modelWidth: Int,
+        headCount: Int,
+        headDimension: Int
+    ): Boolean {
+        if (!isRuntimeAvailable || !residentAttentionReady ||
+            sequenceLength <= 0 || modelWidth <= 0 ||
+            headCount <= 0 || headDimension <= 0) {
+            return false
+        }
+
+        val sequenceModelElements = runCatching {
+            Math.multiplyExact(sequenceLength.toLong(), modelWidth.toLong())
+        }.getOrNull() ?: return false
+        val qkvBytes = runCatching {
+            Math.multiplyExact(Math.multiplyExact(sequenceModelElements, 3L), Float.SIZE_BYTES.toLong())
+        }.getOrNull() ?: return false
+        val scoreElements = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(headCount.toLong(), sequenceLength.toLong()),
+                sequenceLength.toLong()
+            )
+        }.getOrNull() ?: return false
+        val scoreBytes = runCatching {
+            Math.multiplyExact(scoreElements, Float.SIZE_BYTES.toLong())
+        }.getOrNull() ?: return false
+        val activationBytes = runCatching {
+            Math.multiplyExact(sequenceModelElements, Float.SIZE_BYTES.toLong())
+        }.getOrNull() ?: return false
+        val weightBytes = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(modelWidth.toLong(), modelWidth.toLong()),
+                Short.SIZE_BYTES.toLong()
+            )
+        }.getOrNull() ?: return false
+
+        if (qkv.byteCount < qkvBytes || scores.byteCount < scoreBytes ||
+            attentionOutput.byteCount < activationBytes ||
+            projectedOutput.byteCount < activationBytes ||
+            residual.byteCount < activationBytes ||
+            outputWeights.byteCount < weightBytes) {
+            return false
+        }
+
+        val applied = try {
+            nativeRunResidentAttention(
+                qkv.nativeHandle,
+                scores.nativeHandle,
+                attentionOutput.nativeHandle,
+                projectedOutput.nativeHandle,
+                residual.nativeHandle,
+                outputWeights.nativeHandle,
+                sequenceLength,
+                modelWidth,
+                headCount,
+                headDimension
+            )
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident Vulkan attention JNI entry point is unavailable.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident Vulkan attention graph dispatch failed.", error)
+            false
+        }
+        if (applied) {
+            refreshGpuPerformanceMetrics()
+        } else {
+            residentAttentionReady = false
+            Log.w(TAG, "Resident Vulkan attention dispatch failed; M3B–M3D fall back to Kotlin.")
+        }
+        return applied
+    }
+
+
+    private fun verifyResidentAttentionKernel(): Boolean {
+        val sequenceLength = 4
+        val modelWidth = 8
+        val headCount = 2
+        val headDimension = modelWidth / headCount
+        val query = Array(sequenceLength) { row ->
+            FloatArray(modelWidth) { column -> (((row * 7 + column * 3) % 17) - 8) * 0.0625f }
+        }
+        val key = Array(sequenceLength) { row ->
+            FloatArray(modelWidth) { column -> (((row * 5 + column * 11) % 19) - 9) * 0.046875f }
+        }
+        val value = Array(sequenceLength) { row ->
+            FloatArray(modelWidth) { column -> (((row * 13 + column * 2) % 23) - 11) * 0.03125f }
+        }
+        val residual = Array(sequenceLength) { row ->
+            FloatArray(modelWidth) { column -> (((row * 3 + column * 5) % 13) - 6) * 0.025f }
+        }
+        val outputWeight = Float16ParameterArray.fromFloatArray(
+            FloatArray(modelWidth * modelWidth) { index -> (((index * 7) % 29) - 14) * 0.0078125f }
+        )
+        val outputWeightValues = outputWeight.toFloatArray()
+        val expectedScores = Array(headCount * sequenceLength) { FloatArray(sequenceLength) }
+        val expectedAttention = Array(sequenceLength) { FloatArray(modelWidth) }
+        val expectedProjected = Array(sequenceLength) { FloatArray(modelWidth) }
+        val scale = 1.0f / kotlin.math.sqrt(headDimension.toFloat())
+
+        for (head in 0 until headCount) {
+            val offset = head * headDimension
+            for (queryIndex in 0 until sequenceLength) {
+                var maximum = -Float.MAX_VALUE
+                for (keyIndex in 0..queryIndex) {
+                    var dot = 0f
+                    for (dimension in 0 until headDimension) {
+                        dot += query[queryIndex][offset + dimension] * key[keyIndex][offset + dimension]
+                    }
+                    val score = dot * scale
+                    expectedScores[head * sequenceLength + queryIndex][keyIndex] = score
+                    maximum = max(maximum, score)
+                }
+                var denominator = 0f
+                for (keyIndex in 0..queryIndex) {
+                    val probability = exp(
+                        expectedScores[head * sequenceLength + queryIndex][keyIndex] - maximum
+                    )
+                    expectedScores[head * sequenceLength + queryIndex][keyIndex] = probability
+                    denominator += probability
+                }
+                for (keyIndex in 0..queryIndex) {
+                    expectedScores[head * sequenceLength + queryIndex][keyIndex] /= denominator
+                }
+                for (keyIndex in queryIndex + 1 until sequenceLength) {
+                    expectedScores[head * sequenceLength + queryIndex][keyIndex] = 0f
+                }
+                for (dimension in 0 until headDimension) {
+                    var result = 0f
+                    for (keyIndex in 0..queryIndex) {
+                        result += expectedScores[head * sequenceLength + queryIndex][keyIndex] *
+                            value[keyIndex][offset + dimension]
+                    }
+                    expectedAttention[queryIndex][offset + dimension] = result
+                }
+            }
+        }
+
+        for (row in 0 until sequenceLength) {
+            for (column in 0 until modelWidth) {
+                var result = 0f
+                for (inner in 0 until modelWidth) {
+                    result += expectedAttention[row][inner] *
+                        outputWeightValues[inner * modelWidth + column]
+                }
+                expectedProjected[row][column] = result + residual[row][column]
+            }
+        }
+
+        var qkvHandle = 0L
+        var scoreHandle = 0L
+        var attentionOutputHandle = 0L
+        var projectedOutputHandle = 0L
+        var residualHandle = 0L
+        var outputWeightHandle = 0L
+        try {
+            val qkvValues = FloatArray(sequenceLength * modelWidth * 3)
+            var cursor = 0
+            for (matrix in arrayOf(query, key, value)) {
+                for (row in matrix) {
+                    row.copyInto(qkvValues, cursor)
+                    cursor += row.size
+                }
+            }
+            val residualValues = FloatArray(sequenceLength * modelWidth)
+            for (row in 0 until sequenceLength) {
+                residual[row].copyInto(residualValues, row * modelWidth)
+            }
+            val qkvBytes = encodeFloatArray(qkvValues)
+            val residualBytes = encodeFloatArray(residualValues)
+            val weightBytes = outputWeight.toLittleEndianByteArray()
+            val scoreByteCount = Math.multiplyExact(
+                Math.multiplyExact(headCount, sequenceLength * sequenceLength),
+                Float.SIZE_BYTES
+            )
+            val activationByteCount = Math.multiplyExact(
+                Math.multiplyExact(sequenceLength, modelWidth),
+                Float.SIZE_BYTES
+            )
+
+            qkvHandle = nativeAllocateTensor(qkvBytes.size.toLong())
+            scoreHandle = nativeAllocateTensor(scoreByteCount.toLong())
+            attentionOutputHandle = nativeAllocateTensor(activationByteCount.toLong())
+            projectedOutputHandle = nativeAllocateTensor(activationByteCount.toLong())
+            residualHandle = nativeAllocateTensor(residualBytes.size.toLong())
+            outputWeightHandle = nativeAllocateTensor(weightBytes.size.toLong())
+            if (qkvHandle == 0L || scoreHandle == 0L ||
+                attentionOutputHandle == 0L || projectedOutputHandle == 0L ||
+                residualHandle == 0L || outputWeightHandle == 0L) {
+                return false
+            }
+
+            if (!nativeUploadTensor(qkvHandle, qkvBytes) ||
+                !nativeUploadTensor(residualHandle, residualBytes) ||
+                !nativeUploadTensor(outputWeightHandle, weightBytes) ||
+                !nativeRunResidentAttention(
+                    qkvHandle, scoreHandle, attentionOutputHandle, projectedOutputHandle,
+                    residualHandle, outputWeightHandle,
+                    sequenceLength, modelWidth, headCount, headDimension
+                )) {
+                return false
+            }
+
+            val actualScoresBytes = ByteArray(scoreByteCount)
+            val actualAttentionBytes = ByteArray(activationByteCount)
+            val actualProjectedBytes = ByteArray(activationByteCount)
+            if (!nativeDownloadTensor(scoreHandle, actualScoresBytes) ||
+                !nativeDownloadTensor(attentionOutputHandle, actualAttentionBytes) ||
+                !nativeDownloadTensor(projectedOutputHandle, actualProjectedBytes)) {
+                return false
+            }
+
+            val expectedScoreValues = FloatArray(headCount * sequenceLength * sequenceLength)
+            for (row in expectedScores.indices) {
+                expectedScores[row].copyInto(expectedScoreValues, row * sequenceLength)
+            }
+            val expectedAttentionValues = FloatArray(sequenceLength * modelWidth)
+            val expectedProjectedValues = FloatArray(sequenceLength * modelWidth)
+            for (row in 0 until sequenceLength) {
+                expectedAttention[row].copyInto(expectedAttentionValues, row * modelWidth)
+                expectedProjected[row].copyInto(expectedProjectedValues, row * modelWidth)
+            }
+            return approximatelyEqual(decodeFloatArray(actualScoresBytes), expectedScoreValues, 2e-4f) &&
+                approximatelyEqual(decodeFloatArray(actualAttentionBytes), expectedAttentionValues, 2e-4f) &&
+                approximatelyEqual(decodeFloatArray(actualProjectedBytes), expectedProjectedValues, 2e-4f)
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident attention self-check JNI entry point is unavailable.", error)
+            return false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident attention self-check failed.", error)
+            return false
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident attention self-check exceeded available memory.", error)
+            return false
+        } finally {
+            if (outputWeightHandle != 0L) runCatching { nativeReleaseTensor(outputWeightHandle) }
+            if (residualHandle != 0L) runCatching { nativeReleaseTensor(residualHandle) }
+            if (projectedOutputHandle != 0L) runCatching { nativeReleaseTensor(projectedOutputHandle) }
+            if (attentionOutputHandle != 0L) runCatching { nativeReleaseTensor(attentionOutputHandle) }
+            if (scoreHandle != 0L) runCatching { nativeReleaseTensor(scoreHandle) }
+            if (qkvHandle != 0L) runCatching { nativeReleaseTensor(qkvHandle) }
         }
     }
 
@@ -2907,6 +3351,19 @@ internal object VulkanTrainingBackend {
         inputColumns: Int,
         outputColumns: Int,
         transposeWeights: Boolean
+    ): Boolean
+
+    private external fun nativeRunResidentAttention(
+        qkvHandle: Long,
+        scoreHandle: Long,
+        attentionOutputHandle: Long,
+        projectedOutputHandle: Long,
+        residualHandle: Long,
+        outputWeightHandle: Long,
+        sequenceLength: Int,
+        modelWidth: Int,
+        headCount: Int,
+        headDimension: Int
     ): Boolean
 
     private external fun nativeApplyLinear(

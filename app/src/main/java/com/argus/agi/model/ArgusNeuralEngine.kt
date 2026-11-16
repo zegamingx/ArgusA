@@ -1756,35 +1756,53 @@ class ArgusNeuralEngine private constructor(
                 addLoraProjection(layerInput[t], b.loraVa, b.loraVb, dModel, dModel, loraRank, lf.mV[t], lf.v[t])
             }
 
-            for (h in 0 until nHeads) {
-                val hOffset = h * headDim
-                for (i in 0 until seqLen) {
-                    var maxScore = -Float.MAX_VALUE
-                    for (j in 0..i) {
-                        var dot = 0f
-                        for (d in 0 until headDim) dot += lf.q[i][hOffset + d] * lf.k[j][hOffset + d]
-                        val sc = dot * scale
-                        lf.attnWeights[h][i][j] = sc
-                        if (sc > maxScore) maxScore = sc
-                    }
-                    var sumExp = 0f
-                    for (j in 0..i) {
-                        val e = exp(lf.attnWeights[h][i][j] - maxScore)
-                        lf.attnWeights[h][i][j] = e; sumExp += e
-                    }
-                    val invSum = 1.0f / max(sumExp, 1e-9f)
-                    for (j in 0..i) lf.attnWeights[h][i][j] *= invSum
-                    for (d in 0 until headDim) {
-                        var weightedV = 0f
-                        for (j in 0..i) weightedV += lf.attnWeights[h][i][j] * lf.v[j][hOffset + d]
-                        lf.attnOut[i][hOffset + d] = weightedV
+
+            val residentAttentionCompleted = VulkanTrainingBackend.tryApplyResidentAttention(
+                queryRows = lf.q,
+                keyRows = lf.k,
+                valueRows = lf.v,
+                residualRows = layerInput,
+                outputWeights = b.wO,
+                attentionWeights = lf.attnWeights,
+                attentionOutputRows = lf.attnOut,
+                projectedOutputRows = lf.h1PreLN,
+                modelWidth = dModel,
+                headCount = nHeads
+            )
+            if (!residentAttentionCompleted) {
+                for (h in 0 until nHeads) {
+                    val hOffset = h * headDim
+                    for (i in 0 until seqLen) {
+                        var maxScore = -Float.MAX_VALUE
+                        for (j in 0..i) {
+                            var dot = 0f
+                            for (d in 0 until headDim) dot += lf.q[i][hOffset + d] * lf.k[j][hOffset + d]
+                            val sc = dot * scale
+                            lf.attnWeights[h][i][j] = sc
+                            if (sc > maxScore) maxScore = sc
+                        }
+                        var sumExp = 0f
+                        for (j in 0..i) {
+                            val e = exp(lf.attnWeights[h][i][j] - maxScore)
+                            lf.attnWeights[h][i][j] = e; sumExp += e
+                        }
+                        val invSum = 1.0f / max(sumExp, 1e-9f)
+                        for (j in 0..i) lf.attnWeights[h][i][j] *= invSum
+                        for (d in 0 until headDim) {
+                            var weightedV = 0f
+                            for (j in 0..i) weightedV += lf.attnWeights[h][i][j] * lf.v[j][hOffset + d]
+                            lf.attnOut[i][hOffset + d] = weightedV
+                        }
                     }
                 }
+    
+    
+                computeLinearBatch(lf.attnOut, b.wO, dModel, dModel, lf.h1PreLN)
+                for (t in 0 until seqLen) {
+                    for (d in 0 until dModel) lf.h1PreLN[t][d] += layerInput[t][d]
+                }
             }
-
-            computeLinearBatch(lf.attnOut, b.wO, dModel, dModel, lf.h1PreLN)
             for (t in 0 until seqLen) {
-                for (d in 0 until dModel) lf.h1PreLN[t][d] += layerInput[t][d]
                 System.arraycopy(lf.h1PreLN[t], 0, lf.h1[t], 0, dModel)
                 layerNormInPlace(lf.h1[t], dModel)
             }

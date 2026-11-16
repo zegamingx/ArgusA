@@ -131,6 +131,14 @@ argus_compile_shader(
     "kArgusResidentLinearShaderSpvSize"
 )
 
+argus_compile_shader(
+    "${CMAKE_CURRENT_SOURCE_DIR}/attention_resident.comp"
+    "attention_resident.comp.spv"
+    "attention_resident_shader_spv.h"
+    "kArgusResidentAttentionShaderSpv"
+    "kArgusResidentAttentionShaderSpvSize"
+)
+
 get_property(
     ARGUS_SHADER_HEADERS
     GLOBAL

@@ -1,0 +1,162 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) buffer TensorArena { uint values[]; };
+
+layout(push_constant) uniform ResidentAttentionParameters {
+    uint operation;
+    uint sequenceLength;
+    uint modelWidth;
+    uint headCount;
+    uint headDimension;
+    uint qkvOffsetWords;
+    uint scoreOffsetWords;
+    uint attentionOutputOffsetWords;
+    uint projectedOutputOffsetWords;
+    uint residualOffsetWords;
+    uint outputWeightOffsetHalf;
+    uint reserved;
+} parameters;
+
+const float MASKED_SCORE = -3.402823e+38;
+
+float loadHalfAsFloat(uint halfIndex) {
+    const vec2 pair = unpackHalf2x16(values[halfIndex >> 1u]);
+    return (halfIndex & 1u) == 0u ? pair.x : pair.y;
+}
+
+void runCausalScore(uint invocation, uint stride) {
+    const uint scoreElementCount =
+        parameters.headCount * parameters.sequenceLength * parameters.sequenceLength;
+    for (uint index = invocation; index < scoreElementCount; index += stride) {
+        const uint scoresPerHead =
+            parameters.sequenceLength * parameters.sequenceLength;
+        const uint head = index / scoresPerHead;
+        const uint withinHead = index - head * scoresPerHead;
+        const uint query = withinHead / parameters.sequenceLength;
+        const uint key = withinHead - query * parameters.sequenceLength;
+
+        if (key > query) {
+            values[parameters.scoreOffsetWords + index] = floatBitsToUint(MASKED_SCORE);
+            continue;
+        }
+
+        const uint queryBase = parameters.qkvOffsetWords +
+            query * parameters.modelWidth + head * parameters.headDimension;
+        const uint keyBase = parameters.qkvOffsetWords +
+            parameters.sequenceLength * parameters.modelWidth +
+            key * parameters.modelWidth + head * parameters.headDimension;
+
+        float dotProduct = 0.0;
+        for (uint dimension = 0u; dimension < parameters.headDimension; ++dimension) {
+            dotProduct = fma(
+                uintBitsToFloat(values[queryBase + dimension]),
+                uintBitsToFloat(values[keyBase + dimension]),
+                dotProduct
+            );
+        }
+        const float score = dotProduct * inversesqrt(float(parameters.headDimension));
+        values[parameters.scoreOffsetWords + index] =
+            floatBitsToUint(isnan(score) || isinf(score) ? 0.0 : score);
+    }
+}
+
+void runCausalSoftmax(uint invocation, uint stride) {
+    const uint rowCount = parameters.headCount * parameters.sequenceLength;
+    for (uint row = invocation; row < rowCount; row += stride) {
+        const uint query = row % parameters.sequenceLength;
+        const uint rowBase = parameters.scoreOffsetWords + row * parameters.sequenceLength;
+        float maximumScore = MASKED_SCORE;
+
+        for (uint key = 0u; key <= query; ++key) {
+            maximumScore = max(maximumScore, uintBitsToFloat(values[rowBase + key]));
+        }
+
+        float denominator = 0.0;
+        for (uint key = 0u; key <= query; ++key) {
+            denominator += exp(uintBitsToFloat(values[rowBase + key]) - maximumScore);
+        }
+
+        if (!(denominator > 0.0) || isnan(denominator) || isinf(denominator)) {
+            for (uint key = 0u; key < parameters.sequenceLength; ++key) {
+                values[rowBase + key] = floatBitsToUint(0.0);
+            }
+            continue;
+        }
+
+        const float inverseDenominator = 1.0 / denominator;
+        for (uint key = 0u; key <= query; ++key) {
+            const float probability =
+                exp(uintBitsToFloat(values[rowBase + key]) - maximumScore) *
+                inverseDenominator;
+            values[rowBase + key] = floatBitsToUint(probability);
+        }
+        for (uint key = query + 1u; key < parameters.sequenceLength; ++key) {
+            values[rowBase + key] = floatBitsToUint(0.0);
+        }
+    }
+}
+
+void runAttentionValue(uint invocation, uint stride) {
+    const uint elementCount = parameters.sequenceLength * parameters.modelWidth;
+    for (uint index = invocation; index < elementCount; index += stride) {
+        const uint query = index / parameters.modelWidth;
+        const uint dimension = index - query * parameters.modelWidth;
+        const uint head = dimension / parameters.headDimension;
+        const uint headDimensionIndex = dimension - head * parameters.headDimension;
+        const uint scoreRow = parameters.scoreOffsetWords +
+            (head * parameters.sequenceLength + query) * parameters.sequenceLength;
+        const uint valueBase = parameters.qkvOffsetWords +
+            2u * parameters.sequenceLength * parameters.modelWidth +
+            head * parameters.headDimension + headDimensionIndex;
+
+        float result = 0.0;
+        for (uint key = 0u; key <= query; ++key) {
+            result = fma(
+                uintBitsToFloat(values[scoreRow + key]),
+                uintBitsToFloat(values[valueBase + key * parameters.modelWidth]),
+                result
+            );
+        }
+        values[parameters.attentionOutputOffsetWords + index] = floatBitsToUint(result);
+    }
+}
+
+void runOutputProjectionAndResidual(uint invocation, uint stride) {
+    const uint elementCount = parameters.sequenceLength * parameters.modelWidth;
+    for (uint index = invocation; index < elementCount; index += stride) {
+        const uint row = index / parameters.modelWidth;
+        const uint outputColumn = index - row * parameters.modelWidth;
+        const uint inputBase = parameters.attentionOutputOffsetWords + row * parameters.modelWidth;
+
+        float projected = 0.0;
+        for (uint inner = 0u; inner < parameters.modelWidth; ++inner) {
+            const uint weightIndex =
+                parameters.outputWeightOffsetHalf + inner * parameters.modelWidth + outputColumn;
+            projected = fma(
+                uintBitsToFloat(values[inputBase + inner]),
+                loadHalfAsFloat(weightIndex),
+                projected
+            );
+        }
+
+        values[parameters.projectedOutputOffsetWords + index] = floatBitsToUint(
+            projected + uintBitsToFloat(values[parameters.residualOffsetWords + index])
+        );
+    }
+}
+
+void main() {
+    const uint invocation = gl_GlobalInvocationID.x;
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    if (stride == 0u) return;
+    if (parameters.operation == 0u) {
+        runCausalScore(invocation, stride);
+    } else if (parameters.operation == 1u) {
+        runCausalSoftmax(invocation, stride);
+    } else if (parameters.operation == 2u) {
+        runAttentionValue(invocation, stride);
+    } else if (parameters.operation == 3u) {
+        runOutputProjectionAndResidual(invocation, stride);
+    }
+}

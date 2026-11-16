@@ -10,6 +10,7 @@
 #include "linear_shader_spv.h"
 #include "linear_fp16_shader_spv.h"
 #include "linear_resident_shader_spv.h"
+#include "attention_resident_shader_spv.h"
 #include "tensor_arena_core.h"
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <cstdio>
 #include <limits>
+#include <initializer_list>
 #include <mutex>
 #include <new>
 #include <sstream>
@@ -86,6 +88,25 @@ struct ResidentLinearPushConstants {
 static_assert(sizeof(ResidentLinearPushConstants) == 40);
 static_assert(offsetof(ResidentLinearPushConstants, batchCount) == 4);
 static_assert(offsetof(ResidentLinearPushConstants, weightOffsetsTableOffsetWords) == 36);
+
+struct ResidentAttentionPushConstants {
+    uint32_t operation;
+    uint32_t sequenceLength;
+    uint32_t modelWidth;
+    uint32_t headCount;
+    uint32_t headDimension;
+    uint32_t qkvOffsetWords;
+    uint32_t scoreOffsetWords;
+    uint32_t attentionOutputOffsetWords;
+    uint32_t projectedOutputOffsetWords;
+    uint32_t residualOffsetWords;
+    uint32_t outputWeightOffsetHalf;
+    uint32_t reserved;
+};
+
+static_assert(sizeof(ResidentAttentionPushConstants) == 48);
+static_assert(offsetof(ResidentAttentionPushConstants, qkvOffsetWords) == 20);
+static_assert(offsetof(ResidentAttentionPushConstants, outputWeightOffsetHalf) == 40);
 
 struct CooperativeMatrixCapability {
     uint32_t mSize = 0;
@@ -154,6 +175,7 @@ struct VulkanRuntime {
     VkPipeline linearPipeline = VK_NULL_HANDLE;
     VkPipeline fp16LinearPipeline = VK_NULL_HANDLE;
     VkPipeline residentLinearPipeline = VK_NULL_HANDLE;
+    VkPipeline residentAttentionPipeline = VK_NULL_HANDLE;
 
     uint32_t instanceApiVersion = VK_API_VERSION_1_0;
     bool supportsFp16Compute = false;
@@ -406,6 +428,9 @@ void destroyRuntime() {
         destroyTensorArena();
         destroyStorageBuffer();
 
+        if (gRuntime.residentAttentionPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(gRuntime.device, gRuntime.residentAttentionPipeline, nullptr);
+        }
         if (gRuntime.residentLinearPipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(gRuntime.device, gRuntime.residentLinearPipeline, nullptr);
         }
@@ -2355,7 +2380,11 @@ bool initializeRuntime() {
     pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushConstantRange.offset = 0;
     pushConstantRange.size = static_cast<uint32_t>(
-        std::max(sizeof(AdamwPushConstants), sizeof(LinearPushConstants))
+        std::max({
+            sizeof(AdamwPushConstants),
+            sizeof(LinearPushConstants),
+            sizeof(ResidentAttentionPushConstants)
+        })
     );
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
@@ -2512,6 +2541,45 @@ bool initializeRuntime() {
             residentResult
         );
     }
+
+    VkShaderModuleCreateInfo attentionShaderInfo{};
+    attentionShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    attentionShaderInfo.codeSize = kArgusResidentAttentionShaderSpvSize;
+    attentionShaderInfo.pCode =
+        reinterpret_cast<const uint32_t*>(kArgusResidentAttentionShaderSpv);
+
+    VkShaderModule attentionShaderModule = VK_NULL_HANDLE;
+    VkResult attentionResult = vkCreateShaderModule(
+        gRuntime.device, &attentionShaderInfo, nullptr, &attentionShaderModule
+    );
+    if (attentionResult == VK_SUCCESS) {
+        VkPipelineShaderStageCreateInfo attentionShaderStage{};
+        attentionShaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        attentionShaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        attentionShaderStage.module = attentionShaderModule;
+        attentionShaderStage.pName = "main";
+
+        VkComputePipelineCreateInfo attentionPipelineInfo{};
+        attentionPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        attentionPipelineInfo.stage = attentionShaderStage;
+        attentionPipelineInfo.layout = gRuntime.pipelineLayout;
+
+        attentionResult = vkCreateComputePipelines(
+            gRuntime.device, VK_NULL_HANDLE, 1u, &attentionPipelineInfo,
+            nullptr, &gRuntime.residentAttentionPipeline
+        );
+    }
+    if (attentionShaderModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(gRuntime.device, attentionShaderModule, nullptr);
+    }
+    if (attentionResult != VK_SUCCESS) {
+        gRuntime.residentAttentionPipeline = VK_NULL_HANDLE;
+        logError(
+            "Resident causal-attention pipeline is unavailable; the verified Kotlin fallback remains active.",
+            attentionResult
+        );
+    }
+
 
     if (gRuntime.supportsFp16Compute) {
         VkShaderModuleCreateInfo fp16ShaderInfo{};
@@ -5389,6 +5457,329 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinearBatch(
 }
 
 
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
+    JNIEnv*,
+    jobject,
+    jlong qkvHandle,
+    jlong scoreHandle,
+    jlong attentionOutputHandle,
+    jlong projectedOutputHandle,
+    jlong residualHandle,
+    jlong outputWeightHandle,
+    jint sequenceLength,
+    jint modelWidth,
+    jint headCount,
+    jint headDimension
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.residentAttentionPipeline == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        qkvHandle <= 0 || scoreHandle <= 0 ||
+        attentionOutputHandle <= 0 || projectedOutputHandle <= 0 ||
+        residualHandle <= 0 || outputWeightHandle <= 0 ||
+        sequenceLength <= 0 || modelWidth <= 0 ||
+        headCount <= 0 || headDimension <= 0 ||
+        static_cast<uint64_t>(headCount) * static_cast<uint64_t>(headDimension) !=
+            static_cast<uint64_t>(modelWidth)) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t sequence = static_cast<uint64_t>(sequenceLength);
+    const uint64_t width = static_cast<uint64_t>(modelWidth);
+    const uint64_t heads = static_cast<uint64_t>(headCount);
+    const uint64_t headWidth = static_cast<uint64_t>(headDimension);
+    constexpr uint64_t kMaximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+
+    if (sequence > std::numeric_limits<uint64_t>::max() / width ||
+        sequence > std::numeric_limits<uint64_t>::max() / sequence ||
+        heads > std::numeric_limits<uint64_t>::max() / sequence ||
+        heads * sequence > std::numeric_limits<uint64_t>::max() / sequence ||
+        width > std::numeric_limits<uint64_t>::max() / width) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t sequenceWidthElements = sequence * width;
+    if (sequenceWidthElements > std::numeric_limits<uint64_t>::max() / 3u) {
+        return JNI_FALSE;
+    }
+    const uint64_t qkvElements = sequenceWidthElements * 3u;
+    const uint64_t scoreElements = heads * sequence * sequence;
+    const uint64_t activationElements = sequenceWidthElements;
+    const uint64_t weightElements = width * width;
+    if (qkvElements == 0u || scoreElements == 0u ||
+        activationElements == 0u || weightElements == 0u ||
+        qkvElements > kMaximumShaderIndex ||
+        scoreElements > kMaximumShaderIndex ||
+        activationElements > kMaximumShaderIndex ||
+        weightElements > kMaximumShaderIndex) {
+        logError("Resident attention dimensions exceed 32-bit shader indexing.");
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize qkvByteCount = static_cast<VkDeviceSize>(qkvElements * sizeof(float));
+    const VkDeviceSize scoreByteCount = static_cast<VkDeviceSize>(scoreElements * sizeof(float));
+    const VkDeviceSize activationByteCount =
+        static_cast<VkDeviceSize>(activationElements * sizeof(float));
+    const VkDeviceSize weightByteCount =
+        static_cast<VkDeviceSize>(weightElements * sizeof(uint16_t));
+    const VkDeviceSize maximumStorageRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    if (qkvByteCount > maximumStorageRange ||
+        scoreByteCount > maximumStorageRange ||
+        activationByteCount > maximumStorageRange ||
+        weightByteCount > maximumStorageRange) {
+        logError("Resident attention tensors exceed maxStorageBufferRange.");
+        return JNI_FALSE;
+    }
+
+    const jlong handles[] = {
+        qkvHandle, scoreHandle, attentionOutputHandle,
+        projectedOutputHandle, residualHandle, outputWeightHandle
+    };
+    for (size_t index = 0u; index < 6u; ++index) {
+        for (size_t previous = 0u; previous < index; ++previous) {
+            if (handles[index] == handles[previous]) {
+                logError("Resident attention tensors must use distinct arena allocations.");
+                return JNI_FALSE;
+            }
+        }
+    }
+
+    TensorArenaAllocation* qkvAllocation =
+        findArenaAllocation(static_cast<uint64_t>(qkvHandle));
+    TensorArenaAllocation* scoreAllocation =
+        findArenaAllocation(static_cast<uint64_t>(scoreHandle));
+    TensorArenaAllocation* attentionOutputAllocation =
+        findArenaAllocation(static_cast<uint64_t>(attentionOutputHandle));
+    TensorArenaAllocation* projectedOutputAllocation =
+        findArenaAllocation(static_cast<uint64_t>(projectedOutputHandle));
+    TensorArenaAllocation* residualAllocation =
+        findArenaAllocation(static_cast<uint64_t>(residualHandle));
+    TensorArenaAllocation* outputWeightAllocation =
+        findArenaAllocation(static_cast<uint64_t>(outputWeightHandle));
+
+    if (qkvAllocation == nullptr || scoreAllocation == nullptr ||
+        attentionOutputAllocation == nullptr || projectedOutputAllocation == nullptr ||
+        residualAllocation == nullptr || outputWeightAllocation == nullptr) {
+        logError("Resident attention references an unknown Tensor Arena allocation.");
+        return JNI_FALSE;
+    }
+
+    if (qkvAllocation->logicalSize < qkvByteCount ||
+        scoreAllocation->logicalSize < scoreByteCount ||
+        attentionOutputAllocation->logicalSize < activationByteCount ||
+        projectedOutputAllocation->logicalSize < activationByteCount ||
+        residualAllocation->logicalSize < activationByteCount ||
+        outputWeightAllocation->logicalSize < weightByteCount) {
+        logError("Resident attention allocation sizes do not match requested tensor shapes.");
+        return JNI_FALSE;
+    }
+
+    const TensorArenaAllocation* floatAllocations[] = {
+        qkvAllocation, scoreAllocation, attentionOutputAllocation,
+        projectedOutputAllocation, residualAllocation
+    };
+    const VkDeviceSize floatByteCounts[] = {
+        qkvByteCount, scoreByteCount, activationByteCount,
+        activationByteCount, activationByteCount
+    };
+    for (size_t index = 0u; index < 5u; ++index) {
+        const TensorArenaAllocation& allocation = *floatAllocations[index];
+        if ((allocation.offset & 3u) != 0u ||
+            allocation.offset > gRuntime.tensorArenaCapacity ||
+            floatByteCounts[index] > gRuntime.tensorArenaCapacity - allocation.offset) {
+            logError("Resident attention FP32 allocation is misaligned or outside Tensor Arena.");
+            return JNI_FALSE;
+        }
+    }
+    if ((outputWeightAllocation->offset & 1u) != 0u ||
+        outputWeightAllocation->offset > gRuntime.tensorArenaCapacity ||
+        weightByteCount > gRuntime.tensorArenaCapacity - outputWeightAllocation->offset) {
+        logError("Resident attention FP16 output weights are misaligned or outside Tensor Arena.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t qkvOffsetWords = qkvAllocation->offset / sizeof(uint32_t);
+    const uint64_t scoreOffsetWords = scoreAllocation->offset / sizeof(uint32_t);
+    const uint64_t attentionOutputOffsetWords =
+        attentionOutputAllocation->offset / sizeof(uint32_t);
+    const uint64_t projectedOutputOffsetWords =
+        projectedOutputAllocation->offset / sizeof(uint32_t);
+    const uint64_t residualOffsetWords = residualAllocation->offset / sizeof(uint32_t);
+    const uint64_t outputWeightOffsetHalf =
+        outputWeightAllocation->offset / sizeof(uint16_t);
+    const uint64_t maximumIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    if (qkvOffsetWords > maximumIndex || scoreOffsetWords > maximumIndex ||
+        attentionOutputOffsetWords > maximumIndex ||
+        projectedOutputOffsetWords > maximumIndex ||
+        residualOffsetWords > maximumIndex || outputWeightOffsetHalf > maximumIndex ||
+        qkvElements - 1u > maximumIndex - qkvOffsetWords ||
+        scoreElements - 1u > maximumIndex - scoreOffsetWords ||
+        activationElements - 1u > maximumIndex - attentionOutputOffsetWords ||
+        activationElements - 1u > maximumIndex - projectedOutputOffsetWords ||
+        activationElements - 1u > maximumIndex - residualOffsetWords ||
+        weightElements - 1u > maximumIndex - outputWeightOffsetHalf) {
+        logError("Resident attention tensor indices exceed 32-bit shader addressability.");
+        return JNI_FALSE;
+    }
+
+    const uint32_t scoreGroups = calculateDispatchWorkGroupCount(scoreElements);
+    const uint32_t softmaxGroups = calculateDispatchWorkGroupCount(heads * sequence);
+    const uint32_t activationGroups = calculateDispatchWorkGroupCount(activationElements);
+    if (scoreGroups == 0u || softmaxGroups == 0u || activationGroups == 0u) {
+        logError("Resident attention graph has no available compute workgroups.");
+        return JNI_FALSE;
+    }
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset resident attention command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin resident attention command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR beforeDependency{};
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_2_KHR;
+    beforeDependency.memoryBarrierCount = 1u;
+    beforeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
+
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.residentAttentionPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0u,
+        1u,
+        &gRuntime.tensorArenaDescriptorSet,
+        0u,
+        nullptr
+    );
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    const uint32_t groupCounts[] = {
+        scoreGroups, softmaxGroups, activationGroups, activationGroups
+    };
+    VkMemoryBarrier2KHR betweenStages{};
+    betweenStages.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    betweenStages.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    betweenStages.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    betweenStages.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    betweenStages.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR betweenDependency{};
+    betweenDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_2_KHR;
+    betweenDependency.memoryBarrierCount = 1u;
+    betweenDependency.pMemoryBarriers = &betweenStages;
+
+    for (uint32_t operation = 0u; operation < 4u; ++operation) {
+        const ResidentAttentionPushConstants parameters{
+            operation,
+            static_cast<uint32_t>(sequence),
+            static_cast<uint32_t>(width),
+            static_cast<uint32_t>(heads),
+            static_cast<uint32_t>(headWidth),
+            static_cast<uint32_t>(qkvOffsetWords),
+            static_cast<uint32_t>(scoreOffsetWords),
+            static_cast<uint32_t>(attentionOutputOffsetWords),
+            static_cast<uint32_t>(projectedOutputOffsetWords),
+            static_cast<uint32_t>(residualOffsetWords),
+            static_cast<uint32_t>(outputWeightOffsetHalf),
+            0u
+        };
+        vkCmdPushConstants(
+            gRuntime.commandBuffer,
+            gRuntime.pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0u,
+            sizeof(ResidentAttentionPushConstants),
+            &parameters
+        );
+        vkCmdDispatch(gRuntime.commandBuffer, groupCounts[operation], 1u, 1u);
+        if (operation != 3u) {
+            gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &betweenDependency);
+        }
+    }
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    VkBufferMemoryBarrier2KHR outputBarriers[3]{};
+    const TensorArenaAllocation* outputAllocations[] = {
+        scoreAllocation, attentionOutputAllocation, projectedOutputAllocation
+    };
+    const VkDeviceSize outputSizes[] = {
+        scoreByteCount, activationByteCount, activationByteCount
+    };
+    for (size_t index = 0u; index < 3u; ++index) {
+        outputBarriers[index].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+        outputBarriers[index].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        outputBarriers[index].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+        outputBarriers[index].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+        outputBarriers[index].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+        outputBarriers[index].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outputBarriers[index].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outputBarriers[index].buffer = gRuntime.tensorArenaBuffer;
+        outputBarriers[index].offset = outputAllocations[index]->offset;
+        outputBarriers[index].size = outputSizes[index];
+    }
+    VkDependencyInfoKHR outputDependency{};
+    outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_2_KHR;
+    outputDependency.bufferMemoryBarrierCount = 3u;
+    outputDependency.pBufferMemoryBarriers = outputBarriers;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish resident attention command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Resident attention graph submission or fence wait failed.")) {
+        return JNI_FALSE;
+    }
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastLinearGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
+}
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_argus_agi_model_VulkanTrainingBackend_nativeAllocateTensor(
