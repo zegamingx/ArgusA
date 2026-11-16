@@ -129,6 +129,7 @@ android {
 // for new tests and gradual migration.
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
     testLogging {
         events(
             TestLogEvent.STARTED,

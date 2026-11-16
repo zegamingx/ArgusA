@@ -38,7 +38,7 @@ data class VulkanGpuPerformanceMetrics(
 }
 
 
-internal data class VulkanTensorAllocation internal constructor(
+internal class VulkanTensorAllocation internal constructor(
     internal val nativeHandle: Long,
     val byteCount: Long
 )
@@ -1042,7 +1042,7 @@ internal object VulkanTrainingBackend {
 
     private fun verifyNativeFp16Kernel(): Boolean {
         // Exercise partial 8x16 tiles, a second K tile, independent batches,
-        // odd packed lengths, both matrix layouts, and persistent arena weights.
+        // odd packed lengths, both matrix layouts, and both persistent paths.
         val batchCount = 3
         val rowsPerBatch = 9
         val inputColumns = 19
@@ -1109,6 +1109,37 @@ internal object VulkanTrainingBackend {
             return expected
         }
 
+        fun calculateExpectedSingleMatrix(
+            weightValues: ShortArray,
+            transposeWeights: Boolean
+        ): FloatArray {
+            val expected = FloatArray(rowCount * outputColumns)
+            for (row in 0 until rowCount) {
+                val inputRowOffset = row * inputColumns
+                val outputRowOffset = row * outputColumns
+                for (column in 0 until outputColumns) {
+                    var sum = 0f
+                    for (inner in 0 until inputColumns) {
+                        val inputValue = Float16Codec.toFloat(
+                            Float16Codec.fromFiniteFloat(input[inputRowOffset + inner])
+                        )
+                        val weightIndex = if (transposeWeights) {
+                            column * inputColumns + inner
+                        } else {
+                            inner * outputColumns + column
+                        }
+                        val weightValue = Float16Codec.toFloat(weightValues[weightIndex])
+                        val halfProduct = Float16Codec.toFloat(
+                            Float16Codec.fromFiniteFloat(inputValue * weightValue)
+                        )
+                        sum += halfProduct
+                    }
+                    expected[outputRowOffset + column] = sum
+                }
+            }
+            return expected
+        }
+
         fun verifyStaging(
             weightValues: ShortArray,
             transposeWeights: Boolean
@@ -1128,7 +1159,7 @@ internal object VulkanTrainingBackend {
             ) && approximatelyEqual(actual, expected, 1e-3f)
         }
 
-        fun verifyPersistent(
+        fun verifyPersistentBatched(
             weightValues: ShortArray,
             transposeWeights: Boolean
         ): Boolean {
@@ -1178,13 +1209,13 @@ internal object VulkanTrainingBackend {
                     transposeWeights = transposeWeights
                 ) && approximatelyEqual(actual, expected, 1e-3f)
             } catch (error: LinkageError) {
-                Log.e(TAG, "Persistent FP16 Vulkan self-check entry point is unavailable.", error)
+                Log.e(TAG, "Persistent batched FP16 Vulkan self-check entry point is unavailable.", error)
                 return false
             } catch (error: RuntimeException) {
-                Log.e(TAG, "Persistent FP16 Vulkan self-check failed.", error)
+                Log.e(TAG, "Persistent batched FP16 Vulkan self-check failed.", error)
                 return false
             } catch (error: OutOfMemoryError) {
-                Log.w(TAG, "Persistent FP16 Vulkan self-check exceeded available memory.", error)
+                Log.w(TAG, "Persistent batched FP16 Vulkan self-check exceeded available memory.", error)
                 return false
             } finally {
                 for (handle in handles) {
@@ -1195,10 +1226,65 @@ internal object VulkanTrainingBackend {
             }
         }
 
+        fun verifyPersistentSingleMatrix(
+            weightValues: ShortArray,
+            transposeWeights: Boolean
+        ): Boolean {
+            val matrixValues = weightValues.copyOfRange(0, weightBatchSize)
+            val parameters = Float16ParameterArray.fromFloatArray(
+                FloatArray(weightBatchSize) { index ->
+                    Float16Codec.toFloat(matrixValues[index])
+                }
+            )
+            val expected = calculateExpectedSingleMatrix(matrixValues, transposeWeights)
+            var handle = 0L
+
+            try {
+                val byteCount = Math.multiplyExact(
+                    parameters.size.toLong(),
+                    Short.SIZE_BYTES.toLong()
+                )
+                handle = nativeAllocateTensor(byteCount)
+                if (handle == 0L) return false
+
+                if (!nativeUploadTensor(handle, parameters.toLittleEndianByteArray())) {
+                    return false
+                }
+
+                val actual = FloatArray(expected.size)
+                return nativeApplyFp16LinearWithArena(
+                    input = input,
+                    weightHandles = longArrayOf(handle),
+                    output = actual,
+                    rows = rowCount,
+                    batchCount = 1,
+                    rowsPerBatch = rowCount,
+                    inputColumns = inputColumns,
+                    outputColumns = outputColumns,
+                    transposeWeights = transposeWeights
+                ) && approximatelyEqual(actual, expected, 1e-3f)
+            } catch (error: LinkageError) {
+                Log.e(TAG, "Persistent single-matrix FP16 Vulkan self-check entry point is unavailable.", error)
+                return false
+            } catch (error: RuntimeException) {
+                Log.e(TAG, "Persistent single-matrix FP16 Vulkan self-check failed.", error)
+                return false
+            } catch (error: OutOfMemoryError) {
+                Log.w(TAG, "Persistent single-matrix FP16 Vulkan self-check exceeded available memory.", error)
+                return false
+            } finally {
+                if (handle != 0L) {
+                    runCatching { nativeReleaseTensor(handle) }
+                }
+            }
+        }
+
         return verifyStaging(weights, transposeWeights = false) &&
             verifyStaging(transposedWeights, transposeWeights = true) &&
-            verifyPersistent(weights, transposeWeights = false) &&
-            verifyPersistent(transposedWeights, transposeWeights = true)
+            verifyPersistentBatched(weights, transposeWeights = false) &&
+            verifyPersistentBatched(transposedWeights, transposeWeights = true) &&
+            verifyPersistentSingleMatrix(weights, transposeWeights = false) &&
+            verifyPersistentSingleMatrix(transposedWeights, transposeWeights = true)
     }
 
     /**
