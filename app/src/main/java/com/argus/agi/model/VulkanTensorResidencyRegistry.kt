@@ -177,6 +177,43 @@ internal class VulkanTensorResidencyRegistry(
 
 
     /**
+     * Stages every resident parameter tensor from GPU before committing any host mirror.
+     * This is required before CPU fallback, native runtime teardown, or checkpoint writing.
+     */
+    @Synchronized
+    fun synchronizeHostMirrors(): Boolean {
+        if (entries.isEmpty()) return true
+        val readback = download ?: return false
+        val staged = ArrayList<Pair<Float16ParameterArray, ByteArray>>(entries.size)
+        for ((parameters, entry) in entries) {
+            if (entry.uploadedRevision == Long.MIN_VALUE) return false
+            val byteCount = parameterByteCount(parameters) ?: return false
+            if (byteCount != entry.allocation.byteCount || byteCount > Int.MAX_VALUE.toLong()) {
+                return false
+            }
+            val snapshot = try {
+                ByteArray(byteCount.toInt())
+            } catch (_: OutOfMemoryError) {
+                return false
+            }
+            if (!readback(entry.allocation, snapshot)) return false
+            try {
+                parameters.validateLittleEndianPrefix(snapshot, parameters.size)
+            } catch (_: IllegalArgumentException) {
+                return false
+            }
+            staged.add(parameters to snapshot)
+        }
+
+        for ((parameters, snapshot) in staged) {
+            parameters.copyPrefixFromLittleEndianByteArray(snapshot, parameters.size)
+            val entry = entries[parameters] ?: return false
+            entry.uploadedRevision = parameters.mutationVersion
+        }
+        return true
+    }
+
+    /**
      * Records a completed device-side parameter update without scheduling a redundant
      * host-to-device upload. The caller must first commit the matching GPU readback to
      * the Float16ParameterArray while holding the model-update lock.
