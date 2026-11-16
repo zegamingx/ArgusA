@@ -3497,6 +3497,8 @@ internal object VulkanTrainingBackend {
         val gradientBytes = encodeFloatArray(flattenedGradients)
 
         val parameterAllocations = ArrayList<VulkanTensorAllocation>(initialParameters.size)
+        val candidateParameterAllocations =
+            ArrayList<VulkanTensorAllocation>(initialParameters.size)
         val firstMomentAllocations = ArrayList<VulkanTensorAllocation>(initialParameters.size)
         val secondMomentAllocations = ArrayList<VulkanTensorAllocation>(initialParameters.size)
         val candidateFirstMomentAllocations =
@@ -3510,6 +3512,9 @@ internal object VulkanTrainingBackend {
         try {
             for (group in initialParameters.indices) {
                 parameterAllocations.add(
+                    allocateGpuTensor(parameterBytes[group].size.toLong()) ?: return false
+                )
+                candidateParameterAllocations.add(
                     allocateGpuTensor(parameterBytes[group].size.toLong()) ?: return false
                 )
                 val momentBytes = firstMomentBytes[group].size.toLong()
@@ -3548,6 +3553,9 @@ internal object VulkanTrainingBackend {
             fun dispatch(): Boolean = nativeApplyResidentAdamWUpdate(
                 parameterHandles = LongArray(parameterAllocations.size) { index ->
                     parameterAllocations[index].nativeHandle
+                },
+                candidateParameterHandles = LongArray(candidateParameterAllocations.size) { index ->
+                    candidateParameterAllocations[index].nativeHandle
                 },
                 gradientHandle = gradientTensor.nativeHandle,
                 firstMomentHandles = LongArray(firstMomentAllocations.size) { index ->
@@ -3621,7 +3629,16 @@ internal object VulkanTrainingBackend {
             }
             for (group in initialParameters.indices) {
                 val updatedParameterBytes = ByteArray(parameterBytes[group].size)
-                if (!downloadGpuTensor(parameterAllocations[group], updatedParameterBytes) ||
+                val unchangedActiveParameterBytes = ByteArray(parameterBytes[group].size)
+                if (!downloadGpuTensor(
+                        candidateParameterAllocations[group],
+                        updatedParameterBytes
+                    ) ||
+                    !downloadGpuTensor(
+                        parameterAllocations[group],
+                        unchangedActiveParameterBytes
+                    ) ||
+                    !unchangedActiveParameterBytes.contentEquals(parameterBytes[group]) ||
                     !downloadGpuTensor(
                         candidateFirstMomentAllocations[group],
                         validCandidateFirstBytes[group]
@@ -3688,11 +3705,16 @@ internal object VulkanTrainingBackend {
             }
             for (group in parameterAllocations.indices) {
                 val rejectedParameters = ByteArray(parameterBytes[group].size)
+                val rejectedCandidateParameters = ByteArray(parameterBytes[group].size)
                 val rejectedFirstMoments = ByteArray(firstMomentBytes[group].size)
                 val rejectedSecondMoments = ByteArray(secondMomentBytes[group].size)
                 val rejectedCandidateFirst = ByteArray(firstMomentBytes[group].size)
                 val rejectedCandidateSecond = ByteArray(secondMomentBytes[group].size)
                 if (!downloadGpuTensor(parameterAllocations[group], rejectedParameters) ||
+                    !downloadGpuTensor(
+                        candidateParameterAllocations[group],
+                        rejectedCandidateParameters
+                    ) ||
                     !downloadGpuTensor(firstMomentAllocations[group], rejectedFirstMoments) ||
                     !downloadGpuTensor(secondMomentAllocations[group], rejectedSecondMoments) ||
                     !downloadGpuTensor(
@@ -3702,6 +3724,7 @@ internal object VulkanTrainingBackend {
                         candidateSecondMomentAllocations[group], rejectedCandidateSecond
                     ) ||
                     !rejectedParameters.contentEquals(parameterBytes[group]) ||
+                    !rejectedCandidateParameters.contentEquals(parameterBytes[group]) ||
                     !rejectedFirstMoments.contentEquals(firstMomentBytes[group]) ||
                     !rejectedSecondMoments.contentEquals(secondMomentBytes[group]) ||
                     !rejectedCandidateFirst.contentEquals(validCandidateFirstBytes[group]) ||
@@ -3720,6 +3743,7 @@ internal object VulkanTrainingBackend {
             var cleanupSucceeded = true
             val temporary = ArrayList<VulkanTensorAllocation>(
                 parameterAllocations.size +
+                    candidateParameterAllocations.size +
                     firstMomentAllocations.size +
                     secondMomentAllocations.size +
                     candidateFirstMomentAllocations.size +
@@ -3731,6 +3755,7 @@ internal object VulkanTrainingBackend {
             temporary.addAll(candidateFirstMomentAllocations.asReversed())
             temporary.addAll(secondMomentAllocations.asReversed())
             temporary.addAll(firstMomentAllocations.asReversed())
+            temporary.addAll(candidateParameterAllocations.asReversed())
             temporary.addAll(parameterAllocations.asReversed())
             for (allocation in temporary) {
                 if (!releaseGpuTensor(allocation)) cleanupSucceeded = false
