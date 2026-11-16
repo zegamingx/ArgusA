@@ -716,6 +716,7 @@ internal object VulkanTrainingBackend {
             residentResidualLayerNormReady = false
             residentBackwardReady = false
             residentGradientAccumulatorReady = false
+            residentAdamwReady = false
             disabledAfterRuntimeFailure = true
             _currentBackend = "Kotlin CPU"
             _runtimeStatus.value = "Kotlin CPU fallback — Vulkan runtime is no longer available"
@@ -1548,6 +1549,9 @@ internal object VulkanTrainingBackend {
         residentAttentionReady = false
         residentSwiGluReady = false
         residentResidualLayerNormReady = false
+        residentBackwardReady = false
+        residentGradientAccumulatorReady = false
+        residentAdamwReady = false
         disabledAfterRuntimeFailure = false
         initializationAttempted = false
         residencySuspended = false
@@ -1587,6 +1591,7 @@ internal object VulkanTrainingBackend {
         residentResidualLayerNormReady = false
         residentBackwardReady = false
         residentGradientAccumulatorReady = false
+        residentAdamwReady = false
         initializationAttempted = true
         _deviceCapabilities.value = null
         _runtimeStatus.value = "Preparing Vulkan after model initialization…"
