@@ -5008,6 +5008,7 @@ internal object VulkanTrainingBackend {
 
         var totalActiveElements = 0L
         var totalGradientBytes = 0L
+        var totalParameterBytes = 0L
         var totalMomentBytes = 0L
         for (index in parameters.indices) {
             val parameterSize = parameters[index].size
@@ -5033,6 +5034,12 @@ internal object VulkanTrainingBackend {
                     Math.multiplyExact(activeSize.toLong(), Float.SIZE_BYTES.toLong())
                 )
             }.getOrNull() ?: return false
+            totalParameterBytes = runCatching {
+                Math.addExact(
+                    totalParameterBytes,
+                    Math.multiplyExact(parameterSize.toLong(), Short.SIZE_BYTES.toLong())
+                )
+            }.getOrNull() ?: return false
             totalMomentBytes = runCatching {
                 val bytesPerMoment = Math.multiplyExact(
                     parameterSize.toLong(),
@@ -5056,6 +5063,20 @@ internal object VulkanTrainingBackend {
             Long.MAX_VALUE
         } else {
             optimizerBudget * 2L
+        }
+
+        val modelBudget = _modelTensorResidencyBudgetBytes.value.coerceAtLeast(0L)
+        val maximumDoubleBufferedModelBytes = if (modelBudget > Long.MAX_VALUE / 2L) {
+            Long.MAX_VALUE
+        } else {
+            modelBudget * 2L
+        }
+        val requiredModelArenaBytes = runCatching {
+            Math.addExact(tensorResidencyRegistry.residentByteCount(), totalParameterBytes)
+        }.getOrNull() ?: return false
+        if (requiredModelArenaBytes > maximumDoubleBufferedModelBytes) {
+            Log.d(TAG, "Resident AdamW candidate parameters exceed the reserved double-buffer budget.")
+            return false
         }
         val requiredMomentArenaBytes = runCatching {
             Math.addExact(
@@ -5109,8 +5130,10 @@ internal object VulkanTrainingBackend {
         var gradientAllocation: VulkanTensorAllocation? = null
         var statusAllocation: VulkanTensorAllocation? = null
         var ownsGradientAllocation = residentGradient == null
+        val candidateParameters = ArrayList<VulkanTensorAllocation>(parameters.size)
         val candidateFirstMoments = ArrayList<VulkanTensorAllocation>(parameters.size)
         val candidateSecondMoments = ArrayList<VulkanTensorAllocation>(parameters.size)
+        var candidateParametersCommitted = false
         var candidateMomentsCommitted = false
         var gradientReleased = false
         var statusReleased = false
@@ -5120,6 +5143,13 @@ internal object VulkanTrainingBackend {
 
         try {
             for (group in parameters.indices) {
+                val parameterBytes = Math.multiplyExact(
+                    parameters[group].size.toLong(),
+                    Short.SIZE_BYTES.toLong()
+                )
+                val candidateParameter = allocateGpuTensor(parameterBytes) ?: return false
+                candidateParameters.add(candidateParameter)
+
                 val momentBytes = Math.multiplyExact(
                     parameters[group].size.toLong(),
                     Float.SIZE_BYTES.toLong()
@@ -5170,6 +5200,9 @@ internal object VulkanTrainingBackend {
                 nativeApplyResidentAdamWUpdate(
                     parameterHandles = LongArray(residentParameters.size) { index ->
                         residentParameters[index].nativeHandle
+                    },
+                    candidateParameterHandles = LongArray(candidateParameters.size) { index ->
+                        candidateParameters[index].nativeHandle
                     },
                     gradientHandle = gradientTensor.nativeHandle,
                     firstMomentHandles = LongArray(residentFirstMoments.size) { index ->
@@ -5243,31 +5276,55 @@ internal object VulkanTrainingBackend {
             val candidateMomentAllocations = ArrayList<VulkanTensorAllocation>(parameters.size * 2)
             candidateMomentAllocations.addAll(candidateFirstMoments)
             candidateMomentAllocations.addAll(candidateSecondMoments)
-            if (!optimizerStateResidencyRegistry.replaceAll(
-                    tensors = momentInventory,
-                    expectedAllocations = expectedMomentAllocations,
-                    replacementAllocations = candidateMomentAllocations
+            val parameterInventory = parameters.toList()
+            val expectedParameterAllocations = residentParameters.toList()
+            val candidateParameterAllocations = candidateParameters.toList()
+
+            // Preflight both registries before publishing either side of the optimizer
+            // transaction. The backend lock prevents another owner from replacing them
+            // between these checks and the two allocation swaps.
+            if (!tensorResidencyRegistry.canReplaceAll(
+                    parameterInventory,
+                    expectedParameterAllocations,
+                    candidateParameterAllocations
+                ) ||
+                !optimizerStateResidencyRegistry.canReplaceAll(
+                    momentInventory,
+                    expectedMomentAllocations,
+                    candidateMomentAllocations
                 )) {
                 teardownRequired = true
-                Log.e(TAG, "Resident AdamW could not atomically publish candidate moment buffers.")
+                Log.e(TAG, "Resident AdamW candidate parameter/moment registry preflight failed.")
+                return false
+            }
+
+            if (!tensorResidencyRegistry.replaceAll(
+                    parameterInventory,
+                    expectedParameterAllocations,
+                    candidateParameterAllocations
+                )) {
+                teardownRequired = true
+                Log.e(TAG, "Resident AdamW could not atomically publish candidate FP16 parameters.")
+                return false
+            }
+            candidateParametersCommitted = true
+
+            if (!optimizerStateResidencyRegistry.replaceAll(
+                    momentInventory,
+                    expectedMomentAllocations,
+                    candidateMomentAllocations
+                )) {
+                // This can only happen if a registry invariant changes after the preflight.
+                // Keep the runtime unavailable instead of silently continuing with mixed state.
+                teardownRequired = true
+                Log.e(TAG, "Resident AdamW could not atomically publish candidate FP32 moments.")
                 return false
             }
             candidateMomentsCommitted = true
             deviceCommitCompleted = true
-            // Resident FP16 weights and candidate FP32 moments are now authoritative.
-            // Host mirrors stay stale and are read only at explicit CPU/inference/checkpoint
-            // boundaries, never after every optimizer update.
+            // Candidate FP16 parameters and FP32 moments are now authoritative together.
+            // Host mirrors remain stale until an explicit CPU/inference/checkpoint boundary.
             optimizerStateMirrorReliable = false
-
-            val revisionsSynchronized = parameters.indices.all { index ->
-                tensorResidencyRegistry.markGpuReplicaSynchronized(
-                    parameters[index], residentParameters[index]
-                )
-            }
-            if (!revisionsSynchronized) {
-                teardownRequired = true
-                Log.e(TAG, "Resident AdamW could not publish every committed model mutation revision.")
-            }
 
             _currentBackend = "Vulkan Compute (Resident FP16 AdamW)"
             runCatching { refreshGpuPerformanceMetrics() }
@@ -5307,19 +5364,24 @@ internal object VulkanTrainingBackend {
                 }
             }
 
-            if (!candidateMomentsCommitted && isRuntimeAvailable) {
-                for (allocation in candidateSecondMoments.asReversed() +
-                    candidateFirstMoments.asReversed()) {
-                    if (!releaseGpuTensor(allocation)) teardownRequired = true
+            if (isRuntimeAvailable) {
+                if (!candidateParametersCommitted) {
+                    for (allocation in candidateParameters.asReversed()) {
+                        if (!releaseGpuTensor(allocation)) teardownRequired = true
+                    }
+                }
+                if (!candidateMomentsCommitted) {
+                    for (allocation in candidateSecondMoments.asReversed() +
+                        candidateFirstMoments.asReversed()) {
+                        if (!releaseGpuTensor(allocation)) teardownRequired = true
+                    }
                 }
             }
 
             if (teardownRequired && nativeReady) {
-                if (!hostCommitCompleted && !candidateMomentsCommitted) {
-                    // We discard this runtime as a rollback. Host weights were not committed,
-                    // and the active moment buffers were read-only; preserve the old host weights
-                    // while recovering the unchanged active FP32 moments.
-                    modelParameterMirrorReliable = true
+                if (!candidateParametersCommitted && !candidateMomentsCommitted) {
+                    // All writes target candidate allocations. Active parameter and moment
+                    // buffers remain unchanged when the transaction does not commit.
                 }
                 runCatching { destroyNativeRuntime() }
                     .onFailure { error ->
@@ -5744,6 +5806,7 @@ internal object VulkanTrainingBackend {
 
     private external fun nativeApplyResidentAdamWUpdate(
         parameterHandles: LongArray,
+        candidateParameterHandles: LongArray,
         gradientHandle: Long,
         firstMomentHandles: LongArray,
         secondMomentHandles: LongArray,
