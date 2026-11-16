@@ -194,4 +194,68 @@ class VulkanOptimizerStateRegistryTest {
         assertTrue(second.contentEquals(floatArrayOf(-0.25f, 0.5f, -0.75f)))
     }
 
+
+    @Test
+    fun swapsAllMomentBuffersOnlyAfterEveryReplacementIsValid() {
+        val arena = FakeArena()
+        val state = registry(arena)
+        val first = FloatArray(4) { 0.1f * (it + 1) }
+        val second = FloatArray(4) { -0.2f * (it + 1) }
+        assertTrue(state.synchronizeAll(listOf(first, second)))
+
+        val oldFirst = state.acquire(first) ?: error("First active moment buffer is missing.")
+        val oldSecond = state.acquire(second) ?: error("Second active moment buffer is missing.")
+        val candidateFirst = arena.allocate(oldFirst.byteCount)
+            ?: error("First candidate moment allocation failed.")
+        val candidateSecond = arena.allocate(oldSecond.byteCount)
+            ?: error("Second candidate moment allocation failed.")
+        assertTrue(arena.upload(candidateFirst, ByteArray(candidateFirst.byteCount.toInt())))
+        assertTrue(arena.upload(candidateSecond, ByteArray(candidateSecond.byteCount.toInt())))
+
+        arena.releaseFailure = true
+        assertTrue(
+            state.replaceAll(
+                tensors = listOf(first, second),
+                expectedAllocations = listOf(oldFirst, oldSecond),
+                replacementAllocations = listOf(candidateFirst, candidateSecond)
+            )
+        )
+        assertEquals(candidateFirst.nativeHandle, state.acquire(first)?.nativeHandle)
+        assertEquals(candidateSecond.nativeHandle, state.acquire(second)?.nativeHandle)
+        assertEquals(64L, state.residentByteCount())
+
+        arena.releaseFailure = false
+        assertTrue(state.synchronizeAll(listOf(first, second)))
+        assertEquals(32L, state.residentByteCount())
+        assertFalse(arena.contents.containsKey(oldFirst.nativeHandle))
+        assertFalse(arena.contents.containsKey(oldSecond.nativeHandle))
+    }
+
+    @Test
+    fun rejectsIncompleteMomentBufferSwapWithoutChangingAnyActiveHandle() {
+        val arena = FakeArena()
+        val state = registry(arena)
+        val first = FloatArray(3)
+        val second = FloatArray(3)
+        assertTrue(state.synchronizeAll(listOf(first, second)))
+
+        val oldFirst = state.acquire(first) ?: error("First active moment buffer is missing.")
+        val oldSecond = state.acquire(second) ?: error("Second active moment buffer is missing.")
+        val candidateFirst = arena.allocate(oldFirst.byteCount)
+            ?: error("Candidate moment allocation failed.")
+        val duplicateCandidate = arena.allocate(oldSecond.byteCount)
+            ?: error("Second candidate allocation failed.")
+
+        assertFalse(
+            state.replaceAll(
+                tensors = listOf(first, second),
+                expectedAllocations = listOf(oldFirst, oldFirst),
+                replacementAllocations = listOf(candidateFirst, duplicateCandidate)
+            )
+        )
+        assertEquals(oldFirst.nativeHandle, state.acquire(first)?.nativeHandle)
+        assertEquals(oldSecond.nativeHandle, state.acquire(second)?.nativeHandle)
+        assertEquals(4, state.residentTensorCount())
+    }
+
 }
