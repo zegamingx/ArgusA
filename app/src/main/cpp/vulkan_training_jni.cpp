@@ -7173,6 +7173,44 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             1u,
             &parameterCopy
         );
+
+        const TensorArenaAllocation* sourceFirst = firstMomentAllocations[index];
+        const TensorArenaAllocation* destinationFirst = candidateFirstMomentAllocations[index];
+        const TensorArenaAllocation* sourceSecond = secondMomentAllocations[index];
+        const TensorArenaAllocation* destinationSecond = candidateSecondMomentAllocations[index];
+        if (sourceFirst->allocatedSize == 0u ||
+            sourceFirst->allocatedSize != destinationFirst->allocatedSize ||
+            sourceFirst->offset == destinationFirst->offset ||
+            sourceSecond->allocatedSize == 0u ||
+            sourceSecond->allocatedSize != destinationSecond->allocatedSize ||
+            sourceSecond->offset == destinationSecond->offset) {
+            logError("Resident AdamW candidate moment clone range is invalid.");
+            return JNI_FALSE;
+        }
+
+        VkBufferCopy firstMomentCopy{};
+        firstMomentCopy.srcOffset = sourceFirst->offset;
+        firstMomentCopy.dstOffset = destinationFirst->offset;
+        firstMomentCopy.size = sourceFirst->allocatedSize;
+        vkCmdCopyBuffer(
+            gRuntime.commandBuffer,
+            gRuntime.tensorArenaBuffer,
+            gRuntime.tensorArenaBuffer,
+            1u,
+            &firstMomentCopy
+        );
+
+        VkBufferCopy secondMomentCopy{};
+        secondMomentCopy.srcOffset = sourceSecond->offset;
+        secondMomentCopy.dstOffset = destinationSecond->offset;
+        secondMomentCopy.size = sourceSecond->allocatedSize;
+        vkCmdCopyBuffer(
+            gRuntime.commandBuffer,
+            gRuntime.tensorArenaBuffer,
+            gRuntime.tensorArenaBuffer,
+            1u,
+            &secondMomentCopy
+        );
     }
 
     VkMemoryBarrier2KHR parameterCopyToCompute{};
