@@ -13,6 +13,7 @@
 #include "attention_resident_shader_spv.h"
 #include "swiglu_resident_shader_spv.h"
 #include "backward_resident_shader_spv.h"
+#include "adamw_resident_shader_spv.h"
 #include "tensor_arena_core.h"
 
 #include <algorithm>
@@ -141,6 +142,31 @@ static_assert(offsetof(ResidentBackwardPushConstants, output0OffsetWords) == 28)
 static_assert(offsetof(ResidentBackwardPushConstants, scale) == 36);
 static_assert(offsetof(ResidentBackwardPushConstants, epsilon) == 40);
 
+struct ResidentAdamwPushConstants {
+    uint32_t operation;
+    uint32_t elementCount;
+    uint32_t pairCount;
+    uint32_t parameterOffsetWords;
+    uint32_t gradientOffsetWords;
+    uint32_t gradientElementOffset;
+    uint32_t firstMomentOffsetWords;
+    uint32_t secondMomentOffsetWords;
+    uint32_t statusOffsetWords;
+    float learningRate;
+    float beta1;
+    float beta2;
+    float biasCorrection1;
+    float biasCorrection2;
+    float epsilon;
+    float gradientClipFactor;
+    float weightDecay;
+};
+
+static_assert(sizeof(ResidentAdamwPushConstants) == 68);
+static_assert(offsetof(ResidentAdamwPushConstants, parameterOffsetWords) == 12);
+static_assert(offsetof(ResidentAdamwPushConstants, learningRate) == 36);
+static_assert(offsetof(ResidentAdamwPushConstants, weightDecay) == 64);
+
 struct CooperativeMatrixCapability {
     uint32_t mSize = 0;
     uint32_t nSize = 0;
@@ -211,6 +237,7 @@ struct VulkanRuntime {
     VkPipeline residentAttentionPipeline = VK_NULL_HANDLE;
     VkPipeline residentSwiGluPipeline = VK_NULL_HANDLE;
     VkPipeline residentBackwardPipeline = VK_NULL_HANDLE;
+    VkPipeline residentAdamwPipeline = VK_NULL_HANDLE;
 
     uint32_t instanceApiVersion = VK_API_VERSION_1_0;
     bool supportsFp16Compute = false;
@@ -463,6 +490,9 @@ void destroyRuntime() {
         destroyTensorArena();
         destroyStorageBuffer();
 
+        if (gRuntime.residentAdamwPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(gRuntime.device, gRuntime.residentAdamwPipeline, nullptr);
+        }
         if (gRuntime.residentBackwardPipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(gRuntime.device, gRuntime.residentBackwardPipeline, nullptr);
         }
@@ -2425,7 +2455,8 @@ bool initializeRuntime() {
             sizeof(AdamwPushConstants),
             sizeof(LinearPushConstants),
             sizeof(ResidentAttentionPushConstants),
-            sizeof(ResidentBackwardPushConstants)
+            sizeof(ResidentBackwardPushConstants),
+            sizeof(ResidentAdamwPushConstants)
         })
     );
 
@@ -2687,6 +2718,49 @@ bool initializeRuntime() {
         logError(
             "Resident backward pipeline is unavailable; Kotlin backward fallback remains active.",
             backwardResult
+        );
+    }
+
+    VkShaderModuleCreateInfo residentAdamwShaderInfo{};
+    residentAdamwShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    residentAdamwShaderInfo.codeSize = kArgusResidentAdamwShaderSpvSize;
+    residentAdamwShaderInfo.pCode =
+        reinterpret_cast<const uint32_t*>(kArgusResidentAdamwShaderSpv);
+    VkShaderModule residentAdamwShaderModule = VK_NULL_HANDLE;
+    VkResult residentAdamwResult = vkCreateShaderModule(
+        gRuntime.device,
+        &residentAdamwShaderInfo,
+        nullptr,
+        &residentAdamwShaderModule
+    );
+    if (residentAdamwResult == VK_SUCCESS) {
+        VkPipelineShaderStageCreateInfo residentAdamwShaderStage{};
+        residentAdamwShaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        residentAdamwShaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        residentAdamwShaderStage.module = residentAdamwShaderModule;
+        residentAdamwShaderStage.pName = "main";
+
+        VkComputePipelineCreateInfo residentAdamwPipelineInfo{};
+        residentAdamwPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        residentAdamwPipelineInfo.stage = residentAdamwShaderStage;
+        residentAdamwPipelineInfo.layout = gRuntime.pipelineLayout;
+        residentAdamwResult = vkCreateComputePipelines(
+            gRuntime.device,
+            VK_NULL_HANDLE,
+            1u,
+            &residentAdamwPipelineInfo,
+            nullptr,
+            &gRuntime.residentAdamwPipeline
+        );
+    }
+    if (residentAdamwShaderModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(gRuntime.device, residentAdamwShaderModule, nullptr);
+    }
+    if (residentAdamwResult != VK_SUCCESS) {
+        gRuntime.residentAdamwPipeline = VK_NULL_HANDLE;
+        logError(
+            "Resident FP16 AdamW pipeline is unavailable; the staged optimizer fallback remains active.",
+            residentAdamwResult
         );
     }
 
@@ -6705,4 +6779,405 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetTensorArenaMetrics(
          << "}";
     const std::string payload = json.str();
     return env->NewStringUTF(payload.c_str());
+}
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
+    JNIEnv* env,
+    jobject,
+    jlongArray parameterHandles,
+    jlong gradientHandle,
+    jlongArray firstMomentHandles,
+    jlongArray secondMomentHandles,
+    jintArray activeElementCounts,
+    jfloatArray weightDecayByGroup,
+    jfloat learningRate,
+    jfloat beta1,
+    jfloat beta2,
+    jfloat biasCorrection1,
+    jfloat biasCorrection2,
+    jfloat epsilon,
+    jfloat gradientClipFactor,
+    jlong statusHandle
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.residentAdamwPipeline == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        parameterHandles == nullptr ||
+        firstMomentHandles == nullptr ||
+        secondMomentHandles == nullptr ||
+        activeElementCounts == nullptr ||
+        weightDecayByGroup == nullptr ||
+        gradientHandle <= 0 ||
+        statusHandle <= 0 ||
+        !std::isfinite(learningRate) || learningRate < 0.0f ||
+        !std::isfinite(beta1) || beta1 < 0.0f || beta1 >= 1.0f ||
+        !std::isfinite(beta2) || beta2 < 0.0f || beta2 >= 1.0f ||
+        !std::isfinite(biasCorrection1) || biasCorrection1 <= 0.0f ||
+        !std::isfinite(biasCorrection2) || biasCorrection2 <= 0.0f ||
+        !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        !std::isfinite(gradientClipFactor) ||
+        gradientClipFactor < 0.0f || gradientClipFactor > 1.0f) {
+        return JNI_FALSE;
+    }
+
+    const jsize groupCount = env->GetArrayLength(parameterHandles);
+    if (env->ExceptionCheck() || groupCount <= 0 ||
+        env->GetArrayLength(firstMomentHandles) != groupCount ||
+        env->GetArrayLength(secondMomentHandles) != groupCount ||
+        env->GetArrayLength(activeElementCounts) != groupCount ||
+        env->GetArrayLength(weightDecayByGroup) != groupCount) {
+        return JNI_FALSE;
+    }
+
+    std::vector<jlong> parameterHandleValues;
+    std::vector<jlong> firstMomentHandleValues;
+    std::vector<jlong> secondMomentHandleValues;
+    std::vector<jint> elementCounts;
+    std::vector<jfloat> weightDecayValues;
+    try {
+        const size_t count = static_cast<size_t>(groupCount);
+        parameterHandleValues.resize(count);
+        firstMomentHandleValues.resize(count);
+        secondMomentHandleValues.resize(count);
+        elementCounts.resize(count);
+        weightDecayValues.resize(count);
+    } catch (const std::bad_alloc&) {
+        return JNI_FALSE;
+    }
+
+    env->GetLongArrayRegion(
+        parameterHandles, 0, groupCount, parameterHandleValues.data()
+    );
+    env->GetLongArrayRegion(
+        firstMomentHandles, 0, groupCount, firstMomentHandleValues.data()
+    );
+    env->GetLongArrayRegion(
+        secondMomentHandles, 0, groupCount, secondMomentHandleValues.data()
+    );
+    env->GetIntArrayRegion(
+        activeElementCounts, 0, groupCount, elementCounts.data()
+    );
+    env->GetFloatArrayRegion(
+        weightDecayByGroup, 0, groupCount, weightDecayValues.data()
+    );
+    if (env->ExceptionCheck()) return JNI_FALSE;
+
+    TensorArenaAllocation* gradientAllocation = findArenaAllocation(gradientHandle);
+    TensorArenaAllocation* statusAllocation = findArenaAllocation(statusHandle);
+    if (gradientAllocation == nullptr || statusAllocation == nullptr ||
+        gradientAllocation->logicalSize == 0u ||
+        statusAllocation->logicalSize < sizeof(uint32_t) ||
+        (gradientAllocation->offset & 3u) != 0u ||
+        (statusAllocation->offset & 3u) != 0u) {
+        logError("Resident AdamW gradient or status allocation is invalid.");
+        return JNI_FALSE;
+    }
+
+    constexpr uint64_t kMaximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    const uint64_t gradientOffsetWords =
+        gradientAllocation->offset / sizeof(uint32_t);
+    const uint64_t statusOffsetWords =
+        statusAllocation->offset / sizeof(uint32_t);
+    if (gradientOffsetWords > kMaximumShaderIndex ||
+        statusOffsetWords > kMaximumShaderIndex) {
+        logError("Resident AdamW gradient or status offset exceeds shader indexing.");
+        return JNI_FALSE;
+    }
+
+    uint64_t totalGradientElements = 0u;
+    uint64_t allocatedPairCount = 0u;
+    std::vector<TensorArenaAllocation*> parameterAllocations;
+    std::vector<TensorArenaAllocation*> firstMomentAllocations;
+    std::vector<TensorArenaAllocation*> secondMomentAllocations;
+    try {
+        const size_t count = static_cast<size_t>(groupCount);
+        parameterAllocations.reserve(count);
+        firstMomentAllocations.reserve(count);
+        secondMomentAllocations.reserve(count);
+    } catch (const std::bad_alloc&) {
+        return JNI_FALSE;
+    }
+
+    std::vector<jlong> uniqueHandles;
+    try {
+        uniqueHandles.reserve(static_cast<size_t>(groupCount) * 3u + 2u);
+    } catch (const std::bad_alloc&) {
+        return JNI_FALSE;
+    }
+    uniqueHandles.push_back(gradientHandle);
+    uniqueHandles.push_back(statusHandle);
+
+    for (jsize index = 0; index < groupCount; ++index) {
+        const size_t groupIndex = static_cast<size_t>(index);
+        const jlong parameterHandle = parameterHandleValues[groupIndex];
+        const jlong firstMomentHandle = firstMomentHandleValues[groupIndex];
+        const jlong secondMomentHandle = secondMomentHandleValues[groupIndex];
+        const jint rawElementCount = elementCounts[groupIndex];
+        const jfloat weightDecay = weightDecayValues[groupIndex];
+
+        if (parameterHandle <= 0 || firstMomentHandle <= 0 ||
+            secondMomentHandle <= 0 || rawElementCount <= 0 ||
+            !std::isfinite(weightDecay) || weightDecay < 0.0f) {
+            logError("Resident AdamW group handles, dimensions, or weight decay are invalid.");
+            return JNI_FALSE;
+        }
+
+        const jlong groupHandles[] = {
+            parameterHandle, firstMomentHandle, secondMomentHandle
+        };
+        for (jlong handle : groupHandles) {
+            if (std::find(uniqueHandles.begin(), uniqueHandles.end(), handle) !=
+                uniqueHandles.end()) {
+                logError("Resident AdamW tensor handles must be unique.");
+                return JNI_FALSE;
+            }
+            uniqueHandles.push_back(handle);
+        }
+
+        TensorArenaAllocation* parameterAllocation =
+            findArenaAllocation(parameterHandle);
+        TensorArenaAllocation* firstMomentAllocation =
+            findArenaAllocation(firstMomentHandle);
+        TensorArenaAllocation* secondMomentAllocation =
+            findArenaAllocation(secondMomentHandle);
+        if (parameterAllocation == nullptr ||
+            firstMomentAllocation == nullptr ||
+            secondMomentAllocation == nullptr) {
+            logError("Resident AdamW references an unknown Tensor Arena allocation.");
+            return JNI_FALSE;
+        }
+
+        const uint64_t elementCount = static_cast<uint64_t>(rawElementCount);
+        const uint64_t parameterBytes = elementCount * sizeof(uint16_t);
+        const uint64_t packedParameterBytes =
+            ((elementCount + 1u) / 2u) * sizeof(uint32_t);
+        const uint64_t momentBytes = elementCount * sizeof(float);
+        if (elementCount > std::numeric_limits<uint64_t>::max() / sizeof(float) ||
+            parameterAllocation->logicalSize < parameterBytes ||
+            parameterAllocation->allocatedSize < packedParameterBytes ||
+            firstMomentAllocation->logicalSize < momentBytes ||
+            secondMomentAllocation->logicalSize < momentBytes ||
+            (parameterAllocation->offset & 3u) != 0u ||
+            (firstMomentAllocation->offset & 3u) != 0u ||
+            (secondMomentAllocation->offset & 3u) != 0u) {
+            logError("Resident AdamW tensor sizes or alignments do not match the active prefix.");
+            return JNI_FALSE;
+        }
+
+        const uint64_t parameterOffsetWords =
+            parameterAllocation->offset / sizeof(uint32_t);
+        const uint64_t firstMomentOffsetWords =
+            firstMomentAllocation->offset / sizeof(uint32_t);
+        const uint64_t secondMomentOffsetWords =
+            secondMomentAllocation->offset / sizeof(uint32_t);
+        const uint64_t pairCount = (elementCount + 1u) / 2u;
+        if (parameterOffsetWords > kMaximumShaderIndex ||
+            firstMomentOffsetWords > kMaximumShaderIndex ||
+            secondMomentOffsetWords > kMaximumShaderIndex ||
+            pairCount - 1u > kMaximumShaderIndex - parameterOffsetWords ||
+            elementCount - 1u > kMaximumShaderIndex - firstMomentOffsetWords ||
+            elementCount - 1u > kMaximumShaderIndex - secondMomentOffsetWords ||
+            totalGradientElements > kMaximumShaderIndex ||
+            elementCount > kMaximumShaderIndex - totalGradientElements) {
+            logError("Resident AdamW tensor offsets exceed 32-bit shader addressability.");
+            return JNI_FALSE;
+        }
+
+        totalGradientElements += elementCount;
+        allocatedPairCount += pairCount;
+        parameterAllocations.push_back(parameterAllocation);
+        firstMomentAllocations.push_back(firstMomentAllocation);
+        secondMomentAllocations.push_back(secondMomentAllocation);
+    }
+
+    if (totalGradientElements == 0u ||
+        totalGradientElements > std::numeric_limits<uint64_t>::max() / sizeof(float) ||
+        totalGradientElements * sizeof(float) > gradientAllocation->logicalSize ||
+        totalGradientElements * sizeof(float) > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange ||
+        allocatedPairCount == 0u) {
+        logError("Resident AdamW gradient staging allocation is too small or exceeds device limits.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t maximumWorkGroups =
+        gRuntime.physicalDeviceProperties.limits.maxComputeWorkGroupCountX;
+    if (maximumWorkGroups == 0u) return JNI_FALSE;
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset resident AdamW command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin resident AdamW command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR beforeComputeDependency{};
+    beforeComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeComputeDependency.memoryBarrierCount = 1u;
+    beforeComputeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeComputeDependency);
+
+    const uint64_t gradientLogicalWords =
+        gradientAllocation->offset / sizeof(uint32_t);
+    uint64_t gradientElementOffset = 0u;
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+
+    auto dispatchGroup = [&](size_t groupIndex, uint32_t operation) -> bool {
+        const uint64_t elementCount =
+            static_cast<uint64_t>(elementCounts[groupIndex]);
+        const uint64_t pairCount = (elementCount + 1u) / 2u;
+        const uint64_t parameterOffsetWords =
+            parameterAllocations[groupIndex]->offset / sizeof(uint32_t);
+        const uint64_t firstMomentOffsetWords =
+            firstMomentAllocations[groupIndex]->offset / sizeof(uint32_t);
+        const uint64_t secondMomentOffsetWords =
+            secondMomentAllocations[groupIndex]->offset / sizeof(uint32_t);
+        const uint64_t requiredGroups =
+            1u + (pairCount - 1u) / kLocalWorkGroupSize;
+        const uint32_t dispatchGroups =
+            calculateDispatchGroupCount(requiredGroups);
+        if (dispatchGroups == 0u ||
+            parameterOffsetWords > kMaximumShaderIndex ||
+            firstMomentOffsetWords > kMaximumShaderIndex ||
+            secondMomentOffsetWords > kMaximumShaderIndex ||
+            gradientElementOffset > kMaximumShaderIndex) {
+            return false;
+        }
+
+        const ResidentAdamwPushConstants pushConstants{
+            operation,
+            static_cast<uint32_t>(elementCount),
+            static_cast<uint32_t>(pairCount),
+            static_cast<uint32_t>(parameterOffsetWords),
+            static_cast<uint32_t>(gradientLogicalWords),
+            static_cast<uint32_t>(gradientElementOffset),
+            static_cast<uint32_t>(firstMomentOffsetWords),
+            static_cast<uint32_t>(secondMomentOffsetWords),
+            static_cast<uint32_t>(statusOffsetWords),
+            learningRate,
+            beta1,
+            beta2,
+            biasCorrection1,
+            biasCorrection2,
+            epsilon,
+            gradientClipFactor,
+            weightDecayValues[groupIndex]
+        };
+        vkCmdBindPipeline(
+            gRuntime.commandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            gRuntime.residentAdamwPipeline
+        );
+        vkCmdBindDescriptorSets(
+            gRuntime.commandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            gRuntime.pipelineLayout,
+            0u,
+            1u,
+            &gRuntime.tensorArenaDescriptorSet,
+            0u,
+            nullptr
+        );
+        vkCmdPushConstants(
+            gRuntime.commandBuffer,
+            gRuntime.pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0u,
+            sizeof(ResidentAdamwPushConstants),
+            &pushConstants
+        );
+        vkCmdDispatch(gRuntime.commandBuffer, dispatchGroups, 1u, 1u);
+        gradientElementOffset += elementCount;
+        return true;
+    };
+
+    for (jsize index = 0; index < groupCount; ++index) {
+        if (!dispatchGroup(static_cast<size_t>(index), 0u)) {
+            logError("Resident AdamW validation dispatch could not be recorded.");
+            return JNI_FALSE;
+        }
+    }
+
+    VkMemoryBarrier2KHR validationToUpdate{};
+    validationToUpdate.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    validationToUpdate.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    validationToUpdate.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    validationToUpdate.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    validationToUpdate.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR validationToUpdateDependency{};
+    validationToUpdateDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    validationToUpdateDependency.memoryBarrierCount = 1u;
+    validationToUpdateDependency.pMemoryBarriers = &validationToUpdate;
+    gRuntime.cmdPipelineBarrier2(
+        gRuntime.commandBuffer,
+        &validationToUpdateDependency
+    );
+
+    gradientElementOffset = 0u;
+    for (jsize index = 0; index < groupCount; ++index) {
+        if (!dispatchGroup(static_cast<size_t>(index), 1u)) {
+            logError("Resident AdamW update dispatch could not be recorded.");
+            return JNI_FALSE;
+        }
+    }
+
+    VkMemoryBarrier2KHR afterUpdate{};
+    afterUpdate.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    afterUpdate.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    afterUpdate.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    afterUpdate.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    afterUpdate.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+    VkDependencyInfoKHR afterUpdateDependency{};
+    afterUpdateDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_2_KHR;
+    afterUpdateDependency.memoryBarrierCount = 1u;
+    afterUpdateDependency.pMemoryBarriers = &afterUpdate;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &afterUpdateDependency);
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish resident AdamW command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Resident AdamW queue submission or fence wait failed.")) {
+        return JNI_FALSE;
+    }
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastAdamwGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
 }
