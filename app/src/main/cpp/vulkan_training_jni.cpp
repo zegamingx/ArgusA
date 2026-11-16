@@ -4709,9 +4709,12 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeClearTensorArena(
         logError("Cannot clear the Vulkan tensor arena without a valid fallback storage buffer.");
         return JNI_FALSE;
     }
+    const VkDeviceSize maxStorageBufferRange = static_cast<VkDeviceSize>(
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange
+    );
     const VkDeviceSize fallbackRange = std::min(
         gRuntime.storageCapacity,
-        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange
+        maxStorageBufferRange
     );
     if (fallbackRange == 0u) return JNI_FALSE;
 
