@@ -11,6 +11,7 @@ layout(push_constant) uniform ResidentAdamWParameters {
     uint elementCount;
     uint pairCount;
     uint parameterOffsetWords;
+    uint candidateParameterOffsetWords;
     uint gradientOffsetWords;
     uint gradientElementOffset;
     uint firstMomentOffsetWords;
@@ -147,7 +148,7 @@ void main() {
                 values[parameters.candidateSecondMomentOffsetWords + firstElement + 1u] =
                     floatBitsToUint(updatedSecondMoment1);
             }
-            values[parameters.parameterOffsetWords + pairIndex] =
+            values[parameters.candidateParameterOffsetWords + pairIndex] =
                 packHalf2x16(vec2(updatedParameter0, updatedParameter1));
         }
 
