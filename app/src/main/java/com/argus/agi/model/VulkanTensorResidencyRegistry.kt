@@ -58,9 +58,6 @@ internal class VulkanTensorResidencyRegistry(
         }
 
         if (candidate == null) {
-            val currentBytes = runCatching {
-                Math.addExact(residentBytes, retiredResidentBytes)
-            }.getOrNull() ?: return null
             val nextActiveBytes = runCatching {
                 Math.addExact(residentBytes, byteCount)
             }.getOrNull() ?: return null
