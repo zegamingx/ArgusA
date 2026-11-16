@@ -4985,7 +4985,8 @@ internal object VulkanTrainingBackend {
         biasCorrection1: Float,
         biasCorrection2: Float,
         epsilon: Float,
-        gradientClipFactor: Float
+        gradientClipFactor: Float,
+        residentGradient: VulkanTensorAllocation? = null
     ): Boolean {
         if (!isResidentAdamWAvailable ||
             parameters.isEmpty() ||
@@ -5070,9 +5071,13 @@ internal object VulkanTrainingBackend {
         val runtime = Runtime.getRuntime()
         val availableHeapBytes = runtime.freeMemory() +
             (runtime.maxMemory() - runtime.totalMemory()).coerceAtLeast(0L)
-        val stagingBytes = runCatching {
-            Math.multiplyExact(totalGradientBytes, 2L)
-        }.getOrNull() ?: return false
+        val stagingBytes = if (residentGradient == null) {
+            runCatching {
+                Math.multiplyExact(totalGradientBytes, 2L)
+            }.getOrNull() ?: return false
+        } else {
+            0L
+        }
         if (stagingBytes > availableHeapBytes / 2L) {
             Log.d(TAG, "Resident AdamW gradient staging exceeds the safe host-heap budget.")
             return false
@@ -5103,6 +5108,7 @@ internal object VulkanTrainingBackend {
 
         var gradientAllocation: VulkanTensorAllocation? = null
         var statusAllocation: VulkanTensorAllocation? = null
+        var ownsGradientAllocation = residentGradient == null
         val candidateFirstMoments = ArrayList<VulkanTensorAllocation>(parameters.size)
         val candidateSecondMoments = ArrayList<VulkanTensorAllocation>(parameters.size)
         var candidateMomentsCommitted = false
@@ -5113,15 +5119,6 @@ internal object VulkanTrainingBackend {
         var deviceCommitCompleted = false
 
         try {
-            val flattenedGradients = FloatArray(totalActiveElements.toInt())
-            var gradientCursor = 0
-            for (gradient in gradients) {
-                System.arraycopy(
-                    gradient, 0, flattenedGradients, gradientCursor, gradient.size
-                )
-                gradientCursor = Math.addExact(gradientCursor, gradient.size)
-            }
-
             for (group in parameters.indices) {
                 val momentBytes = Math.multiplyExact(
                     parameters[group].size.toLong(),
@@ -5133,13 +5130,35 @@ internal object VulkanTrainingBackend {
                 candidateSecondMoments.add(candidateSecond)
             }
 
-            val gradientTensor = allocateGpuTensor(totalGradientBytes) ?: return false
-            gradientAllocation = gradientTensor
+            val gradientTensor = if (residentGradient == null) {
+                val flattenedGradients = FloatArray(totalActiveElements.toInt())
+                var gradientCursor = 0
+                for (gradient in gradients) {
+                    System.arraycopy(
+                        gradient, 0, flattenedGradients, gradientCursor, gradient.size
+                    )
+                    gradientCursor = Math.addExact(gradientCursor, gradient.size)
+                }
+                val allocation = allocateGpuTensor(totalGradientBytes) ?: return false
+                gradientAllocation = allocation
+                if (!uploadGpuTensor(allocation, encodeFloatArray(flattenedGradients))) {
+                    Log.w(TAG, "Resident AdamW could not upload staged gradient values.")
+                    return false
+                }
+                ownsGradientAllocation = true
+                allocation
+            } else {
+                if (residentGradient.byteCount < totalGradientBytes) {
+                    Log.w(TAG, "The resident M4 gradient tensor is smaller than the AdamW inventory.")
+                    return false
+                }
+                ownsGradientAllocation = false
+                residentGradient
+            }
             val statusTensor = allocateGpuTensor(Int.SIZE_BYTES.toLong()) ?: return false
             statusAllocation = statusTensor
-            if (!uploadGpuTensor(gradientTensor, encodeFloatArray(flattenedGradients)) ||
-                !uploadGpuTensor(statusTensor, ByteArray(Int.SIZE_BYTES))) {
-                Log.w(TAG, "Resident AdamW could not stage gradients or initialize its validation flag.")
+            if (!uploadGpuTensor(statusTensor, ByteArray(Int.SIZE_BYTES))) {
+                Log.w(TAG, "Resident AdamW could not initialize its validation flag.")
                 return false
             }
 
@@ -5205,11 +5224,13 @@ internal object VulkanTrainingBackend {
             }
 
             // Release transient staging before publishing candidate moment allocations.
-            if (!releaseGpuTensor(gradientTensor)) {
-                teardownRequired = true
-                return false
+            if (ownsGradientAllocation) {
+                if (!releaseGpuTensor(gradientTensor)) {
+                    teardownRequired = true
+                    return false
+                }
+                gradientReleased = true
             }
-            gradientReleased = true
             if (!releaseGpuTensor(statusTensor)) {
                 teardownRequired = true
                 return false
@@ -5268,7 +5289,10 @@ internal object VulkanTrainingBackend {
             if (dispatchAttempted) teardownRequired = true
             return false
         } finally {
-            if (!gradientReleased && gradientAllocation != null && isRuntimeAvailable) {
+            if (ownsGradientAllocation &&
+                !gradientReleased &&
+                gradientAllocation != null &&
+                isRuntimeAvailable) {
                 if (releaseGpuTensor(gradientAllocation)) {
                     gradientReleased = true
                 } else {
@@ -5328,7 +5352,8 @@ internal object VulkanTrainingBackend {
         biasCorrection1: Float,
         biasCorrection2: Float,
         epsilon: Float,
-        gradientClipFactor: Float
+        gradientClipFactor: Float,
+        residentGradient: VulkanTensorAllocation? = null
     ): Boolean {
         require(parameters.isNotEmpty()) {
             "AdamW requires at least one parameter group."
@@ -5372,7 +5397,8 @@ internal object VulkanTrainingBackend {
                 biasCorrection1 = biasCorrection1,
                 biasCorrection2 = biasCorrection2,
                 epsilon = epsilon,
-                gradientClipFactor = gradientClipFactor
+                gradientClipFactor = gradientClipFactor,
+                residentGradient = residentGradient
             )
         ) {
             return true
