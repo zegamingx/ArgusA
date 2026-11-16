@@ -5032,6 +5032,27 @@ internal object VulkanTrainingBackend {
             "AdamW gradient clipping factor must be in [0, 1]."
         }
 
+        if (tryApplyResidentFp16AdamWUpdate(
+                parameters = parameters,
+                gradients = gradients,
+                firstMoments = firstMoments,
+                secondMoments = secondMoments,
+                weightDecayByGroup = weightDecayByGroup,
+                learningRate = learningRate,
+                beta1 = beta1,
+                beta2 = beta2,
+                biasCorrection1 = biasCorrection1,
+                biasCorrection2 = biasCorrection2,
+                epsilon = epsilon,
+                gradientClipFactor = gradientClipFactor
+            )
+        ) {
+            return true
+        }
+
+        // The persistent moment replica must never survive into a CPU or staged update.
+        invalidateOptimizerStateResidency()
+
         var totalElements = 0L
         var stagingElements = 0L
         for (index in parameters.indices) {
