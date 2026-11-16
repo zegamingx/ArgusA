@@ -1041,8 +1041,8 @@ internal object VulkanTrainingBackend {
     }
 
     private fun verifyNativeFp16Kernel(): Boolean {
-        // Cover partial 8x16 tiles, a second K tile, multiple independent
-        // batches, odd packed-input and weight lengths, and both weight layouts.
+        // Exercise partial 8x16 tiles, a second K tile, independent batches,
+        // odd packed lengths, both matrix layouts, and persistent arena weights.
         val batchCount = 3
         val rowsPerBatch = 9
         val inputColumns = 19
@@ -1070,7 +1070,10 @@ internal object VulkanTrainingBackend {
             }
         }
 
-        fun verify(weightValues: ShortArray, transposeWeights: Boolean): Boolean {
+        fun calculateExpected(
+            weightValues: ShortArray,
+            transposeWeights: Boolean
+        ): FloatArray {
             val expected = FloatArray(rowCount * outputColumns)
             for (batchIndex in 0 until batchCount) {
                 val inputBatchOffset = batchIndex * rowsPerBatch * inputColumns
@@ -1103,7 +1106,14 @@ internal object VulkanTrainingBackend {
                     }
                 }
             }
+            return expected
+        }
 
+        fun verifyStaging(
+            weightValues: ShortArray,
+            transposeWeights: Boolean
+        ): Boolean {
+            val expected = calculateExpected(weightValues, transposeWeights)
             val actual = FloatArray(expected.size)
             return nativeApplyFp16Linear(
                 input = input,
@@ -1118,8 +1128,77 @@ internal object VulkanTrainingBackend {
             ) && approximatelyEqual(actual, expected, 1e-3f)
         }
 
-        return verify(weights, transposeWeights = false) &&
-            verify(transposedWeights, transposeWeights = true)
+        fun verifyPersistent(
+            weightValues: ShortArray,
+            transposeWeights: Boolean
+        ): Boolean {
+            val expected = calculateExpected(weightValues, transposeWeights)
+            val parameters = Array(batchCount) { batchIndex ->
+                val offset = batchIndex * weightBatchSize
+                val batchValues = FloatArray(weightBatchSize) { index ->
+                    Float16Codec.toFloat(weightValues[offset + index])
+                }
+                Float16ParameterArray.fromFloatArray(batchValues)
+            }
+            val handles = LongArray(batchCount)
+
+            try {
+                // Allocate each matrix separately. Their arena offsets are not
+                // assumed to be contiguous; the kernel must use the offset table.
+                for (batchIndex in parameters.indices) {
+                    val byteCount = Math.multiplyExact(
+                        parameters[batchIndex].size.toLong(),
+                        Short.SIZE_BYTES.toLong()
+                    )
+                    val handle = nativeAllocateTensor(byteCount)
+                    if (handle == 0L) return false
+                    handles[batchIndex] = handle
+                }
+
+                for (batchIndex in parameters.indices) {
+                    if (!nativeUploadTensor(
+                            handles[batchIndex],
+                            parameters[batchIndex].toLittleEndianByteArray()
+                        )
+                    ) {
+                        return false
+                    }
+                }
+
+                val actual = FloatArray(expected.size)
+                return nativeApplyFp16LinearWithArena(
+                    input = input,
+                    weightHandles = handles,
+                    output = actual,
+                    rows = rowCount,
+                    batchCount = batchCount,
+                    rowsPerBatch = rowsPerBatch,
+                    inputColumns = inputColumns,
+                    outputColumns = outputColumns,
+                    transposeWeights = transposeWeights
+                ) && approximatelyEqual(actual, expected, 1e-3f)
+            } catch (error: LinkageError) {
+                Log.e(TAG, "Persistent FP16 Vulkan self-check entry point is unavailable.", error)
+                return false
+            } catch (error: RuntimeException) {
+                Log.e(TAG, "Persistent FP16 Vulkan self-check failed.", error)
+                return false
+            } catch (error: OutOfMemoryError) {
+                Log.w(TAG, "Persistent FP16 Vulkan self-check exceeded available memory.", error)
+                return false
+            } finally {
+                for (handle in handles) {
+                    if (handle != 0L) {
+                        runCatching { nativeReleaseTensor(handle) }
+                    }
+                }
+            }
+        }
+
+        return verifyStaging(weights, transposeWeights = false) &&
+            verifyStaging(transposedWeights, transposeWeights = true) &&
+            verifyPersistent(weights, transposeWeights = false) &&
+            verifyPersistent(transposedWeights, transposeWeights = true)
     }
 
     /**

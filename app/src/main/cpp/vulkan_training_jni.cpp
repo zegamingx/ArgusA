@@ -4028,8 +4028,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
         if (allocation == nullptr ||
             allocation->logicalSize < weightByteCount ||
             (allocation->offset & 1u) != 0u ||
-            allocation->offset / 2u > std::numeric_limits<uint32_t>::max()) {
-            logError("Persistent FP16 batch references an invalid or undersized weight allocation.");
+            allocation->offset / 2u > std::numeric_limits<uint32_t>::max() ||
+            weightElements - 1u >
+                std::numeric_limits<uint32_t>::max() - allocation->offset / 2u) {
+            logError("Persistent FP16 batch references an invalid, undersized, or shader-unaddressable weight allocation.");
             return JNI_FALSE;
         }
         weightAllocations.push_back(allocation);
@@ -4047,6 +4049,19 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
         offsetTableByteOffset / 4u + batches - 1u >
             std::numeric_limits<uint32_t>::max()) {
         logError("Persistent batched FP16 scratch offsets exceed shader address limits.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t maximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    const uint64_t inputOffsetHalf = scratchAllocation->offset / 2u;
+    const uint64_t outputOffsetWords =
+        (scratchAllocation->offset + inputPaddedBytes) / 4u;
+    const uint64_t offsetTableWordIndex = offsetTableByteOffset / 4u;
+    if (inputElements - 1u > maximumShaderIndex - inputOffsetHalf ||
+        outputElements - 1u > maximumShaderIndex - outputOffsetWords ||
+        batches - 1u > maximumShaderIndex - offsetTableWordIndex) {
+        logError("Persistent batched FP16 tensor ranges exceed 32-bit shader indexing.");
         return JNI_FALSE;
     }
 
@@ -4229,11 +4244,11 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
         static_cast<uint32_t>(rowsPerBatch),
         static_cast<uint32_t>(inputColumns),
         static_cast<uint32_t>(outputColumns),
-        static_cast<uint32_t>(scratchAllocation->offset / 2u),
+        static_cast<uint32_t>(inputOffsetHalf),
         0u,
-        static_cast<uint32_t>((scratchAllocation->offset + inputPaddedBytes) / 4u),
+        static_cast<uint32_t>(outputOffsetWords),
         transposeWeights == JNI_TRUE ? 1u : 0u,
-        static_cast<uint32_t>(offsetTableByteOffset / 4u)
+        static_cast<uint32_t>(offsetTableWordIndex)
     };
     vkCmdPushConstants(
         gRuntime.commandBuffer,
