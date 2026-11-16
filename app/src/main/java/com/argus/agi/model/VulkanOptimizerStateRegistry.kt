@@ -217,7 +217,10 @@ internal class VulkanOptimizerStateRegistry(
         if (!commitReplacementAfterPreflight(tensors, expectedAllocations, replacementAllocations)) {
             return false
         }
-        return finishReplacementAfterPreflight()
+        // Registry publication is committed even when an old allocation cannot
+        // be released yet; it remains tracked and is retried on a later sync.
+        finishReplacementAfterPreflight()
+        return true
     }
 
     /** Releases old moment buffers after the paired parameter registry has committed. */
