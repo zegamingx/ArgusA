@@ -74,6 +74,10 @@ void calculateUpdate(
         finiteValue(updatedFirstMoment) &&
         finiteValue(updatedSecondMoment) &&
         updatedSecondMoment >= 0.0 &&
+        finiteValue(correctedFirstMoment) &&
+        finiteValue(correctedSecondMoment) &&
+        correctedSecondMoment >= 0.0 &&
+        finiteValue(update) &&
         finiteValue(updatedParameter) &&
         abs(updatedParameter) <= 65504.0;
 }
