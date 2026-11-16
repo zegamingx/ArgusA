@@ -423,8 +423,8 @@ class VulkanTensorResidencyRegistryTest {
                 }
             },
             upload = { allocation, bytes ->
-                val destination = gpuBytes[allocation.nativeHandle] ?: return@VulkanTensorResidencyRegistry false
-                if (destination.size != bytes.size) {
+                val destination = gpuBytes[allocation.nativeHandle]
+                if (destination == null || destination.size != bytes.size) {
                     false
                 } else {
                     bytes.copyInto(destination)
