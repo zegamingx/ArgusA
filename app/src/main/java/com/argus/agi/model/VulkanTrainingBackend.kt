@@ -6014,6 +6014,8 @@ internal object VulkanTrainingBackend {
         statusHandle: Long
     ): Boolean
 
+    private external fun nativeAllocateTensor(byteCount: Long): Long
+
     private external fun nativeUploadTensor(tensorHandle: Long, source: ByteArray): Boolean
 
     private external fun nativeDownloadTensor(
