@@ -3001,6 +3001,39 @@ class ArgusNeuralEngine private constructor(
         gradientClipFactor: Float,
         residentGradient: VulkanTensorAllocation? = null
     ) {
+        try {
+            applyAdamWUpdateTransaction(
+                parameters = parameters,
+                gradients = gradients,
+                firstMoments = firstMoments,
+                secondMoments = secondMoments,
+                weightDecayByGroup = weightDecayByGroup,
+                learningRate = learningRate,
+                biasCorrection1 = biasCorrection1,
+                biasCorrection2 = biasCorrection2,
+                gradientClipFactor = gradientClipFactor,
+                residentGradient = residentGradient
+            )
+        } catch (error: RuntimeException) {
+            // Both direct windows and accumulated batches increment exactly one
+            // optimizer step before entering this transaction.
+            adamStep = (adamStep - 1).coerceAtLeast(0)
+            throw error
+        }
+    }
+
+    private fun applyAdamWUpdateTransaction(
+        parameters: Array<Float16ParameterArray>,
+        gradients: Array<FloatArray>,
+        firstMoments: Array<FloatArray>,
+        secondMoments: Array<FloatArray>,
+        weightDecayByGroup: Float,
+        learningRate: Float,
+        biasCorrection1: Float,
+        biasCorrection2: Float,
+        gradientClipFactor: Float,
+        residentGradient: VulkanTensorAllocation? = null
+    ) {
         require(parameters.isNotEmpty()) {
             "AdamW requires at least one parameter group."
         }
@@ -3029,11 +3062,6 @@ class ArgusNeuralEngine private constructor(
                 gradientClipFactor = gradientClipFactor,
                 residentGradient = residentGradient
             )
-        } catch (error: RuntimeException) {
-            // The caller incremented the logical optimizer step before dispatch.
-            // A failed state recovery must not advance that step or continue on stale state.
-            adamStep = (adamStep - 1).coerceAtLeast(0)
-            throw error
         }
         if (gpuOrStagedUpdateCompleted) {
             synchronizeVulkanModelTensorResidency("Vulkan AdamW parameter update")
