@@ -40,6 +40,7 @@ internal class VulkanOptimizerStateRegistry(
 
     @Synchronized
     fun synchronizeAll(tensors: List<FloatArray>): Boolean {
+        preparedReplacement = null
         require(tensors.isNotEmpty()) {
             "The AdamW optimizer-state inventory cannot be empty."
         }
@@ -250,6 +251,7 @@ internal class VulkanOptimizerStateRegistry(
 
     @Synchronized
     fun invalidate(releaseAllocations: Boolean): Boolean {
+        preparedReplacement = null
         if (!releaseAllocations) {
             entries.clear()
             retiredAllocations.clear()
