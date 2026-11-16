@@ -5491,7 +5491,11 @@ internal object VulkanTrainingBackend {
             return true
         }
 
-        // The persistent moment replica must never survive into a CPU or staged update.
+        // The resident transaction can be rejected before commit while previous GPU
+        // updates still leave the model mirror stale. Recover both sides before fallback.
+        check(synchronizeTrainingStateMirrors()) {
+            "GPU model or optimizer state could not be recovered before the fallback update."
+        }
         check(invalidateOptimizerStateResidency()) {
             "GPU optimizer moments could not be synchronized before the fallback update."
         }
