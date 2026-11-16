@@ -530,6 +530,13 @@ internal object VulkanTrainingBackend {
         maxResidentBytes = { _modelTensorResidencyBudgetBytes.value }
     )
 
+    private val optimizerStateResidencyRegistry = VulkanOptimizerStateRegistry(
+        allocate = { byteCount -> allocateGpuTensor(byteCount) },
+        upload = { allocation, bytes -> uploadGpuTensor(allocation, bytes) },
+        release = { allocation -> releaseGpuTensor(allocation) },
+        maxResidentBytes = { _activationTensorResidencyBudgetBytes.value }
+    )
+
     private val _modelTensorResidencyReady = MutableStateFlow(false)
     val modelTensorResidencyReady: StateFlow<Boolean> =
         _modelTensorResidencyReady.asStateFlow()
@@ -547,6 +554,12 @@ internal object VulkanTrainingBackend {
     private var residentBackwardReady = false
     @Volatile
     private var residentGradientAccumulatorReady = false
+
+    @Volatile
+    private var residentAdamwReady = false
+
+    internal val isResidentAdamWAvailable: Boolean
+        get() = isRuntimeAvailable && residentActivationLinearReady && residentAdamwReady
     private val activationTensorRegistry = VulkanActivationTensorRegistry(
         allocate = { byteCount -> allocateGpuTensor(byteCount) },
         upload = { allocation, bytes -> uploadGpuTensor(allocation, bytes) },
@@ -598,12 +611,15 @@ internal object VulkanTrainingBackend {
         _modelTensorResidencyReady.value = false
         val modelReleased = tensorResidencyRegistry.invalidate(releaseAllocations)
         val activationsReleased = activationTensorRegistry.invalidate(releaseAllocations)
-        val released = modelReleased && activationsReleased
+        val optimizerStatesReleased =
+            optimizerStateResidencyRegistry.invalidate(releaseAllocations)
+        val released = modelReleased && activationsReleased && optimizerStatesReleased
         if (!released && releaseAllocations && nativeReady) {
             val arenaCleared = runCatching { nativeClearTensorArena() }.getOrDefault(false)
             if (arenaCleared) {
                 tensorResidencyRegistry.invalidate(releaseAllocations = false)
                 activationTensorRegistry.invalidate(releaseAllocations = false)
+                optimizerStateResidencyRegistry.invalidate(releaseAllocations = false)
                 refreshTensorArenaMetrics()
                 return true
             }
@@ -828,6 +844,21 @@ internal object VulkanTrainingBackend {
         }
         if (released) refreshTensorArenaMetrics()
         return released
+    }
+
+    /** Drops GPU moment replicas before a CPU optimizer path changes their host mirrors. */
+    @Synchronized
+    internal fun invalidateOptimizerStateResidency() {
+        val released = optimizerStateResidencyRegistry.invalidate(
+            releaseAllocations = isRuntimeAvailable
+        )
+        if (!released && isRuntimeAvailable) {
+            Log.w(TAG, "Optimizer-state release failed; rebuilding the optional Vulkan runtime.")
+            runCatching { destroyNativeRuntime() }
+                .onFailure { error ->
+                    Log.e(TAG, "Vulkan teardown after optimizer-state release failure failed.", error)
+                }
+        }
     }
 
     /**
