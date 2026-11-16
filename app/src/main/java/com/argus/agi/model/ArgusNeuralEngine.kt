@@ -1728,9 +1728,10 @@ class ArgusNeuralEngine private constructor(
             "GPU-resident embedding or LoRA weights could not be recovered before host-side training operations."
         }
 
-        if (updateParameters && gradientAccumulator == null) adamStep++
-        val lr = if (updateParameters && gradientAccumulator == null) {
-            baseLearningRate / (1f + 0.0002f * adamStep)
+        val advancesOptimizerStep = updateParameters && gradientAccumulator == null
+        val nextAdamStep = if (advancesOptimizerStep) Math.addExact(adamStep, 1) else adamStep
+        val lr = if (advancesOptimizerStep) {
+            baseLearningRate / (1f + 0.0002f * nextAdamStep)
         } else {
             0f
         }
@@ -2672,8 +2673,8 @@ class ArgusNeuralEngine private constructor(
             return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
 
-        val beta1Pow = Math.pow(beta1.toDouble(), adamStep.toDouble()).toFloat()
-        val beta2Pow = Math.pow(beta2.toDouble(), adamStep.toDouble()).toFloat()
+        val beta1Pow = Math.pow(beta1.toDouble(), nextAdamStep.toDouble()).toFloat()
+        val beta2Pow = Math.pow(beta2.toDouble(), nextAdamStep.toDouble()).toFloat()
         val biasCorr1 = 1f - beta1Pow
         val biasCorr2 = 1f - beta2Pow
 
@@ -2708,7 +2709,6 @@ class ArgusNeuralEngine private constructor(
         val clippedOnGpu = try {
             tryNormalizeAndClipGradientsOnVulkan(gradientGroups, maxGradNorm)
         } catch (error: RuntimeException) {
-            adamStep--
             throw error
         }
         val clipFactor = if (clippedOnGpu) {
@@ -2720,7 +2720,6 @@ class ArgusNeuralEngine private constructor(
             }
             val totalNorm = sqrt(sumSquares)
             if (!totalNorm.isFinite()) {
-                adamStep--
                 return Float.NaN
             }
             if (totalNorm > maxGradNorm) {
@@ -2741,6 +2740,7 @@ class ArgusNeuralEngine private constructor(
             biasCorrection2 = biasCorr2,
             gradientClipFactor = clipFactor
         )
+        if (advancesOptimizerStep) adamStep = nextAdamStep
 
         return if (validSteps > 0) totalLoss / validSteps else Float.NaN
     }
@@ -2953,12 +2953,12 @@ class ArgusNeuralEngine private constructor(
                 1.0f
             }
 
-            adamStep++
-            val learningRate = baseLearningRate / (1f + 0.0002f * adamStep)
+            val nextAdamStep = Math.addExact(adamStep, 1)
+            val learningRate = baseLearningRate / (1f + 0.0002f * nextAdamStep)
             val biasCorrection1 = 1f -
-                Math.pow(beta1.toDouble(), adamStep.toDouble()).toFloat()
+                Math.pow(beta1.toDouble(), nextAdamStep.toDouble()).toFloat()
             val biasCorrection2 = 1f -
-                Math.pow(beta2.toDouble(), adamStep.toDouble()).toFloat()
+                Math.pow(beta2.toDouble(), nextAdamStep.toDouble()).toFloat()
             val weightDecayByGroup = FloatArray(parameters.size).also { values ->
                 for (layer in 0 until layerCount) {
                     val offset = 2 + layer * 11
@@ -2978,6 +2978,7 @@ class ArgusNeuralEngine private constructor(
                 gradientClipFactor = clipFactor,
                 residentGradient = residentGradient
             )
+            adamStep = nextAdamStep
         } finally {
             residentAccumulator?.let { value ->
                 VulkanTrainingBackend.discardResidentGradientAccumulator(value)
@@ -3001,25 +3002,18 @@ class ArgusNeuralEngine private constructor(
         gradientClipFactor: Float,
         residentGradient: VulkanTensorAllocation? = null
     ) {
-        try {
-            applyAdamWUpdateTransaction(
-                parameters = parameters,
-                gradients = gradients,
-                firstMoments = firstMoments,
-                secondMoments = secondMoments,
-                weightDecayByGroup = weightDecayByGroup,
-                learningRate = learningRate,
-                biasCorrection1 = biasCorrection1,
-                biasCorrection2 = biasCorrection2,
-                gradientClipFactor = gradientClipFactor,
-                residentGradient = residentGradient
-            )
-        } catch (error: RuntimeException) {
-            // Both direct windows and accumulated batches increment exactly one
-            // optimizer step before entering this transaction.
-            adamStep = (adamStep - 1).coerceAtLeast(0)
-            throw error
-        }
+        applyAdamWUpdateTransaction(
+            parameters = parameters,
+            gradients = gradients,
+            firstMoments = firstMoments,
+            secondMoments = secondMoments,
+            weightDecayByGroup = weightDecayByGroup,
+            learningRate = learningRate,
+            biasCorrection1 = biasCorrection1,
+            biasCorrection2 = biasCorrection2,
+            gradientClipFactor = gradientClipFactor,
+            residentGradient = residentGradient
+        )
     }
 
     private fun applyAdamWUpdateTransaction(
