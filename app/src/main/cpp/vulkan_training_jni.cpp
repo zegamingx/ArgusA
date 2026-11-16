@@ -7348,8 +7348,13 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
     afterUpdate.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
     afterUpdate.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
     afterUpdate.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
-    afterUpdate.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
-    afterUpdate.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+    afterUpdate.dstStageMask =
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    afterUpdate.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR |
+        VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
     VkDependencyInfoKHR afterUpdateDependency{};
     afterUpdateDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
     afterUpdateDependency.memoryBarrierCount = 1u;
