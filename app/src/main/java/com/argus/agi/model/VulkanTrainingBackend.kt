@@ -488,19 +488,48 @@ internal object VulkanTrainingBackend {
     val tensorArenaMetrics: StateFlow<VulkanTensorArenaMetrics> =
         _tensorArenaMetrics.asStateFlow()
 
+    private val _modelTensorResidencyBudgetBytes = MutableStateFlow(0L)
+    val modelTensorResidencyBudgetBytes: StateFlow<Long> =
+        _modelTensorResidencyBudgetBytes.asStateFlow()
+
     private val tensorResidencyRegistry = VulkanTensorResidencyRegistry(
         allocate = { byteCount -> allocateGpuTensor(byteCount) },
         upload = { allocation, bytes -> uploadGpuTensor(allocation, bytes) },
-        release = { allocation -> releaseGpuTensor(allocation) }
+        release = { allocation -> releaseGpuTensor(allocation) },
+        maxResidentBytes = { _modelTensorResidencyBudgetBytes.value }
     )
 
     private val _modelTensorResidencyReady = MutableStateFlow(false)
     val modelTensorResidencyReady: StateFlow<Boolean> =
         _modelTensorResidencyReady.asStateFlow()
 
-    private fun invalidateTensorResidency(releaseAllocations: Boolean) {
+    private var lastModelParameterInventory: List<VulkanModelParameterTensor> = emptyList()
+    private var residencySuspended = false
+    private var residencyBlockedAfterFailure = false
+    private var residencyRebuildPending = false
+    private var runtimeRestartPending = false
+
+    private fun invalidateTensorResidency(releaseAllocations: Boolean): Boolean {
         _modelTensorResidencyReady.value = false
-        tensorResidencyRegistry.invalidate(releaseAllocations)
+        val released = tensorResidencyRegistry.invalidate(releaseAllocations)
+        if (!released && releaseAllocations && nativeReady) {
+            val arenaCleared = runCatching { nativeClearTensorArena() }.getOrDefault(false)
+            if (arenaCleared) {
+                tensorResidencyRegistry.invalidate(releaseAllocations = false)
+                refreshTensorArenaMetrics()
+                return true
+            }
+
+            disabledAfterRuntimeFailure = true
+            _currentBackend = "Kotlin CPU"
+            _runtimeStatus.value =
+                "Kotlin CPU fallback — Vulkan tensor-arena release failed"
+            runCatching { destroyNativeRuntime() }
+                .onFailure { error ->
+                    Log.e(TAG, "Vulkan runtime teardown after an arena-release failure failed.", error)
+                }
+        }
+        return released
     }
 
     internal val hasAttemptedInitialization: Boolean
@@ -554,7 +583,10 @@ internal object VulkanTrainingBackend {
         try {
             nativeDestroy()
         } finally {
+            nativeReady = false
+            fp16RuntimeReady = false
             invalidateTensorResidency(releaseAllocations = false)
+            _tensorArenaMetrics.value = VulkanTensorArenaMetrics()
         }
     }
 
@@ -581,6 +613,20 @@ internal object VulkanTrainingBackend {
         }.onFailure { error ->
             Log.d(TAG, "Vulkan tensor-arena metrics could not be read.", error)
         }
+    }
+
+    private fun calculateModelTensorResidencyBudgetBytes(
+        capabilities: VulkanDeviceCapabilities?
+    ): Long {
+        val maximumAppHeap = Runtime.getRuntime().maxMemory().coerceAtLeast(0L)
+        val appBudget = maximumAppHeap / 4L
+        val reportedHeapHeadroom = capabilities?.memoryBudgetHeadroomBytes
+            ?.filter { it > 0L }
+            ?.minOrNull()
+        val gpuBudget = reportedHeapHeadroom?.div(3L) ?: appBudget
+        val descriptorRange = capabilities?.maxStorageBufferRangeBytes
+            ?.takeIf { it > 0L } ?: Long.MAX_VALUE
+        return minOf(appBudget, gpuBudget, descriptorRange).coerceAtLeast(0L)
     }
 
     /**
@@ -656,12 +702,36 @@ internal object VulkanTrainingBackend {
      * Prepares the complete model parameter inventory in persistent Tensor Arena
      * allocations. The registry remains a read-only mirror of Kotlin-owned weights.
      */
+    private fun refreshModelTensorResidencyBudget() {
+        if (!nativeReady) return
+        runCatching {
+            VulkanDeviceCapabilities.fromJson(nativeGetDeviceCapabilities())
+        }.onSuccess { capabilities ->
+            _deviceCapabilities.value = capabilities
+            _modelTensorResidencyBudgetBytes.value =
+                calculateModelTensorResidencyBudgetBytes(capabilities)
+            Log.i(
+                TAG,
+                "Refreshed FP16 model-residency budget: " +
+                    "${_modelTensorResidencyBudgetBytes.value} bytes."
+            )
+        }.onFailure { error ->
+            Log.w(
+                TAG,
+                "Could not refresh Vulkan memory-budget telemetry; retaining the last verified budget.",
+                error
+            )
+        }
+    }
+
     @Synchronized
     fun synchronizeModelTensorResidency(
         tensors: List<VulkanModelParameterTensor>
     ): Boolean {
-        if (!isFp16ComputeAvailable) {
-            _modelTensorResidencyReady.value = false
+        lastModelParameterInventory = tensors.toList()
+        residencyRebuildPending = false
+        _modelTensorResidencyReady.value = false
+        if (residencySuspended || residencyBlockedAfterFailure || !isFp16ComputeAvailable) {
             return false
         }
 
@@ -677,17 +747,134 @@ internal object VulkanTrainingBackend {
 
         if (!synchronized) {
             invalidateTensorResidency(releaseAllocations = true)
+            residencyBlockedAfterFailure = true
             Log.w(
                 TAG,
-                "Full model tensor residency is unavailable; per-operation Vulkan acquisition " +
-                    "or the existing CPU fallback remains active."
+                "Complete FP16 model residency was not established within the device memory budget; " +
+                    "persistent FP16 dispatch is disabled until the next foreground recovery. " +
+                    "The verified FP32 Vulkan/CPU fallback remains active."
             )
         } else {
-            Log.i(TAG, "Resident and revision-verified ${tensors.size} model parameter tensors.")
+            residencyBlockedAfterFailure = false
+            Log.i(
+                TAG,
+                "Resident and revision-verified ${tensors.size} model parameter tensors " +
+                    "(${tensorResidencyRegistry.residentByteCount()} bytes)."
+            )
         }
         refreshTensorArenaMetrics()
         _modelTensorResidencyReady.value = synchronized
         return synchronized
+    }
+
+    /**
+     * Drop rebuildable GPU replicas when the app is backgrounded. Kotlin model weights,
+     * optimizer moments and checkpoints remain authoritative and untouched.
+     */
+    @Synchronized
+    fun releaseModelTensorResidencyForMemoryPressure(): Boolean {
+        residencySuspended = true
+        residencyRebuildPending = false
+        _modelTensorResidencyReady.value = false
+
+        if (!isRuntimeAvailable) {
+            invalidateTensorResidency(releaseAllocations = false)
+            return false
+        }
+
+        val cleared = try {
+            nativeClearTensorArena()
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Vulkan arena-clear entry point is unavailable.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Vulkan arena clear failed during memory pressure.", error)
+            false
+        }
+
+        if (cleared) {
+            invalidateTensorResidency(releaseAllocations = false)
+            refreshTensorArenaMetrics()
+            Log.i(TAG, "Released the complete Vulkan tensor arena for background memory pressure.")
+            return true
+        }
+
+        invalidateTensorResidency(releaseAllocations = true)
+        runtimeRestartPending = true
+        disabledAfterRuntimeFailure = true
+        _currentBackend = "Kotlin CPU"
+        _runtimeStatus.value =
+            "Kotlin CPU fallback — Vulkan arena could not be returned under memory pressure"
+        runCatching { destroyNativeRuntime() }
+            .onFailure { error ->
+                Log.e(TAG, "Vulkan teardown after memory-pressure release failure failed.", error)
+            }
+        refreshTensorArenaMetrics()
+        return false
+    }
+
+    /** Re-enable a single full-inventory rebuild after the app returns to the foreground. */
+    @Synchronized
+    fun resumeModelTensorResidencyAfterForeground() {
+        if (runtimeRestartPending) {
+            runtimeRestartPending = false
+            resetRuntimeForRetry()
+            if (!initializeAfterModelReady()) {
+                residencySuspended = true
+                return
+            }
+            residencySuspended = false
+            residencyBlockedAfterFailure = false
+            residencyRebuildPending = lastModelParameterInventory.isNotEmpty()
+            return
+        }
+        if (!residencySuspended) return
+        refreshModelTensorResidencyBudget()
+        residencySuspended = false
+        residencyBlockedAfterFailure = false
+        residencyRebuildPending = lastModelParameterInventory.isNotEmpty()
+    }
+
+    private fun ensureModelTensorResidencyReady(): Boolean {
+        if (_modelTensorResidencyReady.value) return true
+        if (residencySuspended || !residencyRebuildPending) return false
+
+        val inventory = lastModelParameterInventory
+        residencyRebuildPending = false
+        if (inventory.isEmpty()) return false
+        return synchronizeModelTensorResidency(inventory)
+    }
+
+    /** Reset failed native state before the user explicitly retries Vulkan initialization. */
+    @Synchronized
+    fun resetRuntimeForRetry() {
+        if (initializationAttempted) {
+            runCatching { nativeDestroy() }
+                .onFailure { error ->
+                    Log.w(TAG, "Vulkan native cleanup during runtime retry failed.", error)
+                }
+        }
+        nativeReady = false
+        fp16RuntimeReady = false
+        fp16DisabledAfterRuntimeFailure = false
+        disabledAfterRuntimeFailure = false
+        initializationAttempted = false
+        residencySuspended = false
+        residencyBlockedAfterFailure = false
+        residencyRebuildPending = false
+        runtimeRestartPending = false
+        invalidateTensorResidency(releaseAllocations = false)
+        _modelTensorResidencyBudgetBytes.value = 0L
+        _deviceCapabilities.value = null
+        _gpuPerformanceMetrics.value = VulkanGpuPerformanceMetrics()
+        _tensorArenaMetrics.value = VulkanTensorArenaMetrics()
+        _currentBackend = "Kotlin CPU"
+        _runtimeStatus.value = "Kotlin CPU — Vulkan retry requested"
+        publishInitializationProgress(
+            status = "Waiting for model readiness",
+            driverInfo = "Vulkan driver detection pending",
+            isInitializing = false
+        )
     }
 
     @Synchronized
@@ -728,6 +915,12 @@ internal object VulkanTrainingBackend {
                     Log.w(TAG, "Vulkan runtime started but capability metadata could not be parsed.", error)
                 }.getOrNull()
                 _deviceCapabilities.value = detectedCapabilities
+                _modelTensorResidencyBudgetBytes.value =
+                    calculateModelTensorResidencyBudgetBytes(detectedCapabilities)
+                Log.i(
+                    TAG,
+                    "FP16 model-residency budget: ${_modelTensorResidencyBudgetBytes.value} bytes."
+                )
                 if (detectedCapabilities != null) {
                     Log.i(
                         TAG,
@@ -1376,7 +1569,9 @@ internal object VulkanTrainingBackend {
         val operationCount = runCatching {
             Math.multiplyExact(inputElements, outputColumns.toLong())
         }.getOrNull() ?: return false
-        if (!isFp16ComputeAvailable || operationCount < MIN_LINEAR_OPERATION_COUNT) {
+        if (!isFp16ComputeAvailable ||
+            operationCount < MIN_LINEAR_OPERATION_COUNT ||
+            !ensureModelTensorResidencyReady()) {
             return false
         }
 
@@ -1518,7 +1713,9 @@ internal object VulkanTrainingBackend {
                 outputColumns.toLong()
             )
         }.getOrNull() ?: return false
-        if (!isFp16ComputeAvailable || operationCount < MIN_LINEAR_OPERATION_COUNT) {
+        if (!isFp16ComputeAvailable ||
+            operationCount < MIN_LINEAR_OPERATION_COUNT ||
+            !ensureModelTensorResidencyReady()) {
             return false
         }
 
@@ -2108,4 +2305,6 @@ internal object VulkanTrainingBackend {
     private external fun nativeGetTensorArenaMetrics(): String
 
     private external fun nativeDestroy()
+
+    private external fun nativeClearTensorArena(): Boolean
 }

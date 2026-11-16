@@ -490,7 +490,14 @@ bool hasMemoryBudgetHeadroom(uint32_t memoryTypeIndex, VkDeviceSize requiredByte
     }
 
     const VkDeviceSize remainingBudget = budget - usage;
-    if (requiredBytes <= remainingBudget) {
+    const VkDeviceSize minimumReserve = 1024u * 1024u;
+    const VkDeviceSize proportionalReserve = budget / 10u;
+    const VkDeviceSize reserve = std::min(
+        budget / 4u,
+        std::max(minimumReserve, proportionalReserve)
+    );
+    if (requiredBytes <= remainingBudget &&
+        remainingBudget - requiredBytes >= reserve) {
         return true;
     }
 
@@ -979,18 +986,18 @@ bool createArenaBacking(
     return false;
 }
 
-void updateTensorArenaDescriptorSet() {
+void updateTensorArenaDescriptorSet(VkBuffer buffer, VkDeviceSize range) {
     if (gRuntime.device == VK_NULL_HANDLE ||
         gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
-        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
-        gRuntime.tensorArenaCapacity == 0u) {
+        buffer == VK_NULL_HANDLE ||
+        range == 0u) {
         return;
     }
 
     VkDescriptorBufferInfo descriptorInfo{};
-    descriptorInfo.buffer = gRuntime.tensorArenaBuffer;
+    descriptorInfo.buffer = buffer;
     descriptorInfo.offset = 0u;
-    descriptorInfo.range = gRuntime.tensorArenaCapacity;
+    descriptorInfo.range = range;
 
     VkWriteDescriptorSet descriptorWrite{};
     descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1002,6 +1009,13 @@ void updateTensorArenaDescriptorSet() {
     descriptorWrite.pBufferInfo = &descriptorInfo;
 
     vkUpdateDescriptorSets(gRuntime.device, 1u, &descriptorWrite, 0u, nullptr);
+}
+
+void updateTensorArenaDescriptorSet() {
+    updateTensorArenaDescriptorSet(
+        gRuntime.tensorArenaBuffer,
+        gRuntime.tensorArenaCapacity
+    );
 }
 
 bool growTensorArena(VkDeviceSize additionalBytes) {
@@ -4670,6 +4684,42 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeDestroy(
     destroyRuntime();
 }
 
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeClearTensorArena(
+    JNIEnv*, jobject
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.device == VK_NULL_HANDLE) return JNI_FALSE;
+
+    if (gRuntime.tensorArenaBuffer == VK_NULL_HANDLE) {
+        gRuntime.tensorArena.reset();
+        return JNI_TRUE;
+    }
+
+    const VkResult idle = vkDeviceWaitIdle(gRuntime.device);
+    if (idle != VK_SUCCESS) {
+        logError("Vulkan device did not become idle before clearing the tensor arena.", idle);
+        return JNI_FALSE;
+    }
+
+    // Persistent FP16 dispatch is suspended by the Kotlin backend before this call.
+    // Rebind descriptor set 1 to the still-live staging buffer before destroying the arena.
+    if (gRuntime.storageBuffer == VK_NULL_HANDLE || gRuntime.storageCapacity == 0u) {
+        logError("Cannot clear the Vulkan tensor arena without a valid fallback storage buffer.");
+        return JNI_FALSE;
+    }
+    const VkDeviceSize fallbackRange = std::min(
+        gRuntime.storageCapacity,
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange
+    );
+    if (fallbackRange == 0u) return JNI_FALSE;
+
+    updateTensorArenaDescriptorSet(gRuntime.storageBuffer, fallbackRange);
+    destroyTensorArena();
+    refreshMemoryBudget();
+    return JNI_TRUE;
+}
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_argus_agi_model_VulkanTrainingBackend_nativeAllocateTensor(

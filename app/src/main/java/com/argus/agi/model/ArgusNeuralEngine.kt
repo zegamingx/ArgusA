@@ -328,6 +328,17 @@ class ArgusNeuralEngine private constructor(
         return true
     }
 
+    fun releaseVulkanTensorResidencyForMemoryPressure(): Boolean =
+        VulkanTrainingBackend.releaseModelTensorResidencyForMemoryPressure()
+
+    fun resumeVulkanTensorResidencyAfterForeground() {
+        VulkanTrainingBackend.resumeModelTensorResidencyAfterForeground()
+    }
+
+    fun resetOptionalVulkanRuntimeForRetry() {
+        VulkanTrainingBackend.resetRuntimeForRetry()
+    }
+
     private fun synchronizeVulkanModelTensorResidency(reason: String) {
         if (!VulkanTrainingBackend.isFp16ComputeAvailable) return
         val synchronized = VulkanTrainingBackend.synchronizeModelTensorResidency(
@@ -337,7 +348,7 @@ class ArgusNeuralEngine private constructor(
             Log.w(
                 TAG,
                 "Complete FP16 model residency was not established after $reason; " +
-                    "eligible operations will acquire tensors individually or use fallback."
+                    "the verified FP32 Vulkan path or Kotlin CPU fallback remains active."
             )
         }
     }

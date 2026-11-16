@@ -172,6 +172,81 @@ class VulkanTensorResidencyRegistryTest {
     }
 
     @Test
+    fun rejectsWholeModelInventoryBeforeAllocatingWhenBudgetIsInsufficient() {
+        var allocationCount = 0
+        var releaseCount = 0
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount ->
+                allocationCount++
+                VulkanTensorAllocation(allocationCount.toLong(), byteCount)
+            },
+            upload = { _, _ -> true },
+            release = { releaseCount++; true },
+            maxResidentBytes = { 7L }
+        )
+        val inventory = listOf(
+            VulkanModelParameterTensor(
+                "embedding",
+                Float16ParameterArray.fromFloatArray(floatArrayOf(1f, 2f))
+            ),
+            VulkanModelParameterTensor(
+                "head",
+                Float16ParameterArray.fromFloatArray(floatArrayOf(3f, 4f))
+            )
+        )
+
+        assertFalse(registry.synchronizeAll(inventory))
+        assertEquals(0, allocationCount)
+        assertEquals(0, releaseCount)
+        assertEquals(0, registry.residentTensorCount())
+        assertEquals(0L, registry.residentByteCount())
+    }
+
+    @Test
+    fun tracksResidentBytesAndRejectsAdditionalAllocationsBeyondBudget() {
+        var nextHandle = 1L
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount -> VulkanTensorAllocation(nextHandle++, byteCount) },
+            upload = { _, _ -> true },
+            release = { true },
+            maxResidentBytes = { 8L }
+        )
+        val first = Float16ParameterArray.fromFloatArray(floatArrayOf(1f, 2f))
+        val second = Float16ParameterArray.fromFloatArray(floatArrayOf(3f, 4f))
+        val third = Float16ParameterArray.fromFloatArray(floatArrayOf(5f))
+
+        assertNotNull(registry.acquire(first))
+        assertNotNull(registry.acquire(second))
+        assertEquals(8L, registry.residentByteCount())
+        assertNull(registry.acquire(third))
+
+        assertTrue(registry.invalidate(releaseAllocations = true))
+        assertEquals(0L, registry.residentByteCount())
+        assertEquals(0, registry.residentTensorCount())
+        assertNotNull(registry.acquire(third))
+    }
+
+    @Test
+    fun keepsFailedReleasesTrackedUntilTheNativeArenaCanBeCleared() {
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount -> VulkanTensorAllocation(1L, byteCount) },
+            upload = { _, _ -> true },
+            release = { false },
+            maxResidentBytes = { 8L }
+        )
+        val parameters = Float16ParameterArray.fromFloatArray(floatArrayOf(1f, 2f))
+
+        assertNotNull(registry.acquire(parameters))
+        assertFalse(registry.invalidate(releaseAllocations = true))
+        assertEquals(1, registry.residentTensorCount())
+        assertEquals(4L, registry.residentByteCount())
+
+        assertTrue(registry.invalidate(releaseAllocations = false))
+        assertEquals(0, registry.residentTensorCount())
+        assertEquals(0L, registry.residentByteCount())
+    }
+
+    @Test
     fun serializesHalfValuesInLittleEndianOrder() {
         val weights = Float16ParameterArray.fromFloatArray(floatArrayOf(1.0f, -2.0f))
         assertArrayEquals(

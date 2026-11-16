@@ -1,12 +1,15 @@
 package com.argus.agi
 
+import android.app.Activity
 import android.app.ActivityManager
 import android.app.Application
 import android.app.ApplicationExitInfo
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.content.ComponentCallbacks2
 import android.os.Build
+import android.os.Bundle
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.argus.agi.model.ArgusNeuralEngine
@@ -156,12 +159,32 @@ class ArgusApp : Application() {
     @Volatile
     private var coreInitializationJob: Job? = null
 
+    @Volatile
+    private var residencyTrimJob: Job? = null
+
     override fun onCreate() {
         super.onCreate()
         _instance = this
         capturePreviousProcessExit()
         installUncaughtExceptionHandler()
         createNotificationChannel()
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+            override fun onActivityStarted(activity: Activity) = Unit
+            override fun onActivityPaused(activity: Activity) = Unit
+            override fun onActivityStopped(activity: Activity) = Unit
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+            override fun onActivityDestroyed(activity: Activity) = Unit
+
+            override fun onActivityResumed(activity: Activity) {
+                val engine = if (_neuralEngine.isInitialized()) _neuralEngine.value else return
+                val pendingTrim = residencyTrimJob
+                applicationScope.launch(Dispatchers.IO) {
+                    pendingTrim?.join()
+                    engine.resumeVulkanTensorResidencyAfterForeground()
+                }
+            }
+        })
         initializeCoreRuntime()
     }
 
@@ -253,7 +276,7 @@ class ArgusApp : Application() {
      * Initializes blocking singletons on the application IO scope.
      * The activity must not create its ViewModel until this state becomes Ready.
      */
-    private fun initializeCoreRuntime() {
+    private fun initializeCoreRuntime(resetVulkanRuntime: Boolean = false) {
         synchronized(this) {
             if (coreInitializationJob?.isActive == true) return
 
@@ -261,6 +284,11 @@ class ArgusApp : Application() {
             _coreInitializationProgress.value = ArgusCoreInitializationProgress()
             coreInitializationJob = applicationScope.launch {
                 try {
+                    if (resetVulkanRuntime && _neuralEngine.isInitialized()) {
+                        initializationStage = "Resetting Vulkan runtime for retry"
+                        _neuralEngine.value.resetOptionalVulkanRuntimeForRetry()
+                    }
+
                     initializationStage = "Reading system device profile"
                     publishCoreProgress("Reading device specifications")
                     val profile = hardwareInfo
@@ -373,7 +401,21 @@ class ArgusApp : Application() {
     }
 
     fun retryCoreInitialization() {
-        initializeCoreRuntime()
+        initializeCoreRuntime(resetVulkanRuntime = true)
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level < ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) return
+        val engine = if (_neuralEngine.isInitialized()) _neuralEngine.value else return
+        val previousTrim = residencyTrimJob
+        residencyTrimJob = applicationScope.launch(Dispatchers.IO) {
+            previousTrim?.join()
+            val released = engine.releaseVulkanTensorResidencyForMemoryPressure()
+            if (released) {
+                Log.i(TAG, "Persistent Vulkan model residency released after memory-trim callback.")
+            }
+        }
     }
 
     private fun createNotificationChannel() {

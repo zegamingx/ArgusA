@@ -11,11 +11,15 @@ internal data class VulkanModelParameterTensor(
 /**
  * Keeps read-only GPU replicas of authoritative Kotlin FP16 model tensors.
  * Kotlin remains the source of truth; uploads occur only after mutation revisions change.
+ *
+ * The registry refuses partial model residency: its configured byte budget is checked
+ * against the complete inventory before any allocation is created.
  */
 internal class VulkanTensorResidencyRegistry(
     private val allocate: (Long) -> VulkanTensorAllocation?,
     private val upload: (VulkanTensorAllocation, ByteArray) -> Boolean,
-    private val release: (VulkanTensorAllocation) -> Boolean
+    private val release: (VulkanTensorAllocation) -> Boolean,
+    private val maxResidentBytes: () -> Long = { Long.MAX_VALUE }
 ) {
     private data class Entry(
         val allocation: VulkanTensorAllocation,
@@ -23,26 +27,31 @@ internal class VulkanTensorResidencyRegistry(
     )
 
     private val entries = IdentityHashMap<Float16ParameterArray, Entry>()
+    private var residentBytes: Long = 0L
 
     @Synchronized
     fun acquire(parameters: Float16ParameterArray): VulkanTensorAllocation? {
-        val byteCount = runCatching {
-            Math.multiplyExact(parameters.size.toLong(), Short.SIZE_BYTES.toLong())
-        }.getOrNull() ?: return null
-        if (byteCount <= 0L || byteCount > Int.MAX_VALUE.toLong()) return null
-
+        val byteCount = parameterByteCount(parameters) ?: return null
         var candidate = entries[parameters]
+
         if (candidate != null && candidate.allocation.byteCount != byteCount) {
-            release(candidate.allocation)
-            entries.remove(parameters)
+            if (!release(candidate.allocation)) return null
+            removeEntry(parameters, candidate)
             candidate = null
         }
+
         if (candidate == null) {
+            val nextResidentBytes = runCatching {
+                Math.addExact(residentBytes, byteCount)
+            }.getOrNull() ?: return null
+            if (nextResidentBytes > maxResidentBytes().coerceAtLeast(0L)) return null
+
             val allocation = allocate(byteCount) ?: return null
             candidate = Entry(allocation, uploadedRevision = Long.MIN_VALUE)
             entries[parameters] = candidate
+            residentBytes = nextResidentBytes
         }
-        val entry: Entry = candidate
+        val entry: Entry = candidate ?: return null
 
         repeat(MAX_SNAPSHOT_ATTEMPTS) {
             val revisionBefore = parameters.mutationVersion
@@ -74,7 +83,7 @@ internal class VulkanTensorResidencyRegistry(
 
     /**
      * Reconciles the full model inventory and releases tensors no longer owned by it.
-     * On failure, all entries are invalidated so partial residency is never reported ready.
+     * The complete byte budget is validated before old or new allocations are changed.
      */
     @Synchronized
     fun synchronizeAll(tensors: List<VulkanModelParameterTensor>): Boolean {
@@ -84,6 +93,7 @@ internal class VulkanTensorResidencyRegistry(
 
         val desired = IdentityHashMap<Float16ParameterArray, String>()
         val names = HashSet<String>(tensors.size)
+        var requiredBytes = 0L
         for (tensor in tensors) {
             require(tensor.name.isNotBlank()) {
                 "Model parameter tensor names cannot be blank."
@@ -94,18 +104,29 @@ internal class VulkanTensorResidencyRegistry(
             require(desired.put(tensor.parameters, tensor.name) == null) {
                 "A model parameter array cannot be registered under multiple names."
             }
+            val byteCount = parameterByteCount(tensor.parameters) ?: return false
+            requiredBytes = runCatching {
+                Math.addExact(requiredBytes, byteCount)
+            }.getOrNull() ?: return false
         }
 
+        if (requiredBytes > maxResidentBytes().coerceAtLeast(0L)) return false
+
+        var releaseSucceeded = true
         val staleParameters = entries.keys.filter { parameters ->
             !desired.containsKey(parameters)
         }
         for (parameters in staleParameters) {
             val entry = entries[parameters] ?: continue
-            if (!release(entry.allocation)) {
-                invalidate(releaseAllocations = true)
-                return false
+            if (release(entry.allocation)) {
+                removeEntry(parameters, entry)
+            } else {
+                releaseSucceeded = false
             }
-            entries.remove(parameters)
+        }
+        if (!releaseSucceeded) {
+            invalidate(releaseAllocations = true)
+            return false
         }
 
         for (tensor in tensors) {
@@ -127,21 +148,58 @@ internal class VulkanTensorResidencyRegistry(
             val entry = entries[tensor.parameters] ?: return false
             if (entry.uploadedRevision != tensor.parameters.mutationVersion) return false
         }
-        return true
+        return residentBytes <= maxResidentBytes().coerceAtLeast(0L)
     }
 
+    /**
+     * Releases every tracked allocation. Failed releases remain tracked so the caller
+     * can retry or invalidate the native arena as a whole without losing their handles.
+     */
     @Synchronized
-    fun invalidate(releaseAllocations: Boolean) {
-        if (releaseAllocations) entries.values.forEach { entry -> release(entry.allocation) }
-        entries.clear()
+    fun invalidate(releaseAllocations: Boolean): Boolean {
+        if (!releaseAllocations) {
+            entries.clear()
+            residentBytes = 0L
+            return true
+        }
+
+        var allReleased = true
+        val snapshot = entries.entries.map { it.key to it.value }
+        for ((parameters, entry) in snapshot) {
+            if (release(entry.allocation)) {
+                removeEntry(parameters, entry)
+            } else {
+                allReleased = false
+            }
+        }
+        return allReleased
     }
 
     @Synchronized
     fun residentTensorCount(): Int = entries.size
 
+    @Synchronized
+    fun residentByteCount(): Long = residentBytes
+
     private fun discard(parameters: Float16ParameterArray, entry: Entry) {
-        entries.remove(parameters)
-        release(entry.allocation)
+        if (release(entry.allocation)) {
+            removeEntry(parameters, entry)
+        } else {
+            entry.uploadedRevision = Long.MIN_VALUE
+        }
+    }
+
+    private fun removeEntry(parameters: Float16ParameterArray, entry: Entry) {
+        if (entries.remove(parameters) != null) {
+            residentBytes = (residentBytes - entry.allocation.byteCount).coerceAtLeast(0L)
+        }
+    }
+
+    private fun parameterByteCount(parameters: Float16ParameterArray): Long? {
+        val bytes = runCatching {
+            Math.multiplyExact(parameters.size.toLong(), Short.SIZE_BYTES.toLong())
+        }.getOrNull() ?: return null
+        return bytes.takeIf { it > 0L && it <= Int.MAX_VALUE.toLong() }
     }
 
     private companion object {
