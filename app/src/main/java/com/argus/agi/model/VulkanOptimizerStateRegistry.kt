@@ -21,13 +21,16 @@ internal class VulkanOptimizerStateRegistry(
     private data class Entry(
         var allocation: VulkanTensorAllocation,
         var uploaded: Boolean,
-        var hostMirrorCurrent: Boolean
+        var hostMirrorCurrent: Boolean,
+        var deviceRevision: Long
     )
 
     private data class PreparedReplacement(
         val tensors: List<FloatArray>,
         val expectedAllocations: List<VulkanTensorAllocation>,
         val replacementAllocations: List<VulkanTensorAllocation>,
+        val sourceDeviceRevisions: LongArray,
+        val deviceRevisionsAfterCommit: LongArray,
         val retiredBytesAfterCommit: Long
     )
 
@@ -140,6 +143,15 @@ internal class VulkanOptimizerStateRegistry(
         preparedReplacement = null
         if (!validateReplacement(tensors, expectedAllocations, replacementAllocations)) return false
 
+        val sourceDeviceRevisions = LongArray(tensors.size)
+        val deviceRevisionsAfterCommit = LongArray(tensors.size)
+        for (index in tensors.indices) {
+            val entry = entries[tensors[index]] ?: return false
+            sourceDeviceRevisions[index] = entry.deviceRevision
+            deviceRevisionsAfterCommit[index] = runCatching {
+                Math.addExact(entry.deviceRevision, 1L)
+            }.getOrNull() ?: return false
+        }
         val nextRetiredBytes = runCatching {
             expectedAllocations.fold(retiredResidentBytes) { total, allocation ->
                 Math.addExact(total, allocation.byteCount)
@@ -156,6 +168,8 @@ internal class VulkanOptimizerStateRegistry(
                 tensors = preparedTensors,
                 expectedAllocations = preparedExpected,
                 replacementAllocations = preparedReplacements,
+                sourceDeviceRevisions = sourceDeviceRevisions,
+                deviceRevisionsAfterCommit = deviceRevisionsAfterCommit,
                 retiredBytesAfterCommit = nextRetiredBytes
             )
             true
@@ -185,7 +199,8 @@ internal class VulkanOptimizerStateRegistry(
             val entry = entries[prepared.tensors[index]] ?: return false
             val expected = prepared.expectedAllocations[index]
             val replacement = prepared.replacementAllocations[index]
-            if (entry.allocation.nativeHandle != expected.nativeHandle ||
+            if (entry.deviceRevision != prepared.sourceDeviceRevisions[index] ||
+                entry.allocation.nativeHandle != expected.nativeHandle ||
                 entry.allocation.byteCount != expected.byteCount ||
                 replacement.byteCount != expected.byteCount) {
                 return false
@@ -198,6 +213,7 @@ internal class VulkanOptimizerStateRegistry(
             val previous = entry.allocation
             entry.allocation = prepared.replacementAllocations[index]
             entry.uploaded = true
+            entry.deviceRevision = prepared.deviceRevisionsAfterCommit[index]
             entry.hostMirrorCurrent = false
             retiredAllocations.add(previous)
         }
@@ -293,6 +309,11 @@ internal class VulkanOptimizerStateRegistry(
     @Synchronized
     fun residentTensorCount(): Int = entries.size
 
+    /** Returns the committed GPU generation for one optimizer tensor, or null if not resident. */
+    @Synchronized
+    internal fun deviceRevision(tensor: FloatArray): Long? =
+        entries[tensor]?.deviceRevision
+
     /** Includes active tensors and allocations awaiting a successful deferred release. */
     @Synchronized
     fun residentByteCount(): Long = Math.addExact(activeResidentBytes, retiredResidentBytes)
@@ -336,7 +357,8 @@ internal class VulkanOptimizerStateRegistry(
             entry = Entry(
                 allocation = allocation,
                 uploaded = false,
-                hostMirrorCurrent = true
+                hostMirrorCurrent = true,
+                deviceRevision = 0L
             )
             entries[tensor] = entry
             activeResidentBytes = nextActiveBytes
@@ -344,6 +366,9 @@ internal class VulkanOptimizerStateRegistry(
 
         if (entry.uploaded) return entry.allocation
 
+        val nextDeviceRevision = runCatching {
+            Math.addExact(entry.deviceRevision, 1L)
+        }.getOrNull() ?: return null
         val snapshot = try {
             encodeFloatArray(tensor)
         } catch (_: OutOfMemoryError) {
@@ -357,6 +382,7 @@ internal class VulkanOptimizerStateRegistry(
         }
 
         entry.uploaded = true
+        entry.deviceRevision = nextDeviceRevision
         entry.hostMirrorCurrent = true
         return entry.allocation
     }

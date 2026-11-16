@@ -36,22 +36,26 @@ class Float16ParameterArray(size: Int) {
 
     operator fun get(index: Int): Float = Float16Codec.toFloat(storage[index])
 
+    @Synchronized
     operator fun set(index: Int, value: Float) {
         storage[index] = Float16Codec.fromFiniteFloat(value)
         markModified()
     }
 
+    @Synchronized
     fun fill(value: Float) {
         storage.fill(Float16Codec.fromFiniteFloat(value))
         if (storage.isNotEmpty()) markModified()
     }
 
+    @Synchronized
     fun copyFrom(source: Float16ParameterArray) {
         require(source.size == size) { "FP16 parameter-array sizes must match." }
         System.arraycopy(source.storage, 0, storage, 0, size)
         if (size > 0) markModified()
     }
 
+    @Synchronized
     fun copyFrom(
         source: Float16ParameterArray,
         sourceOffset: Int,
@@ -77,6 +81,7 @@ class Float16ParameterArray(size: Int) {
     fun toShortArray(): ShortArray = storage.copyOf()
 
     /** Returns the binary16 payload in explicit little-endian byte order for Vulkan. */
+    @Synchronized
     internal fun toLittleEndianByteArray(): ByteArray {
         val byteCount = Math.multiplyExact(storage.size, Short.SIZE_BYTES)
         return ByteArray(byteCount).also { bytes ->
@@ -111,6 +116,7 @@ class Float16ParameterArray(size: Int) {
     }
 
     /** Commits one validated GPU readback and advances the model mutation revision once. */
+    @Synchronized
     internal fun copyPrefixFromLittleEndianByteArray(source: ByteArray, elementCount: Int) {
         validateLittleEndianPrefix(source, elementCount)
         for (index in 0 until elementCount) {
@@ -121,6 +127,25 @@ class Float16ParameterArray(size: Int) {
                 ).toShort()
         }
         if (elementCount > 0) markModified()
+    }
+
+    @Synchronized
+    internal fun copyPrefixFromLittleEndianByteArrayIfRevision(
+        source: ByteArray,
+        elementCount: Int,
+        expectedMutationVersion: Long
+    ): Long? {
+        if (currentMutationVersion != expectedMutationVersion) return null
+        validateLittleEndianPrefix(source, elementCount)
+        for (index in 0 until elementCount) {
+            val byteOffset = index * Short.SIZE_BYTES
+            storage[index] = (
+                (source[byteOffset].toInt() and 0xFF) or
+                    ((source[byteOffset + 1].toInt() and 0xFF) shl 8)
+                ).toShort()
+        }
+        if (elementCount > 0) markModified()
+        return currentMutationVersion
     }
 
     companion object {

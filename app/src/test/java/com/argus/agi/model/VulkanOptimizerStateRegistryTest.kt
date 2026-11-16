@@ -68,6 +68,8 @@ class VulkanOptimizerStateRegistryTest {
         assertTrue(state.synchronizeAll(listOf(first, second)))
         assertEquals(2, arena.uploadCount)
         assertEquals(2, state.residentTensorCount())
+        assertEquals(1L, state.deviceRevision(first))
+        assertEquals(1L, state.deviceRevision(second))
 
         assertTrue(state.synchronizeAll(listOf(first, second)))
         assertEquals(2, arena.uploadCount)
@@ -320,10 +322,14 @@ class VulkanOptimizerStateRegistryTest {
 
         assertEquals(candidateFirst.nativeHandle, state.acquire(first)?.nativeHandle)
         assertEquals(candidateSecond.nativeHandle, state.acquire(second)?.nativeHandle)
+        assertEquals(2L, state.deviceRevision(first))
+        assertEquals(2L, state.deviceRevision(second))
         assertEquals(64L, state.residentByteCount())
         arena.releaseFailure = false
         assertTrue(state.synchronizeAll(listOf(first, second)))
         assertEquals(32L, state.residentByteCount())
+        assertEquals(2L, state.deviceRevision(first))
+        assertEquals(2L, state.deviceRevision(second))
         assertFalse(arena.contents.containsKey(oldFirst.nativeHandle))
         assertFalse(arena.contents.containsKey(oldSecond.nativeHandle))
     }

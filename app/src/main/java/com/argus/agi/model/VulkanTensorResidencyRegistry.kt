@@ -29,13 +29,17 @@ internal class VulkanTensorResidencyRegistry(
     private data class Entry(
         var allocation: VulkanTensorAllocation,
         var uploadedRevision: Long,
-        var hostMirrorCurrent: Boolean
+        var hostMirrorCurrent: Boolean,
+        var deviceRevision: Long
     )
 
     private data class PreparedReplacement(
         val tensors: List<Float16ParameterArray>,
         val expectedAllocations: List<VulkanTensorAllocation>,
         val replacementAllocations: List<VulkanTensorAllocation>,
+        val sourceHostRevisions: LongArray,
+        val sourceDeviceRevisions: LongArray,
+        val deviceRevisionsAfterCommit: LongArray,
         val retiredBytesAfterCommit: Long
     )
 
@@ -70,15 +74,26 @@ internal class VulkanTensorResidencyRegistry(
             candidate = Entry(
                 allocation = allocation,
                 uploadedRevision = Long.MIN_VALUE,
-                hostMirrorCurrent = false
+                hostMirrorCurrent = false,
+                deviceRevision = 0L
             )
             entries[parameters] = candidate
             residentBytes = nextActiveBytes
         }
         val entry: Entry = candidate
+        if (!entry.hostMirrorCurrent &&
+            entry.uploadedRevision != Long.MIN_VALUE &&
+            entry.uploadedRevision != parameters.mutationVersion) {
+            return null
+        }
 
         repeat(MAX_SNAPSHOT_ATTEMPTS) {
             val revisionBefore = parameters.mutationVersion
+            if (!entry.hostMirrorCurrent &&
+                entry.uploadedRevision != Long.MIN_VALUE &&
+                entry.uploadedRevision != revisionBefore) {
+                return null
+            }
             if (entry.uploadedRevision == revisionBefore) return entry.allocation
 
             val snapshot = try {
@@ -90,6 +105,9 @@ internal class VulkanTensorResidencyRegistry(
             val revisionAfterSnapshot = parameters.mutationVersion
             if (revisionBefore != revisionAfterSnapshot) return@repeat
 
+            val nextDeviceRevision = runCatching {
+                Math.addExact(entry.deviceRevision, 1L)
+            }.getOrNull() ?: return null
             if (!upload(entry.allocation, snapshot)) {
                 discard(parameters, entry)
                 return null
@@ -97,6 +115,7 @@ internal class VulkanTensorResidencyRegistry(
             val revisionAfterUpload = parameters.mutationVersion
             if (revisionAfterUpload == revisionAfterSnapshot) {
                 entry.uploadedRevision = revisionAfterUpload
+                entry.deviceRevision = nextDeviceRevision
                 entry.hostMirrorCurrent = true
                 return entry.allocation
             }
@@ -221,7 +240,11 @@ internal class VulkanTensorResidencyRegistry(
     fun synchronizeHostMirror(parameters: Float16ParameterArray): Boolean {
         val entry = entries[parameters] ?: return true
         if (entry.hostMirrorCurrent) return true
-        if (entry.uploadedRevision == Long.MIN_VALUE) return false
+        if (entry.uploadedRevision == Long.MIN_VALUE ||
+            parameters.mutationVersion != entry.uploadedRevision) {
+            return false
+        }
+        val expectedHostRevision = entry.uploadedRevision
         val readback = download ?: return false
         val byteCount = parameterByteCount(parameters) ?: return false
         if (byteCount != entry.allocation.byteCount || byteCount > Int.MAX_VALUE.toLong()) {
@@ -238,8 +261,12 @@ internal class VulkanTensorResidencyRegistry(
         } catch (_: IllegalArgumentException) {
             return false
         }
-        parameters.copyPrefixFromLittleEndianByteArray(snapshot, parameters.size)
-        entry.uploadedRevision = parameters.mutationVersion
+        val committedRevision = parameters.copyPrefixFromLittleEndianByteArrayIfRevision(
+            snapshot,
+            parameters.size,
+            expectedHostRevision
+        ) ?: return false
+        entry.uploadedRevision = committedRevision
         entry.hostMirrorCurrent = true
         return true
     }
@@ -254,9 +281,13 @@ internal class VulkanTensorResidencyRegistry(
         val staleEntries = entries.entries.filter { (_, entry) -> !entry.hostMirrorCurrent }
         if (staleEntries.isEmpty()) return true
         val readback = download ?: return false
-        val staged = ArrayList<Pair<Float16ParameterArray, ByteArray>>(staleEntries.size)
+        val staged = ArrayList<Triple<Float16ParameterArray, ByteArray, Long>>(staleEntries.size)
         for ((parameters, entry) in staleEntries) {
-            if (entry.uploadedRevision == Long.MIN_VALUE) return false
+            val expectedHostRevision = entry.uploadedRevision
+            if (expectedHostRevision == Long.MIN_VALUE ||
+                parameters.mutationVersion != expectedHostRevision) {
+                return false
+            }
             val byteCount = parameterByteCount(parameters) ?: return false
             if (byteCount != entry.allocation.byteCount || byteCount > Int.MAX_VALUE.toLong()) {
                 return false
@@ -272,13 +303,17 @@ internal class VulkanTensorResidencyRegistry(
             } catch (_: IllegalArgumentException) {
                 return false
             }
-            staged.add(parameters to snapshot)
+            staged.add(Triple(parameters, snapshot, expectedHostRevision))
         }
 
-        for ((parameters, snapshot) in staged) {
-            parameters.copyPrefixFromLittleEndianByteArray(snapshot, parameters.size)
+        for ((parameters, snapshot, expectedHostRevision) in staged) {
+            val committedRevision = parameters.copyPrefixFromLittleEndianByteArrayIfRevision(
+                snapshot,
+                parameters.size,
+                expectedHostRevision
+            ) ?: return false
             val entry = entries[parameters] ?: return false
-            entry.uploadedRevision = parameters.mutationVersion
+            entry.uploadedRevision = committedRevision
             entry.hostMirrorCurrent = true
         }
         return true
@@ -303,10 +338,19 @@ internal class VulkanTensorResidencyRegistry(
             entry.allocation.byteCount != allocation.byteCount) {
             return false
         }
+        val nextDeviceRevision = runCatching {
+            Math.addExact(entry.deviceRevision, 1L)
+        }.getOrNull() ?: return false
         entry.uploadedRevision = parameters.mutationVersion
+        entry.deviceRevision = nextDeviceRevision
         entry.hostMirrorCurrent = false
         return true
     }
+
+    /** Returns the committed GPU generation for one model tensor, or null if it is not resident. */
+    @Synchronized
+    internal fun deviceRevision(parameters: Float16ParameterArray): Long? =
+        entries[parameters]?.deviceRevision
 
     /** Validates a complete replacement before either the caller or this registry commits it. */
     @Synchronized
@@ -318,6 +362,20 @@ internal class VulkanTensorResidencyRegistry(
         preparedReplacement = null
         if (!validateReplacement(tensors, expectedAllocations, replacementAllocations)) return false
 
+        val sourceHostRevisions = LongArray(tensors.size)
+        val sourceDeviceRevisions = LongArray(tensors.size)
+        val deviceRevisionsAfterCommit = LongArray(tensors.size)
+        for (index in tensors.indices) {
+            val tensor = tensors[index]
+            val entry = entries[tensor] ?: return false
+            val hostRevision = tensor.mutationVersion
+            if (entry.uploadedRevision != hostRevision) return false
+            sourceHostRevisions[index] = hostRevision
+            sourceDeviceRevisions[index] = entry.deviceRevision
+            deviceRevisionsAfterCommit[index] = runCatching {
+                Math.addExact(entry.deviceRevision, 1L)
+            }.getOrNull() ?: return false
+        }
         val nextRetiredBytes = runCatching {
             expectedAllocations.fold(retiredResidentBytes) { total, allocation ->
                 Math.addExact(total, allocation.byteCount)
@@ -334,6 +392,9 @@ internal class VulkanTensorResidencyRegistry(
                 tensors = preparedTensors,
                 expectedAllocations = preparedExpected,
                 replacementAllocations = preparedReplacements,
+                sourceHostRevisions = sourceHostRevisions,
+                sourceDeviceRevisions = sourceDeviceRevisions,
+                deviceRevisionsAfterCommit = deviceRevisionsAfterCommit,
                 retiredBytesAfterCommit = nextRetiredBytes
             )
             true
@@ -366,7 +427,10 @@ internal class VulkanTensorResidencyRegistry(
             val entry = entries[prepared.tensors[index]] ?: return false
             val expected = prepared.expectedAllocations[index]
             val replacement = prepared.replacementAllocations[index]
-            if (entry.allocation.nativeHandle != expected.nativeHandle ||
+            if (prepared.sourceHostRevisions[index] != prepared.tensors[index].mutationVersion ||
+                entry.uploadedRevision != prepared.sourceHostRevisions[index] ||
+                entry.deviceRevision != prepared.sourceDeviceRevisions[index] ||
+                entry.allocation.nativeHandle != expected.nativeHandle ||
                 entry.allocation.byteCount != expected.byteCount ||
                 replacement.byteCount != expected.byteCount) {
                 return false
@@ -378,7 +442,8 @@ internal class VulkanTensorResidencyRegistry(
             val entry = entries[tensor] ?: return false
             val previous = entry.allocation
             entry.allocation = prepared.replacementAllocations[index]
-            entry.uploadedRevision = tensor.mutationVersion
+            entry.uploadedRevision = prepared.sourceHostRevisions[index]
+            entry.deviceRevision = prepared.deviceRevisionsAfterCommit[index]
             entry.hostMirrorCurrent = false
             retiredAllocations.add(previous)
         }

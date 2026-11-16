@@ -28,11 +28,13 @@ class VulkanTensorResidencyRegistryTest {
         assertEquals(first?.nativeHandle, second?.nativeHandle)
         assertEquals(1, uploadCount)
         assertEquals(1, registry.residentTensorCount())
+        assertEquals(1L, registry.deviceRevision(weights))
 
         weights[1] = 0.75f
         val afterMutation = registry.acquire(weights)
         assertEquals(first?.nativeHandle, afterMutation?.nativeHandle)
         assertEquals(2, uploadCount)
+        assertEquals(2L, registry.deviceRevision(weights))
     }
 
     @Test
@@ -244,6 +246,60 @@ class VulkanTensorResidencyRegistryTest {
         assertTrue(registry.invalidate(releaseAllocations = false))
         assertEquals(0, registry.residentTensorCount())
         assertEquals(0L, registry.residentByteCount())
+    }
+
+
+    @Test
+    fun refusesToUploadOrOverwriteHostMutationWhileGpuMirrorIsAuthoritative() {
+        var nextHandle = 1L
+        var uploadCount = 0
+        val gpuBytes = LinkedHashMap<Long, ByteArray>()
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount ->
+                VulkanTensorAllocation(nextHandle++, byteCount).also { allocation ->
+                    gpuBytes[allocation.nativeHandle] = ByteArray(byteCount.toInt())
+                }
+            },
+            upload = { allocation, bytes ->
+                val destination = gpuBytes[allocation.nativeHandle]
+                if (destination == null || destination.size != bytes.size) {
+                    false
+                } else {
+                    bytes.copyInto(destination)
+                    uploadCount++
+                    true
+                }
+            },
+            release = { allocation -> gpuBytes.remove(allocation.nativeHandle) != null },
+            download = { allocation, destination ->
+                val sourceBytes = gpuBytes[allocation.nativeHandle]
+                if (sourceBytes == null || sourceBytes.size != destination.size) {
+                    false
+                } else {
+                    sourceBytes.copyInto(destination)
+                    true
+                }
+            }
+        )
+        val parameters = Float16ParameterArray.fromFloatArray(floatArrayOf(0.25f, -0.5f))
+        val allocation = registry.acquire(parameters)
+            ?: error("The initial resident parameter allocation is missing.")
+        val updatedGpuBytes = Float16ParameterArray
+            .fromFloatArray(floatArrayOf(1.25f, 1.5f))
+            .toLittleEndianByteArray()
+        updatedGpuBytes.copyInto(requireNotNull(gpuBytes[allocation.nativeHandle]))
+        registry.markDeviceMutationPending(listOf(parameters))
+        assertTrue(registry.markGpuReplicaSynchronized(parameters, allocation))
+        assertEquals(2L, registry.deviceRevision(parameters))
+
+        parameters[0] = 9.0f
+        val hostValueAfterMutation = parameters.toShortArray()
+        assertNull(registry.acquire(parameters))
+        assertFalse(registry.synchronizeHostMirror(parameters))
+        assertFalse(registry.synchronizeHostMirrors())
+        assertArrayEquals(hostValueAfterMutation, parameters.toShortArray())
+        assertEquals(1, uploadCount)
+        assertEquals(2L, registry.deviceRevision(parameters))
     }
 
     @Test
@@ -637,6 +693,8 @@ class VulkanTensorResidencyRegistryTest {
         }
 
         assertTrue(registry.canReplaceAll(listOf(first, second), oldAllocations, replacements))
+        assertEquals(1L, registry.deviceRevision(first))
+        assertEquals(1L, registry.deviceRevision(second))
         releaseFailure = true
         assertTrue(
             registry.commitReplacementAfterPreflight(
@@ -648,6 +706,8 @@ class VulkanTensorResidencyRegistryTest {
         assertEquals(previousUploadCount, uploadCount)
         assertEquals(replacements[0].nativeHandle, registry.acquire(first)?.nativeHandle)
         assertEquals(replacements[1].nativeHandle, registry.acquire(second)?.nativeHandle)
+        assertEquals(2L, registry.deviceRevision(first))
+        assertEquals(2L, registry.deviceRevision(second))
         assertEquals(20L, registry.residentByteCount())
 
         releaseFailure = false
@@ -656,6 +716,8 @@ class VulkanTensorResidencyRegistryTest {
         assertFalse(gpuBytes.containsKey(oldAllocations[0].nativeHandle))
         assertFalse(gpuBytes.containsKey(oldAllocations[1].nativeHandle))
         assertTrue(registry.synchronizeHostMirrors())
+        assertEquals(2L, registry.deviceRevision(first))
+        assertEquals(2L, registry.deviceRevision(second))
         assertArrayEquals(
             Float16ParameterArray.fromFloatArray(values[0]).toShortArray(),
             first.toShortArray()
