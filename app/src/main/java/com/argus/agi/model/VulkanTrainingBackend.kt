@@ -529,6 +529,7 @@ internal object VulkanTrainingBackend {
         allocate = { byteCount -> allocateGpuTensor(byteCount) },
         upload = { allocation, bytes -> uploadGpuTensor(allocation, bytes) },
         release = { allocation -> releaseGpuTensor(allocation) },
+        download = { allocation, bytes -> downloadGpuTensor(allocation, bytes) },
         maxResidentBytes = { _modelTensorResidencyBudgetBytes.value }
     )
 
@@ -609,12 +610,15 @@ internal object VulkanTrainingBackend {
     private var residencyBlockedAfterFailure = false
     private var residencyRebuildPending = false
     private var runtimeRestartPending = false
+    private var modelParameterMirrorReliable = true
+    private var optimizerStateMirrorReliable = true
 
     private fun invalidateTensorResidency(releaseAllocations: Boolean): Boolean {
-        if (releaseAllocations && nativeReady &&
-            optimizerStateResidencyRegistry.residentTensorCount() > 0 &&
-            !synchronizeOptimizerStateMirrors()) {
-            Log.e(TAG, "Tensor Arena release was refused because resident optimizer moments could not be recovered.")
+        if (releaseAllocations && nativeReady && !synchronizeTrainingStateMirrors()) {
+            Log.e(
+                TAG,
+                "Tensor Arena release was refused because model or optimizer state could not be recovered."
+            )
             return false
         }
         _modelTensorResidencyReady.value = false
@@ -714,6 +718,12 @@ internal object VulkanTrainingBackend {
     }
 
     private fun destroyNativeRuntime() {
+        if (nativeReady && !synchronizeTrainingStateMirrors()) {
+            Log.e(
+                TAG,
+                "Vulkan runtime teardown is discarding GPU state that could not be synchronized to the host mirror."
+            )
+        }
         try {
             nativeDestroy()
         } finally {
@@ -866,13 +876,33 @@ internal object VulkanTrainingBackend {
         return released
     }
 
+    /** Synchronizes resident FP16 model weights into the host recovery mirror. */
+    @Synchronized
+    internal fun synchronizeModelParameterMirrors(): Boolean {
+        if (modelParameterMirrorReliable) return true
+        if (!isRuntimeAvailable) return false
+        return try {
+            val synchronized = tensorResidencyRegistry.synchronizeHostMirrors()
+            if (synchronized) modelParameterMirrorReliable = true
+            synchronized
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Model-parameter recovery readback exceeded the available heap.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Model-parameter recovery readback failed.", error)
+            false
+        }
+    }
+
     /** Synchronizes persistent FP32 moments into the checkpoint/CPU recovery mirror. */
     @Synchronized
     internal fun synchronizeOptimizerStateMirrors(): Boolean {
-        if (optimizerStateResidencyRegistry.residentTensorCount() == 0) return true
+        if (optimizerStateMirrorReliable) return true
         if (!isRuntimeAvailable) return false
         return try {
-            optimizerStateResidencyRegistry.synchronizeHostMirrors()
+            val synchronized = optimizerStateResidencyRegistry.synchronizeHostMirrors()
+            if (synchronized) optimizerStateMirrorReliable = true
+            synchronized
         } catch (error: OutOfMemoryError) {
             Log.w(TAG, "Optimizer-state recovery readback exceeded the available heap.", error)
             false
@@ -882,11 +912,20 @@ internal object VulkanTrainingBackend {
         }
     }
 
+    /** Both host mirrors must be current before CPU fallback, checkpointing, or teardown. */
+    @Synchronized
+    internal fun synchronizeTrainingStateMirrors(): Boolean =
+        synchronizeModelParameterMirrors() && synchronizeOptimizerStateMirrors()
+
     /** Drops optimizer replicas only after the exact GPU moments have been recovered. */
     @Synchronized
     internal fun invalidateOptimizerStateResidency(): Boolean {
-        if (isRuntimeAvailable && !synchronizeOptimizerStateMirrors()) {
-            Log.e(TAG, "Cannot invalidate GPU optimizer moments because host recovery was not verified.")
+        if (nativeReady && !synchronizeTrainingStateMirrors()) {
+            Log.e(TAG, "Cannot invalidate GPU optimizer state because host recovery was not verified.")
+            return false
+        }
+        if (!modelParameterMirrorReliable || !optimizerStateMirrorReliable) {
+            Log.e(TAG, "CPU fallback is blocked because a host training-state mirror is stale.")
             return false
         }
         val released = optimizerStateResidencyRegistry.invalidate(
@@ -994,10 +1033,10 @@ internal object VulkanTrainingBackend {
             return false
         }
 
-        if (!synchronizeOptimizerStateMirrors()) {
+        if (!synchronizeTrainingStateMirrors()) {
             residencySuspended = false
             _modelTensorResidencyReady.value = wasResidencyReady
-            Log.e(TAG, "Memory-pressure release was postponed because GPU optimizer moments could not be recovered.")
+            Log.e(TAG, "Memory-pressure release was postponed because model or optimizer state could not be recovered.")
             return false
         }
 
@@ -1587,8 +1626,12 @@ internal object VulkanTrainingBackend {
     /** Reset failed native state before the user explicitly retries Vulkan initialization. */
     @Synchronized
     fun resetRuntimeForRetry() {
-        if (isRuntimeAvailable && !synchronizeOptimizerStateMirrors()) {
-            Log.e(TAG, "Vulkan retry was postponed because optimizer moments could not be recovered.")
+        if (nativeReady && !synchronizeTrainingStateMirrors()) {
+            Log.e(TAG, "Vulkan retry was postponed because model or optimizer state could not be recovered.")
+            return
+        }
+        if (!modelParameterMirrorReliable || !optimizerStateMirrorReliable) {
+            Log.e(TAG, "Vulkan retry was refused because a host training-state mirror is stale.")
             return
         }
         if (initializationAttempted) {
@@ -1641,6 +1684,10 @@ internal object VulkanTrainingBackend {
             return true
         }
         if (initializationAttempted) return false
+        if (!modelParameterMirrorReliable || !optimizerStateMirrorReliable) {
+            Log.e(TAG, "Vulkan initialization is blocked because the host training-state mirror is stale.")
+            return false
+        }
 
         residentActivationLinearReady = false
         residentAttentionReady = false
@@ -4880,6 +4927,10 @@ internal object VulkanTrainingBackend {
             }
 
             dispatchAttempted = true
+            // A failed submission can have an uncertain commit point. The runtime
+            // teardown path must recover both mirrors before allowing CPU fallback.
+            modelParameterMirrorReliable = false
+            optimizerStateMirrorReliable = false
             val dispatched = try {
                 nativeApplyResidentAdamWUpdate(
                     parameterHandles = LongArray(residentParameters.size) { index ->
@@ -4925,7 +4976,8 @@ internal object VulkanTrainingBackend {
                 .order(ByteOrder.LITTLE_ENDIAN)
                 .int
             if (transactionStatus != 0) {
-                teardownRequired = true
+                // Validation runs in a separate dispatch phase. The update phase sees
+                // the non-zero status and skips every group, so the resident state is unchanged.
                 Log.e(TAG, "Resident AdamW rejected a non-finite or out-of-range update before host commit.")
                 return false
             }
@@ -4991,6 +5043,10 @@ internal object VulkanTrainingBackend {
                 }
             }
             hostCommitCompleted = true
+            modelParameterMirrorReliable = true
+            // Host moments are a recovery mirror. Keep the GPU copy authoritative and
+            // read it back only at checkpoint, fallback, memory-pressure, or teardown.
+            optimizerStateMirrorReliable = false
 
             val revisionsSynchronized = parameters.indices.all { index ->
                 tensorResidencyRegistry.markGpuReplicaSynchronized(
@@ -5028,7 +5084,10 @@ internal object VulkanTrainingBackend {
                     teardownRequired = true
                 }
             }
-            if (teardownRequired && isRuntimeAvailable) {
+            if (teardownRequired && nativeReady) {
+                // Teardown performs an atomic readback of model weights and optimizer
+                // moments before clearing the arena. Failed recovery leaves the mirrors
+                // marked stale, which prevents a destructive CPU fallback.
                 runCatching { destroyNativeRuntime() }
                     .onFailure { error ->
                         Log.e(TAG, "Vulkan teardown after a failed resident AdamW transaction failed.", error)
