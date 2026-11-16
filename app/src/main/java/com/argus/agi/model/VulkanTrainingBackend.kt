@@ -757,8 +757,7 @@ internal object VulkanTrainingBackend {
             )
             invalidateTensorResidency(releaseAllocations = false)
             _tensorArenaMetrics.value = VulkanTensorArenaMetrics()
-        }
-        true
+            true
         } catch (error: RuntimeException) {
             Log.e(TAG, "Vulkan native runtime destruction failed.", error)
             false
