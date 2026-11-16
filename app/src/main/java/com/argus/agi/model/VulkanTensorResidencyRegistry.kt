@@ -400,7 +400,7 @@ internal class VulkanTensorResidencyRegistry(
             retiredAllocations.add(previous)
         }
         retiredResidentBytes = nextRetiredBytes
-        releaseRetiredAllocations()
+        runCatching { releaseRetiredAllocations() }
         return true
     }
     private fun validateReplacement(
