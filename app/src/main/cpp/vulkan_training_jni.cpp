@@ -101,12 +101,13 @@ struct ResidentAttentionPushConstants {
     uint32_t projectedOutputOffsetWords;
     uint32_t residualOffsetWords;
     uint32_t outputWeightOffsetHalf;
-    uint32_t reserved;
+    uint32_t normalizedOutputOffsetWords;
 };
 
 static_assert(sizeof(ResidentAttentionPushConstants) == 48);
 static_assert(offsetof(ResidentAttentionPushConstants, qkvOffsetWords) == 20);
 static_assert(offsetof(ResidentAttentionPushConstants, outputWeightOffsetHalf) == 40);
+static_assert(offsetof(ResidentAttentionPushConstants, normalizedOutputOffsetWords) == 44);
 
 struct CooperativeMatrixCapability {
     uint32_t mSize = 0;
@@ -5467,6 +5468,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
     jlong scoreHandle,
     jlong attentionOutputHandle,
     jlong projectedOutputHandle,
+    jlong normalizedOutputHandle,
     jlong residualHandle,
     jlong outputWeightHandle,
     jint sequenceLength,
@@ -5485,7 +5487,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
         gRuntime.cmdPipelineBarrier2 == nullptr ||
         qkvHandle <= 0 || scoreHandle <= 0 ||
         attentionOutputHandle <= 0 || projectedOutputHandle <= 0 ||
-        residualHandle <= 0 || outputWeightHandle <= 0 ||
+        normalizedOutputHandle <= 0 || residualHandle <= 0 || outputWeightHandle <= 0 ||
         sequenceLength <= 0 || modelWidth <= 0 ||
         headCount <= 0 || headDimension <= 0 ||
         static_cast<uint64_t>(headCount) * static_cast<uint64_t>(headDimension) !=
@@ -5544,9 +5546,9 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
 
     const jlong handles[] = {
         qkvHandle, scoreHandle, attentionOutputHandle,
-        projectedOutputHandle, residualHandle, outputWeightHandle
+        projectedOutputHandle, normalizedOutputHandle, residualHandle, outputWeightHandle
     };
-    for (size_t index = 0u; index < 6u; ++index) {
+    for (size_t index = 0u; index < 7u; ++index) {
         for (size_t previous = 0u; previous < index; ++previous) {
             if (handles[index] == handles[previous]) {
                 logError("Resident attention tensors must use distinct arena allocations.");
@@ -5563,6 +5565,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
         findArenaAllocation(static_cast<uint64_t>(attentionOutputHandle));
     TensorArenaAllocation* projectedOutputAllocation =
         findArenaAllocation(static_cast<uint64_t>(projectedOutputHandle));
+    TensorArenaAllocation* normalizedOutputAllocation =
+        findArenaAllocation(static_cast<uint64_t>(normalizedOutputHandle));
     TensorArenaAllocation* residualAllocation =
         findArenaAllocation(static_cast<uint64_t>(residualHandle));
     TensorArenaAllocation* outputWeightAllocation =
@@ -5570,7 +5574,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
 
     if (qkvAllocation == nullptr || scoreAllocation == nullptr ||
         attentionOutputAllocation == nullptr || projectedOutputAllocation == nullptr ||
-        residualAllocation == nullptr || outputWeightAllocation == nullptr) {
+        normalizedOutputAllocation == nullptr || residualAllocation == nullptr ||
+        outputWeightAllocation == nullptr) {
         logError("Resident attention references an unknown Tensor Arena allocation.");
         return JNI_FALSE;
     }
@@ -5579,6 +5584,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
         scoreAllocation->logicalSize < scoreByteCount ||
         attentionOutputAllocation->logicalSize < activationByteCount ||
         projectedOutputAllocation->logicalSize < activationByteCount ||
+        normalizedOutputAllocation->logicalSize < activationByteCount ||
         residualAllocation->logicalSize < activationByteCount ||
         outputWeightAllocation->logicalSize < weightByteCount) {
         logError("Resident attention allocation sizes do not match requested tensor shapes.");
@@ -5587,13 +5593,13 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
 
     const TensorArenaAllocation* floatAllocations[] = {
         qkvAllocation, scoreAllocation, attentionOutputAllocation,
-        projectedOutputAllocation, residualAllocation
+        projectedOutputAllocation, normalizedOutputAllocation, residualAllocation
     };
     const VkDeviceSize floatByteCounts[] = {
         qkvByteCount, scoreByteCount, activationByteCount,
-        activationByteCount, activationByteCount
+        activationByteCount, activationByteCount, activationByteCount
     };
-    for (size_t index = 0u; index < 5u; ++index) {
+    for (size_t index = 0u; index < 6u; ++index) {
         const TensorArenaAllocation& allocation = *floatAllocations[index];
         if ((allocation.offset & 3u) != 0u ||
             allocation.offset > gRuntime.tensorArenaCapacity ||
@@ -5615,6 +5621,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
         attentionOutputAllocation->offset / sizeof(uint32_t);
     const uint64_t projectedOutputOffsetWords =
         projectedOutputAllocation->offset / sizeof(uint32_t);
+    const uint64_t normalizedOutputOffsetWords =
+        normalizedOutputAllocation->offset / sizeof(uint32_t);
     const uint64_t residualOffsetWords = residualAllocation->offset / sizeof(uint32_t);
     const uint64_t outputWeightOffsetHalf =
         outputWeightAllocation->offset / sizeof(uint16_t);
@@ -5623,11 +5631,13 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
     if (qkvOffsetWords > maximumIndex || scoreOffsetWords > maximumIndex ||
         attentionOutputOffsetWords > maximumIndex ||
         projectedOutputOffsetWords > maximumIndex ||
+        normalizedOutputOffsetWords > maximumIndex ||
         residualOffsetWords > maximumIndex || outputWeightOffsetHalf > maximumIndex ||
         qkvElements - 1u > maximumIndex - qkvOffsetWords ||
         scoreElements - 1u > maximumIndex - scoreOffsetWords ||
         activationElements - 1u > maximumIndex - attentionOutputOffsetWords ||
         activationElements - 1u > maximumIndex - projectedOutputOffsetWords ||
+        activationElements - 1u > maximumIndex - normalizedOutputOffsetWords ||
         activationElements - 1u > maximumIndex - residualOffsetWords ||
         weightElements - 1u > maximumIndex - outputWeightOffsetHalf) {
         logError("Resident attention tensor indices exceed 32-bit shader addressability.");
@@ -5637,7 +5647,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
     const uint32_t scoreGroups = calculateDispatchWorkGroupCount(scoreElements);
     const uint32_t softmaxGroups = calculateDispatchWorkGroupCount(heads * sequence);
     const uint32_t activationGroups = calculateDispatchWorkGroupCount(activationElements);
-    if (scoreGroups == 0u || softmaxGroups == 0u || activationGroups == 0u) {
+    const uint32_t layerNormGroups = static_cast<uint32_t>(sequence);
+    if (scoreGroups == 0u || softmaxGroups == 0u || activationGroups == 0u ||
+        layerNormGroups == 0u ||
+        sequence > static_cast<uint64_t>(gRuntime.maxComputeWorkGroupCountX)) {
         logError("Resident attention graph has no available compute workgroups.");
         return JNI_FALSE;
     }
@@ -5693,7 +5706,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
 
     const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
     const uint32_t groupCounts[] = {
-        scoreGroups, softmaxGroups, activationGroups, activationGroups
+        scoreGroups, softmaxGroups, activationGroups, activationGroups, layerNormGroups
     };
     VkMemoryBarrier2KHR betweenStages{};
     betweenStages.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
@@ -5708,7 +5721,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
     betweenDependency.memoryBarrierCount = 1u;
     betweenDependency.pMemoryBarriers = &betweenStages;
 
-    for (uint32_t operation = 0u; operation < 4u; ++operation) {
+    for (uint32_t operation = 0u; operation < 5u; ++operation) {
         const ResidentAttentionPushConstants parameters{
             operation,
             static_cast<uint32_t>(sequence),
@@ -5721,7 +5734,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
             static_cast<uint32_t>(projectedOutputOffsetWords),
             static_cast<uint32_t>(residualOffsetWords),
             static_cast<uint32_t>(outputWeightOffsetHalf),
-            0u
+            static_cast<uint32_t>(normalizedOutputOffsetWords)
         };
         vkCmdPushConstants(
             gRuntime.commandBuffer,
@@ -5732,20 +5745,21 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
             &parameters
         );
         vkCmdDispatch(gRuntime.commandBuffer, groupCounts[operation], 1u, 1u);
-        if (operation != 3u) {
+        if (operation != 4u) {
             gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &betweenDependency);
         }
     }
     endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
 
-    VkBufferMemoryBarrier2KHR outputBarriers[3]{};
+    VkBufferMemoryBarrier2KHR outputBarriers[4]{};
     const TensorArenaAllocation* outputAllocations[] = {
-        scoreAllocation, attentionOutputAllocation, projectedOutputAllocation
+        scoreAllocation, attentionOutputAllocation, projectedOutputAllocation,
+        normalizedOutputAllocation
     };
     const VkDeviceSize outputSizes[] = {
-        scoreByteCount, activationByteCount, activationByteCount
+        scoreByteCount, activationByteCount, activationByteCount, activationByteCount
     };
-    for (size_t index = 0u; index < 3u; ++index) {
+    for (size_t index = 0u; index < 4u; ++index) {
         outputBarriers[index].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
         outputBarriers[index].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
         outputBarriers[index].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
@@ -5759,7 +5773,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
     }
     VkDependencyInfoKHR outputDependency{};
     outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_2_KHR;
-    outputDependency.bufferMemoryBarrierCount = 3u;
+    outputDependency.bufferMemoryBarrierCount = 4u;
     outputDependency.pBufferMemoryBarriers = outputBarriers;
     gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputDependency);
 

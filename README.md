@@ -99,9 +99,11 @@ can run through Vulkan Compute (using `linear_fp16.comp` with FP16 weights and F
 accumulation when GPU FP16 arithmetic passes post-model runtime self-checks, or `linear.comp` otherwise). The three Q/K/V input-gradient products used by
 embedding backpropagation are also batched through Vulkan. The fused AdamW update
 runs on Vulkan for workloads with at least 49,152 optimizer elements. Attention
-score generation, softmax, the softmax-Jacobian reduction, layer normalization,
-low-rank LoRA gradient accumulation, token-ID embedding scatter, and global
-gradient-norm reduction remain in Kotlin. This is an incremental GPU training
+causal score generation, stable softmax, weighted V reduction, W_O plus residual,
+and the post-attention LayerNorm now run in the batched training forward graph on
+Vulkan. The post-SwiGLU LayerNorm and autoregressive generation LayerNorm remain
+in Kotlin, as do the softmax-Jacobian reduction, LayerNorm backward, low-rank LoRA
+gradient accumulation, token-ID embedding scatter, and global gradient-norm reduction. This is an incremental GPU training
 path, not a fully GPU-resident training graph.
 
 Vulkan is prepared asynchronously only after the local model has been constructed
@@ -225,7 +227,7 @@ Current limitations:
 - Corpus replay rejects documents that already have queued or active training work, preventing accidental duplicate scheduling. A completed or cleared corpus can be replayed again using the same seed.
 - Replay is bounded to 500 documents per scheduling request. Its default chunk limit is estimated from the current app heap (using a conservative 4 KiB per queue item) and capped at 4,096; callers may configure a larger limit up to the 50,000-item hard ceiling. Requests exceeding the configured limit are rejected before queue insertion.
 - `replayCorpusDocument` remains available for one-document replay and defaults to sequential chunk order.
-- Vulkan executes eligible batched forward/backward matrix products (via `linear_fp16.comp` or `linear.comp`) and AdamW updates (`adamw.comp`) after native numerical self-checks. Attention score generation, softmax, layer normalization, QKV/LoRA gradient accumulation, and global gradient-norm reduction remain Kotlin operations. NPU/APU hardware detection is informational only; no vendor-specific NPU/APU training runtime is integrated.
+- Vulkan executes eligible batched forward/backward matrix products (via `linear_fp16.comp` or `linear.comp`) and AdamW updates (`adamw.comp`) after native numerical self-checks. The batched training forward graph uses Vulkan for causal attention, W_O plus residual, and post-attention LayerNorm after native verification. QKV/LoRA gradient accumulation, LayerNorm backward, and global gradient-norm reduction remain Kotlin operations. NPU/APU hardware detection is informational only; no vendor-specific NPU/APU training runtime is integrated.
 - This pipeline is not yet validated as scalable from-random-initialization pretraining or general intelligence training.
 
 ## Compatibility note

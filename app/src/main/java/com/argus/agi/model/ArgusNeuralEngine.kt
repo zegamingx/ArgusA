@@ -1766,6 +1766,7 @@ class ArgusNeuralEngine private constructor(
                 attentionWeights = lf.attnWeights,
                 attentionOutputRows = lf.attnOut,
                 projectedOutputRows = lf.h1PreLN,
+                normalizedOutputRows = lf.h1,
                 modelWidth = dModel,
                 headCount = nHeads
             )
@@ -1802,9 +1803,11 @@ class ArgusNeuralEngine private constructor(
                     for (d in 0 until dModel) lf.h1PreLN[t][d] += layerInput[t][d]
                 }
             }
-            for (t in 0 until seqLen) {
-                System.arraycopy(lf.h1PreLN[t], 0, lf.h1[t], 0, dModel)
-                layerNormInPlace(lf.h1[t], dModel)
+            if (!residentAttentionCompleted) {
+                for (t in 0 until seqLen) {
+                    System.arraycopy(lf.h1PreLN[t], 0, lf.h1[t], 0, dModel)
+                    layerNormInPlace(lf.h1[t], dModel)
+                }
             }
 
             computeLinearBatch(lf.h1, b.wGate, dModel, dFf, lf.gate)

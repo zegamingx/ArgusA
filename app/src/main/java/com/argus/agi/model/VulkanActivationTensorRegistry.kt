@@ -41,11 +41,12 @@ internal class VulkanActivationTensorRegistry(
         VulkanTensorAllocation,
         VulkanTensorAllocation,
         VulkanTensorAllocation,
+        VulkanTensorAllocation,
         Int,
         Int,
         Int,
         Int
-    ) -> Boolean = { _, _, _, _, _, _, _, _, _, _ -> false }
+    ) -> Boolean = { _, _, _, _, _, _, _, _, _, _, _ -> false }
 ) {
     private val active = IdentityHashMap<VulkanActivationTensor, VulkanTensorAllocation>()
     private var residentBytes = 0L
@@ -216,6 +217,7 @@ internal class VulkanActivationTensorRegistry(
         scores: VulkanActivationTensor,
         attentionOutput: VulkanActivationTensor,
         projectedOutput: VulkanActivationTensor,
+        normalizedOutput: VulkanActivationTensor,
         residual: VulkanActivationTensor,
         outputWeights: VulkanTensorAllocation,
         sequenceLength: Int,
@@ -227,6 +229,7 @@ internal class VulkanActivationTensorRegistry(
         val scoreAllocation = active[scores] ?: return false
         val attentionOutputAllocation = active[attentionOutput] ?: return false
         val projectedOutputAllocation = active[projectedOutput] ?: return false
+        val normalizedOutputAllocation = active[normalizedOutput] ?: return false
         val residualAllocation = active[residual] ?: return false
 
         if (sequenceLength <= 0 ||
@@ -256,6 +259,8 @@ internal class VulkanActivationTensorRegistry(
             attentionOutput.columns != modelWidth ||
             projectedOutput.rows != sequenceLength ||
             projectedOutput.columns != modelWidth ||
+            normalizedOutput.rows != sequenceLength ||
+            normalizedOutput.columns != modelWidth ||
             residual.rows != sequenceLength ||
             residual.columns != modelWidth ||
             outputWeights.nativeHandle <= 0L ||
@@ -268,6 +273,7 @@ internal class VulkanActivationTensorRegistry(
             scoreAllocation,
             attentionOutputAllocation,
             projectedOutputAllocation,
+            normalizedOutputAllocation,
             residualAllocation
         )
         val handles = allocations.map { it.nativeHandle } + outputWeights.nativeHandle
@@ -278,6 +284,7 @@ internal class VulkanActivationTensorRegistry(
             scoreAllocation,
             attentionOutputAllocation,
             projectedOutputAllocation,
+            normalizedOutputAllocation,
             residualAllocation,
             outputWeights,
             sequenceLength,

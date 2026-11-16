@@ -535,11 +535,11 @@ internal object VulkanTrainingBackend {
                 transposeWeights
             )
         },
-        dispatchAttention = { qkv, scores, attentionOutput, projectedOutput, residual, outputWeights,
-            sequenceLength, modelWidth, headCount, headDimension ->
+        dispatchAttention = { qkv, scores, attentionOutput, projectedOutput, normalizedOutput,
+            residual, outputWeights, sequenceLength, modelWidth, headCount, headDimension ->
             tryApplyResidentAttention(
-                qkv, scores, attentionOutput, projectedOutput, residual, outputWeights,
-                sequenceLength, modelWidth, headCount, headDimension
+                qkv, scores, attentionOutput, projectedOutput, normalizedOutput, residual,
+                outputWeights, sequenceLength, modelWidth, headCount, headDimension
             )
         }
     )
@@ -1065,6 +1065,7 @@ internal object VulkanTrainingBackend {
         attentionWeights: Array<Array<FloatArray>>,
         attentionOutputRows: Array<FloatArray>,
         projectedOutputRows: Array<FloatArray>,
+        normalizedOutputRows: Array<FloatArray>,
         modelWidth: Int,
         headCount: Int
     ): Boolean {
@@ -1079,6 +1080,7 @@ internal object VulkanTrainingBackend {
             residualRows.size != sequenceLength ||
             attentionOutputRows.size != sequenceLength ||
             projectedOutputRows.size != sequenceLength ||
+            normalizedOutputRows.size != sequenceLength ||
             attentionWeights.size != headCount ||
             queryRows.any { it.size != modelWidth } ||
             keyRows.any { it.size != modelWidth } ||
@@ -1086,6 +1088,7 @@ internal object VulkanTrainingBackend {
             residualRows.any { it.size != modelWidth } ||
             attentionOutputRows.any { it.size != modelWidth } ||
             projectedOutputRows.any { it.size != modelWidth } ||
+            normalizedOutputRows.any { it.size != modelWidth } ||
             attentionWeights.any { head ->
                 head.size != sequenceLength || head.any { it.size != sequenceLength }
             }) {
@@ -1114,10 +1117,11 @@ internal object VulkanTrainingBackend {
             return false
         }
 
-        val temporary = ArrayList<VulkanActivationTensor>(5)
+        val temporary = ArrayList<VulkanActivationTensor>(6)
         var stagedScores: Array<FloatArray>? = null
         var stagedAttention: Array<FloatArray>? = null
         var stagedProjected: Array<FloatArray>? = null
+        var stagedNormalized: Array<FloatArray>? = null
         var completed = false
         var cleanupSucceeded = true
 
@@ -1142,28 +1146,35 @@ internal object VulkanTrainingBackend {
                             val projected = activationTensorRegistry.allocate(sequenceLength, modelWidth)
                             if (projected != null) {
                                 temporary.add(projected)
-                                if (activationTensorRegistry.upload(qkv, packedQkvRows) &&
-                                    activationTensorRegistry.upload(residual, residualRows) &&
-                                    activationTensorRegistry.applyAttention(
-                                        qkv = qkv,
-                                        scores = scores,
-                                        attentionOutput = attention,
-                                        projectedOutput = projected,
-                                        residual = residual,
-                                        outputWeights = residentWeights,
-                                        sequenceLength = sequenceLength,
-                                        modelWidth = modelWidth,
-                                        headCount = headCount,
-                                        headDimension = modelWidth / headCount
-                                    )
-                                ) {
-                                    stagedScores = activationTensorRegistry.download(scores)
-                                    stagedAttention = activationTensorRegistry.download(attention)
-                                    stagedProjected = activationTensorRegistry.download(projected)
-                                    completed =
-                                        stagedScores != null &&
-                                        stagedAttention != null &&
-                                        stagedProjected != null
+                                val normalized = activationTensorRegistry.allocate(sequenceLength, modelWidth)
+                                if (normalized != null) {
+                                    temporary.add(normalized)
+                                    if (activationTensorRegistry.upload(qkv, packedQkvRows) &&
+                                        activationTensorRegistry.upload(residual, residualRows) &&
+                                        activationTensorRegistry.applyAttention(
+                                            qkv = qkv,
+                                            scores = scores,
+                                            attentionOutput = attention,
+                                            projectedOutput = projected,
+                                            normalizedOutput = normalized,
+                                            residual = residual,
+                                            outputWeights = residentWeights,
+                                            sequenceLength = sequenceLength,
+                                            modelWidth = modelWidth,
+                                            headCount = headCount,
+                                            headDimension = modelWidth / headCount
+                                        )
+                                    ) {
+                                        stagedScores = activationTensorRegistry.download(scores)
+                                        stagedAttention = activationTensorRegistry.download(attention)
+                                        stagedProjected = activationTensorRegistry.download(projected)
+                                        stagedNormalized = activationTensorRegistry.download(normalized)
+                                        completed =
+                                            stagedScores != null &&
+                                            stagedAttention != null &&
+                                            stagedProjected != null &&
+                                            stagedNormalized != null
+                                    }
                                 }
                             }
                         }
@@ -1191,9 +1202,11 @@ internal object VulkanTrainingBackend {
         val scores = stagedScores ?: return false
         val attention = stagedAttention ?: return false
         val projected = stagedProjected ?: return false
+        val normalized = stagedNormalized ?: return false
         if (scores.size != headCount * sequenceLength ||
             attention.size != sequenceLength ||
-            projected.size != sequenceLength) {
+            projected.size != sequenceLength ||
+            normalized.size != sequenceLength) {
             return false
         }
 
@@ -1211,6 +1224,7 @@ internal object VulkanTrainingBackend {
         for (row in 0 until sequenceLength) {
             System.arraycopy(attention[row], 0, attentionOutputRows[row], 0, modelWidth)
             System.arraycopy(projected[row], 0, projectedOutputRows[row], 0, modelWidth)
+            System.arraycopy(normalized[row], 0, normalizedOutputRows[row], 0, modelWidth)
         }
         return true
     }
@@ -1854,6 +1868,7 @@ internal object VulkanTrainingBackend {
         scores: VulkanTensorAllocation,
         attentionOutput: VulkanTensorAllocation,
         projectedOutput: VulkanTensorAllocation,
+        normalizedOutput: VulkanTensorAllocation,
         residual: VulkanTensorAllocation,
         outputWeights: VulkanTensorAllocation,
         sequenceLength: Int,
@@ -1895,6 +1910,7 @@ internal object VulkanTrainingBackend {
         if (qkv.byteCount < qkvBytes || scores.byteCount < scoreBytes ||
             attentionOutput.byteCount < activationBytes ||
             projectedOutput.byteCount < activationBytes ||
+            normalizedOutput.byteCount < activationBytes ||
             residual.byteCount < activationBytes ||
             outputWeights.byteCount < weightBytes) {
             return false
@@ -1906,6 +1922,7 @@ internal object VulkanTrainingBackend {
                 scores.nativeHandle,
                 attentionOutput.nativeHandle,
                 projectedOutput.nativeHandle,
+                normalizedOutput.nativeHandle,
                 residual.nativeHandle,
                 outputWeights.nativeHandle,
                 sequenceLength,
@@ -1924,7 +1941,7 @@ internal object VulkanTrainingBackend {
             refreshGpuPerformanceMetrics()
         } else {
             residentAttentionReady = false
-            Log.w(TAG, "Resident Vulkan attention dispatch failed; M3B–M3D fall back to Kotlin.")
+            Log.w(TAG, "Resident Vulkan attention/LayerNorm dispatch failed; M3B–M3E fall back to Kotlin.")
         }
         return applied
     }
@@ -1932,20 +1949,24 @@ internal object VulkanTrainingBackend {
 
     private fun verifyResidentAttentionKernel(): Boolean {
         val sequenceLength = 4
-        val modelWidth = 8
+        val modelWidth = 72
         val headCount = 2
         val headDimension = modelWidth / headCount
         val query = Array(sequenceLength) { row ->
-            FloatArray(modelWidth) { column -> (((row * 7 + column * 3) % 17) - 8) * 0.0625f }
+            if (row == 0) FloatArray(modelWidth) else
+                FloatArray(modelWidth) { column -> (((row * 7 + column * 3) % 17) - 8) * 0.0625f }
         }
         val key = Array(sequenceLength) { row ->
-            FloatArray(modelWidth) { column -> (((row * 5 + column * 11) % 19) - 9) * 0.046875f }
+            if (row == 0) FloatArray(modelWidth) else
+                FloatArray(modelWidth) { column -> (((row * 5 + column * 11) % 19) - 9) * 0.046875f }
         }
         val value = Array(sequenceLength) { row ->
-            FloatArray(modelWidth) { column -> (((row * 13 + column * 2) % 23) - 11) * 0.03125f }
+            if (row == 0) FloatArray(modelWidth) else
+                FloatArray(modelWidth) { column -> (((row * 13 + column * 2) % 23) - 11) * 0.03125f }
         }
         val residual = Array(sequenceLength) { row ->
-            FloatArray(modelWidth) { column -> (((row * 3 + column * 5) % 13) - 6) * 0.025f }
+            if (row == 0) FloatArray(modelWidth) else
+                FloatArray(modelWidth) { column -> (((row * 3 + column * 5) % 13) - 6) * 0.025f }
         }
         val outputWeight = Float16ParameterArray.fromFloatArray(
             FloatArray(modelWidth * modelWidth) { index -> (((index * 7) % 29) - 14) * 0.0078125f }
@@ -1954,6 +1975,7 @@ internal object VulkanTrainingBackend {
         val expectedScores = Array(headCount * sequenceLength) { FloatArray(sequenceLength) }
         val expectedAttention = Array(sequenceLength) { FloatArray(modelWidth) }
         val expectedProjected = Array(sequenceLength) { FloatArray(modelWidth) }
+        val expectedNormalized = Array(sequenceLength) { FloatArray(modelWidth) }
         val scale = 1.0f / kotlin.math.sqrt(headDimension.toFloat())
 
         for (head in 0 until headCount) {
@@ -2003,12 +2025,27 @@ internal object VulkanTrainingBackend {
                 }
                 expectedProjected[row][column] = result + residual[row][column]
             }
+            var mean = 0f
+            for (column in 0 until modelWidth) mean += expectedProjected[row][column]
+            mean /= modelWidth
+            var variance = 0f
+            for (column in 0 until modelWidth) {
+                val difference = expectedProjected[row][column] - mean
+                variance += difference * difference
+            }
+            variance /= modelWidth
+            val inverseStandardDeviation = 1.0f / kotlin.math.sqrt(variance + 1e-5f)
+            for (column in 0 until modelWidth) {
+                expectedNormalized[row][column] =
+                    (expectedProjected[row][column] - mean) * inverseStandardDeviation
+            }
         }
 
         var qkvHandle = 0L
         var scoreHandle = 0L
         var attentionOutputHandle = 0L
         var projectedOutputHandle = 0L
+        var normalizedOutputHandle = 0L
         var residualHandle = 0L
         var outputWeightHandle = 0L
         try {
@@ -2040,11 +2077,12 @@ internal object VulkanTrainingBackend {
             scoreHandle = nativeAllocateTensor(scoreByteCount.toLong())
             attentionOutputHandle = nativeAllocateTensor(activationByteCount.toLong())
             projectedOutputHandle = nativeAllocateTensor(activationByteCount.toLong())
+            normalizedOutputHandle = nativeAllocateTensor(activationByteCount.toLong())
             residualHandle = nativeAllocateTensor(residualBytes.size.toLong())
             outputWeightHandle = nativeAllocateTensor(weightBytes.size.toLong())
             if (qkvHandle == 0L || scoreHandle == 0L ||
                 attentionOutputHandle == 0L || projectedOutputHandle == 0L ||
-                residualHandle == 0L || outputWeightHandle == 0L) {
+                normalizedOutputHandle == 0L || residualHandle == 0L || outputWeightHandle == 0L) {
                 return false
             }
 
@@ -2053,7 +2091,7 @@ internal object VulkanTrainingBackend {
                 !nativeUploadTensor(outputWeightHandle, weightBytes) ||
                 !nativeRunResidentAttention(
                     qkvHandle, scoreHandle, attentionOutputHandle, projectedOutputHandle,
-                    residualHandle, outputWeightHandle,
+                    normalizedOutputHandle, residualHandle, outputWeightHandle,
                     sequenceLength, modelWidth, headCount, headDimension
                 )) {
                 return false
@@ -2062,9 +2100,11 @@ internal object VulkanTrainingBackend {
             val actualScoresBytes = ByteArray(scoreByteCount)
             val actualAttentionBytes = ByteArray(activationByteCount)
             val actualProjectedBytes = ByteArray(activationByteCount)
+            val actualNormalizedBytes = ByteArray(activationByteCount)
             if (!nativeDownloadTensor(scoreHandle, actualScoresBytes) ||
                 !nativeDownloadTensor(attentionOutputHandle, actualAttentionBytes) ||
-                !nativeDownloadTensor(projectedOutputHandle, actualProjectedBytes)) {
+                !nativeDownloadTensor(projectedOutputHandle, actualProjectedBytes) ||
+                !nativeDownloadTensor(normalizedOutputHandle, actualNormalizedBytes)) {
                 return false
             }
 
@@ -2074,13 +2114,16 @@ internal object VulkanTrainingBackend {
             }
             val expectedAttentionValues = FloatArray(sequenceLength * modelWidth)
             val expectedProjectedValues = FloatArray(sequenceLength * modelWidth)
+            val expectedNormalizedValues = FloatArray(sequenceLength * modelWidth)
             for (row in 0 until sequenceLength) {
                 expectedAttention[row].copyInto(expectedAttentionValues, row * modelWidth)
                 expectedProjected[row].copyInto(expectedProjectedValues, row * modelWidth)
+                expectedNormalized[row].copyInto(expectedNormalizedValues, row * modelWidth)
             }
             return approximatelyEqual(decodeFloatArray(actualScoresBytes), expectedScoreValues, 2e-4f) &&
                 approximatelyEqual(decodeFloatArray(actualAttentionBytes), expectedAttentionValues, 2e-4f) &&
-                approximatelyEqual(decodeFloatArray(actualProjectedBytes), expectedProjectedValues, 2e-4f)
+                approximatelyEqual(decodeFloatArray(actualProjectedBytes), expectedProjectedValues, 2e-4f) &&
+                approximatelyEqual(decodeFloatArray(actualNormalizedBytes), expectedNormalizedValues, 2e-4f)
         } catch (error: LinkageError) {
             Log.e(TAG, "Resident attention self-check JNI entry point is unavailable.", error)
             return false
@@ -2093,6 +2136,7 @@ internal object VulkanTrainingBackend {
         } finally {
             if (outputWeightHandle != 0L) runCatching { nativeReleaseTensor(outputWeightHandle) }
             if (residualHandle != 0L) runCatching { nativeReleaseTensor(residualHandle) }
+            if (normalizedOutputHandle != 0L) runCatching { nativeReleaseTensor(normalizedOutputHandle) }
             if (projectedOutputHandle != 0L) runCatching { nativeReleaseTensor(projectedOutputHandle) }
             if (attentionOutputHandle != 0L) runCatching { nativeReleaseTensor(attentionOutputHandle) }
             if (scoreHandle != 0L) runCatching { nativeReleaseTensor(scoreHandle) }
@@ -3360,6 +3404,7 @@ internal object VulkanTrainingBackend {
         scoreHandle: Long,
         attentionOutputHandle: Long,
         projectedOutputHandle: Long,
+        normalizedOutputHandle: Long,
         residualHandle: Long,
         outputWeightHandle: Long,
         sequenceLength: Int,

@@ -214,12 +214,13 @@ class VulkanActivationTensorRegistryTest {
             release = { true },
             dispatch = { _, _, _, _, _, _, _ -> false },
             maxResidentBytes = { 4096L },
-            dispatchAttention = { qkv, scores, attentionOutput, projectedOutput, residual, weights,
-                sequenceLength, modelWidth, headCount, headDimension ->
+            dispatchAttention = { qkv, scores, attentionOutput, projectedOutput, normalizedOutput,
+                residual, weights, sequenceLength, modelWidth, headCount, headDimension ->
                 dispatched = true
                 qkv.nativeHandle > 0L && scores.nativeHandle > 0L &&
                     attentionOutput.nativeHandle > 0L && projectedOutput.nativeHandle > 0L &&
-                    residual.nativeHandle > 0L && weights.nativeHandle == 100L &&
+                    normalizedOutput.nativeHandle > 0L && residual.nativeHandle > 0L &&
+                    weights.nativeHandle == 100L &&
                     sequenceLength == 4 && modelWidth == 8 && headCount == 2 && headDimension == 4
             }
         )
@@ -227,12 +228,13 @@ class VulkanActivationTensorRegistryTest {
         val scores = requireNotNull(registry.allocate(8, 4))
         val attentionOutput = requireNotNull(registry.allocate(4, 8))
         val projectedOutput = requireNotNull(registry.allocate(4, 8))
+        val normalizedOutput = requireNotNull(registry.allocate(4, 8))
         val residual = requireNotNull(registry.allocate(4, 8))
         val weights = VulkanTensorAllocation(100L, 8L * 8L * Short.SIZE_BYTES)
 
         assertTrue(
             registry.applyAttention(
-                qkv, scores, attentionOutput, projectedOutput, residual,
+                qkv, scores, attentionOutput, projectedOutput, normalizedOutput, residual,
                 weights, sequenceLength = 4, modelWidth = 8, headCount = 2, headDimension = 4
             )
         )
@@ -250,7 +252,7 @@ class VulkanActivationTensorRegistryTest {
             release = { true },
             dispatch = { _, _, _, _, _, _, _ -> false },
             maxResidentBytes = { 4096L },
-            dispatchAttention = { _, _, _, _, _, _, _, _, _, _ ->
+            dispatchAttention = { _, _, _, _, _, _, _, _, _, _, _ ->
                 dispatchCount++
                 true
             }
@@ -259,12 +261,13 @@ class VulkanActivationTensorRegistryTest {
         val scores = requireNotNull(registry.allocate(8, 4))
         val attentionOutput = requireNotNull(registry.allocate(4, 8))
         val projectedOutput = requireNotNull(registry.allocate(4, 8))
+        val normalizedOutput = requireNotNull(registry.allocate(4, 8))
         val residual = requireNotNull(registry.allocate(4, 8))
         val weights = VulkanTensorAllocation(100L, 8L * 8L * Short.SIZE_BYTES)
 
         assertFalse(
             registry.applyAttention(
-                qkv, scores, attentionOutput, projectedOutput, residual,
+                qkv, scores, attentionOutput, projectedOutput, normalizedOutput, residual,
                 weights, sequenceLength = 4, modelWidth = 8, headCount = 2, headDimension = 4
             )
         )

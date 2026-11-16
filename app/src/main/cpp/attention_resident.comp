@@ -15,10 +15,11 @@ layout(push_constant) uniform ResidentAttentionParameters {
     uint projectedOutputOffsetWords;
     uint residualOffsetWords;
     uint outputWeightOffsetHalf;
-    uint reserved;
+    uint normalizedOutputOffsetWords;
 } parameters;
 
 const float MASKED_SCORE = -3.402823e+38;
+shared float layerNormReduction[64];
 
 float loadHalfAsFloat(uint halfIndex) {
     const vec2 pair = unpackHalf2x16(values[halfIndex >> 1u]);
@@ -146,9 +147,65 @@ void runOutputProjectionAndResidual(uint invocation, uint stride) {
     }
 }
 
+void runLayerNorm() {
+    const uint row = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    if (row >= parameters.sequenceLength) return;
+
+    const uint inputBase =
+        parameters.projectedOutputOffsetWords + row * parameters.modelWidth;
+    const uint outputBase =
+        parameters.normalizedOutputOffsetWords + row * parameters.modelWidth;
+
+    float partialSum = 0.0;
+    for (uint column = lane; column < parameters.modelWidth; column += gl_WorkGroupSize.x) {
+        partialSum += uintBitsToFloat(values[inputBase + column]);
+    }
+    layerNormReduction[lane] = partialSum;
+    barrier();
+
+    for (uint offset = gl_WorkGroupSize.x >> 1u; offset > 0u; offset >>= 1u) {
+        if (lane < offset) {
+            layerNormReduction[lane] += layerNormReduction[lane + offset];
+        }
+        barrier();
+    }
+
+    const float mean = layerNormReduction[0] / float(parameters.modelWidth);
+    // All lanes must cache the shared mean before the variance reduction reuses shared memory.
+    barrier();
+
+    float partialVariance = 0.0;
+    for (uint column = lane; column < parameters.modelWidth; column += gl_WorkGroupSize.x) {
+        const float difference = uintBitsToFloat(values[inputBase + column]) - mean;
+        partialVariance = fma(difference, difference, partialVariance);
+    }
+    layerNormReduction[lane] = partialVariance;
+    barrier();
+
+    for (uint offset = gl_WorkGroupSize.x >> 1u; offset > 0u; offset >>= 1u) {
+        if (lane < offset) {
+            layerNormReduction[lane] += layerNormReduction[lane + offset];
+        }
+        barrier();
+    }
+
+    const float variance = layerNormReduction[0] / float(parameters.modelWidth);
+    const float inverseStandardDeviation = inversesqrt(variance + 1.0e-5);
+    for (uint column = lane; column < parameters.modelWidth; column += gl_WorkGroupSize.x) {
+        const float value = uintBitsToFloat(values[inputBase + column]);
+        values[outputBase + column] =
+            floatBitsToUint((value - mean) * inverseStandardDeviation);
+    }
+}
+
 void main() {
     const uint invocation = gl_GlobalInvocationID.x;
     const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    if (parameters.operation == 4u) {
+        runLayerNorm();
+        return;
+    }
     if (stride == 0u) return;
     if (parameters.operation == 0u) {
         runCausalScore(invocation, stride);
