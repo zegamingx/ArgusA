@@ -5085,7 +5085,7 @@ internal object VulkanTrainingBackend {
             totalGradientBytes = runCatching {
                 Math.addExact(
                     totalGradientBytes,
-                    Math.multiplyExact(activeSize.toLong(), Float.SIZE_BYTES.toLong())
+                    Math.multiplyExact(parameterSize.toLong(), Float.SIZE_BYTES.toLong())
                 )
             }.getOrNull() ?: return false
             totalParameterBytes = runCatching {
@@ -5216,13 +5216,22 @@ internal object VulkanTrainingBackend {
             }
 
             val gradientTensor = if (residentGradient == null) {
-                val flattenedGradients = FloatArray(totalActiveElements.toInt())
+                val flattenedGradientElements = (
+                    totalGradientBytes / Float.SIZE_BYTES.toLong()
+                ).toInt()
+                val flattenedGradients = FloatArray(flattenedGradientElements)
                 var gradientCursor = 0
-                for (gradient in gradients) {
+                for (index in gradients.indices) {
+                    val gradient = gradients[index]
                     System.arraycopy(
                         gradient, 0, flattenedGradients, gradientCursor, gradient.size
                     )
-                    gradientCursor = Math.addExact(gradientCursor, gradient.size)
+                    // The next group begins after full model-tensor capacity, matching
+                    // VulkanResidentGradientAccumulator and native AdamW offset arithmetic.
+                    gradientCursor = Math.addExact(gradientCursor, parameters[index].size)
+                }
+                check(gradientCursor == flattenedGradients.size) {
+                    "Staged AdamW gradient layout does not match the full parameter inventory."
                 }
                 val allocation = allocateGpuTensor(totalGradientBytes) ?: return false
                 gradientAllocation = allocation
