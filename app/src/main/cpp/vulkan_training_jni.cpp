@@ -9,6 +9,7 @@
 #include "adamw_shader_spv.h"
 #include "linear_shader_spv.h"
 #include "linear_fp16_shader_spv.h"
+#include "tensor_arena_core.h"
 
 #include <algorithm>
 #include <array>
@@ -76,19 +77,6 @@ struct CooperativeMatrixCapability {
     uint32_t resultType = 0;
     bool saturatingAccumulation = false;
     uint32_t scope = 0;
-};
-
-struct TensorArenaAllocation {
-    VkDeviceSize offset = 0;
-    VkDeviceSize allocatedSize = 0;
-    VkDeviceSize logicalSize = 0;
-    uint32_t generation = 0u;
-    bool active = false;
-};
-
-struct TensorArenaFreeBlock {
-    VkDeviceSize offset = 0;
-    VkDeviceSize size = 0;
 };
 
 struct VulkanRuntime {
@@ -227,10 +215,8 @@ struct VulkanRuntime {
     VkBuffer tensorArenaBuffer = VK_NULL_HANDLE;
     VkDeviceMemory tensorArenaMemory = VK_NULL_HANDLE;
     VkDeviceSize tensorArenaCapacity = 0;
-    VkDeviceSize tensorArenaAllocatedBytes = 0;
     bool tensorArenaDeviceLocal = false;
-    std::vector<TensorArenaAllocation> tensorArenaAllocations;
-    std::vector<TensorArenaFreeBlock> tensorArenaFreeBlocks;
+    argus::vulkan::TensorArenaCore tensorArena;
 };
 
 struct GroupArrays {
@@ -252,11 +238,6 @@ struct AdamwSegment {
 
 std::mutex gRuntimeMutex;
 VulkanRuntime gRuntime{};
-
-// Process-lifetime token generation prevents handles from becoming valid again
-// after a Vulkan runtime is destroyed and initialized with a fresh allocation table.
-// All accesses are serialized by gRuntimeMutex.
-uint32_t gNextTensorArenaHandleGeneration = 1u;
 
 void logError(const char* message, VkResult result = VK_SUCCESS) {
     if (result == VK_SUCCESS) {
@@ -786,41 +767,6 @@ bool alignArenaSize(VkDeviceSize value, VkDeviceSize alignment, VkDeviceSize& ou
     return true;
 }
 
-void mergeArenaFreeBlocks() {
-    auto& blocks = gRuntime.tensorArenaFreeBlocks;
-    std::sort(blocks.begin(), blocks.end(),
-        [](const TensorArenaFreeBlock& a, const TensorArenaFreeBlock& b) {
-            return a.offset < b.offset;
-        });
-    size_t write = 0u;
-    for (size_t read = 0u; read < blocks.size(); ++read) {
-        const TensorArenaFreeBlock block = blocks[read];
-        if (block.size == 0u) continue;
-        if (write > 0u) {
-            TensorArenaFreeBlock& previous = blocks[write - 1u];
-            if (previous.offset + previous.size == block.offset) {
-                previous.size += block.size;
-                continue;
-            }
-        }
-        blocks[write++] = block;
-    }
-    blocks.resize(write);
-}
-
-bool addArenaFreeBlock(VkDeviceSize offset, VkDeviceSize size) {
-    if (size == 0u) return true;
-    try {
-        gRuntime.tensorArenaFreeBlocks.reserve(gRuntime.tensorArenaFreeBlocks.size() + 1u);
-        gRuntime.tensorArenaFreeBlocks.push_back({offset, size});
-    } catch (const std::bad_alloc&) {
-        logError("Not enough host memory to update the Vulkan tensor-arena free list.");
-        return false;
-    }
-    mergeArenaFreeBlocks();
-    return true;
-}
-
 void destroyTensorArena() {
     if (gRuntime.device != VK_NULL_HANDLE) {
         if (gRuntime.tensorArenaBuffer != VK_NULL_HANDLE) {
@@ -833,10 +779,8 @@ void destroyTensorArena() {
     gRuntime.tensorArenaBuffer = VK_NULL_HANDLE;
     gRuntime.tensorArenaMemory = VK_NULL_HANDLE;
     gRuntime.tensorArenaCapacity = 0u;
-    gRuntime.tensorArenaAllocatedBytes = 0u;
     gRuntime.tensorArenaDeviceLocal = false;
-    gRuntime.tensorArenaAllocations.clear();
-    gRuntime.tensorArenaFreeBlocks.clear();
+    gRuntime.tensorArena.reset();
 }
 
 bool copyBufferSync(
@@ -1057,9 +1001,8 @@ bool growTensorArena(VkDeviceSize additionalBytes) {
     }
     if (!alignArenaSize(targetCapacity, alignment, targetCapacity)) return false;
 
-    try {
-        gRuntime.tensorArenaFreeBlocks.reserve(gRuntime.tensorArenaFreeBlocks.size() + 1u);
-    } catch (const std::bad_alloc&) {
+    if (!gRuntime.tensorArena.prepareCapacityExtension()) {
+        logError("Not enough host memory to prepare the Vulkan tensor-arena capacity update.");
         return false;
     }
 
@@ -1096,64 +1039,31 @@ bool growTensorArena(VkDeviceSize additionalBytes) {
             logError("Could not preserve live tensors while growing the Vulkan arena.");
             return false;
         }
+    }
+
+    if (!gRuntime.tensorArena.extendCapacity(oldCapacity, createdCapacity)) {
+        vkDestroyBuffer(gRuntime.device, nextBuffer, nullptr);
+        vkFreeMemory(gRuntime.device, nextMemory, nullptr);
+        logError("Could not commit the tensor-arena free range after buffer growth.");
+        return false;
+    }
+
+    if (gRuntime.tensorArenaBuffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(gRuntime.device, gRuntime.tensorArenaBuffer, nullptr);
         vkFreeMemory(gRuntime.device, gRuntime.tensorArenaMemory, nullptr);
     }
-
     gRuntime.tensorArenaBuffer = nextBuffer;
     gRuntime.tensorArenaMemory = nextMemory;
     gRuntime.tensorArenaCapacity = createdCapacity;
     gRuntime.tensorArenaDeviceLocal = nextDeviceLocal;
-    return addArenaFreeBlock(oldCapacity, gRuntime.tensorArenaCapacity - oldCapacity);
+    return true;
 }
 
-bool takeArenaRange(VkDeviceSize size, VkDeviceSize& offset) {
-    const VkDeviceSize alignment = std::max<VkDeviceSize>(
-        4u, gRuntime.physicalDeviceProperties.limits.minStorageBufferOffsetAlignment
-    );
-    auto& blocks = gRuntime.tensorArenaFreeBlocks;
-    for (size_t index = 0u; index < blocks.size(); ++index) {
-        const TensorArenaFreeBlock block = blocks[index];
-        VkDeviceSize alignedOffset = 0u;
-        if (!alignArenaSize(block.offset, alignment, alignedOffset)) continue;
-        const VkDeviceSize prefix = alignedOffset - block.offset;
-        if (prefix > block.size || size > block.size - prefix) continue;
-        const VkDeviceSize suffixOffset = alignedOffset + size;
-        const VkDeviceSize suffixSize = block.size - prefix - size;
-        if (prefix > 0u && suffixSize > 0u) {
-            try {
-                blocks.reserve(blocks.size() + 1u);
-            } catch (const std::bad_alloc&) {
-                return false;
-            }
-            blocks[index] = {block.offset, prefix};
-            blocks.insert(
-                blocks.begin() + static_cast<std::ptrdiff_t>(index + 1u),
-                {suffixOffset, suffixSize}
-            );
-        } else if (prefix > 0u) {
-            blocks[index] = {block.offset, prefix};
-        } else if (suffixSize > 0u) {
-            blocks[index] = {suffixOffset, suffixSize};
-        } else {
-            blocks.erase(blocks.begin() + static_cast<std::ptrdiff_t>(index));
-        }
-        offset = alignedOffset;
-        return true;
-    }
-    return false;
-}
+using TensorArenaAllocation = argus::vulkan::TensorArenaCore::Allocation;
 
 TensorArenaAllocation* findArenaAllocation(jlong rawHandle) {
     if (rawHandle == 0) return nullptr;
-    const uint64_t handle = static_cast<uint64_t>(rawHandle);
-    const uint32_t encodedIndex = static_cast<uint32_t>(handle & 0xFFFFFFFFu);
-    const uint32_t generation = static_cast<uint32_t>(handle >> 32u);
-    if (encodedIndex == 0u || generation == 0u) return nullptr;
-    const size_t index = static_cast<size_t>(encodedIndex - 1u);
-    if (index >= gRuntime.tensorArenaAllocations.size()) return nullptr;
-    TensorArenaAllocation& allocation = gRuntime.tensorArenaAllocations[index];
-    return allocation.active && allocation.generation == generation ? &allocation : nullptr;
+    return gRuntime.tensorArena.find(static_cast<uint64_t>(rawHandle));
 }
 
 jlong allocateArenaTensor(VkDeviceSize logicalSize) {
@@ -1162,58 +1072,21 @@ jlong allocateArenaTensor(VkDeviceSize logicalSize) {
         logicalSize > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange) {
         return 0;
     }
-    if (gNextTensorArenaHandleGeneration == 0u) {
-        logError("Vulkan tensor-arena handle generation space is exhausted.");
-        return 0;
-    }
-
     VkDeviceSize allocatedSize = 0u;
     if (!alignArenaSize(logicalSize, 4u, allocatedSize)) return 0;
-
-    size_t index = gRuntime.tensorArenaAllocations.size();
-    for (size_t candidate = 0u; candidate < index; ++candidate) {
-        const TensorArenaAllocation& item = gRuntime.tensorArenaAllocations[candidate];
-        if (!item.active) {
-            index = candidate;
-            break;
-        }
+    const VkDeviceSize offsetAlignment = std::max<VkDeviceSize>(
+        4u, gRuntime.physicalDeviceProperties.limits.minStorageBufferOffsetAlignment
+    );
+    const VkDeviceSize maxRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    uint64_t token = 0U;
+    if (gRuntime.tensorArena.tryAllocate(logicalSize, maxRange, offsetAlignment, token)) {
+        return static_cast<jlong>(token);
     }
-    const bool newSlot = index == gRuntime.tensorArenaAllocations.size();
-    if (newSlot) {
-        if (index >= static_cast<size_t>(std::numeric_limits<uint32_t>::max() - 1u)) return 0;
-        try {
-            gRuntime.tensorArenaAllocations.emplace_back();
-        } catch (const std::bad_alloc&) {
-            return 0;
-        }
+    if (!growTensorArena(allocatedSize) ||
+        !gRuntime.tensorArena.tryAllocate(logicalSize, maxRange, offsetAlignment, token)) {
+        return 0;
     }
-
-    VkDeviceSize offset = 0u;
-    if (!takeArenaRange(allocatedSize, offset)) {
-        if (!growTensorArena(allocatedSize) || !takeArenaRange(allocatedSize, offset)) {
-            if (newSlot) gRuntime.tensorArenaAllocations.pop_back();
-            return 0;
-        }
-    }
-
-    TensorArenaAllocation& allocation = gRuntime.tensorArenaAllocations[index];
-    allocation.offset = offset;
-    allocation.allocatedSize = allocatedSize;
-    allocation.logicalSize = logicalSize;
-    allocation.generation = gNextTensorArenaHandleGeneration;
-    allocation.active = true;
-
-    if (gNextTensorArenaHandleGeneration ==
-        std::numeric_limits<uint32_t>::max()) {
-        gNextTensorArenaHandleGeneration = 0u;
-    } else {
-        ++gNextTensorArenaHandleGeneration;
-    }
-
-    gRuntime.tensorArenaAllocatedBytes += allocatedSize;
-    const uint64_t token =
-        (static_cast<uint64_t>(allocation.generation) << 32u) |
-        (static_cast<uint64_t>(index) + 1u);
     return static_cast<jlong>(token);
 }
 
@@ -4265,20 +4138,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeReleaseTensor(
     JNIEnv*, jobject, jlong tensorHandle
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
-    TensorArenaAllocation* allocation = findArenaAllocation(tensorHandle);
-    if (allocation == nullptr) return JNI_FALSE;
-    const VkDeviceSize offset = allocation->offset;
-    const VkDeviceSize size = allocation->allocatedSize;
-    if (!addArenaFreeBlock(offset, size)) return JNI_FALSE;
-
-    gRuntime.tensorArenaAllocatedBytes =
-        size > gRuntime.tensorArenaAllocatedBytes ? 0u : gRuntime.tensorArenaAllocatedBytes - size;
-    allocation->active = false;
-    allocation->offset = 0u;
-    allocation->allocatedSize = 0u;
-    allocation->logicalSize = 0u;
-    allocation->generation = 0u;
-    return JNI_TRUE;
+    return gRuntime.tensorArena.release(static_cast<uint64_t>(tensorHandle))
+        ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -4286,15 +4147,11 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetTensorArenaMetrics(
     JNIEnv* env, jobject
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
-    uint32_t activeCount = 0u;
-    for (const TensorArenaAllocation& item : gRuntime.tensorArenaAllocations) {
-        if (item.active) ++activeCount;
-    }
     std::ostringstream json;
     json << "{"
-         << "\"capacityBytes\":" << gRuntime.tensorArenaCapacity << ","
-         << "\"allocatedBytes\":" << gRuntime.tensorArenaAllocatedBytes << ","
-         << "\"activeAllocationCount\":" << activeCount << ","
+         << "\"capacityBytes\":" << gRuntime.tensorArena.capacityBytes() << ","
+         << "\"allocatedBytes\":" << gRuntime.tensorArena.allocatedBytes() << ","
+         << "\"activeAllocationCount\":" << gRuntime.tensorArena.activeAllocationCount() << ","
          << "\"deviceLocalMemory\":"
          << (gRuntime.tensorArenaDeviceLocal ? "true" : "false")
          << "}";
