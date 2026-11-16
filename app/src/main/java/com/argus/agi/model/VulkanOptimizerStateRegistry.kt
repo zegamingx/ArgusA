@@ -19,12 +19,14 @@ internal class VulkanOptimizerStateRegistry(
     private val maxResidentBytes: () -> Long = { Long.MAX_VALUE }
 ) {
     private data class Entry(
-        val allocation: VulkanTensorAllocation,
+        var allocation: VulkanTensorAllocation,
         var uploaded: Boolean
     )
 
     private val entries = IdentityHashMap<FloatArray, Entry>()
-    private var residentBytes: Long = 0L
+    private val retiredAllocations = ArrayList<VulkanTensorAllocation>()
+    private var activeResidentBytes: Long = 0L
+    private var retiredResidentBytes: Long = 0L
 
     @Synchronized
     fun synchronizeAll(tensors: List<FloatArray>): Boolean {
@@ -50,6 +52,7 @@ internal class VulkanOptimizerStateRegistry(
             }.getOrNull() ?: return false
         }
 
+        releaseRetiredAllocations()
         if (requiredBytes > maxResidentBytes().coerceAtLeast(0L)) return false
 
         val staleArrays = entries.keys.filter { tensor -> !desired.containsKey(tensor) }
@@ -68,8 +71,8 @@ internal class VulkanOptimizerStateRegistry(
 
         return entries.size == tensors.size &&
             tensors.all { tensor -> entries[tensor]?.uploaded == true } &&
-            residentBytes == requiredBytes &&
-            residentBytes <= maxResidentBytes().coerceAtLeast(0L)
+            activeResidentBytes == requiredBytes &&
+            activeResidentBytes <= maxResidentBytes().coerceAtLeast(0L)
     }
 
     @Synchronized
@@ -105,11 +108,65 @@ internal class VulkanOptimizerStateRegistry(
         }
         return true
     }
+    /**
+     * Atomically publishes a complete set of candidate moment buffers after a successful
+     * GPU optimizer dispatch. Old allocations remain tracked until their release succeeds.
+     */
+    @Synchronized
+    fun replaceAll(
+        tensors: List<FloatArray>,
+        expectedAllocations: List<VulkanTensorAllocation>,
+        replacementAllocations: List<VulkanTensorAllocation>
+    ): Boolean {
+        if (tensors.isEmpty() ||
+            tensors.size != expectedAllocations.size ||
+            tensors.size != replacementAllocations.size ||
+            entries.size != tensors.size) {
+            return false
+        }
+
+        val seenTensors = IdentityHashMap<FloatArray, Boolean>()
+        val seenReplacementHandles = HashSet<Long>()
+        val replacements = ArrayList<Pair<Entry, VulkanTensorAllocation>>(tensors.size)
+        for (index in tensors.indices) {
+            val tensor = tensors[index]
+            if (seenTensors.put(tensor, true) != null) return false
+            val entry = entries[tensor] ?: return false
+            val expected = expectedAllocations[index]
+            val replacement = replacementAllocations[index]
+            if (entry.allocation.nativeHandle != expected.nativeHandle ||
+                entry.allocation.byteCount != expected.byteCount ||
+                replacement.byteCount != expected.byteCount ||
+                replacement.nativeHandle <= 0L ||
+                !seenReplacementHandles.add(replacement.nativeHandle)) {
+                return false
+            }
+            if (entries.values.any { existing ->
+                    existing.allocation.nativeHandle == replacement.nativeHandle
+                }) {
+                return false
+            }
+            replacements.add(entry to replacement)
+        }
+
+        for ((entry, replacement) in replacements) {
+            val retired = entry.allocation
+            entry.allocation = replacement
+            entry.uploaded = true
+            retiredAllocations.add(retired)
+            retiredResidentBytes = Math.addExact(retiredResidentBytes, retired.byteCount)
+        }
+        releaseRetiredAllocations()
+        return true
+    }
+
     @Synchronized
     fun invalidate(releaseAllocations: Boolean): Boolean {
         if (!releaseAllocations) {
             entries.clear()
-            residentBytes = 0L
+            retiredAllocations.clear()
+            activeResidentBytes = 0L
+            retiredResidentBytes = 0L
             return true
         }
 
@@ -122,14 +179,32 @@ internal class VulkanOptimizerStateRegistry(
                 allReleased = false
             }
         }
+        if (!releaseRetiredAllocations()) allReleased = false
         return allReleased
     }
 
     @Synchronized
     fun residentTensorCount(): Int = entries.size
 
+    /** Includes active tensors and allocations awaiting a successful deferred release. */
     @Synchronized
-    fun residentByteCount(): Long = residentBytes
+    fun residentByteCount(): Long = Math.addExact(activeResidentBytes, retiredResidentBytes)
+
+    private fun releaseRetiredAllocations(): Boolean {
+        var allReleased = true
+        val iterator = retiredAllocations.iterator()
+        while (iterator.hasNext()) {
+            val allocation = iterator.next()
+            if (release(allocation)) {
+                retiredResidentBytes =
+                    (retiredResidentBytes - allocation.byteCount).coerceAtLeast(0L)
+                iterator.remove()
+            } else {
+                allReleased = false
+            }
+        }
+        return allReleased
+    }
 
     private fun acquireInternal(tensor: FloatArray): VulkanTensorAllocation? {
         val requiredBytes = byteCount(tensor) ?: return null
@@ -143,14 +218,14 @@ internal class VulkanOptimizerStateRegistry(
 
         if (entry == null) {
             val nextBytes = runCatching {
-                Math.addExact(residentBytes, requiredBytes)
+                Math.addExact(activeResidentBytes, requiredBytes)
             }.getOrNull() ?: return null
             if (nextBytes > maxResidentBytes().coerceAtLeast(0L)) return null
 
             val allocation = allocate(requiredBytes) ?: return null
             entry = Entry(allocation, uploaded = false)
             entries[tensor] = entry
-            residentBytes = nextBytes
+            activeResidentBytes = nextBytes
         }
 
         if (entry.uploaded) return entry.allocation
@@ -181,7 +256,8 @@ internal class VulkanOptimizerStateRegistry(
 
     private fun removeEntry(tensor: FloatArray, entry: Entry) {
         if (entries.remove(tensor) != null) {
-            residentBytes = (residentBytes - entry.allocation.byteCount).coerceAtLeast(0L)
+            activeResidentBytes =
+                (activeResidentBytes - entry.allocation.byteCount).coerceAtLeast(0L)
         }
     }
 
