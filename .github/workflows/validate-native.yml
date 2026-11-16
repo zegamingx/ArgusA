@@ -106,6 +106,7 @@ jobs:
           test -n "${glslc_path}"
           test -x "${glslc_path}"
           echo "NDK r30, CMake ${cmake_version}, and NDK glslc are ready."
+# Validate allocator metadata and handle lifetime without requiring a Vulkan device.
       - name: Run Tensor Arena host unit tests
         shell: bash
         run: |
