@@ -876,7 +876,53 @@ internal object VulkanTrainingBackend {
         return released
     }
 
-    /** Synchronizes resident FP16 model weights into the host recovery mirror. */
+    /** Synchronizes one host parameter only when its resident GPU copy is newer. */
+    @Synchronized
+    internal fun synchronizeModelParameterTensor(
+        parameters: Float16ParameterArray
+    ): Boolean {
+        if (modelParameterMirrorReliable) return true
+        if (!nativeReady) return false
+        return try {
+            val synchronized = tensorResidencyRegistry.synchronizeHostMirror(parameters)
+            if (synchronized && tensorResidencyRegistry.areHostMirrorsCurrent()) {
+                modelParameterMirrorReliable = true
+            }
+            synchronized
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Model-parameter recovery readback exceeded the available heap.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Model-parameter recovery readback failed.", error)
+            false
+        }
+    }
+
+    /** Synchronizes only the host tensors required by a CPU fallback operation. */
+    @Synchronized
+    internal fun synchronizeModelParameterTensors(
+        parameters: List<Float16ParameterArray>
+    ): Boolean {
+        if (parameters.isEmpty() || modelParameterMirrorReliable) return true
+        if (!nativeReady) return false
+        return try {
+            for (parameter in parameters) {
+                if (!tensorResidencyRegistry.synchronizeHostMirror(parameter)) return false
+            }
+            if (tensorResidencyRegistry.areHostMirrorsCurrent()) {
+                modelParameterMirrorReliable = true
+            }
+            true
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Selected model-parameter readback exceeded the available heap.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Selected model-parameter readback failed.", error)
+            false
+        }
+    }
+
+    /** Synchronizes the complete model only for inference, checkpointing, or runtime recovery. */
     @Synchronized
     internal fun synchronizeModelParameterMirrors(): Boolean {
         if (modelParameterMirrorReliable) return true
