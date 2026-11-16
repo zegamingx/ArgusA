@@ -328,6 +328,7 @@ class VulkanTensorResidencyRegistryTest {
         val secondAllocation = registry.acquire(second) ?: error("Second allocation missing.")
         val previousFirst = first.toShortArray()
         val previousSecond = second.toShortArray()
+        registry.markDeviceMutationPending(listOf(first, second))
         gpuBytes[firstAllocation.nativeHandle] =
             Float16ParameterArray.fromFloatArray(floatArrayOf(1.25f, 1.5f)).toLittleEndianByteArray()
         gpuBytes[secondAllocation.nativeHandle] =
@@ -355,5 +356,143 @@ class VulkanTensorResidencyRegistryTest {
             )
         ))
     }
+
+    @Test
+    fun synchronizesOnlyTheRequestedStaleParameterTensor() {
+        var nextHandle = 1L
+        var uploadCount = 0
+        val gpuBytes = LinkedHashMap<Long, ByteArray>()
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount ->
+                VulkanTensorAllocation(nextHandle++, byteCount).also { allocation ->
+                    gpuBytes[allocation.nativeHandle] = ByteArray(byteCount.toInt())
+                }
+            },
+            upload = { allocation, bytes ->
+                bytes.copyInto(requireNotNull(gpuBytes[allocation.nativeHandle]))
+                uploadCount++
+                true
+            },
+            release = { allocation -> gpuBytes.remove(allocation.nativeHandle) != null },
+            download = { allocation, destination ->
+                val source = gpuBytes[allocation.nativeHandle]
+                if (source == null || source.size != destination.size) {
+                    false
+                } else {
+                    source.copyInto(destination)
+                    true
+                }
+            }
+        )
+        val first = Float16ParameterArray.fromFloatArray(floatArrayOf(0.25f, -0.5f))
+        val second = Float16ParameterArray.fromFloatArray(floatArrayOf(0.75f, -1.0f))
+        val inventory = listOf(
+            VulkanModelParameterTensor("first", first),
+            VulkanModelParameterTensor("second", second)
+        )
+        assertTrue(registry.synchronizeAll(inventory))
+        val firstAllocation = registry.acquire(first) ?: error("First resident parameter is missing.")
+        val secondBefore = second.toShortArray()
+        val firstGpuBytes = Float16ParameterArray.fromFloatArray(
+            floatArrayOf(1.25f, 1.5f)
+        ).toLittleEndianByteArray()
+
+        registry.markDeviceMutationPending(listOf(first))
+        firstGpuBytes.copyInto(requireNotNull(gpuBytes[firstAllocation.nativeHandle]))
+
+        assertTrue(registry.synchronizeHostMirror(first))
+        assertArrayEquals(
+            Float16ParameterArray.fromFloatArray(floatArrayOf(1.25f, 1.5f)).toShortArray(),
+            first.toShortArray()
+        )
+        assertArrayEquals(secondBefore, second.toShortArray())
+        assertTrue(registry.areHostMirrorsCurrent())
+        assertEquals(2, uploadCount)
+        assertEquals(firstAllocation.nativeHandle, registry.acquire(first)?.nativeHandle)
+    }
+
+    @Test
+    fun replacesAllResidentParameterHandlesWithoutUploadingHostSnapshots() {
+        var nextHandle = 1L
+        var uploadCount = 0
+        val gpuBytes = LinkedHashMap<Long, ByteArray>()
+        val registry = VulkanTensorResidencyRegistry(
+            allocate = { byteCount ->
+                VulkanTensorAllocation(nextHandle++, byteCount).also { allocation ->
+                    gpuBytes[allocation.nativeHandle] = ByteArray(byteCount.toInt())
+                }
+            },
+            upload = { allocation, bytes ->
+                val destination = gpuBytes[allocation.nativeHandle] ?: return@VulkanTensorResidencyRegistry false
+                if (destination.size != bytes.size) {
+                    false
+                } else {
+                    bytes.copyInto(destination)
+                    uploadCount++
+                    true
+                }
+            },
+            release = { allocation -> gpuBytes.remove(allocation.nativeHandle) != null },
+            download = { allocation, destination ->
+                val source = gpuBytes[allocation.nativeHandle]
+                if (source == null || source.size != destination.size) {
+                    false
+                } else {
+                    source.copyInto(destination)
+                    true
+                }
+            }
+        )
+        val first = Float16ParameterArray.fromFloatArray(floatArrayOf(0.25f, -0.5f, 0.75f))
+        val second = Float16ParameterArray.fromFloatArray(floatArrayOf(-0.125f, 0.375f))
+        val inventory = listOf(
+            VulkanModelParameterTensor("first", first),
+            VulkanModelParameterTensor("second", second)
+        )
+        assertTrue(registry.synchronizeAll(inventory))
+        val previousUploads = uploadCount
+        val oldAllocations = listOf(
+            registry.acquire(first) ?: error("First active parameter is missing."),
+            registry.acquire(second) ?: error("Second active parameter is missing.")
+        )
+        val newValues = listOf(
+            floatArrayOf(1.0f, 1.5f, -1.25f),
+            floatArrayOf(0.5f, -0.75f)
+        )
+        val replacements = newValues.mapIndexed { index, values ->
+            val allocation = VulkanTensorAllocation(nextHandle++, oldAllocations[index].byteCount)
+            gpuBytes[allocation.nativeHandle] = Float16ParameterArray
+                .fromFloatArray(values)
+                .toLittleEndianByteArray()
+            allocation
+        }
+
+        assertTrue(registry.canReplaceAll(
+            listOf(first, second),
+            oldAllocations,
+            replacements
+        ))
+        assertTrue(registry.replaceAll(
+            listOf(first, second),
+            oldAllocations,
+            replacements
+        ))
+
+        assertEquals(replacements[0].nativeHandle, registry.acquire(first)?.nativeHandle)
+        assertEquals(replacements[1].nativeHandle, registry.acquire(second)?.nativeHandle)
+        assertEquals(previousUploads, uploadCount)
+        assertFalse(gpuBytes.containsKey(oldAllocations[0].nativeHandle))
+        assertFalse(gpuBytes.containsKey(oldAllocations[1].nativeHandle))
+        assertTrue(registry.synchronizeHostMirrors())
+        assertArrayEquals(
+            Float16ParameterArray.fromFloatArray(newValues[0]).toShortArray(),
+            first.toShortArray()
+        )
+        assertArrayEquals(
+            Float16ParameterArray.fromFloatArray(newValues[1]).toShortArray(),
+            second.toShortArray()
+        )
+    }
+
 
 }
