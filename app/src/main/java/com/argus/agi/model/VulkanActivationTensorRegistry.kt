@@ -24,7 +24,16 @@ internal class VulkanActivationTensorRegistry(
         Int,
         Boolean
     ) -> Boolean,
-    private val maxResidentBytes: () -> Long
+    private val maxResidentBytes: () -> Long,
+    private val dispatchLinearSet: (
+        VulkanTensorAllocation,
+        List<VulkanTensorAllocation>,
+        VulkanTensorAllocation,
+        Int,
+        Int,
+        Int,
+        Boolean
+    ) -> Boolean = { _, _, _, _, _, _, _ -> false }
 ) {
     private val active = IdentityHashMap<VulkanActivationTensor, VulkanTensorAllocation>()
     private var residentBytes = 0L
@@ -119,6 +128,61 @@ internal class VulkanActivationTensorRegistry(
         if (weights.byteCount < expectedWeightBytes) return false
 
         return dispatch(
+            inputAllocation,
+            weights,
+            outputAllocation,
+            input.rows,
+            input.columns,
+            output.columns,
+            transposeWeights
+        )
+    }
+
+
+    /**
+     * Applies independent matrices to one shared resident input and packs their outputs
+     * into consecutive row ranges of one resident output tensor. No activation readback
+     * occurs between the matrix projections.
+     */
+    @Synchronized
+    fun applyLinearSet(
+        input: VulkanActivationTensor,
+        weights: List<VulkanTensorAllocation>,
+        output: VulkanActivationTensor,
+        transposeWeights: Boolean = false
+    ): Boolean {
+        val inputAllocation = active[input] ?: return false
+        val outputAllocation = active[output] ?: return false
+        if (weights.isEmpty() ||
+            input === output ||
+            input.rows <= 0 ||
+            input.columns <= 0 ||
+            output.columns <= 0) {
+            return false
+        }
+
+        val expectedOutputRows = runCatching {
+            Math.multiplyExact(input.rows, weights.size)
+        }.getOrNull() ?: return false
+        if (output.rows != expectedOutputRows) return false
+
+        val expectedWeightBytes = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(input.columns.toLong(), output.columns.toLong()),
+                Short.SIZE_BYTES.toLong()
+            )
+        }.getOrNull() ?: return false
+        if (weights.any { weight ->
+                weight.nativeHandle <= 0L ||
+                    weight.byteCount < expectedWeightBytes ||
+                    weight.nativeHandle == inputAllocation.nativeHandle ||
+                    weight.nativeHandle == outputAllocation.nativeHandle
+            }) {
+            return false
+        }
+        if (weights.map { it.nativeHandle }.toSet().size != weights.size) return false
+
+        return dispatchLinearSet(
             inputAllocation,
             weights,
             outputAllocation,

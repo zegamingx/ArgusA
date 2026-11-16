@@ -70,6 +70,23 @@ static_assert(sizeof(LinearPushConstants) == 40);
 static_assert(offsetof(LinearPushConstants, transposeWeights) == 32);
 static_assert(offsetof(LinearPushConstants, weightOffsetsTableOffset) == 36);
 
+struct ResidentLinearPushConstants {
+    uint32_t inputBatchStrideWords;
+    uint32_t batchCount;
+    uint32_t rowsPerBatch;
+    uint32_t inputColumns;
+    uint32_t outputColumns;
+    uint32_t inputOffsetWords;
+    uint32_t weightOffsetHalf;
+    uint32_t outputOffsetWords;
+    uint32_t transposeWeights;
+    uint32_t weightOffsetsTableOffsetWords;
+};
+
+static_assert(sizeof(ResidentLinearPushConstants) == 40);
+static_assert(offsetof(ResidentLinearPushConstants, batchCount) == 4);
+static_assert(offsetof(ResidentLinearPushConstants, weightOffsetsTableOffsetWords) == 36);
+
 struct CooperativeMatrixCapability {
     uint32_t mSize = 0;
     uint32_t nSize = 0;
@@ -4943,8 +4960,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinear(
         nullptr
     );
 
-    const LinearPushConstants pushConstants{
-        static_cast<uint32_t>(rowCount),
+    const ResidentLinearPushConstants pushConstants{
+        0u,
         1u,
         static_cast<uint32_t>(rowCount),
         static_cast<uint32_t>(inputColumns),
@@ -4998,6 +5015,380 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinear(
     }
     return JNI_TRUE;
 }
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinearBatch(
+    JNIEnv* env,
+    jobject,
+    jlong inputHandle,
+    jlongArray weightHandleArray,
+    jlong outputHandle,
+    jint rowsPerBatch,
+    jint inputColumns,
+    jint outputColumns,
+    jboolean transposeWeights
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (env == nullptr ||
+        gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.residentLinearPipeline == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        inputHandle <= 0 ||
+        outputHandle <= 0 ||
+        inputHandle == outputHandle ||
+        weightHandleArray == nullptr ||
+        rowsPerBatch <= 0 ||
+        inputColumns <= 0 ||
+        outputColumns <= 0 ||
+        (transposeWeights != JNI_TRUE && transposeWeights != JNI_FALSE)) {
+        return JNI_FALSE;
+    }
+
+    const jsize batchCountValue = env->GetArrayLength(weightHandleArray);
+    if (env->ExceptionCheck() || batchCountValue < 2 || batchCountValue > 8) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t batches = static_cast<uint64_t>(batchCountValue);
+    const uint64_t rows = static_cast<uint64_t>(rowsPerBatch);
+    const uint64_t inputWidth = static_cast<uint64_t>(inputColumns);
+    const uint64_t outputWidth = static_cast<uint64_t>(outputColumns);
+    constexpr uint64_t kMaximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+
+    if (rows > std::numeric_limits<uint64_t>::max() / inputWidth ||
+        rows > std::numeric_limits<uint64_t>::max() / outputWidth ||
+        inputWidth > std::numeric_limits<uint64_t>::max() / outputWidth ||
+        batches > std::numeric_limits<uint64_t>::max() / rows ||
+        batches * rows > std::numeric_limits<uint64_t>::max() / outputWidth) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t inputElements = rows * inputWidth;
+    const uint64_t outputElements = batches * rows * outputWidth;
+    const uint64_t weightElements = inputWidth * outputWidth;
+    if (inputElements == 0u ||
+        outputElements == 0u ||
+        weightElements == 0u ||
+        inputElements > kMaximumShaderIndex ||
+        outputElements > kMaximumShaderIndex ||
+        weightElements > kMaximumShaderIndex) {
+        logError("Resident projection-set dimensions exceed 32-bit shader indexing.");
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize inputByteCount =
+        static_cast<VkDeviceSize>(inputElements * sizeof(float));
+    const VkDeviceSize outputByteCount =
+        static_cast<VkDeviceSize>(outputElements * sizeof(float));
+    const VkDeviceSize weightByteCount =
+        static_cast<VkDeviceSize>(weightElements * sizeof(uint16_t));
+    const VkDeviceSize tableByteCount =
+        static_cast<VkDeviceSize>(batches * sizeof(uint32_t));
+    const VkDeviceSize maximumStorageRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    if (inputByteCount == 0u ||
+        outputByteCount == 0u ||
+        weightByteCount == 0u ||
+        tableByteCount == 0u ||
+        inputByteCount > maximumStorageRange ||
+        outputByteCount > maximumStorageRange ||
+        weightByteCount > maximumStorageRange ||
+        tableByteCount > maximumStorageRange) {
+        return JNI_FALSE;
+    }
+
+    TensorArenaAllocation* inputAllocation =
+        findArenaAllocation(static_cast<uint64_t>(inputHandle));
+    TensorArenaAllocation* outputAllocation =
+        findArenaAllocation(static_cast<uint64_t>(outputHandle));
+    if (inputAllocation == nullptr || outputAllocation == nullptr) {
+        logError("Resident projection set references an unknown input or output allocation.");
+        return JNI_FALSE;
+    }
+
+    std::vector<jlong> weightHandles;
+    std::vector<TensorArenaAllocation*> weightAllocations;
+    try {
+        weightHandles.resize(batches);
+        weightAllocations.reserve(batches);
+    } catch (const std::bad_alloc&) {
+        logError("Resident projection-set metadata allocation failed.");
+        return JNI_FALSE;
+    }
+    env->GetLongArrayRegion(
+        weightHandleArray,
+        0,
+        batchCountValue,
+        weightHandles.data()
+    );
+    if (env->ExceptionCheck()) return JNI_FALSE;
+
+    if (inputAllocation->logicalSize < inputByteCount ||
+        outputAllocation->logicalSize < outputByteCount ||
+        (inputAllocation->offset & 3u) != 0u ||
+        (outputAllocation->offset & 3u) != 0u ||
+        inputAllocation->offset > gRuntime.tensorArenaCapacity ||
+        outputAllocation->offset > gRuntime.tensorArenaCapacity ||
+        inputByteCount > gRuntime.tensorArenaCapacity - inputAllocation->offset ||
+        outputByteCount > gRuntime.tensorArenaCapacity - outputAllocation->offset) {
+        logError("Resident projection-set input/output allocation is undersized or outside the arena.");
+        return JNI_FALSE;
+    }
+
+    for (uint64_t batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+        const jlong handle = weightHandles[static_cast<size_t>(batchIndex)];
+        if (handle <= 0 ||
+            handle == inputHandle ||
+            handle == outputHandle) {
+            logError("Resident projection set contains an invalid or aliased weight handle.");
+            return JNI_FALSE;
+        }
+        for (uint64_t previous = 0u; previous < batchIndex; ++previous) {
+            if (weightHandles[static_cast<size_t>(previous)] == handle) {
+                logError("Resident projection set contains duplicate weight handles.");
+                return JNI_FALSE;
+            }
+        }
+
+        TensorArenaAllocation* allocation =
+            findArenaAllocation(static_cast<uint64_t>(handle));
+        if (allocation == nullptr ||
+            allocation->logicalSize < weightByteCount ||
+            (allocation->offset & 1u) != 0u ||
+            allocation->offset > gRuntime.tensorArenaCapacity ||
+            weightByteCount > gRuntime.tensorArenaCapacity - allocation->offset ||
+            allocation->offset / sizeof(uint16_t) > kMaximumShaderIndex ||
+            weightElements - 1u >
+                kMaximumShaderIndex - allocation->offset / sizeof(uint16_t)) {
+            logError("Resident projection-set weight allocation is invalid or shader-unaddressable.");
+            return JNI_FALSE;
+        }
+        weightAllocations.push_back(allocation);
+    }
+
+    const jlong tableHandle = allocateArenaTensor(tableByteCount);
+    if (tableHandle == 0) {
+        logError("Resident projection-set weight-offset table allocation failed.");
+        return JNI_FALSE;
+    }
+    ScopedTensorArenaAllocation tableRelease(static_cast<uint64_t>(tableHandle));
+    TensorArenaAllocation* tableAllocation =
+        findArenaAllocation(static_cast<uint64_t>(tableHandle));
+    if (tableAllocation == nullptr ||
+        tableAllocation->logicalSize < tableByteCount ||
+        (tableAllocation->offset & 3u) != 0u ||
+        tableAllocation->offset > gRuntime.tensorArenaCapacity ||
+        tableByteCount > gRuntime.tensorArenaCapacity - tableAllocation->offset) {
+        logError("Resident projection-set weight-offset table allocation is invalid.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t inputOffsetWords =
+        inputAllocation->offset / sizeof(uint32_t);
+    const uint64_t outputOffsetWords =
+        outputAllocation->offset / sizeof(uint32_t);
+    const uint64_t tableOffsetWords =
+        tableAllocation->offset / sizeof(uint32_t);
+    if (inputOffsetWords > kMaximumShaderIndex ||
+        outputOffsetWords > kMaximumShaderIndex ||
+        tableOffsetWords > kMaximumShaderIndex ||
+        inputElements - 1u > kMaximumShaderIndex - inputOffsetWords ||
+        outputElements - 1u > kMaximumShaderIndex - outputOffsetWords ||
+        batches - 1u > kMaximumShaderIndex - tableOffsetWords) {
+        logError("Resident projection-set offsets exceed 32-bit shader addressability.");
+        return JNI_FALSE;
+    }
+
+    if (!ensureStorageBuffer(tableByteCount) ||
+        gRuntime.mappedStorage == nullptr) {
+        logError("Resident projection-set offset-table staging allocation failed.");
+        return JNI_FALSE;
+    }
+    auto* offsetTable = static_cast<uint32_t*>(gRuntime.mappedStorage);
+    for (uint64_t batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+        offsetTable[batchIndex] = static_cast<uint32_t>(
+            weightAllocations[static_cast<size_t>(batchIndex)]->offset /
+            sizeof(uint16_t)
+        );
+    }
+    if (!syncStagingMemory(false)) return JNI_FALSE;
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset resident projection-set command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin resident projection-set command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkBufferMemoryBarrier2KHR beforeCopy[2]{};
+    beforeCopy[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    beforeCopy[0].srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    beforeCopy[0].srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
+    beforeCopy[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    beforeCopy[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+    beforeCopy[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCopy[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCopy[0].buffer = gRuntime.storageBuffer;
+    beforeCopy[0].offset = 0u;
+    beforeCopy[0].size = tableByteCount;
+
+    beforeCopy[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    beforeCopy[1].srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCopy[1].srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCopy[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    beforeCopy[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    beforeCopy[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCopy[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCopy[1].buffer = gRuntime.tensorArenaBuffer;
+    beforeCopy[1].offset = tableAllocation->offset;
+    beforeCopy[1].size = tableByteCount;
+
+    VkDependencyInfoKHR beforeCopyDependency{};
+    beforeCopyDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeCopyDependency.bufferMemoryBarrierCount = 2u;
+    beforeCopyDependency.pBufferMemoryBarriers = beforeCopy;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeCopyDependency);
+
+    VkBufferCopy tableCopy{};
+    tableCopy.srcOffset = 0u;
+    tableCopy.dstOffset = tableAllocation->offset;
+    tableCopy.size = tableByteCount;
+    vkCmdCopyBuffer(
+        gRuntime.commandBuffer,
+        gRuntime.storageBuffer,
+        gRuntime.tensorArenaBuffer,
+        1u,
+        &tableCopy
+    );
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR beforeComputeDependency{};
+    beforeComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeComputeDependency.memoryBarrierCount = 1u;
+    beforeComputeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeComputeDependency);
+
+    constexpr uint64_t kTileRows = 8u;
+    constexpr uint64_t kTileColumns = 16u;
+    const uint64_t tileRowsPerBatch = 1u + (rows - 1u) / kTileRows;
+    const uint64_t tileColumnsPerBatch = 1u + (outputWidth - 1u) / kTileColumns;
+    if (tileRowsPerBatch > std::numeric_limits<uint64_t>::max() / tileColumnsPerBatch ||
+        batches > std::numeric_limits<uint64_t>::max() /
+            (tileRowsPerBatch * tileColumnsPerBatch)) {
+        return JNI_FALSE;
+    }
+    const uint64_t totalTileCount =
+        batches * tileRowsPerBatch * tileColumnsPerBatch;
+    const uint32_t workGroupCount = calculateDispatchGroupCount(totalTileCount);
+    if (workGroupCount == 0u) {
+        logError("Resident projection-set dispatch has no available workgroups.");
+        return JNI_FALSE;
+    }
+
+    const ResidentLinearPushConstants pushConstants{
+        0u,
+        static_cast<uint32_t>(batches),
+        static_cast<uint32_t>(rowsPerBatch),
+        static_cast<uint32_t>(inputColumns),
+        static_cast<uint32_t>(outputColumns),
+        static_cast<uint32_t>(inputOffsetWords),
+        0u,
+        static_cast<uint32_t>(outputOffsetWords),
+        transposeWeights == JNI_TRUE ? 1u : 0u,
+        static_cast<uint32_t>(tableOffsetWords)
+    };
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.residentLinearPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0u,
+        1u,
+        &gRuntime.tensorArenaDescriptorSet,
+        0u,
+        nullptr
+    );
+    vkCmdPushConstants(
+        gRuntime.commandBuffer,
+        gRuntime.pipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(ResidentLinearPushConstants),
+        &pushConstants
+    );
+    vkCmdDispatch(gRuntime.commandBuffer, workGroupCount, 1u, 1u);
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    VkMemoryBarrier2KHR afterCompute{};
+    afterCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    afterCompute.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    afterCompute.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    afterCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    afterCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR afterComputeDependency{};
+    afterComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    afterComputeDependency.memoryBarrierCount = 1u;
+    afterComputeDependency.pMemoryBarriers = &afterCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &afterComputeDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish resident projection-set command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Resident projection-set queue submission or fence wait failed.")) {
+        return JNI_FALSE;
+    }
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastLinearGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
+}
+
+
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_argus_agi_model_VulkanTrainingBackend_nativeAllocateTensor(

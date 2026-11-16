@@ -2886,6 +2886,19 @@ class ArgusNeuralEngine private constructor(
         outputColumns: Int,
         transposeWeights: Boolean = false
     ) {
+        val sharedInput = inputs.firstOrNull()
+        val residentDispatched = sharedInput != null &&
+            inputs.all { batchInput -> batchInput === sharedInput } &&
+            VulkanTrainingBackend.tryApplyResidentProjectionSet(
+                inputRows = sharedInput,
+                weightTensors = weights,
+                outputRows = outputs,
+                inputColumns = inputColumns,
+                outputColumns = outputColumns,
+                transposeWeights = transposeWeights
+            )
+        if (residentDispatched) return
+
         val fp16Dispatched = VulkanTrainingBackend.tryApplyFp16BatchedLinear(
             inputBatches = inputs,
             weightBatches = weights,

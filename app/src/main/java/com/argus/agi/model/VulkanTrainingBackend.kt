@@ -521,7 +521,18 @@ internal object VulkanTrainingBackend {
                 input, weights, output, rows, inputColumns, outputColumns, transposeWeights
             )
         },
-        maxResidentBytes = { _activationTensorResidencyBudgetBytes.value }
+        maxResidentBytes = { _activationTensorResidencyBudgetBytes.value },
+        dispatchLinearSet = { input, weights, output, rowsPerBatch, inputColumns, outputColumns, transposeWeights ->
+            tryApplyResidentLinearBatch(
+                input,
+                weights,
+                output,
+                rowsPerBatch,
+                inputColumns,
+                outputColumns,
+                transposeWeights
+            )
+        }
     )
     internal val residentActivations: VulkanActivationTensorRegistry
         get() = activationTensorRegistry
@@ -909,6 +920,119 @@ internal object VulkanTrainingBackend {
         }
     }
 
+
+    /**
+     * Runs a set of projections that share one input activation (Q/K/V in the
+     * Transformer forward pass). Inputs are uploaded once, weights are acquired from
+     * the revision-verified model registry, and all outputs remain resident until the
+     * single explicit readback after the complete dispatch.
+     *
+     * Output arrays are committed only after dispatch, readback, and temporary
+     * allocation release succeed, so callers can safely use their normal fallback.
+     */
+    @Synchronized
+    internal fun tryApplyResidentProjectionSet(
+        inputRows: Array<FloatArray>,
+        weightTensors: Array<Float16ParameterArray>,
+        outputRows: Array<Array<FloatArray>>,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean = false
+    ): Boolean {
+        if (!isResidentActivationLinearAvailable ||
+            inputRows.isEmpty() ||
+            weightTensors.isEmpty() ||
+            weightTensors.size != outputRows.size ||
+            inputColumns <= 0 ||
+            outputColumns <= 0 ||
+            inputRows.any { it.size != inputColumns } ||
+            outputRows.any { batch ->
+                batch.size != inputRows.size || batch.any { it.size != outputColumns }
+            }) {
+            return false
+        }
+
+        val expectedWeightElements = runCatching {
+            Math.multiplyExact(inputColumns, outputColumns)
+        }.getOrNull() ?: return false
+        if (weightTensors.any { it.size != expectedWeightElements }) return false
+        if (!ensureModelTensorResidencyReady()) return false
+
+        val residentWeights = ArrayList<VulkanTensorAllocation>(weightTensors.size)
+        for (parameters in weightTensors) {
+            val allocation = acquireResidentModelParameterTensor(parameters) ?: return false
+            residentWeights.add(allocation)
+        }
+
+        val temporaryActivations = ArrayList<VulkanActivationTensor>(2)
+        var stagedOutputs: Array<Array<FloatArray>>? = null
+        var dispatchAndReadbackSucceeded = false
+        var cleanupSucceeded = true
+
+        try {
+            val inputTensor = activationTensorRegistry.allocate(inputRows.size, inputColumns)
+            if (inputTensor != null) {
+                temporaryActivations.add(inputTensor)
+                if (activationTensorRegistry.upload(inputTensor, inputRows)) {
+                    val outputRowCount = runCatching {
+                        Math.multiplyExact(inputRows.size, weightTensors.size)
+                    }.getOrNull()
+                    val outputTensor = outputRowCount?.let { rows ->
+                        activationTensorRegistry.allocate(rows, outputColumns)
+                    }
+                    if (outputTensor != null) {
+                        temporaryActivations.add(outputTensor)
+                        if (activationTensorRegistry.applyLinearSet(
+                                inputTensor,
+                                residentWeights,
+                                outputTensor,
+                                transposeWeights
+                            )
+                        ) {
+                            val packedOutput = activationTensorRegistry.download(outputTensor)
+                            if (packedOutput != null && packedOutput.size == outputRowCount) {
+                                stagedOutputs = Array(weightTensors.size) { batch ->
+                                    Array(inputRows.size) { row ->
+                                        packedOutput[batch * inputRows.size + row]
+                                    }
+                                }
+                                dispatchAndReadbackSucceeded = true
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident projection-set activation allocation exceeded the GPU/host budget.", error)
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident projection-set dispatch failed before output commit.", error)
+        } finally {
+            for (tensor in temporaryActivations.asReversed()) {
+                if (!activationTensorRegistry.release(tensor)) cleanupSucceeded = false
+            }
+        }
+
+        if (!cleanupSucceeded) {
+            Log.w(TAG, "Resident projection-set temporary activation cleanup was incomplete; using fallback.")
+            return false
+        }
+        if (!dispatchAndReadbackSucceeded) return false
+
+        val completedOutputs = stagedOutputs ?: return false
+        for (batch in outputRows.indices) {
+            for (row in inputRows.indices) {
+                System.arraycopy(
+                    completedOutputs[batch][row],
+                    0,
+                    outputRows[batch][row],
+                    0,
+                    outputColumns
+                )
+            }
+        }
+        return true
+    }
+
     /** Reset failed native state before the user explicitly retries Vulkan initialization. */
     @Synchronized
     fun resetRuntimeForRetry() {
@@ -1010,7 +1134,8 @@ internal object VulkanTrainingBackend {
             }.getOrDefault(false)
 
             residentActivationLinearReady = verified && runCatching {
-                verifyResidentActivationLinearKernel()
+                verifyResidentActivationLinearKernel() &&
+                    verifyResidentActivationLinearBatchKernel()
             }.getOrDefault(false)
             if (verified && !residentActivationLinearReady) {
                 Log.w(
@@ -1383,6 +1508,148 @@ internal object VulkanTrainingBackend {
         } finally {
             if (outputHandle != 0L) runCatching { nativeReleaseTensor(outputHandle) }
             if (weightHandle != 0L) runCatching { nativeReleaseTensor(weightHandle) }
+            if (inputHandle != 0L) runCatching { nativeReleaseTensor(inputHandle) }
+        }
+    }
+
+
+    /**
+     * Verifies one shared FP32 input against three independently resident FP16 matrices.
+     * Both matrix orientations are checked, including partial output tiles and a second K tile.
+     */
+    private fun verifyResidentActivationLinearBatchKernel(): Boolean {
+        val batchCount = 3
+        val rows = 9
+        val inputColumns = 19
+        val outputColumns = 17
+        val input = FloatArray(rows * inputColumns) { index ->
+            ((index % 23) - 11) * 0.03125f
+        }
+        val packedMatrices = Array(batchCount) { batch ->
+            Float16ParameterArray.fromFloatArray(
+                FloatArray(inputColumns * outputColumns) { index ->
+                    (((index * (batch + 3)) % 29) - 14) * 0.015625f
+                }
+            ).toShortArray()
+        }
+        val transposedMatrices = Array(batchCount) { batch ->
+            ShortArray(packedMatrices[batch].size).also { transposed ->
+                for (inner in 0 until inputColumns) {
+                    for (column in 0 until outputColumns) {
+                        transposed[column * inputColumns + inner] =
+                            packedMatrices[batch][inner * outputColumns + column]
+                    }
+                }
+            }
+        }
+
+        fun encodeHalf(values: ShortArray): ByteArray {
+            val bytes = ByteArray(Math.multiplyExact(values.size, Short.SIZE_BYTES))
+            val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            for (value in values) buffer.putShort(value)
+            return bytes
+        }
+
+        fun expected(transposeWeights: Boolean): FloatArray {
+            val result = FloatArray(batchCount * rows * outputColumns)
+            for (batch in 0 until batchCount) {
+                val weights = if (transposeWeights) transposedMatrices[batch] else packedMatrices[batch]
+                for (row in 0 until rows) {
+                    for (column in 0 until outputColumns) {
+                        var sum = 0f
+                        for (inner in 0 until inputColumns) {
+                            val weightIndex = if (transposeWeights) {
+                                column * inputColumns + inner
+                            } else {
+                                inner * outputColumns + column
+                            }
+                            sum += input[row * inputColumns + inner] *
+                                Float16Codec.toFloat(weights[weightIndex])
+                        }
+                        result[(batch * rows + row) * outputColumns + column] = sum
+                    }
+                }
+            }
+            return result
+        }
+
+        var inputHandle = 0L
+        var outputHandle = 0L
+        val weightHandles = LongArray(batchCount)
+        try {
+            val inputBytes = encodeFloatArray(input)
+            val outputByteCount = Math.multiplyExact(
+                Math.multiplyExact(batchCount, Math.multiplyExact(rows, outputColumns)).toLong(),
+                Float.SIZE_BYTES.toLong()
+            )
+            inputHandle = nativeAllocateTensor(inputBytes.size.toLong())
+            outputHandle = nativeAllocateTensor(outputByteCount)
+            if (inputHandle == 0L || outputHandle == 0L) return false
+
+            for (batch in 0 until batchCount) {
+                val weightBytes = encodeHalf(packedMatrices[batch])
+                weightHandles[batch] = nativeAllocateTensor(weightBytes.size.toLong())
+                if (weightHandles[batch] == 0L ||
+                    !nativeUploadTensor(weightHandles[batch], weightBytes)
+                ) {
+                    return false
+                }
+            }
+            if (!nativeUploadTensor(inputHandle, inputBytes)) return false
+
+            fun verifyOrientation(transposeWeights: Boolean): Boolean {
+                if (transposeWeights) {
+                    for (batch in 0 until batchCount) {
+                        if (!nativeUploadTensor(
+                                weightHandles[batch],
+                                encodeHalf(transposedMatrices[batch])
+                            )
+                        ) return false
+                    }
+                }
+
+                if (!nativeApplyResidentLinearBatch(
+                        inputHandle,
+                        weightHandles,
+                        outputHandle,
+                        rows,
+                        inputColumns,
+                        outputColumns,
+                        transposeWeights
+                    )
+                ) return false
+
+                val outputElementCount = Math.multiplyExact(
+                    batchCount,
+                    Math.multiplyExact(rows, outputColumns)
+                )
+                val outputBytes = ByteArray(
+                    Math.multiplyExact(outputElementCount, Float.SIZE_BYTES)
+                )
+                if (!nativeDownloadTensor(outputHandle, outputBytes)) return false
+                return approximatelyEqual(
+                    decodeFloatArray(outputBytes),
+                    expected(transposeWeights),
+                    1e-4f
+                )
+            }
+
+            return verifyOrientation(transposeWeights = false) &&
+                verifyOrientation(transposeWeights = true)
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident activation batch self-check entry point is unavailable.", error)
+            return false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident activation batch self-check failed.", error)
+            return false
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "Resident activation batch self-check exceeded available memory.", error)
+            return false
+        } finally {
+            for (handle in weightHandles) {
+                if (handle != 0L) runCatching { nativeReleaseTensor(handle) }
+            }
+            if (outputHandle != 0L) runCatching { nativeReleaseTensor(outputHandle) }
             if (inputHandle != 0L) runCatching { nativeReleaseTensor(inputHandle) }
         }
     }
@@ -1812,6 +2079,79 @@ internal object VulkanTrainingBackend {
         } else {
             residentActivationLinearReady = false
             Log.w(TAG, "Resident activation-linear dispatch failed; this M3 path is disabled for this runtime.")
+        }
+        return applied
+    }
+
+
+    private fun tryApplyResidentLinearBatch(
+        input: VulkanTensorAllocation,
+        weights: List<VulkanTensorAllocation>,
+        output: VulkanTensorAllocation,
+        rowsPerBatch: Int,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean
+    ): Boolean {
+        if (!isRuntimeAvailable ||
+            !residentActivationLinearReady ||
+            weights.size < 2 ||
+            rowsPerBatch <= 0 ||
+            inputColumns <= 0 ||
+            outputColumns <= 0) {
+            return false
+        }
+
+        val inputByteCount = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(rowsPerBatch.toLong(), inputColumns.toLong()),
+                Float.SIZE_BYTES.toLong()
+            )
+        }.getOrNull() ?: return false
+        val outputByteCount = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(
+                    Math.multiplyExact(rowsPerBatch.toLong(), weights.size.toLong()),
+                    outputColumns.toLong()
+                ),
+                Float.SIZE_BYTES.toLong()
+            )
+        }.getOrNull() ?: return false
+        val weightByteCount = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(inputColumns.toLong(), outputColumns.toLong()),
+                Short.SIZE_BYTES.toLong()
+            )
+        }.getOrNull() ?: return false
+
+        if (input.byteCount < inputByteCount ||
+            output.byteCount < outputByteCount ||
+            weights.any { it.byteCount < weightByteCount }) {
+            return false
+        }
+
+        val applied = try {
+            nativeApplyResidentLinearBatch(
+                input.nativeHandle,
+                LongArray(weights.size) { index -> weights[index].nativeHandle },
+                output.nativeHandle,
+                rowsPerBatch,
+                inputColumns,
+                outputColumns,
+                transposeWeights
+            )
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Resident Vulkan batched-linear JNI entry point is unavailable.", error)
+            false
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Resident Vulkan batched-linear dispatch failed.", error)
+            false
+        }
+        if (applied) {
+            refreshGpuPerformanceMetrics()
+        } else {
+            residentActivationLinearReady = false
+            Log.w(TAG, "Resident Vulkan batched-linear dispatch failed; this resident M3 path is disabled for this runtime.")
         }
         return applied
     }
@@ -2554,6 +2894,16 @@ internal object VulkanTrainingBackend {
         weightHandle: Long,
         outputHandle: Long,
         rows: Int,
+        inputColumns: Int,
+        outputColumns: Int,
+        transposeWeights: Boolean
+    ): Boolean
+
+    private external fun nativeApplyResidentLinearBatch(
+        inputHandle: Long,
+        weightHandles: LongArray,
+        outputHandle: Long,
+        rowsPerBatch: Int,
         inputColumns: Int,
         outputColumns: Int,
         transposeWeights: Boolean

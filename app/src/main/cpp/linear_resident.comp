@@ -9,7 +9,7 @@ layout(set = 0, binding = 0, std430) buffer TensorArena {
 };
 
 layout(push_constant) uniform ResidentLinearParameters {
-    uint rowCount;
+    uint inputBatchStrideWords;
     uint batchCount;
     uint rowsPerBatch;
     uint inputColumns;
@@ -59,7 +59,11 @@ void main() {
         const uint globalRow = batchIndex * parameters.rowsPerBatch + rowInBatch;
         const uint inputBatchOffset =
             parameters.inputOffsetWords +
-            globalRow * parameters.inputColumns;
+            batchIndex * parameters.inputBatchStrideWords +
+            rowInBatch * parameters.inputColumns;
+        const uint batchWeightOffsetHalf = parameters.batchCount > 1u
+            ? values[parameters.reservedOffset + batchIndex]
+            : parameters.weightOffsetHalf;
 
         float accumulated = 0.0;
         for (uint kBase = 0u; kBase < parameters.inputColumns; kBase += TILE_K) {
@@ -78,12 +82,12 @@ void main() {
                 uint weightIndex0;
                 if (parameters.transposeWeights == 0u) {
                     weightIndex0 =
-                        parameters.weightOffsetHalf +
+                        batchWeightOffsetHalf +
                         weightK0 * parameters.outputColumns +
                         outputColumn;
                 } else {
                     weightIndex0 =
-                        parameters.weightOffsetHalf +
+                        batchWeightOffsetHalf +
                         outputColumn * parameters.inputColumns +
                         weightK0;
                 }
@@ -96,12 +100,12 @@ void main() {
                 uint weightIndex1;
                 if (parameters.transposeWeights == 0u) {
                     weightIndex1 =
-                        parameters.weightOffsetHalf +
+                        batchWeightOffsetHalf +
                         weightK1 * parameters.outputColumns +
                         outputColumn;
                 } else {
                     weightIndex1 =
-                        parameters.weightOffsetHalf +
+                        batchWeightOffsetHalf +
                         outputColumn * parameters.inputColumns +
                         weightK1;
                 }
