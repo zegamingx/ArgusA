@@ -1993,7 +1993,7 @@ internal object VulkanTrainingBackend {
                 }
                 var denominator = 0f
                 for (keyIndex in 0..queryIndex) {
-                    val probability = exp(
+                    val probability = kotlin.math.exp(
                         expectedScores[head * sequenceLength + queryIndex][keyIndex] - maximum
                     )
                     expectedScores[head * sequenceLength + queryIndex][keyIndex] = probability
