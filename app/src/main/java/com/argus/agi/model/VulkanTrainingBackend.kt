@@ -498,6 +498,14 @@ internal object VulkanTrainingBackend {
         )
     }
 
+    internal fun recordGpuAdamWTiming(operationCount: Long, elapsedNanoseconds: Long) {
+        AdaptiveComputeDispatchPolicy.recordGpu(
+            AdaptiveComputeOperation.ADAMW,
+            operationCount,
+            elapsedNanoseconds
+        )
+    }
+
     internal const val BACKWARD_CROSS_ENTROPY = 0
     internal const val BACKWARD_SWIGLU = 1
     internal const val BACKWARD_LAYER_NORM = 2
@@ -5702,8 +5710,6 @@ internal object VulkanTrainingBackend {
             "AdamW gradient clipping factor must be in [0, 1]."
         }
 
-        val adaptiveOperationCount = gradients.sumOf { gradient -> gradient.size.toLong() }
-        val adaptiveTimingStartNanos = System.nanoTime()
         if (tryApplyResidentFp16AdamWUpdate(
                 parameters = parameters,
                 gradients = gradients,
@@ -5720,11 +5726,6 @@ internal object VulkanTrainingBackend {
                 residentGradient = residentGradient
             )
         ) {
-            AdaptiveComputeDispatchPolicy.recordGpu(
-                AdaptiveComputeOperation.ADAMW,
-                adaptiveOperationCount,
-                System.nanoTime() - adaptiveTimingStartNanos
-            )
             return true
         }
 
@@ -5885,11 +5886,6 @@ internal object VulkanTrainingBackend {
                     )
                 }
             }
-            AdaptiveComputeDispatchPolicy.recordGpu(
-                AdaptiveComputeOperation.ADAMW,
-                adaptiveOperationCount,
-                System.nanoTime() - adaptiveTimingStartNanos
-            )
             true
         } catch (error: OutOfMemoryError) {
             Log.w(TAG, "Not enough heap memory to stage FP16 parameters for Vulkan AdamW; retaining CPU fallback.", error)
