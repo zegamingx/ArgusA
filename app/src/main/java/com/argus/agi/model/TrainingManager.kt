@@ -336,10 +336,19 @@ class TrainingManager(
                 repository.recoverInterruptedTrainingItems()
                 val committedItems = repository.getOptimizerCommittedTrainingItemsSnapshot()
                 val pendingItems = repository.getPendingQueueSnapshot()
-                prependCommittedQueueItems(committedItems)
-                prependPersistingQueueItems(pendingItems.filterNot { pending ->
-                    _nextQueue.value.any { current -> current.id == pending.id }
-                })
+                val databaseIds = (committedItems + pendingItems).mapTo(HashSet()) { it.id }
+                val inMemoryItems = synchronized(queueLock) {
+                    _nextQueue.value.filterNot { item -> item.id in databaseIds }
+                }
+                val restoredItems = committedItems.sortedBy { it.timestamp } +
+                    pendingItems.sortedBy { it.timestamp } +
+                    inMemoryItems.map { item -> item.copy(status = TrainingStatus.QUEUED) }
+                synchronized(queueLock) {
+                    _nextQueue.value = restoredItems.distinctBy(TrainingData::id)
+                    restoredItems.maxOfOrNull { it.timestamp }?.let { latest ->
+                        lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
+                    }
+                }
                 _currentTrainingItem.value = null
                 _activeDocument.value = null
                 synchronized(queueLock) {
@@ -1954,10 +1963,20 @@ class TrainingManager(
             var validationRunActive = false
             var validationRunHadFailures = false
             try {
-                // A candidate checkpoint from an interrupted quality-gate run must survive
-                // startup. Restore the accepted checkpoint only when no candidate run exists.
+                // Finish in-memory queue writes before examining persisted state.
+                awaitQueuePersistenceIdle()
+                val repository = repo
+                val persistedCommitted = repository
+                    ?.getOptimizerCommittedTrainingItemsSnapshot()
+                    .orEmpty()
                 val resumeInterruptedCandidate =
-                    conversationalValidationPersistence.hasInterruptedCandidateRun()
+                    conversationalValidationPersistence.hasInterruptedCandidateRun() ||
+                        trainingCommitJournalFile.isFile ||
+                        persistedCommitted.isNotEmpty()
+
+                // An interrupted candidate must keep the exact model checkpoint that
+                // corresponds to its journal. Restoring the older accepted model here
+                // would invalidate Room's committed rows without replaying their work.
                 if (
                     !resumeInterruptedCandidate &&
                     conversationalValidationPersistence.hasAcceptedCheckpoint()
@@ -1967,19 +1986,32 @@ class TrainingManager(
                     }
                 }
 
-                repo?.let { repository ->
-                    reconcilePersistedTrainingCommit(repository)
-                    repository.recoverInterruptedTrainingItems()
-                    val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
-                    val pending = repository.getPendingQueueSnapshot()
-                    val restoredItems =
-                        committed.sortedBy { it.timestamp } + pending.sortedBy { it.timestamp }
+                repository?.let { activeRepository ->
+                    reconcilePersistedTrainingCommit(activeRepository)
+                    activeRepository.recoverInterruptedTrainingItems()
+                    val committed = activeRepository.getOptimizerCommittedTrainingItemsSnapshot()
+                    val pending = activeRepository.getPendingQueueSnapshot()
+                    val databaseIds = (committed + pending).mapTo(HashSet()) { it.id }
+                    val inMemoryItems = synchronized(queueLock) {
+                        _nextQueue.value.filterNot { item -> item.id in databaseIds }
+                    }
+                    val restoredItems = committed.sortedBy { it.timestamp } +
+                        pending.sortedBy { it.timestamp } +
+                        inMemoryItems.map { item -> item.copy(status = TrainingStatus.QUEUED) }
                     synchronized(queueLock) {
-                        _nextQueue.value = restoredItems
+                        _nextQueue.value = restoredItems.distinctBy(TrainingData::id)
                         restoredItems.maxOfOrNull { it.timestamp }?.let { latest ->
                             lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
                         }
                     }
+                }
+                if (
+                    resumeInterruptedCandidate &&
+                    conversationalValidationPersistence.loadState().baselineReport == null
+                ) {
+                    throw IllegalStateException(
+                        "An interrupted candidate exists without a durable conversational baseline."
+                    )
                 }
 
                 validationRunActive = resumeInterruptedCandidate
