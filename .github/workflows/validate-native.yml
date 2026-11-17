@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - master
     paths:
       - "app/**"
       - "gradle/**"
@@ -14,7 +15,9 @@ on:
       - "version.properties"
       - "tools/cmake-compat/**"
       - "tools/native-tests/**"
+      - "tools/ci/**"
       - ".github/workflows/validate-native.yml"
+      - ".github/workflows/build.yml"
   pull_request:
     branches:
       - main
@@ -28,119 +31,188 @@ on:
       - "version.properties"
       - "tools/cmake-compat/**"
       - "tools/native-tests/**"
+      - "tools/ci/**"
       - ".github/workflows/validate-native.yml"
+      - ".github/workflows/build.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: argus-native-validation-${{ github.event.pull_request.number || github.ref }}
+  group: argus-native-validation-\${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   validate:
     name: Compile Vulkan NDK, lint, test and package debug APK
-    runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 180
 
     steps:
-      - name: Checkout pull request source
+      - name: Checkout source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
-      - name: Set up JDK 25
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
-        with:
-          distribution: temurin
-          java-version: "25"
-          cache: gradle
-
-      - name: Verify runner Android SDK
-        shell: bash
+      - name: Verify Windows runner and pinned Android toolchain
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
-          set -euo pipefail
-          sdk_root="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
-          echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
-          test -s "${sdk_root}/platforms/android-37.0/android.jar"
-          sdk_platform="${sdk_root}/platforms/android-37.0"
-          if [[ ! -s "${sdk_platform}/android.jar" ]]; then
-            echo "::error::Android SDK platform android-37.0 is not installed."
-            exit 1
-          fi
+          $ErrorActionPreference = 'Stop'
+          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+          Write-Host "Runner identity: $identity"
+          if ($identity -ine 'NT AUTHORITY\NETWORK SERVICE') {
+            throw "Unexpected runner identity: $identity"
+          }
 
-      - name: Install Android NDK r30 and CMake 4.5.0
-        shell: bash
+          foreach ($name in @('JAVA_HOME', 'ANDROID_HOME', 'ANDROID_SDK_ROOT', 'ANDROID_NDK_ROOT', 'CMAKE_HOME')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Required machine environment variable is missing: $name"
+            }
+          }
+          if ($env:ANDROID_HOME -ine $env:ANDROID_SDK_ROOT) {
+            throw 'ANDROID_HOME and ANDROID_SDK_ROOT must resolve to the same Android SDK.'
+          }
+
+          $sdk = $env:ANDROID_SDK_ROOT
+          $ndk = Join-Path $sdk 'ndk\30.0.16248370'
+          $java = Join-Path $env:JAVA_HOME 'bin\java.exe'
+          $cmake = Join-Path $env:CMAKE_HOME 'bin\cmake.exe'
+          $ninja = 'C:\Tools\Ninja\ninja.exe'
+
+          $required = @(
+            (Join-Path $sdk 'platforms\android-37.0\android.jar'),
+            (Join-Path $sdk 'build-tools\37.0.0\apksigner.bat'),
+            (Join-Path $ndk 'ndk-build.cmd'),
+            (Join-Path $ndk 'shader-tools\windows-x86_64\glslc.exe'),
+            $java,
+            $cmake,
+            $ninja
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required build tool is unavailable to the runner: $path"
+            }
+          }
+          if ([IO.Path]::GetFullPath($env:ANDROID_NDK_ROOT).TrimEnd('\') -ine [IO.Path]::GetFullPath($ndk).TrimEnd('\')) {
+            throw "ANDROID_NDK_ROOT must point to the pinned NDK: $ndk"
+          }
+
+          $javaOut = Join-Path $env:RUNNER_TEMP 'argus-native-java.stdout.txt'
+          $javaErr = Join-Path $env:RUNNER_TEMP 'argus-native-java.stderr.txt'
+          $javaProcess = Start-Process -FilePath $java -ArgumentList '-version' -NoNewWindow -Wait -PassThru -RedirectStandardOutput $javaOut -RedirectStandardError $javaErr
+          $javaInfo = ''
+          if (Test-Path -LiteralPath $javaOut) { $javaInfo += Get-Content -LiteralPath $javaOut -Raw }
+          if (Test-Path -LiteralPath $javaErr) { $javaInfo += Get-Content -LiteralPath $javaErr -Raw }
+          Write-Host $javaInfo
+          if ($javaProcess.ExitCode -ne 0 -or $javaInfo -notmatch 'version "25\.') {
+            throw 'The Windows runner must use JDK 25.'
+          }
+
+          $cmakeInfo = (& $cmake --version | Select-Object -First 1).Trim()
+          if ($cmakeInfo -ne 'cmake version 4.5.0') { throw "Expected CMake 4.5.0, received: $cmakeInfo" }
+          $ninjaInfo = (& $ninja --version | Out-String).Trim()
+          if ($ninjaInfo -ne '1.13.2') { throw "Expected Ninja 1.13.2, received: $ninjaInfo" }
+
+          Add-Content -Path $env:GITHUB_ENV -Value 'CMAKE_BUILD_PARALLEL_LEVEL=2'
+          Write-Host "Android SDK: $sdk"
+          Write-Host "Android NDK: $ndk"
+          Write-Host "CMake: $cmakeInfo"
+          Write-Host "Ninja: $ninjaInfo"
+          Write-Host 'Windows Android toolchain verification passed.'
+
+      - name: Install and test CMake 4.5.0 compatibility launcher
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
-          set -euo pipefail
+          & .\tools\cmake-compat\install-wrapper.ps1 -RealCMake "$env:CMAKE_HOME\bin\cmake.exe" -WrapperRoot "$env:RUNNER_TEMP\argus-cmake-compat"
 
-          sdkmanager_path="$(command -v sdkmanager || true)"
-          if [[ -z "${sdkmanager_path}" ]]; then
-            sdkmanager_path="$(find "${ANDROID_HOME}/cmdline-tools" -type f -name sdkmanager -print -quit)"
-          fi
-          test -n "${sdkmanager_path}"
-
-          set +o pipefail
-          yes | "${sdkmanager_path}" --licenses >/dev/null
-          set -o pipefail
-          "${sdkmanager_path}" --install "build-tools;37.0.0" "ndk;30.0.16248370"
-          test -x "${ANDROID_HOME}/build-tools/37.0.0/apksigner"
-
-          cmake_version="4.5.0"
-          cmake_archive="cmake-${cmake_version}-linux-x86_64.tar.gz"
-          cmake_archive_path="${RUNNER_TEMP}/${cmake_archive}"
-          cmake_root="${RUNNER_TEMP}/cmake-${cmake_version}"
-          # Fetch the official Kitware release asset; the pinned SHA-256 below remains mandatory.
-          curl --fail --location --retry 3 --silent --show-error \
-            "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/${cmake_archive}" \
-            --output "${cmake_archive_path}"
-          printf '%s  %s\n' "81f0d5b0960fb6adc8197030ffc827fba937640d51e73e39e0e9e40d88c66f6f" "${cmake_archive_path}" | sha256sum --check --status
-          mkdir -p "${cmake_root}"
-          tar -xzf "${cmake_archive_path}" --strip-components=1 -C "${cmake_root}"
-          tools/cmake-compat/install-wrapper.sh "${cmake_root}/bin/cmake" "${RUNNER_TEMP}/argus-cmake-compat"
-          "${RUNNER_TEMP}/argus-cmake-compat/bin/cmake" --version | grep -Fx "cmake version ${cmake_version}"
-
-          glslc_path="$(find "${ANDROID_HOME}/ndk/30.0.16248370/shader-tools" -type f -name glslc -print -quit)"
-          test -n "${glslc_path}"
-          test -x "${glslc_path}"
-          echo "NDK r30, CMake ${cmake_version}, and NDK glslc are ready."
-# Host-side regression coverage for allocator handles and bounded Vulkan buffer transfers.
-      - name: Run Tensor Arena host unit tests
-        shell: bash
+      - name: Run Tensor Arena C++23 host unit tests
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
-          set -euo pipefail
-          c++ -std=c++23 -Wall -Wextra -Wpedantic -Werror \
-            -fsanitize=address,undefined -fno-omit-frame-pointer -O2 \
-            tools/native-tests/tensor_arena_core_test.cpp \
-            -o "${RUNNER_TEMP}/argus-tensor-arena-core-test"
-          "${RUNNER_TEMP}/argus-tensor-arena-core-test"
+          $ErrorActionPreference = 'Stop'
+          $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+          $vswhereCandidates = @()
+          if (-not [string]::IsNullOrWhiteSpace($programFilesX86)) {
+            $vswhereCandidates += (Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe')
+          }
+          $vswhereCandidates += (Join-Path $env:ProgramFiles 'Microsoft Visual Studio\Installer\vswhere.exe')
+          $vswhere = $vswhereCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($vswhere)) {
+            throw 'Tensor Arena host tests require Visual Studio Build Tools with the MSVC x64 C++ workload. Install Desktop development with C++ and the Windows 10/11 SDK.'
+          }
+
+          $vsInstall = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+          if ([string]::IsNullOrWhiteSpace($vsInstall)) {
+            throw 'MSVC x64 C++ build tools were not found. Install the Visual C++ build tools workload.'
+          }
+
+          $vcvars = Join-Path $vsInstall 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path -LiteralPath $vcvars -PathType Leaf)) {
+            throw "MSVC environment initializer is missing: $vcvars"
+          }
+
+          $source = Join-Path $env:GITHUB_WORKSPACE 'tools\native-tests\tensor_arena_core_test.cpp'
+          $testExe = Join-Path $env:RUNNER_TEMP 'argus-tensor-arena-core-test.exe'
+          $batch = Join-Path $env:RUNNER_TEMP 'argus-build-tensor-arena-test.cmd'
+          if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Tensor Arena host test source is missing: $source"
+          }
+
+          $batchContent = @"
+          @echo off
+          call "$vcvars" >nul
+          if errorlevel 1 exit /b %errorlevel%
+          cl.exe /nologo /std:c++23 /EHsc /W4 /WX /O2 "$source" /Fe:"$testExe"
+          if errorlevel 1 exit /b %errorlevel%
+          "$testExe"
+          exit /b %errorlevel%
+          "@
+          [IO.File]::WriteAllText($batch, $batchContent, [Text.Encoding]::ASCII)
+
+          $batchArgument = '"' + $batch + '"'
+          & $env:ComSpec /d /c $batchArgument
+          $testExitCode = $LASTEXITCODE
+          if ($testExitCode -ne 0) { throw "Tensor Arena C++23 host tests failed with exit code $testExitCode." }
+          Write-Host 'Tensor Arena C++23 host unit tests passed.'
 
       - name: Verify Gradle and Java toolchain
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
-          chmod +x gradlew
-          ./gradlew --version
+          $ErrorActionPreference = 'Continue'
+          & .\gradlew.bat --version
+          $gradleExitCode = $LASTEXITCODE
+          if ($gradleExitCode -ne 0) { exit $gradleExitCode }
 
       - name: Run native build, lint and unit tests
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
-          chmod +x gradlew
-          env -u ANDROID_SDK_ROOT ./gradlew \
-            --no-daemon \
-            --no-configuration-cache \
-            --warning-mode=all \
-            --stacktrace \
-            clean \
-            :app:lintRelease \
-            :app:testReleaseUnitTest \
-            :app:assembleDebug
+          $ErrorActionPreference = 'Continue'
+          & .\gradlew.bat --no-daemon --no-configuration-cache --max-workers=2 --warning-mode=all --stacktrace clean :app:lintRelease :app:testReleaseUnitTest :app:assembleDebug
+          $gradleExitCode = $LASTEXITCODE
+          if ($gradleExitCode -ne 0) { exit $gradleExitCode }
 
       - name: Verify packaged native ABI libraries
-        shell: bash
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
-          set -euo pipefail
-          apk_path="app/build/outputs/apk/debug/app-debug.apk"
-          test -s "${apk_path}"
-          for abi in arm64-v8a armeabi-v7a x86_64; do
-            unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
-          done
+          $ErrorActionPreference = 'Stop'
+          $apk = Join-Path $env:GITHUB_WORKSPACE 'app\build\outputs\apk\debug\app-debug.apk'
+          if (-not (Test-Path -LiteralPath $apk -PathType Leaf) -or (Get-Item -LiteralPath $apk).Length -le 0) {
+            throw "Debug APK was not produced: $apk"
+          }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead($apk)
+          try {
+            $entries = @($archive.Entries | ForEach-Object { $_.FullName })
+            foreach ($abi in @('arm64-v8a', 'armeabi-v7a', 'x86_64')) {
+              $requiredEntry = "lib/$abi/libargus_training.so"
+              if ($entries -notcontains $requiredEntry) {
+                throw "Debug APK is missing native ABI library: $requiredEntry"
+              }
+              Write-Host "Verified $requiredEntry"
+            }
+          }
+          finally {
+            $archive.Dispose()
+          }
+          Write-Host 'Packaged native ABI verification passed.'
