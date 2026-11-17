@@ -308,6 +308,9 @@ class ArgusNeuralEngine private constructor(
     val layerCount = config.layerCount
     val isFullTrainingEnabled = config.isFullTrainingEnabled
 
+    val optimizerStep: Int
+        get() = synchronized(modelLock) { adamStep }
+
     val optimizerBackend: String
         get() = VulkanTrainingBackend.currentBackend
     val isVulkanRuntimeReady: Boolean
@@ -1427,7 +1430,8 @@ class ArgusNeuralEngine private constructor(
      */
     fun trainBatchDetailed(
         texts: List<String>,
-        runtimeContextLength: Int = maxSeqLen
+        runtimeContextLength: Int = maxSeqLen,
+        autoCheckpoint: Boolean = true
     ): NeuralTrainingBatchResult {
         require(runtimeContextLength in 2..maxSeqLen) {
             "Runtime context length must be between 2 and the configured model context."
@@ -1439,7 +1443,11 @@ class ArgusNeuralEngine private constructor(
             require(texts.size == 1) {
                 "This legacy checkpoint requires single-sample compatibility training."
             }
-            return trainSingleSampleSequential(texts.single(), runtimeContextLength)
+            return trainSingleSampleSequential(
+                text = texts.single(),
+                runtimeContextLength = runtimeContextLength,
+                autoCheckpoint = autoCheckpoint
+            )
         }
 
         var shouldSaveCheckpoint = false
@@ -1530,43 +1538,54 @@ class ArgusNeuralEngine private constructor(
                     )
                 }
 
-                if (accumulator.targetCount > 0) {
-                    applyAccumulatedGradients(accumulator)
+                val expectedOptimizerUpdates = if (accumulator.targetCount > 0) 1 else 0
+                val firstTrainableSample = sampleResults.indexOfFirst {
+                    it.loss.isFinite() && it.predictionTargetCount > 0
                 }
-            } finally {
-                val remainingResident = accumulator.resident
-                if (remainingResident != null) {
-                    VulkanTrainingBackend.discardResidentGradientAccumulator(remainingResident)
-                    accumulator.resident = null
+                val reportedSamples = ArrayList<NeuralTrainingStepResult>(sampleResults.size)
+                sampleResults.forEachIndexed { index, sample ->
+                    reportedSamples.add(
+                        sample.copy(
+                            optimizerUpdateCount = if (index == firstTrainableSample) {
+                                expectedOptimizerUpdates
+                            } else {
+                                0
+                            }
+                        )
+                    )
                 }
-            }
-
-            val optimizerUpdates = (adamStep - initialAdamStep).coerceAtLeast(0)
-            if (adamStep / CHECKPOINT_INTERVAL > initialAdamStep / CHECKPOINT_INTERVAL) {
-                shouldSaveCheckpoint = true
-            }
-
-            val firstTrainableSample = sampleResults.indexOfFirst {
-                it.loss.isFinite() && it.predictionTargetCount > 0
-            }
-            val reportedSamples = sampleResults.mapIndexed { index, sample ->
-                sample.copy(
-                    optimizerUpdateCount = if (index == firstTrainableSample) {
-                        optimizerUpdates
-                    } else {
-                        0
-                    }
+                // Allocate the complete return value before the optimizer transaction.
+                // A successful AdamW commit must not be followed by result-list allocation.
+                val completedBatch = NeuralTrainingBatchResult(
+                    samples = reportedSamples,
+                    optimizerUpdateCount = expectedOptimizerUpdates,
+                    totalPredictionTargetCount = accumulator.targetCount
                 )
-            }
 
-            NeuralTrainingBatchResult(
-                samples = reportedSamples,
-                optimizerUpdateCount = optimizerUpdates,
-                totalPredictionTargetCount = accumulator.targetCount
-            )
+                try {
+                    if (accumulator.targetCount > 0) {
+                        applyAccumulatedGradients(accumulator)
+                    }
+                } finally {
+                    val remainingResident = accumulator.resident
+                    if (remainingResident != null) {
+                        VulkanTrainingBackend.discardResidentGradientAccumulator(remainingResident)
+                        accumulator.resident = null
+                    }
+                }
+
+                val actualOptimizerUpdates = (adamStep - initialAdamStep).coerceAtLeast(0)
+                check(actualOptimizerUpdates == expectedOptimizerUpdates) {
+                    "The optimizer committed $actualOptimizerUpdates updates; expected $expectedOptimizerUpdates."
+                }
+                if (adamStep / CHECKPOINT_INTERVAL > initialAdamStep / CHECKPOINT_INTERVAL) {
+                    shouldSaveCheckpoint = true
+                }
+
+                completedBatch
         }
 
-        if (shouldSaveCheckpoint) {
+        if (autoCheckpoint && shouldSaveCheckpoint) {
             runCatching { saveCheckpoint() }
                 .onFailure { Log.e(TAG, "Auto-checkpoint save failed", it) }
         }
@@ -1580,7 +1599,8 @@ class ArgusNeuralEngine private constructor(
      */
     private fun trainSingleSampleSequential(
         text: String,
-        runtimeContextLength: Int
+        runtimeContextLength: Int,
+        autoCheckpoint: Boolean
     ): NeuralTrainingBatchResult {
         var shouldSaveCheckpoint = false
         val result = synchronized(modelLock) {
@@ -1668,7 +1688,7 @@ class ArgusNeuralEngine private constructor(
             )
         }
 
-        if (shouldSaveCheckpoint) {
+        if (autoCheckpoint && shouldSaveCheckpoint) {
             runCatching { saveCheckpoint() }
                 .onFailure { Log.e(TAG, "Auto-checkpoint save failed", it) }
         }
