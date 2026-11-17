@@ -657,6 +657,15 @@ class TrainingManager(
         requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
         if (closed) return Pair(0, 0L)
 
+        val availableHeapBytes = captureTrainingMemorySnapshot().availableHeapBytes
+        val streamCharacterLimit = DeviceAdaptiveRuntimePolicy.streamedDocumentCharacterLimit(
+            availableHeapBytes = availableHeapBytes,
+            hardLimitCharacters = MAX_STREAMED_DOCUMENT_CHARACTERS
+        )
+        require(streamCharacterLimit > 0) {
+            "There is not enough available app-heap headroom for a streamed document import."
+        }
+
         check(
             ingestionStagingDirectory.isDirectory ||
                 ingestionStagingDirectory.mkdirs()
@@ -690,9 +699,9 @@ class TrainingManager(
                     if (closed) return Pair(0, totalCharsRead)
 
                     val nextTotal = Math.addExact(totalCharsRead, readCount.toLong())
-                    require(nextTotal <= MAX_STREAMED_DOCUMENT_CHARACTERS.toLong()) {
-                        "Streamed document exceeds the safe limit of " +
-                            "$MAX_STREAMED_DOCUMENT_CHARACTERS UTF-16 characters. " +
+                    require(nextTotal <= streamCharacterLimit.toLong()) {
+                        "Streamed document exceeds the current safe limit of " +
+                            "$streamCharacterLimit UTF-16 characters. " +
                             "Split the source into smaller documents at a record or paragraph boundary."
                     }
 

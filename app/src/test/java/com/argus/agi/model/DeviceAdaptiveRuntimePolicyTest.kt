@@ -9,6 +9,31 @@ import org.junit.Test
 class DeviceAdaptiveRuntimePolicyTest {
 
     @Test
+    fun streamedDocumentImportLimitUsesLiveHeapAndHardMaximum() {
+        assertEquals(
+            4_096,
+            DeviceAdaptiveRuntimePolicy.streamedDocumentCharacterLimit(
+                availableHeapBytes = 49_152L,
+                hardLimitCharacters = 2 * 1024 * 1024
+            )
+        )
+        assertEquals(
+            2 * 1024 * 1024,
+            DeviceAdaptiveRuntimePolicy.streamedDocumentCharacterLimit(
+                availableHeapBytes = Long.MAX_VALUE,
+                hardLimitCharacters = 2 * 1024 * 1024
+            )
+        )
+        assertEquals(
+            0,
+            DeviceAdaptiveRuntimePolicy.streamedDocumentCharacterLimit(
+                availableHeapBytes = 0L,
+                hardLimitCharacters = 2 * 1024 * 1024
+            )
+        )
+    }
+
+    @Test
     fun deviceLocalHeadroomIgnoresHostOnlyMemoryHeaps() {
         val headroom = DeviceAdaptiveRuntimePolicy.deviceLocalHeapHeadroomBytes(
             budgets = listOf(1_000L, 2_000L),

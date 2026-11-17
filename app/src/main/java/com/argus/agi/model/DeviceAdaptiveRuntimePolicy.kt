@@ -17,6 +17,7 @@ internal object DeviceAdaptiveRuntimePolicy {
 
     private const val DEVICE_LOCAL_HEAP_FLAG = 0x1
     private const val MEBIBYTE = 1024L * 1024L
+    private const val STREAMED_INGESTION_BYTES_PER_CHARACTER = 12L
 
     internal data class TensorArenaBudget(
         val totalBytes: Long,
@@ -24,6 +25,23 @@ internal object DeviceAdaptiveRuntimePolicy {
         val activationBytes: Long,
         val optimizerBytes: Long
     )
+
+    fun streamedDocumentCharacterLimit(
+        availableHeapBytes: Long,
+        hardLimitCharacters: Int,
+        estimatedRetainedBytesPerCharacter: Long = STREAMED_INGESTION_BYTES_PER_CHARACTER
+    ): Int {
+        require(hardLimitCharacters > 0) {
+            "The hard streamed-document limit must be positive."
+        }
+        require(estimatedRetainedBytesPerCharacter > 0L) {
+            "The retained-byte estimate per character must be positive."
+        }
+        val heapBoundCharacters = availableHeapBytes
+            .coerceAtLeast(0L)
+            .div(estimatedRetainedBytesPerCharacter)
+        return minOf(hardLimitCharacters.toLong(), heapBoundCharacters).toInt()
+    }
 
     fun deviceLocalHeapHeadroomBytes(
         budgets: List<Long>,
@@ -140,8 +158,6 @@ internal object DeviceAdaptiveRuntimePolicy {
         require(configuredContextLength >= 2)
         require(dModel > 0 && feedForwardSize > 0 && vocabularySize > 0)
         require(layerCount > 0 && headCount > 0)
-
-        if (configuredContextLength <= 2) return configuredContextLength
 
         val minimumContext = min(configuredContextLength, 32)
         val heapRatio = availableHeapRatio(availableHeapBytes, maximumHeapBytes)
