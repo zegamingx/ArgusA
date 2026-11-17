@@ -1532,6 +1532,7 @@ class TrainingManager(
                 ) {
                     "The prepared training batch could not be rolled back to its exact optimizer baseline."
                 }
+                neuralEngine.resumeVulkanTensorResidencyAfterForeground()
             }
             TrainingCommitJournal.delete(trainingCommitJournalFile)
             return
@@ -1584,19 +1585,6 @@ class TrainingManager(
         }
         if (committedItems.isNotEmpty()) {
             repository.markTrainingItemsOptimizerCommitted(committedItems)
-        }
-    }
-
-    private suspend fun deleteTrainingCommitJournalWhenResolved() {
-        val snapshot = TrainingCommitJournal.read(trainingCommitJournalFile) ?: return
-        if (!snapshot.isCommitted) return
-        val repository = repo ?: return
-        val pendingCommittedIds = repository.getOptimizerCommittedTrainingItemsSnapshot()
-            .asSequence()
-            .map(TrainingData::id)
-            .toHashSet()
-        if (snapshot.entries.none { entry -> entry.itemId in pendingCommittedIds }) {
-            TrainingCommitJournal.delete(trainingCommitJournalFile)
         }
     }
 
@@ -1654,63 +1642,6 @@ class TrainingManager(
                 _nextQueue.value = additions + _nextQueue.value
                 wakeupSignal.trySend(Unit)
             }
-        }
-    }
-
-    private suspend fun reconcilePersistedTrainingCommit(
-        repository: com.argus.agi.data.repository.ArgusRepository
-    ) {
-        val snapshot = TrainingCommitJournal.read(trainingCommitJournalFile) ?: return
-        val currentOptimizerStep = neuralEngine.optimizerStep
-
-        if (!snapshot.isCommitted) {
-            check(currentOptimizerStep == snapshot.baselineOptimizerStep) {
-                "A prepared training journal does not match the restored optimizer checkpoint."
-            }
-            TrainingCommitJournal.delete(trainingCommitJournalFile)
-            return
-        }
-
-        val committedOptimizerStep = requireNotNull(snapshot.committedOptimizerStep)
-        if (currentOptimizerStep < committedOptimizerStep) {
-            val committedIds = repository.getOptimizerCommittedTrainingItemsSnapshot()
-                .mapTo(HashSet()) { it.id }
-            check(snapshot.entries.none { it.itemId in committedIds }) {
-                "Room marks a batch committed, but the restored checkpoint is older than its optimizer commit."
-            }
-            // The journal reached COMMITTED but the following checkpoint replacement did not.
-            // The baseline checkpoint remains the durable model and TRAINING rows can retry.
-            TrainingCommitJournal.delete(trainingCommitJournalFile)
-            return
-        }
-
-        val committedItems = ArrayList<TrainingData>(snapshot.entries.size)
-        for (entry in snapshot.entries) {
-            val existing = repository.getTrainingItem(entry.itemId)
-                ?: throw IllegalStateException(
-                    "The committed training journal references a missing queue item: ${entry.itemId}."
-                )
-            if (
-                existing.status == TrainingStatus.COMPLETED ||
-                existing.status == TrainingStatus.FAILED
-            ) {
-                continue
-            }
-            val result = requireNotNull(entry.result) {
-                "A committed journal entry is missing its training result."
-            }
-            committedItems.add(
-                existing.copy(
-                    status = TrainingStatus.OPTIMIZER_COMMITTED,
-                    finalLoss = result.loss,
-                    stepDurationMs = entry.stepDurationMs
-                )
-            )
-        }
-        if (committedItems.isNotEmpty()) {
-            repository.markTrainingItemsOptimizerCommitted(committedItems)
-        } else {
-            TrainingCommitJournal.delete(trainingCommitJournalFile)
         }
     }
 
