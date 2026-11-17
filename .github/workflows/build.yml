@@ -7,6 +7,7 @@ on:
   push:
     branches:
       - main
+      - master
     paths:
       - "app/**"
       - "gradle/**"
@@ -119,7 +120,7 @@ jobs:
           echo "Building Argus ${version_name} (${build}) from $(git rev-parse HEAD)."
 
       - name: Restore persistent Argus signing identity
-        if: github.event_name == 'push'
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -146,7 +147,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x gradlew
-          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
             echo "Running unsigned debug validation for the pull request."
             env -u ANDROID_SDK_ROOT ./gradlew --no-daemon --no-configuration-cache --stacktrace clean :app:lintDebug :app:testDebugUnitTest :app:assembleDebug
           else
@@ -155,7 +156,7 @@ jobs:
           fi
 
       - name: Verify APK signature and prepare checksums
-        if: github.event_name == 'push'
+        if: github.ref == 'refs/heads/main'
         shell: bash
         run: |
           set -euo pipefail
@@ -216,7 +217,7 @@ jobs:
           echo "APK signature verified against the persistent Argus upload certificate."
 
       - name: Remove signing key from workspace
-        if: github.event_name == 'push'
+        if: github.ref == 'refs/heads/main'
         shell: bash
         run: |
           set -euo pipefail
