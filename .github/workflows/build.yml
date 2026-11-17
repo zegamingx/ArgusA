@@ -17,6 +17,7 @@ on:
       - "gradle.properties"
       - "version.properties"
       - "tools/cmake-compat/**"
+      - "tools/ci/**"
       - "README.md"
       - ".github/workflows/build.yml"
 
@@ -33,8 +34,8 @@ jobs:
     name: Lint, test, sign and publish APK
     permissions:
       contents: write
-    runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 180
 
     steps:
       - name: Checkout main source
@@ -42,263 +43,12 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Set up JDK 25
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
-        with:
-          distribution: temurin
-          java-version: "25"
-          cache: gradle
-
-      - name: Verify runner Android SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          sdk_root="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
-          echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
-
-          test -s "${sdk_root}/platforms/android-37.0/android.jar"
-          test -x "${sdk_root}/platform-tools/adb"
-
-          sdk_platform="${sdk_root}/platforms/android-37.0"
-          if [[ ! -s "${sdk_platform}/android.jar" ]]; then
-            echo "::error::Android SDK platform android-37.0 is not installed."
-            exit 1
-          fi
-          echo "Android SDK platform ready: minSdk 34, compileSdk 37, targetSdk 37."
-
-      - name: Install Android NDK r30 and CMake 4.5.0
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sdkmanager_path="$(command -v sdkmanager || true)"
-          if [[ -z "${sdkmanager_path}" ]]; then
-            sdkmanager_path="$(find "${ANDROID_HOME}/cmdline-tools" -type f -name sdkmanager -print -quit)"
-          fi
-          test -n "${sdkmanager_path}"
-
-          set +o pipefail
-          yes | "${sdkmanager_path}" --licenses >/dev/null
-          set -o pipefail
-          "${sdkmanager_path}" --install "build-tools;37.0.0" "ndk;30.0.16248370"
-          test -x "${ANDROID_HOME}/build-tools/37.0.0/apksigner"
-
-          cmake_version="4.5.0"
-          cmake_archive="cmake-${cmake_version}-linux-x86_64.tar.gz"
-          cmake_archive_path="${RUNNER_TEMP}/${cmake_archive}"
-          cmake_root="${RUNNER_TEMP}/cmake-${cmake_version}"
-          # Fetch the official Kitware release asset; the pinned SHA-256 below remains mandatory.
-          curl --fail --location --retry 3 --silent --show-error \
-            "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/${cmake_archive}" \
-            --output "${cmake_archive_path}"
-          printf '%s  %s\n' "81f0d5b0960fb6adc8197030ffc827fba937640d51e73e39e0e9e40d88c66f6f" "${cmake_archive_path}" | sha256sum --check --status
-          mkdir -p "${cmake_root}"
-          tar -xzf "${cmake_archive_path}" --strip-components=1 -C "${cmake_root}"
-          tools/cmake-compat/install-wrapper.sh "${cmake_root}/bin/cmake" "${RUNNER_TEMP}/argus-cmake-compat"
-          "${RUNNER_TEMP}/argus-cmake-compat/bin/cmake" --version | grep -Fx "cmake version ${cmake_version}"
-
-          glslc_path="$(find "${ANDROID_HOME}/ndk/30.0.16248370/shader-tools" -type f -name glslc -print -quit)"
-          test -n "${glslc_path}"
-          test -x "${glslc_path}"
-          echo "NDK r30, CMake ${cmake_version}, and NDK glslc are ready."
-
-      - name: Resolve application version
-        shell: bash
-        run: |
-          set -euo pipefail
-          major="$(awk -F= '$1 == "VERSION_MAJOR" { print $2 }' version.properties)"
-          minor="$(awk -F= '$1 == "VERSION_MINOR" { print $2 }' version.properties)"
-          patch="$(awk -F= '$1 == "VERSION_PATCH" { print $2 }' version.properties)"
-          build="$(awk -F= '$1 == "VERSION_BUILD" { print $2 }' version.properties)"
-
-          version_name="${major}.${minor}.${patch}"
-          if [[ ! "${build}" =~ ^[0-9]+$ || "${build}" -le 0 ]]; then
-            echo "::error::Invalid VERSION_BUILD in version.properties."
-            exit 1
-          fi
-
-          echo "VERSION_NAME=${version_name}" >> "${GITHUB_ENV}"
-          echo "VERSION_BUILD=${build}" >> "${GITHUB_ENV}"
-          echo "Building Argus ${version_name} (${build}) from $(git rev-parse HEAD)."
-
-      - name: Restore persistent Argus signing identity
-        if: github.ref == 'refs/heads/main'
+      - name: Build, verify and publish signed APK on the Windows runner
         env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
+          ARGUS_GH_TOKEN: ${{ github.token }}
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
-          set -euo pipefail
-          mkdir -p signing
-          gh release download argus-signing-key --repo "${GITHUB_REPOSITORY}" --pattern "ARGUS-RELEASE-KEY.p12" --dir signing
-
-          mv "signing/ARGUS-RELEASE-KEY.p12" "signing/argus-release.p12"
-          test -s "signing/argus-release.p12"
-          keytool -list -storetype PKCS12 -keystore "signing/argus-release.p12" -storepass "" -alias upload >/dev/null
-
-          echo "KEYSTORE_PATH=${GITHUB_WORKSPACE}/signing/argus-release.p12" >> "${GITHUB_ENV}"
-          echo "STORE_PASSWORD=" >> "${GITHUB_ENV}"
-          echo "KEY_PASSWORD=" >> "${GITHUB_ENV}"
-          echo "Persistent Argus signing identity restored."
-
-      - name: Verify Gradle Wrapper
-        run: |
-          chmod +x gradlew
-          ./gradlew --version
-
-      - name: Run PR validation or verified release build
-        run: |
-          set -euo pipefail
-          chmod +x gradlew
-          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
-            echo "Running unsigned debug validation for the pull request."
-            env -u ANDROID_SDK_ROOT ./gradlew --no-daemon --no-configuration-cache --stacktrace clean :app:lintDebug :app:testDebugUnitTest :app:assembleDebug
-          else
-            echo "Running the signed release build for main."
-            env -u ANDROID_SDK_ROOT ./gradlew --no-daemon --no-configuration-cache --stacktrace clean :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
-          fi
-
-      - name: Verify APK signature and prepare checksums
-        if: github.ref == 'refs/heads/main'
-        shell: bash
-        run: |
-          set -euo pipefail
-          apk_path="app/build/outputs/apk/release/app-release.apk"
-          test -s "${apk_path}"
-
-          for abi in arm64-v8a armeabi-v7a x86_64; do
-            unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
-          done
-
-          "${ANDROID_HOME}/build-tools/37.0.0/apksigner" verify --verbose --print-certs "${apk_path}" | tee /tmp/apksigner-report.txt
-
-          expected_fingerprint="$(
-            keytool -exportcert \
-              -storetype PKCS12 \
-              -keystore "${KEYSTORE_PATH}" \
-              -storepass "" \
-              -alias upload |
-              sha256sum |
-              awk '{print $1}' |
-              tr '[:upper:]' '[:lower:]'
-          )"
-          actual_fingerprint="$(
-            awk '
-              tolower($0) ~ /certificate sha-256 digest:/ {
-                line = $0
-                sub(/^.*digest:[[:space:]]*/, "", line)
-                gsub(/[^[:xdigit:]]/, "", line)
-                print tolower(line)
-                exit
-              }
-            ' /tmp/apksigner-report.txt
-          )"
-
-          echo "Expected upload certificate SHA-256: ${expected_fingerprint}"
-          echo "Actual APK signer SHA-256: ${actual_fingerprint}"
-
-          if [[ ! "${expected_fingerprint}" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::Could not extract the persistent upload certificate fingerprint."
-            exit 1
-          fi
-
-          if [[ ! "${actual_fingerprint}" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::Could not extract the APK signer certificate fingerprint."
-            exit 1
-          fi
-
-          if [[ "${expected_fingerprint}" != "${actual_fingerprint}" ]]; then
-            echo "::error::APK certificate does not match the persistent Argus signing identity."
-            exit 1
-          fi
-
-          mkdir -p dist
-          cp "${apk_path}" "dist/ARGUS-v${VERSION_NAME}.apk"
-          cp "${apk_path}" "dist/ARGUS.apk"
-          (cd dist && sha256sum "ARGUS-v${VERSION_NAME}.apk" > "ARGUS-v${VERSION_NAME}.apk.sha256")
-          (cd dist && sha256sum "ARGUS.apk" > "ARGUS.apk.sha256")
-          echo "APK signature verified against the persistent Argus upload certificate."
-
-      - name: Remove signing key from workspace
-        if: github.ref == 'refs/heads/main'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The keystore was downloaded only to sign this APK; do not leave it
-          # in the workspace for later steps.
-          if [[ -n "${KEYSTORE_PATH:-}" ]]; then
-            rm -f -- "${KEYSTORE_PATH}"
-          fi
-          rmdir signing 2>/dev/null || true
-
-      # Every successful main build publishes the newly verified APK to the rolling Release channel.
-      - name: Automatically publish latest signed APK to GitHub Release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          release_apk="ARGUS-v${VERSION_NAME}.apk"
-          release_apk_checksum="${release_apk}.sha256"
-          stable_apk="ARGUS.apk"
-          stable_apk_checksum="${stable_apk}.sha256"
-
-          # Reuse the APKs and SHA-256 manifests produced by the signature-verification step.
-          cp "dist/${release_apk}" "${release_apk}"
-          cp "dist/${release_apk_checksum}" "${release_apk_checksum}"
-          cp "dist/${stable_apk}" "${stable_apk}"
-          cp "dist/${stable_apk_checksum}" "${stable_apk_checksum}"
-
-          release_notes="Latest successfully verified Argus main build.
-          Version: v${VERSION_NAME}
-          Build: ${VERSION_BUILD}
-          Source commit: ${GITHUB_SHA}
-
-          This rolling release is updated automatically only after lint, unit tests, APK packaging and signing verification succeed."
-
-          if gh release view "Release" >/dev/null 2>&1; then
-            echo "Updating the rolling Release channel with the verified APK and checksums..."
-            gh release upload "Release" \
-              "${release_apk}" \
-              "${release_apk_checksum}" \
-              "${stable_apk}" \
-              "${stable_apk_checksum}" \
-              --clobber
-            gh release edit "Release" \
-              --title "Argus Latest Release" \
-              --notes "${release_notes}" \
-              --latest
-          else
-            echo "Creating the rolling Release channel..."
-            gh release create "Release" \
-              "${release_apk}" \
-              "${release_apk_checksum}" \
-              "${stable_apk}" \
-              "${stable_apk_checksum}" \
-              --target "${GITHUB_SHA}" \
-              --title "Argus Latest Release" \
-              --notes "${release_notes}" \
-              --latest
-          fi
-
-          # Keep one versioned APK/checksum pair and the stable aliases.
-          # The signing-key backup lives under a separate tag and is untouched.
-          stale_assets="$(gh release view "Release" --json assets --jq '.assets[].name')"
-          while IFS= read -r stale_asset; do
-            [[ -z "${stale_asset}" ]] && continue
-            [[ "${stale_asset}" == ARGUS-v* ]] || continue
-            case "${stale_asset}" in
-              *.apk|*.apk.sha256) ;;
-              *) continue ;;
-            esac
-            [[ "${stale_asset}" == "${release_apk}" ]] && continue
-            [[ "${stale_asset}" == "${release_apk_checksum}" ]] && continue
-            echo "Removing superseded release asset: ${stale_asset}"
-            gh release delete-asset "Release" "${stale_asset}" --yes
-          done <<< "${stale_assets}"
-
-          echo "Successfully published verified APKs to https://github.com/${{ github.repository }}/releases/tag/Release"
+          & .\tools\ci\publish-windows-release.ps1
 
   build-windows-validation:
     name: Windows self-hosted validation
@@ -352,9 +102,14 @@ jobs:
             throw "ANDROID_NDK_ROOT is not pinned to $ndk"
           }
 
-          $javaInfo = (& $java -version 2>&1 | Out-String)
+          $javaStdout = Join-Path $env:RUNNER_TEMP 'argus-java-version.stdout.txt'
+          $javaStderr = Join-Path $env:RUNNER_TEMP 'argus-java-version.stderr.txt'
+          $javaProcess = Start-Process -FilePath $java -ArgumentList '-version' -NoNewWindow -Wait -PassThru -RedirectStandardOutput $javaStdout -RedirectStandardError $javaStderr
+          $javaInfo = ''
+          if (Test-Path -LiteralPath $javaStdout) { $javaInfo += Get-Content -LiteralPath $javaStdout -Raw }
+          if (Test-Path -LiteralPath $javaStderr) { $javaInfo += Get-Content -LiteralPath $javaStderr -Raw }
           Write-Host $javaInfo
-          if ($javaInfo -notmatch 'version "25\.') { throw 'The runner must use JDK 25.' }
+          if ($javaProcess.ExitCode -ne 0 -or $javaInfo -notmatch 'version "25\.') { throw 'The runner must use JDK 25.' }
 
           $cmakeInfo = (& $cmake --version | Select-Object -First 1).Trim()
           Write-Host $cmakeInfo
@@ -372,167 +127,19 @@ jobs:
       - name: Install and test CMake 4.5.0 compatibility launcher
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $realCMake = Join-Path $env:CMAKE_HOME 'bin\cmake.exe'
-          $ninjaPath = 'C:\Tools\Ninja\ninja.exe'
-          $wrapperRoot = Join-Path $env:RUNNER_TEMP 'argus-cmake-compat'
-          $binRoot = Join-Path $wrapperRoot 'bin'
-
-          if (Test-Path -LiteralPath $wrapperRoot) {
-            Remove-Item -LiteralPath $wrapperRoot -Recurse -Force
-          }
-          New-Item -ItemType Directory -Path $binRoot -Force | Out-Null
-          [IO.File]::WriteAllText((Join-Path $wrapperRoot 'real-cmake.path'), $realCMake, ([Text.UTF8Encoding]::new($false)))
-          Copy-Item -LiteralPath $ninjaPath -Destination (Join-Path $binRoot 'ninja.exe') -Force
-
-          $sourceCode = @'
-          using System;
-          using System.Collections.Generic;
-          using System.Diagnostics;
-          using System.IO;
-          using System.Reflection;
-          using System.Text;
-
-          public static class ArgusCMakeCompatLauncher
-          {
-              public static int Main(string[] args)
-              {
-                  try
-                  {
-                      string binDirectory = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
-                      string wrapperRoot = Directory.GetParent(binDirectory).FullName;
-                      string realCMake = File.ReadAllText(Path.Combine(wrapperRoot, "real-cmake.path")).Trim();
-                      if (!File.Exists(realCMake))
-                      {
-                          Console.Error.WriteLine("Real CMake executable was not found: " + realCMake);
-                          return 127;
-                      }
-
-                      List<string> rewritten = new List<string>();
-                      for (int i = 0; i < args.Length; i++)
-                      {
-                          string argument = args[i];
-                          if (String.Equals(argument, "-H", StringComparison.Ordinal))
-                          {
-                              if (i + 1 >= args.Length)
-                              {
-                                  Console.Error.WriteLine("CMake received -H without a source directory.");
-                                  return 2;
-                              }
-                              rewritten.Add("-S");
-                              rewritten.Add(args[++i]);
-                          }
-                          else if (argument.StartsWith("-H", StringComparison.Ordinal) && argument.Length > 2)
-                          {
-                              rewritten.Add("-S" + argument.Substring(2));
-                          }
-                          else
-                          {
-                              rewritten.Add(argument);
-                          }
-                      }
-
-                      ProcessStartInfo start = new ProcessStartInfo();
-                      start.FileName = realCMake;
-                      start.Arguments = String.Join(" ", rewritten.ConvertAll(QuoteArgument));
-                      start.WorkingDirectory = Environment.CurrentDirectory;
-                      start.UseShellExecute = false;
-
-                      using (Process child = Process.Start(start))
-                      {
-                          if (child == null) return 127;
-                          child.WaitForExit();
-                          return child.ExitCode;
-                      }
-                  }
-                  catch (Exception exception)
-                  {
-                      Console.Error.WriteLine("Argus CMake launcher failed: " + exception.Message);
-                      return 127;
-                  }
-              }
-
-              private static string QuoteArgument(string value)
-              {
-                  if (value.Length > 0 && value.IndexOfAny(new char[] { ' ', '\t', '\r', '\n', '"' }) < 0)
-                      return value;
-
-                  StringBuilder result = new StringBuilder();
-                  result.Append('"');
-                  int backslashes = 0;
-                  for (int i = 0; i < value.Length; i++)
-                  {
-                      char current = value[i];
-                      if (current == '\\') { backslashes++; continue; }
-                      if (current == '"')
-                      {
-                          result.Append('\\', backslashes * 2 + 1);
-                          result.Append('"');
-                          backslashes = 0;
-                          continue;
-                      }
-                      if (backslashes > 0)
-                      {
-                          result.Append('\\', backslashes);
-                          backslashes = 0;
-                      }
-                      result.Append(current);
-                  }
-                  if (backslashes > 0) result.Append('\\', backslashes * 2);
-                  result.Append('"');
-                  return result.ToString();
-              }
-          }
-          '@
-
-          $launcher = Join-Path $binRoot 'cmake.exe'
-          Add-Type -TypeDefinition $sourceCode -Language CSharp -OutputAssembly $launcher -OutputType ConsoleApplication
-          $env:PATH = "$binRoot;$env:PATH"
-          [IO.File]::AppendAllText($env:GITHUB_PATH, $binRoot + [Environment]::NewLine, [Text.Encoding]::ASCII)
-
-          $propertiesPath = Join-Path $env:GITHUB_WORKSPACE 'local.properties'
-          $preserved = @()
-          if (Test-Path -LiteralPath $propertiesPath) {
-            $preserved = @(Get-Content -LiteralPath $propertiesPath | Where-Object { $_ -notmatch '^\s*(sdk\.dir|cmake\.dir)\s*=' })
-          }
-          $sdkPath = $env:ANDROID_SDK_ROOT.Replace('\', '/')
-          $cmakePath = $wrapperRoot.Replace('\', '/')
-          $properties = @($preserved) + @("sdk.dir=$sdkPath", "cmake.dir=$cmakePath")
-          [IO.File]::WriteAllText($propertiesPath, (($properties -join [Environment]::NewLine) + [Environment]::NewLine), ([Text.UTF8Encoding]::new($false)))
-
-          $probeRoot = Join-Path $env:RUNNER_TEMP ('argus-cmake-probe-' + [Guid]::NewGuid().ToString('N'))
-          $probeSource = Join-Path $probeRoot 'source'
-          $probeBuild = Join-Path $probeRoot 'build'
-          try {
-            New-Item -ItemType Directory -Path $probeSource -Force | Out-Null
-            $probeContent = 'cmake_minimum_required(VERSION 3.28)' + [Environment]::NewLine + 'project(ArgusCMakeCompatProbe NONE)' + [Environment]::NewLine
-            [IO.File]::WriteAllText((Join-Path $probeSource 'CMakeLists.txt'), $probeContent, ([Text.UTF8Encoding]::new($false)))
-            & $launcher "-H$probeSource" "-B$probeBuild" '-GNinja'
-            if ($LASTEXITCODE -ne 0) { throw "CMake compatibility probe failed: exit code $LASTEXITCODE" }
-            if (-not (Test-Path -LiteralPath (Join-Path $probeBuild 'build.ninja') -PathType Leaf)) {
-              throw 'CMake compatibility probe did not create build.ninja.'
-            }
-          }
-          finally {
-            if (Test-Path -LiteralPath $probeRoot) {
-              Remove-Item -LiteralPath $probeRoot -Recurse -Force
-            }
-          }
-
-          $launcherVersion = (& $launcher --version | Select-Object -First 1).Trim()
-          if ($launcherVersion -ne 'cmake version 4.5.0') { throw "CMake launcher version mismatch: $launcherVersion" }
-          Write-Host 'CMake 4.5.0 Windows compatibility launcher and -H to -S probe passed.'
-
+          & .\tools\cmake-compat\install-wrapper.ps1 -RealCMake "$env:CMAKE_HOME\bin\cmake.exe" -WrapperRoot "$env:RUNNER_TEMP\argus-cmake-compat"
       - name: Verify Gradle wrapper
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Continue'
           & .\gradlew.bat --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $gradleExitCode = $LASTEXITCODE
+          if ($gradleExitCode -ne 0) { exit $gradleExitCode }
 
       - name: Run Android lint, unit tests and debug APK build
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Continue'
           & .\gradlew.bat --no-daemon --no-configuration-cache --max-workers=2 --stacktrace clean :app:lintDebug :app:testDebugUnitTest :app:assembleDebug
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $gradleExitCode = $LASTEXITCODE
+          if ($gradleExitCode -ne 0) { exit $gradleExitCode }
