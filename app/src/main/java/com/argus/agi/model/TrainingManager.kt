@@ -305,41 +305,6 @@ class TrainingManager(
             }
         }
 
-        val restoreGeneration = synchronized(queueLock) { queueGeneration }
-        scope.launch {
-            repo?.let { repository ->
-                runSuspendCatching {
-                    reconcilePersistedTrainingCommit(repository)
-                    repository.recoverInterruptedTrainingItems()
-                    val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
-                    val pending = repository.getPendingQueueSnapshot()
-                    (committed.sortedBy { it.timestamp } + pending.sortedBy { it.timestamp })
-                }
-                    .onSuccess { restoredItems ->
-                        synchronized(queueLock) {
-                            if (
-                                restoreGeneration == queueGeneration &&
-                                _nextQueue.value.isEmpty()
-                            ) {
-                                _nextQueue.value = restoredItems
-                                restoredItems.maxOfOrNull { it.timestamp }?.let { latest ->
-                                    lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
-                                }
-                                wakeupSignal.trySend(Unit)
-                            }
-                        }
-                    }
-                    .onFailure { error ->
-                        _isTrainingPaused.value = true
-                        Log.e(
-                            TAG,
-                            "Training is paused because its durable optimizer-commit state could not be reconciled.",
-                            error
-                        )
-                    }
-            }
-        }
-
         if (repo == null) {
             Log.e(
                 TAG,
@@ -1955,23 +1920,56 @@ class TrainingManager(
 
     private fun startTrainingWorker() {
         workerJob = scope.launch {
+            var validationRunActive = false
+            var validationRunHadFailures = false
             try {
-                if (conversationalValidationPersistence.hasAcceptedCheckpoint()) {
+                // A candidate checkpoint from an interrupted quality-gate run must survive
+                // startup. Restore the accepted checkpoint only when no candidate run exists.
+                val resumeInterruptedCandidate =
+                    conversationalValidationPersistence.hasInterruptedCandidateRun()
+                if (
+                    !resumeInterruptedCandidate &&
+                    conversationalValidationPersistence.hasAcceptedCheckpoint()
+                ) {
                     check(restoreAcceptedConversationCheckpoint()) {
                         "The last accepted conversational checkpoint could not be restored."
                     }
                 }
+
+                repo?.let { repository ->
+                    reconcilePersistedTrainingCommit(repository)
+                    repository.recoverInterruptedTrainingItems()
+                    val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                    val pending = repository.getPendingQueueSnapshot()
+                    val restoredItems =
+                        committed.sortedBy { it.timestamp } + pending.sortedBy { it.timestamp }
+                    synchronized(queueLock) {
+                        _nextQueue.value = restoredItems
+                        restoredItems.maxOfOrNull { it.timestamp }?.let { latest ->
+                            lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
+                        }
+                    }
+                }
+
+                validationRunActive = resumeInterruptedCandidate
+                if (resumeInterruptedCandidate) {
+                    setConversationalValidationStatus(
+                        ConversationValidationStatus.TRAINING,
+                        "Resuming the interrupted local candidate from its last durable optimizer transaction."
+                    )
+                }
+                wakeupSignal.trySend(Unit)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (error: Throwable) {
-                Log.e(TAG, "Failed to restore the accepted conversational checkpoint.", error)
+                Log.e(TAG, "Training startup recovery failed.", error)
                 _isTrainingPaused.value = true
                 setConversationalValidationStatus(
                     ConversationValidationStatus.FAILED,
-                    "Training is paused because the last accepted checkpoint could not be restored: ${error.message}"
+                    "Training is paused because startup checkpoint/queue recovery failed: ${error.message}"
                 )
+                return@launch
             }
-
-            var validationRunActive = false
-            var validationRunHadFailures = false
 
             while (isActive && !closed) {
                 if (_isTrainingPaused.value) {
