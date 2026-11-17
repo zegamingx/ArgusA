@@ -335,6 +335,9 @@ class TrainingManager(
                 // receive its checkpoint; a partial pre-commit step must roll back.
                 reconcilePersistedTrainingCommit(repository)
                 repository.recoverInterruptedTrainingItems()
+                // OOM may have disabled or suspended the native device even when the
+                // host checkpoint was recovered. Re-arm the optional runtime before work.
+                neuralEngine.resumeVulkanTensorResidencyAfterForeground()
                 val committedItems = repository.getOptimizerCommittedTrainingItemsSnapshot()
                 val pendingItems = repository.getPendingQueueSnapshot()
                 val databaseIds = (committedItems + pendingItems).mapTo(HashSet()) { it.id }
