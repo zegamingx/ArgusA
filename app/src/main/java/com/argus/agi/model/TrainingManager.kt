@@ -1969,7 +1969,10 @@ class TrainingManager(
                 deviceGuard.refreshState()
 
                 val firstQueuedItem = _nextQueue.value.firstOrNull()
-                if (!validationRunActive && firstQueuedItem?.status == TrainingStatus.QUEUED) {
+                if (
+                    !validationRunActive &&
+                    firstQueuedItem?.status == TrainingStatus.QUEUED
+                ) {
                     validationRunDocumentIds.clear()
                     validationRunFailedDocumentIds.clear()
                     try {
@@ -1989,43 +1992,6 @@ class TrainingManager(
                     }
                 }
 
-                val safetySnapshot = deviceGuard.safetyState.value
-                val memorySnapshot = captureTrainingMemorySnapshot()
-                val thermalBatchLimit = DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
-                    configuredBatchSize = neuralEngine.config.trainingBatchSize,
-                    thermalStatus = safetySnapshot.thermalStatus,
-                    availableHeapBytes = memorySnapshot.availableHeapBytes,
-                    maximumHeapBytes = memorySnapshot.maximumHeapBytes,
-                    availableSystemMemoryBytes = memorySnapshot.availableSystemMemoryBytes,
-                    systemLowMemory = memorySnapshot.isSystemLowMemory,
-                    isPowerSaveMode = safetySnapshot.isPowerSaveMode,
-                    isCharging = safetySnapshot.isCharging,
-                    batteryPct = safetySnapshot.batteryPct,
-                    memoryRecovery = consecutiveOomRecoveries > 0
-                )
-                if (thermalBatchLimit == 0) {
-                    // Severe thermal states are normally blocked by DeviceGuard above.
-                    // Re-enter the safety wait instead of spinning or starting another batch.
-                    continue
-                }
-
-                val runtimeContextLength = DeviceAdaptiveRuntimePolicy.trainingContextLimit(
-                    configuredContextLength = neuralEngine.config.maxSeqLen,
-                    availableHeapBytes = memorySnapshot.availableHeapBytes,
-                    maximumHeapBytes = memorySnapshot.maximumHeapBytes,
-                    dModel = neuralEngine.config.dModel,
-                    feedForwardSize = neuralEngine.config.dFf,
-                    vocabularySize = neuralEngine.tokenizer.vocabSize,
-                    layerCount = neuralEngine.config.layerCount,
-                    headCount = neuralEngine.config.nHeads,
-                    thermalStatus = safetySnapshot.thermalStatus,
-                    availableSystemMemoryBytes = memorySnapshot.availableSystemMemoryBytes,
-                    systemLowMemory = memorySnapshot.isSystemLowMemory,
-                    isPowerSaveMode = safetySnapshot.isPowerSaveMode,
-                    isCharging = safetySnapshot.isCharging,
-                    memoryRecovery = consecutiveOomRecoveries > 0
-                )
-
                 val firstItem = popNext()
                 if (firstItem == null) {
                     if (_nextQueue.value.isEmpty()) {
@@ -2043,74 +2009,155 @@ class TrainingManager(
                     continue
                 }
 
-                val batchItems = ArrayList<TrainingData>(thermalBatchLimit)
-                batchItems += firstItem
-                while (batchItems.size < thermalBatchLimit) {
-                    val nextItem = popNext() ?: break
-                    batchItems += nextItem
-                }
-
-                val activeItems = batchItems.map { it.copy(status = TrainingStatus.TRAINING) }
-                _currentTrainingItem.value = activeItems.first()
-                updateActiveDocumentEntering(activeItems.first())
-
+                _currentTrainingItem.value = firstItem
+                updateActiveDocumentEntering(firstItem)
                 try {
-                    if (!processBatch(activeItems, runtimeContextLength)) {
-                        validationRunHadFailures = true
-                    } else {
-                        consecutiveOomRecoveries = 0
-                    }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (outOfMemory: OutOfMemoryError) {
-                    Log.e(
-                        TAG,
-                        "Training micro-batch hit memory pressure; preserving queued samples and reducing the next workload.",
-                        outOfMemory
-                    )
-                    val residencyReleased = runCatching {
-                        neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()
-                    }.getOrDefault(false)
-                    val checkpointSaved = runCatching {
-                        neuralEngine.saveCheckpoint()
-                    }.getOrDefault(false)
-                    val requeued = appendPersistingQueueItems(
-                        activeItems.map { item -> item.copy(status = TrainingStatus.QUEUED) }
-                    )
-                    _currentTrainingItem.value = null
-                    _activeDocument.value = null
-
-                    if (requeued.isEmpty()) {
-                        _isTrainingPaused.value = true
-                        Log.e(TAG, "OOM recovery could not return the active samples to the durable queue.")
-                    } else {
-                        consecutiveOomRecoveries++
-                        if (!residencyReleased || !checkpointSaved || consecutiveOomRecoveries > 1) {
-                            _isTrainingPaused.value = true
+                    if (firstItem.status == TrainingStatus.OPTIMIZER_COMMITTED) {
+                        try {
+                            if (!processCommittedItem(firstItem)) {
+                                validationRunHadFailures = true
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (outOfMemory: OutOfMemoryError) {
+                            handleCommittedFinalizationOutOfMemory(firstItem, outOfMemory)
+                        } catch (error: Throwable) {
                             Log.e(
                                 TAG,
-                                "Training paused after OOM recovery: residencyReleased=$residencyReleased, " +
-                                    "checkpointSaved=$checkpointSaved, retries=$consecutiveOomRecoveries."
+                                "Committed training item '${firstItem.id}' could not be finalized.",
+                                error
                             )
-                        } else {
-                            Log.w(
-                                TAG,
-                                "OOM recovery saved the model and requeued ${requeued.size} samples; " +
-                                    "retrying once with batch 1 and a reduced context."
-                            )
+                            prependCommittedQueueItems(listOf(firstItem))
+                            _isTrainingPaused.value = true
                         }
-                    }
-                } catch (error: Throwable) {
-                    validationRunHadFailures = true
-                    activeItems.mapNotNull(TrainingData::documentId)
-                        .forEach(validationRunFailedDocumentIds::add)
-                    Log.e(
-                        TAG,
-                        "Training micro-batch failed (${activeItems.size} samples).",
-                        error
-                    )
-                    activeItems.forEach { item ->
-                        markTrainingItemFailed(item, error.message)
+                    } else {
+                        check(firstItem.status == TrainingStatus.QUEUED) {
+                            "The training worker received an unsupported queue status: ${firstItem.status}."
+                        }
+
+                        val memoryRecovery = synchronized(queueLock) {
+                            firstItem.id in oomRecoveryItemIds
+                        }
+                        val safetySnapshot = deviceGuard.safetyState.value
+                        val memorySnapshot = captureTrainingMemorySnapshot()
+                        val thermalBatchLimit = DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
+                            configuredBatchSize = neuralEngine.config.trainingBatchSize,
+                            thermalStatus = safetySnapshot.thermalStatus,
+                            availableHeapBytes = memorySnapshot.availableHeapBytes,
+                            maximumHeapBytes = memorySnapshot.maximumHeapBytes,
+                            availableSystemMemoryBytes = memorySnapshot.availableSystemMemoryBytes,
+                            systemLowMemory = memorySnapshot.isSystemLowMemory,
+                            isPowerSaveMode = safetySnapshot.isPowerSaveMode,
+                            isCharging = safetySnapshot.isCharging,
+                            batteryPct = safetySnapshot.batteryPct,
+                            memoryRecovery = memoryRecovery
+                        )
+                        if (thermalBatchLimit == 0) {
+                            prependPersistingQueueItems(listOf(firstItem))
+                            continue
+                        }
+
+                        val runtimeContextLength = DeviceAdaptiveRuntimePolicy.trainingContextLimit(
+                            configuredContextLength = neuralEngine.config.maxSeqLen,
+                            availableHeapBytes = memorySnapshot.availableHeapBytes,
+                            maximumHeapBytes = memorySnapshot.maximumHeapBytes,
+                            dModel = neuralEngine.config.dModel,
+                            feedForwardSize = neuralEngine.config.dFf,
+                            vocabularySize = neuralEngine.tokenizer.vocabSize,
+                            layerCount = neuralEngine.config.layerCount,
+                            headCount = neuralEngine.config.nHeads,
+                            thermalStatus = safetySnapshot.thermalStatus,
+                            availableSystemMemoryBytes = memorySnapshot.availableSystemMemoryBytes,
+                            systemLowMemory = memorySnapshot.isSystemLowMemory,
+                            isPowerSaveMode = safetySnapshot.isPowerSaveMode,
+                            isCharging = safetySnapshot.isCharging,
+                            memoryRecovery = memoryRecovery
+                        )
+
+                        val batchItems = ArrayList<TrainingData>(thermalBatchLimit)
+                        batchItems += firstItem
+                        while (batchItems.size < thermalBatchLimit) {
+                            val nextItem = popNext(expectedStatus = TrainingStatus.QUEUED) ?: break
+                            batchItems += nextItem
+                        }
+                        val activeItems = batchItems
+                            .map { item -> item.copy(status = TrainingStatus.TRAINING) }
+                            .toMutableList()
+                        _currentTrainingItem.value = activeItems.first()
+                        updateActiveDocumentEntering(activeItems.first())
+
+                        try {
+                            if (!processBatch(activeItems, runtimeContextLength)) {
+                                validationRunHadFailures = true
+                            } else {
+                                synchronized(queueLock) {
+                                    activeItems.forEach { item ->
+                                        oomRecoveryItemIds.remove(item.id)
+                                        oomRetryCounts.remove(item.id)
+                                    }
+                                }
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (outOfMemory: OutOfMemoryError) {
+                            handleTrainingOutOfMemory(activeItems, outOfMemory)
+                        } catch (error: Throwable) {
+                            Log.e(
+                                TAG,
+                                "Training batch failed (${activeItems.size} samples).",
+                                error
+                            )
+                            val committed = runCatching {
+                                ensureLiveBatchCommitPersisted(activeItems)
+                            }.onFailure { recoveryError ->
+                                Log.e(TAG, "Could not reconcile optimizer state after a training failure.", recoveryError)
+                            }.getOrDefault(false)
+
+                            if (committed || activeBatchRoomCommitted) {
+                                val repository = repo
+                                val pendingCommitted = repository?.getOptimizerCommittedTrainingItemsSnapshot()
+                                    ?.filter { pending -> activeItems.any { it.id == pending.id } }
+                                    .orEmpty()
+                                prependCommittedQueueItems(pendingCommitted)
+                                _isTrainingPaused.value = true
+                            } else {
+                                val journal = runCatching {
+                                    TrainingCommitJournal.read(trainingCommitJournalFile)
+                                }.getOrNull()
+                                if (journal != null) {
+                                    val released = runCatching {
+                                        neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()
+                                    }.getOrDefault(false)
+                                    val baseline = activeBatchBaselineOptimizerStep
+                                        ?: journal.baselineOptimizerStep
+                                    val rolledBack = released && runCatching {
+                                        neuralEngine.loadCheckpointIfExists() &&
+                                            neuralEngine.optimizerStep == baseline
+                                    }.getOrDefault(false)
+                                    if (!rolledBack) {
+                                        _isTrainingPaused.value = true
+                                        Log.e(TAG, "Training paused because the failed batch could not be rolled back to its baseline.")
+                                    } else {
+                                        TrainingCommitJournal.delete(trainingCommitJournalFile)
+                                        neuralEngine.resumeVulkanTensorResidencyAfterForeground()
+                                        activeBatchBaselineOptimizerStep = null
+                                        activeBatchRoomCommitted = false
+                                        activeItems.forEach { item ->
+                                            markTrainingItemFailed(item, error.message)
+                                        }
+                                        activeItems.mapNotNull(TrainingData::documentId)
+                                            .forEach(validationRunFailedDocumentIds::add)
+                                    }
+                                } else {
+                                    activeItems.forEach { item ->
+                                        markTrainingItemFailed(item, error.message)
+                                    }
+                                    activeItems.mapNotNull(TrainingData::documentId)
+                                        .forEach(validationRunFailedDocumentIds::add)
+                                }
+                                validationRunHadFailures = true
+                            }
+                        }
                     }
                 } finally {
                     resetForceOverrideIfSet()
