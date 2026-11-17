@@ -1910,16 +1910,17 @@ class TrainingManager(
                     "Training cannot start without durable local queue storage."
                 }
                 val persistedCommitted = repository.getOptimizerCommittedTrainingItemsSnapshot()
-                val resumeInterruptedCandidate =
-                    conversationalValidationPersistence.hasInterruptedCandidateRun() ||
-                        trainingCommitJournalFile.isFile ||
-                        persistedCommitted.isNotEmpty()
+                val interruptedCandidateRun =
+                    conversationalValidationPersistence.hasInterruptedCandidateRun()
+                val preserveCandidateCheckpoint = interruptedCandidateRun ||
+                    trainingCommitJournalFile.isFile ||
+                    persistedCommitted.isNotEmpty()
 
                 // An interrupted candidate must keep the exact model checkpoint that
                 // corresponds to its journal. Restoring the older accepted model here
                 // would invalidate Room's committed rows without replaying their work.
                 if (
-                    !resumeInterruptedCandidate &&
+                    !preserveCandidateCheckpoint &&
                     conversationalValidationPersistence.hasAcceptedCheckpoint()
                 ) {
                     check(restoreAcceptedConversationCheckpoint()) {
@@ -1946,17 +1947,19 @@ class TrainingManager(
                         }
                     }
                 }
+                val hasRestoredCommittedItems = repository
+                    .getOptimizerCommittedTrainingItemsSnapshot()
+                    .isNotEmpty()
+                validationRunActive = interruptedCandidateRun || hasRestoredCommittedItems
                 if (
-                    resumeInterruptedCandidate &&
+                    validationRunActive &&
                     conversationalValidationPersistence.loadState().baselineReport == null
                 ) {
                     throw IllegalStateException(
                         "An interrupted candidate exists without a durable conversational baseline."
                     )
                 }
-
-                validationRunActive = resumeInterruptedCandidate
-                if (resumeInterruptedCandidate) {
+                if (validationRunActive) {
                     setConversationalValidationStatus(
                         ConversationValidationStatus.TRAINING,
                         "Resuming the interrupted local candidate from its last durable optimizer transaction."
