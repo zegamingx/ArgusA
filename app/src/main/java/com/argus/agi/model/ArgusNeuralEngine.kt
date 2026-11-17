@@ -249,6 +249,23 @@ data class LossEvaluation(
     val evaluatedDocumentCount: Int
 )
 
+/**
+ * Normalizes summed next-token negative log-likelihood by the original UTF-8 byte count.
+ * This makes held-out scores comparable across tokenizers with different token counts.
+ */
+internal object TokenizerEvaluationMetrics {
+    fun bitsPerByte(totalNegativeLogLikelihood: Double, utf8ByteCount: Long): Float {
+        if (
+            !totalNegativeLogLikelihood.isFinite() ||
+            totalNegativeLogLikelihood < 0.0 ||
+            utf8ByteCount <= 0L
+        ) {
+            return Float.NaN
+        }
+        return (totalNegativeLogLikelihood / (ln(2.0) * utf8ByteCount)).toFloat()
+    }
+}
+
 /** Result of a corpus-driven tokenizer vocabulary update. */
 data class TokenizerTrainingResult(
     val previousVocabularySize: Int,
@@ -1264,6 +1281,42 @@ class ArgusNeuralEngine private constructor(
     fun evaluatePerplexity(text: String): Float {
         val loss = evaluateLoss(text)
         return if (loss.isFinite()) exp(loss) else Float.NaN
+    }
+
+    /**
+     * Returns held-out negative log-likelihood in bits per original UTF-8 byte.
+     * Unlike loss per token, this metric remains comparable when token boundaries
+     * or vocabulary sizes differ between model/tokenizer revisions.
+     */
+    fun evaluateBitsPerByte(text: String): Float {
+        val evaluation = evaluateLossWithTargetCount(text)
+        if (evaluation.targetCount <= 0 || !evaluation.meanLoss.isFinite()) {
+            return Float.NaN
+        }
+        val totalNegativeLogLikelihood =
+            evaluation.meanLoss.toDouble() * evaluation.targetCount.toDouble()
+        return TokenizerEvaluationMetrics.bitsPerByte(
+            totalNegativeLogLikelihood = totalNegativeLogLikelihood,
+            utf8ByteCount = tokenizer.utf8ByteCount(text)
+        )
+    }
+
+    /** Aggregates held-out likelihood across documents before byte normalization. */
+    fun evaluateCorpusBitsPerByte(texts: List<String>): Float {
+        val evaluation = evaluateCorpusLoss(texts)
+        if (evaluation.targetCount <= 0 || !evaluation.meanLoss.isFinite()) {
+            return Float.NaN
+        }
+        var utf8ByteCount = 0L
+        for (text in texts) {
+            utf8ByteCount = Math.addExact(utf8ByteCount, tokenizer.utf8ByteCount(text))
+        }
+        val totalNegativeLogLikelihood =
+            evaluation.meanLoss.toDouble() * evaluation.targetCount.toDouble()
+        return TokenizerEvaluationMetrics.bitsPerByte(
+            totalNegativeLogLikelihood = totalNegativeLogLikelihood,
+            utf8ByteCount = utf8ByteCount
+        )
     }
 
     /**

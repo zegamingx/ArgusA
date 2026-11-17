@@ -382,6 +382,13 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         return FIRST_BYTE_TOKEN_ID + byteValue
     }
 
+    /**
+     * Counts the exact UTF-8 bytes used by this tokenizer after malformed UTF-16
+     * replacement. Used to normalize held-out likelihood independently of BPE merges.
+     */
+    internal fun utf8ByteCount(text: String): Long =
+        encodeUtf8WithReplacement(text).size.toLong()
+
     @Synchronized
     fun registerToken(token: String, id: Int? = null): Int {
         val current = state
