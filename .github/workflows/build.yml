@@ -300,7 +300,7 @@ jobs:
 
           echo "Successfully published verified APKs to https://github.com/${{ github.repository }}/releases/tag/Release"
 
-build-windows-validation:
+  build-windows-validation:
     name: Windows self-hosted validation
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
     runs-on: [self-hosted, Windows, X64]
@@ -382,7 +382,7 @@ build-windows-validation:
             Remove-Item -LiteralPath $wrapperRoot -Recurse -Force
           }
           New-Item -ItemType Directory -Path $binRoot -Force | Out-Null
-          [IO.File]::WriteAllText((Join-Path $wrapperRoot 'real-cmake.path'), $realCMake, (New-Object Text.UTF8Encoding($false)))
+          [IO.File]::WriteAllText((Join-Path $wrapperRoot 'real-cmake.path'), $realCMake, ([Text.UTF8Encoding]::new($false)))
           Copy-Item -LiteralPath $ninjaPath -Destination (Join-Path $binRoot 'ninja.exe') -Force
 
           $sourceCode = @'
@@ -498,7 +498,7 @@ build-windows-validation:
           $sdkPath = $env:ANDROID_SDK_ROOT.Replace('\', '/')
           $cmakePath = $wrapperRoot.Replace('\', '/')
           $properties = @($preserved) + @("sdk.dir=$sdkPath", "cmake.dir=$cmakePath")
-          [IO.File]::WriteAllText($propertiesPath, (($properties -join [Environment]::NewLine) + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false)))
+          [IO.File]::WriteAllText($propertiesPath, (($properties -join [Environment]::NewLine) + [Environment]::NewLine), ([Text.UTF8Encoding]::new($false)))
 
           $probeRoot = Join-Path $env:RUNNER_TEMP ('argus-cmake-probe-' + [Guid]::NewGuid().ToString('N'))
           $probeSource = Join-Path $probeRoot 'source'
@@ -506,7 +506,7 @@ build-windows-validation:
           try {
             New-Item -ItemType Directory -Path $probeSource -Force | Out-Null
             $probeContent = 'cmake_minimum_required(VERSION 3.28)' + [Environment]::NewLine + 'project(ArgusCMakeCompatProbe NONE)' + [Environment]::NewLine
-            [IO.File]::WriteAllText((Join-Path $probeSource 'CMakeLists.txt'), $probeContent, (New-Object Text.UTF8Encoding($false)))
+            [IO.File]::WriteAllText((Join-Path $probeSource 'CMakeLists.txt'), $probeContent, ([Text.UTF8Encoding]::new($false)))
             & $launcher "-H$probeSource" "-B$probeBuild" '-GNinja'
             if ($LASTEXITCODE -ne 0) { throw "CMake compatibility probe failed: exit code $LASTEXITCODE" }
             if (-not (Test-Path -LiteralPath (Join-Path $probeBuild 'build.ninja') -PathType Leaf)) {
