@@ -442,6 +442,9 @@ class CorpusPersistenceTest {
 
         try {
             manager.pauseTraining()
+            val existingStagingFiles = context.cacheDir.listFiles().orEmpty()
+                .filter { file -> file.name.startsWith("argus-ingest-") }
+                .mapTo(HashSet()) { file -> file.name }
             // The high surrogate is the final code unit of the first 4 KiB read.
             val transcript = "a".repeat(4095) + "\uD83D\uDE00" +
                 " A stream must preserve the exact UTF-16 fingerprint. ".repeat(12)
@@ -456,7 +459,7 @@ class CorpusPersistenceTest {
             assertTrue(firstImport > 0)
 
             val streamedImport = manager.enqueueDocumentStream(
-                source = "UTF-16 fingerprint parity",
+                source = "UTF-16 fingerprint parity via Reader",
                 title = "Streamed duplicate",
                 reader = StringReader(transcript),
                 chunkSize = 48,
@@ -472,6 +475,13 @@ class CorpusPersistenceTest {
             assertEquals(1, repository.getCorpusDocumentCount())
             val storedDocument = repository.getCorpusDocuments().single()
             assertEquals(2, repository.getCorpusSources(storedDocument.id).size)
+            assertEquals(
+                "The successful stream must also remove its temporary spool.",
+                existingStagingFiles,
+                context.cacheDir.listFiles().orEmpty()
+                    .filter { file -> file.name.startsWith("argus-ingest-") }
+                    .mapTo(HashSet()) { file -> file.name }
+            )
         } finally {
             manager.close()
             database.close()

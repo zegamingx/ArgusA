@@ -610,30 +610,6 @@ class TrainingManager(
     }
 
     /**
-     * Reads a source incrementally with a 4 KB input buffer and a sliding text window.
-     *
-     * Corpus chunks are retained in Room independently from the transient training queue.
-     * The generated chunk strings are still accumulated in memory during this operation;
-     * this is buffered ingestion, not a constant-memory disk-backed queue.
-     *
-     * The fingerprint is computed over the exact UTF-16 code units read from the Reader,
-     * using SHA-256/UTF-16BE. This produces the same identity as enqueueDocument for the
-     * same character sequence, including when surrogate pairs cross read-buffer boundaries.
-     *
-     * @return Pair(number of generated chunks, total characters read)
-     */
-    /**
-     * Reads incrementally but retains the complete source transcript until modality
-     * detection and token-aware processing have finished. Splitting before modality
-     * detection can turn partial conversation roles into unrelated prose and damage SFT.
-     * JSONL records remain atomic in TextModalityProcessor.
-     *
-     * chunkSize and overlap are token counts from the active neural-engine tokenizer.
-     * Model context-window construction remains the engine's responsibility.
-     *
-     * @return Pair(number of generated chunks, total UTF-16 characters read)
-     */
-    /**
      * Ingests a Reader through a bounded disk spool rather than retaining the original
      * transcript in a growing StringBuilder while it is still being read.
      *
