@@ -2647,7 +2647,14 @@ class TrainingManager(
             durationMs
         )
         if (!completionClaimed) {
-            return repository.getTrainingItem(finished.id)?.status == TrainingStatus.COMPLETED
+            val currentItem = repository.getTrainingItem(finished.id)
+                ?: throw IllegalStateException(
+                    "Training item '${finished.id}' disappeared during completion."
+                )
+            check(currentItem.status == TrainingStatus.COMPLETED) {
+                "Training item '${finished.id}' left OPTIMIZER_COMMITTED without a valid completion claim."
+            }
+            return true
         }
 
         // The Room status is durable before transient UI and telemetry updates. If one of
