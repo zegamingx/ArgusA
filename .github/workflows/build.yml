@@ -15,7 +15,6 @@ on:
       - "tools/cmake-compat/**"
       - "README.md"
       - ".github/workflows/build.yml"
-  workflow_dispatch:
 
 permissions:
   contents: write
