@@ -205,6 +205,23 @@ class TokenizerByteLevelBpeTest {
         second.trainBpe(corpus.reversed(), targetVocabSize = 512, maxNewMerges = 64)
 
         assertTrue(first.mergeCount > 0)
+        assertTrue(
+            first.exportMerges().none { (left, right) ->
+                left + right in setOf(
+                    Tokenizer.PAD_TOKEN,
+                    Tokenizer.UNK_TOKEN,
+                    Tokenizer.BOS_TOKEN,
+                    Tokenizer.EOS_TOKEN,
+                    Tokenizer.SYSTEM_TOKEN,
+                    Tokenizer.USER_TOKEN,
+                    Tokenizer.ASSISTANT_TOKEN,
+                    Tokenizer.THINK_START,
+                    Tokenizer.THINK_END,
+                    Tokenizer.TOOL_CALL_TOKEN,
+                    Tokenizer.TOOL_RESULT_TOKEN
+                )
+            }
+        )
         assertEquals(first.exportVocab(), second.exportVocab())
         assertEquals(first.exportMerges(), second.exportMerges())
         assertEquals(originalVocabulary, first.exportVocab().take(originalVocabulary.size))
@@ -232,7 +249,7 @@ class TokenizerByteLevelBpeTest {
     }
 
     @Test
-    fun trainingNeverCreatesMergesThatResolveToReservedControlTokens() {
+    fun importMergesRejectsPairsThatResolveToReservedControlTokens() {
         val tokenizer = newTokenizer()
         tokenizer.registerToken("USER>")
         val original = tokenizer.exportMerges()
