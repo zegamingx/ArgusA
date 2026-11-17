@@ -131,7 +131,7 @@ class ArgusDatabaseMigrationTest {
                     ) VALUES (
                         'legacy-doc', 'legacy-fingerprint', 'SHA256_UTF16_BE', 'legacy-import',
                         'Legacy article', 'en', 'https://example.org/legacy', 20,
-                        1, 'TRAIN', NULL, 1, 'USER_DECLARED', 'PENDING', 200, NULL, 0
+                        1, 'TRAIN', NULL, 1, 'UNVERIFIED', 'PENDING', 200, NULL, 0
                     )
                     """.trimIndent()
                 )
@@ -235,7 +235,11 @@ class ArgusDatabaseMigrationTest {
             ).use { cursor ->
                 assertTrue(cursor.moveToFirst())
                 assertEquals("Legacy article", cursor.getString(0))
-                assertEquals("USER_DECLARED", cursor.getString(1))
+                assertEquals(
+                    "A document's aggregate rights must be promoted from its surviving user-declared source.",
+                    "USER_DECLARED",
+                    cursor.getString(1)
+                )
             }
             database.query(
                 "SELECT `rightsStatus`, `userDeclarationText`, " +

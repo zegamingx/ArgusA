@@ -75,16 +75,29 @@ abstract class ArgusDatabase : RoomDatabase() {
                     "UPDATE `corpus_sources` SET `rightsStatus` = 'UNVERIFIED' " +
                         "WHERE `rightsStatus` = 'LICENSE_REVIEWED'"
                 )
+                // Recompute aggregate document rights from the source records that
+                // still carry durable evidence after conservative legacy downgrades.
                 db.execSQL(
                     """
                     UPDATE `corpus_documents`
-                    SET `rightsStatus` = 'UNVERIFIED'
-                    WHERE `rightsStatus` IN ('USER_DECLARED', 'LICENSE_REVIEWED')
-                      AND NOT EXISTS (
+                    SET `rightsStatus` = CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM `corpus_sources`
+                            WHERE `corpus_sources`.`documentId` = `corpus_documents`.`id`
+                              AND `corpus_sources`.`rightsStatus` = 'LICENSE_REVIEWED'
+                        ) THEN 'LICENSE_REVIEWED'
+                        WHEN EXISTS (
+                            SELECT 1 FROM `corpus_sources`
+                            WHERE `corpus_sources`.`documentId` = `corpus_documents`.`id`
+                              AND `corpus_sources`.`rightsStatus` = 'USER_DECLARED'
+                        ) THEN 'USER_DECLARED'
+                        ELSE 'UNVERIFIED'
+                    END
+                    WHERE EXISTS (
                         SELECT 1 FROM `corpus_sources`
                         WHERE `corpus_sources`.`documentId` = `corpus_documents`.`id`
-                          AND `corpus_sources`.`rightsStatus` IN ('USER_DECLARED', 'LICENSE_REVIEWED')
-                      )
+                    )
+                       OR `rightsStatus` IN ('USER_DECLARED', 'LICENSE_REVIEWED')
                     """.trimIndent()
                 )
             }
