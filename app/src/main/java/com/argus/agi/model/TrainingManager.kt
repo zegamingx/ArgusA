@@ -1527,18 +1527,23 @@ class TrainingManager(
         val currentOptimizerStep = neuralEngine.optimizerStep
 
         if (!snapshot.isCommitted) {
-            if (currentOptimizerStep != snapshot.baselineOptimizerStep) {
-                val residencyReleased = neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()
-                check(
-                    residencyReleased &&
-                        neuralEngine.loadCheckpointIfExists() &&
-                        neuralEngine.optimizerStep == snapshot.baselineOptimizerStep
-                ) {
-                    "The prepared training batch could not be rolled back to its exact optimizer baseline."
-                }
-                neuralEngine.resumeVulkanTensorResidencyAfterForeground()
+            // A CPU update can finish mutating host tensors immediately before an OOM
+            // in its timing/reconciliation tail, while adamStep is still at baseline.
+            // Always restore the full checkpoint; optimizerStep equality alone does not
+            // prove that every parameter and AdamW moment is unchanged.
+            check(neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()) {
+                "Vulkan training state could not be released before PREPARED-batch rollback."
             }
+            check(
+                neuralEngine.loadCheckpointIfExists() &&
+                    neuralEngine.optimizerStep == snapshot.baselineOptimizerStep
+            ) {
+                "The prepared training batch could not be rolled back to its exact optimizer baseline."
+            }
+            neuralEngine.resumeVulkanTensorResidencyAfterForeground()
             TrainingCommitJournal.delete(trainingCommitJournalFile)
+            activeBatchBaselineOptimizerStep = null
+            activeBatchRoomCommitted = false
             return
         }
 
