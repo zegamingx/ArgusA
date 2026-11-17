@@ -111,7 +111,10 @@ jobs:
           Write-Host $javaInfo
           if ($javaProcess.ExitCode -ne 0 -or $javaInfo -notmatch 'version "25\.') { throw 'The runner must use JDK 25.' }
 
-          $cmakeInfo = (& $cmake --version | Select-Object -First 1).Trim()
+          $cmakeVersionOutput = @(& $cmake --version)
+          $cmakeExitCode = $LASTEXITCODE
+          if ($cmakeExitCode -ne 0 -or $cmakeVersionOutput.Count -eq 0) { throw "CMake version check failed with exit code $cmakeExitCode" }
+          $cmakeInfo = ([string]$cmakeVersionOutput[0]).Trim()
           Write-Host $cmakeInfo
           if ($cmakeInfo -ne 'cmake version 4.5.0') { throw "Expected CMake 4.5.0, received $cmakeInfo" }
 
