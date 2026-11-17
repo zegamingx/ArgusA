@@ -1586,6 +1586,12 @@ class TrainingManager(
         }
         if (committedItems.isNotEmpty()) {
             repository.markTrainingItemsOptimizerCommitted(committedItems)
+        } else {
+            // Every journal entry is already COMPLETED or FAILED. Do not let a stale
+            // journal keep an accepted validation run looking interrupted forever.
+            TrainingCommitJournal.delete(trainingCommitJournalFile)
+            activeBatchBaselineOptimizerStep = null
+            activeBatchRoomCommitted = false
         }
     }
 
