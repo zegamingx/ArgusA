@@ -141,7 +141,6 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         private const val MAX_ENCODE_CACHE_ENTRIES = 128
         private const val MAX_CACHEABLE_TEXT_LENGTH = 2_048
         private const val MAX_CACHEABLE_TOKEN_IDS = 4_096
-        private const val MAX_CACHED_TOKEN_IDS = 65_536
 
         const val MAX_TOKEN_LEN = TokenizerConfig.DEFAULT_MAX_TOKEN_LENGTH
         const val MAX_VOCAB_SIZE = TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE
@@ -197,9 +196,10 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         }
 
         /**
-         * Escapes arbitrary payload text before it is combined with structural control tokens.
-         * The doubled marker form makes literal marker characters and literal control strings
-         * unambiguous, including a marker immediately followed by a real control token.
+         * Escapes reserved control spellings before payload text is combined with structural
+         * tokens. Literal U+E000 characters remain unchanged; only a doubled marker directly
+         * before a reserved spelling has escape meaning. A single marker before a real control
+         * token therefore remains payload and does not suppress that control token.
          */
         internal fun escapeLiteralControlTokens(text: String): String {
             if (text.isEmpty()) return text

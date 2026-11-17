@@ -173,6 +173,23 @@ class TokenizerByteLevelBpeTest {
     }
 
     @Test
+    fun repeatedLiteralMarkersBeforeControlSpellingsRemainLiteralPayload() {
+        val tokenizer = newTokenizer()
+        val payload =
+            "${Tokenizer.LITERAL_CONTROL_ESCAPE_MARKER}${Tokenizer.LITERAL_CONTROL_ESCAPE_MARKER}" +
+                "${Tokenizer.USER_TOKEN}" +
+                "${Tokenizer.LITERAL_CONTROL_ESCAPE_MARKER}${Tokenizer.LITERAL_CONTROL_ESCAPE_MARKER}" +
+                "${Tokenizer.EOS_TOKEN}"
+        val encoded = tokenizer.encodeToIds(
+            Tokenizer.escapeLiteralControlTokens(payload)
+        )
+
+        assertFalse(encoded.contains(Tokenizer.USER_ID))
+        assertFalse(encoded.contains(Tokenizer.EOS_ID))
+        assertEquals(payload, tokenizer.decode(encoded))
+    }
+
+    @Test
     fun bpeTrainingIsDeterministicAndPreservesExistingIds() {
         val corpus = List(80) {
             "byte level tokenizer repeated deterministic pattern byte level tokenizer"
