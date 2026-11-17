@@ -34,12 +34,15 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.BufferedReader
 import java.io.Closeable
+import java.io.InputStreamReader
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.Reader
 import java.io.StringReader
+import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
@@ -719,21 +722,30 @@ class TrainingManager(
             if (closed) return Pair(0, totalCharsRead)
             if (totalCharsRead == 0L) return Pair(0, 0L)
 
-            val completeTranscript = readUtf16BeStagingFile(
+            val streamedJsonlChunks = processStagedJsonLinesIfValid(
                 file = stagingFile,
-                expectedCharacterCount = totalCharsRead.toInt()
-            )
-            if (completeTranscript.isBlank()) return Pair(0, totalCharsRead)
-
-            validateStreamedJsonValueSizes(completeTranscript)
-
-            val processedChunks = TextModalityProcessor.process(
-                rawText = completeTranscript,
                 documentTitle = title,
                 chunkSize = chunkSize,
-                overlap = overlap,
-                tokenizer = neuralEngine.tokenizer
+                overlap = overlap
             )
+            val processedChunks = streamedJsonlChunks ?: run {
+                // Single-object ChatML, legacy plain text and other formats retain
+                // their document-level parser semantics under the dynamic heap cap.
+                val completeTranscript = readUtf16BeStagingFile(
+                    file = stagingFile,
+                    expectedCharacterCount = totalCharsRead.toInt()
+                )
+                if (completeTranscript.isBlank()) return Pair(0, totalCharsRead)
+
+                validateStreamedJsonValueSizes(completeTranscript)
+                TextModalityProcessor.process(
+                    rawText = completeTranscript,
+                    documentTitle = title,
+                    chunkSize = chunkSize,
+                    overlap = overlap,
+                    tokenizer = neuralEngine.tokenizer
+                )
+            }
             val rawChunks = processedChunks.map(ProcessedChunk::content)
             val chunksPerEpoch = rawChunks.size
             if (chunksPerEpoch == 0) return Pair(0, totalCharsRead)
@@ -829,6 +841,61 @@ class TrainingManager(
                 Log.w(TAG, "Could not remove temporary streamed-ingestion file: ${stagingFile.name}")
             }
         }
+    }
+
+    /**
+     * Processes JSONL one complete record per line. A non-JSONL file returns null so the
+     * caller can use the document-level parser without committing partial results.
+     *
+     * The returned list is bounded by MAX_STREAMED_DOCUMENT_CHUNKS. Each JSONObject is
+     * parsed and released before the next source line is read; conversation objects stay
+     * atomic because TextModalityProcessor receives the full JSON object for each line.
+     */
+    private suspend fun processStagedJsonLinesIfValid(
+        file: File,
+        documentTitle: String,
+        chunkSize: Int,
+        overlap: Int
+    ): List<ProcessedChunk>? {
+        val processed = ArrayList<ProcessedChunk>()
+        var foundRecord = false
+
+        BufferedReader(
+            InputStreamReader(
+                FileInputStream(file),
+                StandardCharsets.UTF_16BE
+            )
+        ).use { reader ->
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val line = reader.readLine() ?: break
+                val record = line.removePrefix("\uFEFF").trim()
+                if (record.isEmpty()) continue
+                if (!record.startsWith('{')) return null
+
+                val isJsonObject = runCatching {
+                    org.json.JSONObject(record)
+                }.isSuccess
+                if (!isJsonObject) return null
+
+                foundRecord = true
+                val nextChunks = TextModalityProcessor.process(
+                    rawText = record,
+                    documentTitle = documentTitle,
+                    chunkSize = chunkSize,
+                    overlap = overlap,
+                    tokenizer = neuralEngine.tokenizer
+                )
+                val nextSize = Math.addExact(processed.size, nextChunks.size)
+                require(nextSize <= MAX_STREAMED_DOCUMENT_CHUNKS) {
+                    "JSONL document exceeds the safe limit of " +
+                        "$MAX_STREAMED_DOCUMENT_CHUNKS processed records."
+                }
+                processed.addAll(nextChunks)
+            }
+        }
+
+        return processed.takeIf { foundRecord }
     }
 
     /**
