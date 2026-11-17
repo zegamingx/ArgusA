@@ -146,7 +146,11 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - PDF extraction supports selectable text. Scanned/image-only PDFs are rejected; OCR is not included.
 - DOCX reads the Word document XML body. EPUB follows its package spine order.
 - Archive entry counts, per-entry expansion, total expansion, source file size, and extracted text length are bounded.
-- Import budgets are reduced using the device's available RAM and app heap. The active training queue still holds generated chunk records in app memory; ingestion is buffered, not a fully disk-backed queue.
+- Import budgets are reduced using the device's live app-heap headroom and a bounded queue-capacity estimate.
+- `Reader` ingestion stages UTF-16BE code units in a temporary cache file using fixed-size buffers. The file is removed after success, rejection, or coroutine cancellation.
+- JSONL is validated and processed one complete object per line, with per-record size and total generated-record limits. JSONL records are persisted only after the entire source has passed validation, so a malformed tail cannot leave a partially imported document.
+- Single-object ChatML/ShareGPT, reasoning, and legacy plain-text inputs retain document-level parsing semantics. Their in-memory parser path is still bounded by the live-heap limit; this is not a constant-memory parser for every format.
+- The active training queue still holds generated chunk records in app memory; the queue itself is not fully disk-backed.
 
 ### Persistent corpus
 
@@ -156,7 +160,10 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - Active queue rows are marked `TRAINING`; startup recovery returns interrupted rows to `QUEUED`. This is at-least-once recovery, so a chunk may be optimized again if the model checkpoint was saved but its completion status was not persisted before process death.
 - Retained documents can be replayed into the training queue without reopening the original file or fetching the article again.
 - Corpus status records whether training is ready, active, complete, or partial after a failed chunk.
-- Room schema version 2 adds corpus tables and an optional training-item document reference through an additive version 1 to 2 migration. Existing chat, memory, and training-queue rows are preserved; destructive migration fallback is not enabled. Legacy queue rows remain valid but are not retroactively grouped into corpus documents because their original document boundaries and fingerprints were not stored.
+- Room schema version 3 adds corpus tables and an optional training-item document reference through additive migrations 1 to 2 and 2 to 3. Existing chat, memory, queue rows, corpus documents, chunks, and source identities are preserved; destructive migration fallback is not enabled.
+- Version 3 adds nullable source-level license identity/name/URL, attribution, rights-evidence URL, user declaration text/timestamp, and reviewed timestamp. Historical rights claims without sufficient source evidence are conservatively migrated to `UNVERIFIED`; user-declared provenance is retained only when a prior explicit approval marker exists.
+- Aggregate document rights are recalculated from every retained source. A document is not treated as license-reviewed merely because a different source row declared permission.
+- Legacy queue rows remain valid but are not retroactively grouped into corpus documents because their original document boundaries and fingerprints were not stored.
 
 ## Argus-native architecture contract
 
