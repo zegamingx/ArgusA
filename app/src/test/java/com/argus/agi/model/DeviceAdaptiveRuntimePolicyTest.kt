@@ -11,7 +11,7 @@ class DeviceAdaptiveRuntimePolicyTest {
     @Test
     fun streamedDocumentImportLimitUsesLiveHeapAndHardMaximum() {
         assertEquals(
-            4_096,
+            2_048,
             DeviceAdaptiveRuntimePolicy.streamedDocumentCharacterLimit(
                 availableHeapBytes = 49_152L,
                 hardLimitCharacters = 2 * 1024 * 1024

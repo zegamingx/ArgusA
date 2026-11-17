@@ -870,6 +870,11 @@ class TrainingManager(
                 val record = line.removePrefix("\uFEFF").trim()
                 if (record.isEmpty()) continue
                 if (!record.startsWith('{')) return null
+                require(record.length <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
+                    "A streamed JSONL record exceeds " +
+                        "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
+                        "Split the record before importing it."
+                }
 
                 validateStreamedJsonValueSizes(record)
                 val isJsonObject = runCatching {

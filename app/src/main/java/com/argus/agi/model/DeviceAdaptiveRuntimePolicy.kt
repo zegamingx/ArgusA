@@ -17,7 +17,7 @@ internal object DeviceAdaptiveRuntimePolicy {
 
     private const val DEVICE_LOCAL_HEAP_FLAG = 0x1
     private const val MEBIBYTE = 1024L * 1024L
-    private const val STREAMED_INGESTION_BYTES_PER_CHARACTER = 12L
+    private const val STREAMED_INGESTION_BYTES_PER_CHARACTER = 24L
 
     internal data class TensorArenaBudget(
         val totalBytes: Long,
