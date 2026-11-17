@@ -10,6 +10,7 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -131,7 +132,7 @@ class TrainingManagerPersistenceTest {
             )
 
             assertTrue(repository.markTrainingCompleted(item.id, 0.25f, 75L))
-            assertTrue(!repository.markTrainingCompleted(item.id, 0.25f, 75L))
+            assertFalse(repository.markTrainingCompleted(item.id, 0.25f, 75L))
 
             val persisted = requireNotNull(repository.getTrainingItem(item.id))
             assertEquals(TrainingStatus.COMPLETED, persisted.status)
