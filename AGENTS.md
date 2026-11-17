@@ -18,7 +18,7 @@ All agents MUST follow these principles:
 4. Prefer current stable APIs and features officially supported by the pinned toolchain.
 5. Never replace a genuine implementation with a mock, placeholder, simulation, or hardcoded success result.
 6. Never silently remove functionality to resolve compilation errors.
-7. Never sacrifice model integrity, checkpoint compatibility, or user learning data to simplify implementation.
+7. Never sacrifice model integrity or user-owned learning data. Apply checkpoint compatibility to published production formats; follow the explicit pre-release clean-break policy in Section 8 when the project owner authorizes a foundational reset.
 8. Fix root causes instead of hiding symptoms.
 9. Implement changes completely before initiating the final verification pipeline.
 10. Never claim that an implementation works without appropriate test evidence.
@@ -395,7 +395,7 @@ Architecture changes must be evidence-driven.
 
 Do not silently change model dimensions, vocabulary, tokenizer, context length, or training semantics to make an operation fit.
 
-All architecture changes must preserve checkpoint compatibility or provide an explicit migration strategy.
+For published production checkpoint formats, preserve compatibility or implement an explicit migration/new-model strategy. During pre-release development, the project owner may explicitly authorize a clean break: obsolete internal checkpoint/tokenizer formats then require no compatibility reader or migration. Recreate the model, vocabulary, embeddings, and optimizer state as one consistent new model lineage. Preserve imported datasets, corpora, user-created content, and unrelated local data. Once a model/checkpoint format is declared production-supported, its compatibility guarantees apply.
 
 5.6 Training Correctness
 
@@ -629,25 +629,34 @@ A successful JNI function must represent a genuinely completed operation, not me
 
 8. Model, Optimizer, and Checkpoint Integrity
 
-This section is mandatory.
+This section is mandatory. Distinguish disposable pre-release development artifacts from published production models and user-owned learning data.
 
-No implementation may compromise existing learning state.
+8.0 Release Maturity and Clean-Break Policy
+
+Argus is currently pre-release and has no production users or production model/checkpoint format. When the project owner explicitly authorizes a foundational clean break:
+
+- Do not retain obsolete tokenizer algorithms or legacy checkpoint readers solely for backward compatibility.
+- Use one canonical tokenizer/runtime contract and one new checkpoint/snapshot format for the new model lineage.
+- Initialize model weights, token embeddings/output head, optimizer moments, and all dependent state consistently for the new tokenizer. Do not reuse tensors whose token-ID semantics have changed.
+- Old pre-release model checkpoints are disposable and need not be migrated or restored. Detect unsupported old formats safely; never parse them using the new layout.
+- Keep the new checkpoint writes atomic, integrity-checked, and fingerprint-bound even though old-format compatibility is not required.
+- Preserve imported datasets, corpora, user-created content, settings, and unrelated local files. A model/checkpoint reset does not authorize deleting training data.
+- Restrict any cleanup to explicitly identified Argus model-state files; never perform a broad storage wipe.
+
+This clean-break exception applies only to owner-authorized pre-release development. Once a checkpoint/tokenizer format is published or designated production-supported, preserve that format's guarantees or use an explicit migration/new-model strategy. Never silently discard production or user-owned learning state.
 
 8.1 Checkpoint Preservation
 
 Never automatically:
 
-- Delete old checkpoints.
-- Reset model weights.
-- Reset optimizer moments.
-- Reset training progress.
-- Replace an existing trained model with random initialization.
-- Delete tokenizer state.
-- Delete training metadata.
-- Erase local learning data.
-- Overwrite the last valid checkpoint with an unverified checkpoint.
+- Delete a supported production checkpoint.
+- Reset a production model's weights, optimizer moments, or training progress.
+- Replace an existing production model with random initialization.
+- Delete tokenizer state or training metadata belonging to a supported model lineage.
+- Erase imported datasets, corpora, user-created content, or local learning data.
+- Overwrite the active checkpoint with an unverified or partially written checkpoint.
 
-Any cleanup operation affecting model or training data requires explicit authorization.
+The prohibitions above do not block an explicitly authorized pre-release clean break under Section 8.0. Any cleanup operation affecting model state or training data must be narrowly scoped; deleting datasets or user-owned content always requires separate explicit authorization.
 
 8.2 Backend Independence
 
@@ -720,7 +729,7 @@ Unsupported checkpoint formats must fail safely.
 
 Do not silently load incompatible tensors.
 
-Provide explicit migration logic when an architecture or serialization format changes.
+Provide explicit migration logic for published, production-supported formats when migration is required. A project-owner-authorized pre-release clean break may introduce a new canonical format without a legacy reader or migration path.
 
 8.6 Recovery
 
@@ -732,7 +741,7 @@ When a checkpoint is corrupted:
 - Recover from a verified valid state.
 - Report the amount of training progress lost, if any.
 
-Never reset the entire model because one checkpoint cannot be loaded.
+Never silently reset a supported production model because a checkpoint cannot be loaded; use the defined recovery path. An unsupported pre-release checkpoint may be rejected and replaced by a fresh model only under the explicit clean-break policy in Section 8.0.
 
 ---
 
@@ -761,22 +770,27 @@ Do not silently discard invalid records without reporting their count and reason
 
 9.2 Tokenizer Integrity
 
-The tokenizer is part of the model's identity.
+The tokenizer is part of the model's identity. Argus's new pre-release baseline is one canonical byte-level BPE implementation: BYTE_LEVEL_BPE_V1. Do not carry GREEDY_LONGEST_MATCH_V1 or LEARNED_BPE_V1 forward as active training/inference algorithms.
 
-Preserve:
+The new token-ID layout reserves:
 
-- Tokenizer configuration.
-- Vocabulary.
-- Special token definitions.
-- Token IDs.
-- Vocabulary fingerprint.
-- Tokenizer format version.
+- IDs 0–31 for canonical special/control tokens, including conversation, FIM, tool-call/result, web, image, and audio markers.
+- IDs 32–287 for the 256 byte-alphabet entries.
+- IDs 288 and above for learned BPE merge vocabulary entries.
 
-Never silently replace or regenerate a tokenizer for an existing trained checkpoint.
+Define the exact special-token-to-ID manifest once and test it as a stable contract. Never allow training merges to create a reserved control token. Existing IDs must remain stable within a model/tokenizer lineage.
 
-Changing a tokenizer may invalidate existing token embeddings and training state.
+The canonical runtime contract must also require:
 
-An incompatible tokenizer must require an explicit migration or new model strategy.
+- One shared left-to-right special-token parser for training, encoding, and decoding, with symmetric literal escaping/restoration (including U+E000 and literal control-token text).
+- Inference encoding of malformed UTF-16 to replace orphan surrogates with U+FFFD; strict rejection may remain at dataset-ingestion/validation boundaries.
+- Deterministic hard-coded ASCII pre-token classes, not runtime-dependent Character.isLetter classification.
+- Prefix whitespace attached to the following word where possible, separate punctuation, and per-digit numeric pre-tokens; preserve leading/trailing/repeated whitespace losslessly.
+- A bounded pre-token cache and identical pre-tokenization rules in training and inference.
+- An immutable inference snapshot after training, with atomically published state rather than a global synchronized encode/train bottleneck.
+- IntArray-oriented hot-path APIs to avoid boxed List<Int> allocation.
+
+For the authorized pre-release clean break in Section 8.0, no compatibility with previous internal tokenizer IDs, embeddings, snapshots, or checkpoints is required. Build new model tensors against the new ID manifest. Once this format is production-supported, preserve IDs within that model lineage and do not silently regenerate its tokenizer.
 
 9.3 Dataset Provenance
 
@@ -1326,7 +1340,7 @@ Requirements:
 
 - Maintain architecture boundaries.
 - Preserve existing behavior unless intentionally changed.
-- Preserve checkpoint compatibility.
+- Preserve compatibility for published production checkpoint formats; apply Section 8.0 for explicitly authorized pre-release clean breaks.
 - Add regression tests.
 - Update documentation when architecture changes.
 - Avoid unrelated refactoring.
@@ -1391,7 +1405,7 @@ The following actions are prohibited:
 - Removing tests to make CI pass.
 - Disabling lint checks to hide defects.
 - Suppressing compiler warnings indiscriminately.
-- Deleting checkpoints to fix restoration errors.
+- Deleting or resetting supported production checkpoints/models to hide restoration errors. Explicitly authorized pre-release clean breaks under Section 8.0 are not prohibited.
 - Resetting trained model weights during backend migration.
 - Silently changing tokenizer vocabulary.
 - Removing optimizer state.
@@ -1431,11 +1445,10 @@ Functional Correctness
 
 Model Integrity
 
-- Existing checkpoints remain intact.
-- Model weights are preserved.
-- Optimizer state is preserved.
-- Training progress is preserved.
-- Tokenizer compatibility is maintained.
+- Published production checkpoints and user-owned learning state remain intact.
+- Explicitly authorized pre-release clean breaks create a fresh, internally consistent model/tokenizer/embedding/optimizer lineage without legacy migration code.
+- Imported datasets, corpora, user-created content, and unrelated local data are preserved during model resets.
+- Tokenizer IDs and fingerprints remain stable within each supported model lineage.
 - Backend switching does not reset learning state.
 
 Vulkan Correctness
@@ -1485,7 +1498,7 @@ Its long-term objective is a fully local AI system that can:
 8. Preserve all model and optimizer state.
 9. Save and restore checkpoints safely.
 10. Continue learning after application restarts.
-11. Maintain tokenizer and dataset compatibility.
+11. Maintain tokenizer identity within a model lineage and preserve dataset provenance/data; do not require compatibility with superseded pre-release tokenizer or checkpoint formats.
 12. Develop its knowledge through local learning.
 13. Operate without mandatory external training infrastructure.
 14. Preserve user-owned learning data across software updates.
