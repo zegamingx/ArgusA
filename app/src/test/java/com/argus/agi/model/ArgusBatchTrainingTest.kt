@@ -35,7 +35,7 @@ class ArgusBatchTrainingTest {
                     layerCount = 1,
                     tokenizerConfig = TokenizerConfig(
                         maxVocabularySize = 512,
-                        maxTokenLength = 16
+                        maxTokenLength = 32
                     ),
                     trainingBatchSize = 2
                 )
@@ -77,7 +77,7 @@ class ArgusBatchTrainingTest {
                     layerCount = 1,
                     tokenizerConfig = TokenizerConfig(
                         maxVocabularySize = 512,
-                        maxTokenLength = 16
+                        maxTokenLength = 32
                     ),
                     trainingBatchSize = 1,
                     gradientAccumulationEnabled = false
@@ -125,7 +125,7 @@ class ArgusBatchTrainingTest {
                     layerCount = 1,
                     tokenizerConfig = TokenizerConfig(
                         maxVocabularySize = 512,
-                        maxTokenLength = 16
+                        maxTokenLength = 32
                     ),
                     trainingBatchSize = 1
                 )

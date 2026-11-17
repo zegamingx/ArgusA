@@ -57,10 +57,11 @@ class TokenizerByteLevelBpeTest {
 
         for (byteValue in 0..255) {
             val id = 32 + byteValue
-            val symbol = byId[id]
-            assertTrue("Missing byte token $byteValue at ID $id.", symbol != null)
-            assertEquals(1, symbol?.length)
-            assertEquals(byteValue, symbol?.first()?.code)
+            val symbol = requireNotNull(byId[id]) {
+                "Missing byte token $byteValue at ID $id."
+            }
+            assertEquals(1, symbol.length)
+            assertEquals(byteValue, symbol.first().code)
         }
     }
 

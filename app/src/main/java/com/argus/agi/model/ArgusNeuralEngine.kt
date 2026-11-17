@@ -513,6 +513,7 @@ class ArgusNeuralEngine private constructor(
         private const val ARG5_HEADER_SIZE = 96
         private const val ARG5_CHECKPOINT_VERSION = 5
         private const val ARG5_CHECKSUM_OFFSET = 88
+        private const val TOKENIZER_FINGERPRINT_BYTES = 32
         private const val FLOAT32_TENSOR_TYPE = 1
         private const val TENSOR_WRITE_BUFFER_BYTES = 64 * 1024
         private const val CHECKPOINT_INTERVAL = 8
@@ -705,8 +706,15 @@ class ArgusNeuralEngine private constructor(
             require(tensorCount in 1..2048) {
                 "ARG5 tensor count is invalid: $tensorCount."
             }
-            require(payloadBytes >= architectureIdLength.toLong()) {
-                "ARG5 payload length is invalid."
+            val minimumPayloadBytes = Math.addExact(
+                architectureIdLength.toLong(),
+                TOKENIZER_FINGERPRINT_BYTES.toLong()
+            )
+            require(payloadBytes >= minimumPayloadBytes) {
+                "ARG5 payload length cannot contain its architecture ID and tokenizer fingerprint."
+            }
+            require(savedVocabSize == vocabularyEntryCount) {
+                "ARG5 vocabulary size does not match its entry count."
             }
             require(flags == 0) {
                 "ARG5 checkpoint uses unsupported architecture flags."
@@ -938,13 +946,13 @@ class ArgusNeuralEngine private constructor(
             val formattedPrompt = formatGenerationPrompt(prompt, reasoningMode)
 
             // PENTING: autoRegister = false saat inference agar kamus token stabil
-            val rawTokens = tokenizer.encode(formattedPrompt, autoRegister = false)
+            val rawTokens = tokenizer.encodeToIds(formattedPrompt, autoRegister = false)
             generationContext.ensureActive()
             if (rawTokens.isEmpty()) return@withContext "Input kosong."
 
             val currentVocab = tokenizer.vocabSize
             val maxPromptLen = maxSeqLen - 1
-            val effective = if (rawTokens.size > maxPromptLen) rawTokens.takeLast(maxPromptLen)
+            val effective = if (rawTokens.size > maxPromptLen) rawTokens.copyOfRange(rawTokens.size - maxPromptLen, rawTokens.size)
             else rawTokens
             val currentTokens = effective.toMutableList()
             val generatedTokens = mutableListOf<Int>()
@@ -1166,7 +1174,7 @@ class ArgusNeuralEngine private constructor(
      * No parameters, optimizer state, tokenizer vocabulary, or checkpoint files are changed.
      */
     fun evaluateLossWithTargetCount(text: String): LossEvaluation = synchronized(modelLock) {
-        val tokens = tokenizer.encode(text, autoRegister = false)
+        val tokens = tokenizer.encodeToIds(text, autoRegister = false)
         if (tokens.size < 2 || tokenizer.vocabSize > vocabCap) {
             return@synchronized LossEvaluation(Float.NaN, 0, 0)
         }
@@ -1193,7 +1201,7 @@ class ArgusNeuralEngine private constructor(
 
         while (start < tokens.size - 1) {
             val end = min(start + maxSeqLen, tokens.size)
-            val windowTokens = tokens.subList(start, end)
+            val windowTokens = tokens.copyOfRange(start, end)
             if (windowTokens.size >= 2) {
                 val firstTargetIndex = if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
                 val targetCount = (windowTokens.size - 1 - firstTargetIndex).coerceAtLeast(0)
@@ -1273,7 +1281,7 @@ class ArgusNeuralEngine private constructor(
         require(epsilon.isFinite() && epsilon > 0f) {
             "Finite-difference epsilon must be finite and positive."
         }
-        val tokens = tokenizer.encode(text, autoRegister = false)
+        val tokens = tokenizer.encodeToIds(text, autoRegister = false)
         require(tokens.size in 2..maxSeqLen) {
             "Gradient checking requires 2..${maxSeqLen} encoded tokens; got ${tokens.size}."
         }
@@ -1418,7 +1426,7 @@ class ArgusNeuralEngine private constructor(
 
             try {
                 for (text in texts) {
-                    val tokens = tokenizer.encode(text, autoRegister = false)
+                    val tokens = tokenizer.encodeToIds(text, autoRegister = false)
                     if (tokens.size < 2) {
                         sampleResults += NeuralTrainingStepResult(
                             loss = Float.NaN,
@@ -1456,7 +1464,7 @@ class ArgusNeuralEngine private constructor(
                         var start = 0
                         while (start < tokens.size - 1) {
                             val end = min(start + runtimeContextLength, tokens.size)
-                            val windowSequence = tokens.subList(start, end)
+                            val windowSequence = tokens.copyOfRange(start, end)
                             if (windowSequence.size >= 2) {
                                 val firstTargetIndex =
                                     if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
@@ -1566,7 +1574,7 @@ class ArgusNeuralEngine private constructor(
         var shouldSaveCheckpoint = false
         val result = synchronized(modelLock) {
             val initialAdamStep = adamStep
-            val tokens = tokenizer.encode(text, autoRegister = false)
+            val tokens = tokenizer.encodeToIds(text, autoRegister = false)
             if (tokens.size < 2) {
                 return@synchronized NeuralTrainingBatchResult(
                     samples = listOf(
@@ -1605,7 +1613,7 @@ class ArgusNeuralEngine private constructor(
                 var start = 0
                 while (start < tokens.size - 1) {
                     val end = min(start + runtimeContextLength, tokens.size)
-                    val windowSequence = tokens.subList(start, end)
+                    val windowSequence = tokens.copyOfRange(start, end)
                     if (windowSequence.size >= 2) {
                         val firstTargetIndex =
                             if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
@@ -1658,7 +1666,7 @@ class ArgusNeuralEngine private constructor(
 
     private fun computeCrossEntropyLoss(
         logits: Array<FloatArray>,
-        sequence: List<Int>,
+        sequence: IntArray,
         currentVocab: Int,
         firstTargetIndex: Int
     ): Float {
@@ -1700,7 +1708,7 @@ class ArgusNeuralEngine private constructor(
     }
 
     private fun trainSingleWindow(
-        seq: List<Int>,
+        seq: IntArray,
         currentVocab: Int,
         updateParameters: Boolean = true,
         firstTargetIndex: Int = 0,
@@ -3889,10 +3897,10 @@ class ArgusNeuralEngine private constructor(
     }
 
     private fun tokenizerFingerprintBytes(hexFingerprint: String): ByteArray {
-        require(hexFingerprint.length == 64) {
+        require(hexFingerprint.length == TOKENIZER_FINGERPRINT_BYTES * 2) {
             "Tokenizer fingerprint must contain exactly 32 SHA-256 bytes."
         }
-        return ByteArray(32) { index ->
+        return ByteArray(TOKENIZER_FINGERPRINT_BYTES) { index ->
             val start = index * 2
             hexFingerprint.substring(start, start + 2).toInt(16).toByte()
         }
@@ -4287,7 +4295,7 @@ class ArgusNeuralEngine private constructor(
                 require(savedArchitectureId == architectureConfig.architectureId) {
                     "ARG5 architecture ID mismatch."
                 }
-                val savedTokenizerFingerprint = input.readFully(32)
+                val savedTokenizerFingerprint = input.readFully(TOKENIZER_FINGERPRINT_BYTES)
 
                 var measuredPayloadBytes = Math.addExact(
                     architectureIdLength.toLong(),

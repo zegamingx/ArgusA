@@ -895,8 +895,8 @@ object TextModalityProcessor {
             val header = "${Tokenizer.USER_TOKEN} Tanya:$safeQuestion\n" +
                 "${Tokenizer.ASSISTANT_TOKEN} Jawab:"
             val framedAnswer = header + safeAnswer + " " + Tokenizer.EOS_TOKEN
-            val framedTokenCount = tokenizer.encode(framedAnswer, autoRegister = false).size
-            val headerTokenCount = tokenizer.encode(
+            val framedTokenCount = tokenizer.encodeToIds(framedAnswer, autoRegister = false).size
+            val headerTokenCount = tokenizer.encodeToIds(
                 header + " " + Tokenizer.EOS_TOKEN,
                 autoRegister = false
             ).size
@@ -1137,7 +1137,7 @@ object TextModalityProcessor {
         chunkSize: Int,
         tokenizer: Tokenizer
     ): List<String> {
-        if (tokenizer.encode(text, autoRegister = false).size <= chunkSize) {
+        if (tokenizer.encodeToIds(text, autoRegister = false).size <= chunkSize) {
             return listOf(text)
         }
         val chunks = mutableListOf<String>()
@@ -1155,7 +1155,7 @@ object TextModalityProcessor {
             val candidate = current.toString() + record
             if (
                 current.isNotEmpty() &&
-                tokenizer.encode(candidate, autoRegister = false).size > chunkSize
+                tokenizer.encodeToIds(candidate, autoRegister = false).size > chunkSize
             ) {
                 flush()
             }
@@ -1243,7 +1243,7 @@ object TextModalityProcessor {
         tokenizer: Tokenizer,
         quoteAware: Boolean = false
     ): List<String> {
-        if (tokenizer.encode(text, autoRegister = false).size <= chunkSize) {
+        if (tokenizer.encodeToIds(text, autoRegister = false).size <= chunkSize) {
             return listOf(text)
         }
 
@@ -1264,7 +1264,7 @@ object TextModalityProcessor {
                 val bestPunct = maxOf(lastDoubleNl, lastNl, lastDot, lastQm, lastEm)
                 var candidateEnd = if (bestPunct >= 0) start + bestPunct + 1 else start
                 var candidateTokenCount = if (candidateEnd > start) {
-                    tokenizer.encode(
+                    tokenizer.encodeToIds(
                         text.substring(start, candidateEnd),
                         autoRegister = false
                     ).size
@@ -1276,7 +1276,7 @@ object TextModalityProcessor {
                     val lastSpace = window.lastIndexOf(' ')
                     candidateEnd = if (lastSpace >= 0) start + lastSpace + 1 else start
                     candidateTokenCount = if (candidateEnd > start) {
-                        tokenizer.encode(
+                        tokenizer.encodeToIds(
                             text.substring(start, candidateEnd),
                             autoRegister = false
                         ).size
@@ -1297,7 +1297,7 @@ object TextModalityProcessor {
                                     preferAfter = true
                                 )
                                 if (
-                                    tokenizer.encode(
+                                    tokenizer.encodeToIds(
                                         text.substring(start, quotedEnd),
                                         autoRegister = false
                                     ).size <= chunkSize
@@ -1343,7 +1343,7 @@ object TextModalityProcessor {
         )
 
         while (candidate > accepted) {
-            val count = tokenizer.encode(
+            val count = tokenizer.encodeToIds(
                 text.substring(start, candidate),
                 autoRegister = false
             ).size
@@ -1367,7 +1367,7 @@ object TextModalityProcessor {
             val midpoint = low + (high - low) / 2
             val alignedMidpoint = alignUtf16Boundary(text, midpoint, preferAfter = true)
             if (alignedMidpoint <= low || alignedMidpoint >= high) break
-            val count = tokenizer.encode(
+            val count = tokenizer.encodeToIds(
                 text.substring(start, alignedMidpoint),
                 autoRegister = false
             ).size
@@ -1377,14 +1377,14 @@ object TextModalityProcessor {
         var end = low
         while (
             end > start &&
-            tokenizer.encode(text.substring(start, end), autoRegister = false).size > tokenBudget
+            tokenizer.encodeToIds(text.substring(start, end), autoRegister = false).size > tokenBudget
         ) {
             end = previousCodePointBoundary(text, end)
         }
         while (end < text.length) {
             val next = nextCodePointBoundary(text, end)
             if (
-                tokenizer.encode(text.substring(start, next), autoRegister = false).size > tokenBudget
+                tokenizer.encodeToIds(text.substring(start, next), autoRegister = false).size > tokenBudget
             ) break
             end = next
         }
@@ -1406,7 +1406,7 @@ object TextModalityProcessor {
             val midpoint = low + (high - low) / 2
             val alignedMidpoint = alignUtf16Boundary(text, midpoint, preferAfter = true)
             if (alignedMidpoint <= low || alignedMidpoint >= high) break
-            val count = tokenizer.encode(
+            val count = tokenizer.encodeToIds(
                 text.substring(alignedMidpoint, chunkEnd),
                 autoRegister = false
             ).size
@@ -1415,7 +1415,7 @@ object TextModalityProcessor {
 
         while (
             high < chunkEnd &&
-            tokenizer.encode(text.substring(high, chunkEnd), autoRegister = false).size > overlapTokens
+            tokenizer.encodeToIds(text.substring(high, chunkEnd), autoRegister = false).size > overlapTokens
         ) {
             high = nextCodePointBoundary(text, high)
         }

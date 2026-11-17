@@ -258,7 +258,7 @@ class TextModalityPreservationTest {
                 TokenizerConfig(
                     algorithm = algorithm,
                     maxVocabularySize = 512,
-                    maxTokenLength = 16
+                    maxTokenLength = 32
                 )
             )
             val escaped = Tokenizer.escapeLiteralControlTokens(payload)

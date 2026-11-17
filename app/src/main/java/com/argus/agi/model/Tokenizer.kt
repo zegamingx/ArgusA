@@ -208,7 +208,6 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             while (index < text.length) {
                 if (text[index] == LITERAL_CONTROL_ESCAPE_MARKER) {
                     escaped.append(LITERAL_CONTROL_ESCAPE_MARKER)
-                        .append(LITERAL_CONTROL_ESCAPE_MARKER)
                     index++
                     continue
                 }
@@ -739,9 +738,10 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
     /**
      * The one scanner used by training, inference, and payload escaping.
-     * A doubled U+E000 is a literal marker; when followed by a control spelling,
-     * the pair also protects that spelling from being interpreted as a control ID.
-     * A single literal U+E000 never suppresses a following real control token.
+     * U+E000 is ordinary payload unless a doubled marker is immediately followed
+     * by a reserved control spelling. That exact three-part sequence escapes the
+     * control spelling. Marker runs without a following control spelling are emitted
+     * one character at a time, preserving arbitrary literal marker sequences.
      */
     private fun scanSpecialAwareText(
         text: String,
@@ -769,7 +769,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                         index += 2 + escapedSpecial.length
                     } else {
                         plain.append(LITERAL_CONTROL_ESCAPE_MARKER)
-                        index += 2
+                        index++
                     }
                 } else {
                     plain.append(LITERAL_CONTROL_ESCAPE_MARKER)

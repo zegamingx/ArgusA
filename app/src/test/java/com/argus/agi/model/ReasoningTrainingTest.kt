@@ -49,7 +49,7 @@ class ReasoningTrainingTest {
         assertTrue(formatted.endsWith(Tokenizer.EOS_TOKEN))
 
         val tokenizer = Tokenizer(
-            TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 16)
+            TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32)
         )
         val ids = tokenizer.encode(formatted, autoRegister = false)
         assertTrue(ids.contains(Tokenizer.THINK_START_ID))
@@ -271,7 +271,7 @@ class ReasoningTrainingTest {
                     layerCount = 1,
                     tokenizerConfig = TokenizerConfig(
                         maxVocabularySize = 512,
-                        maxTokenLength = 16
+                        maxTokenLength = 32
                     )
                 )
             )
