@@ -67,6 +67,7 @@ com.argus.agi/
 
   runtime/
     AdaptiveRuntimePlanner
+    AdaptiveComputePerformanceMonitor
     RuntimeConfiguration
     RuntimeReadiness
     ComputeBackendSelector
@@ -144,6 +145,8 @@ app/src/main/cpp/
 ```
 
 Kernel families describe implementation capabilities, not vendor names. A Mali-specific or Adreno-specific workaround belongs in a narrowly scoped quirk/capability rule only when a reproducible driver issue requires it. Do not fork the model or optimizer by vendor.
+
+The passive `AdaptiveComputePerformanceMonitor` now lives in the `runtime/` package. Its CPU/GPU timing samples are diagnostic only and are not allowed to participate in backend selection.
 
 ## 5. Component contracts
 

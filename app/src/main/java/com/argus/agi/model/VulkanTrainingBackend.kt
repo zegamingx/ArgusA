@@ -1,5 +1,8 @@
 package com.argus.agi.model
 
+import com.argus.agi.runtime.AdaptiveComputeOperation
+import com.argus.agi.runtime.AdaptiveComputePerformanceMonitor
+
 import android.util.Log
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
