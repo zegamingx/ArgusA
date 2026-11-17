@@ -109,6 +109,37 @@ class TrainingManagerPersistenceTest {
         }
     }
 
+    @Test
+    fun committedItemCanOnlyBeCompletedOnce() = runBlocking {
+        withTrainingManager { _, repository, manager ->
+            manager.pauseTraining()
+            val item = TrainingData(
+                source = "persistence-test",
+                title = "Single completion claim",
+                content = "A committed row must only transition to completed once.",
+                status = TrainingStatus.TRAINING
+            )
+            repository.saveTrainingItem(item)
+            repository.markTrainingItemsOptimizerCommitted(
+                listOf(
+                    item.copy(
+                        status = TrainingStatus.OPTIMIZER_COMMITTED,
+                        finalLoss = 0.25f,
+                        stepDurationMs = 75L
+                    )
+                )
+            )
+
+            assertTrue(repository.markTrainingCompleted(item.id, 0.25f, 75L))
+            assertTrue(!repository.markTrainingCompleted(item.id, 0.25f, 75L))
+
+            val persisted = requireNotNull(repository.getTrainingItem(item.id))
+            assertEquals(TrainingStatus.COMPLETED, persisted.status)
+            assertEquals(0.25f, requireNotNull(persisted.finalLoss), 0f)
+            assertEquals(75L, persisted.stepDurationMs)
+        }
+    }
+
     private suspend fun awaitPersistence(manager: TrainingManager) {
         withTimeout(5_000L) {
             manager.awaitQueuePersistenceIdle()
