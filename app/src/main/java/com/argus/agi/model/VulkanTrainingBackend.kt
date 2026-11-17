@@ -5267,8 +5267,6 @@ internal object VulkanTrainingBackend {
             totalGradientBytes > Int.MAX_VALUE.toLong()) {
             return false
         }
-        val gpuStartNanos = System.nanoTime()
-
         // Active FP32 moments and their candidate replacements must both fit in
         // the optimizer-state reservation during the atomic swap window.
         val optimizerBudget = _optimizerStateResidencyBudgetBytes.value.coerceAtLeast(0L)
@@ -5569,11 +5567,6 @@ internal object VulkanTrainingBackend {
             optimizerStateMirrorReliable = false
 
             _currentBackend = "Vulkan Compute (Resident FP16 AdamW)"
-            AdaptiveComputeDispatchPolicy.recordGpu(
-                AdaptiveComputeOperation.ADAMW,
-                totalActiveElements,
-                System.nanoTime() - gpuStartNanos
-            )
             runCatching { refreshGpuPerformanceMetrics() }
             return true
         } catch (error: OutOfMemoryError) {
@@ -5709,6 +5702,8 @@ internal object VulkanTrainingBackend {
             "AdamW gradient clipping factor must be in [0, 1]."
         }
 
+        val adaptiveOperationCount = gradients.sumOf { gradient -> gradient.size.toLong() }
+        val adaptiveTimingStartNanos = System.nanoTime()
         if (tryApplyResidentFp16AdamWUpdate(
                 parameters = parameters,
                 gradients = gradients,
@@ -5725,6 +5720,11 @@ internal object VulkanTrainingBackend {
                 residentGradient = residentGradient
             )
         ) {
+            AdaptiveComputeDispatchPolicy.recordGpu(
+                AdaptiveComputeOperation.ADAMW,
+                adaptiveOperationCount,
+                System.nanoTime() - adaptiveTimingStartNanos
+            )
             return true
         }
 
@@ -5846,7 +5846,8 @@ internal object VulkanTrainingBackend {
                 biasCorrection1 = biasCorrection1,
                 biasCorrection2 = biasCorrection2,
                 epsilon = epsilon,
-                gradientClipFactor = gradientClipFactor
+                gradientClipFactor = gradientClipFactor,
+                recordAdaptiveTiming = false
             )
             if (!updated) return false
 
@@ -5884,6 +5885,11 @@ internal object VulkanTrainingBackend {
                     )
                 }
             }
+            AdaptiveComputeDispatchPolicy.recordGpu(
+                AdaptiveComputeOperation.ADAMW,
+                adaptiveOperationCount,
+                System.nanoTime() - adaptiveTimingStartNanos
+            )
             true
         } catch (error: OutOfMemoryError) {
             Log.w(TAG, "Not enough heap memory to stage FP16 parameters for Vulkan AdamW; retaining CPU fallback.", error)
@@ -5907,7 +5913,8 @@ internal object VulkanTrainingBackend {
         biasCorrection1: Float,
         biasCorrection2: Float,
         epsilon: Float,
-        gradientClipFactor: Float
+        gradientClipFactor: Float,
+        recordAdaptiveTiming: Boolean = true
     ): Boolean {
         require(parameters.isNotEmpty()) { "AdamW requires at least one parameter group." }
         require(parameters.size == gradients.size) {
@@ -5975,11 +5982,13 @@ internal object VulkanTrainingBackend {
         }
 
         if (updated) {
-            AdaptiveComputeDispatchPolicy.recordGpu(
-                AdaptiveComputeOperation.ADAMW,
-                totalElements,
-                System.nanoTime() - gpuStartNanos
-            )
+            if (recordAdaptiveTiming) {
+                AdaptiveComputeDispatchPolicy.recordGpu(
+                    AdaptiveComputeOperation.ADAMW,
+                    totalElements,
+                    System.nanoTime() - gpuStartNanos
+                )
+            }
             refreshGpuPerformanceMetrics()
             _currentBackend = "Vulkan Compute (AdamW)"
             return true
