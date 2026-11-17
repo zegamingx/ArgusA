@@ -2932,6 +2932,30 @@ uint16_t floatToHalf(float value) {
     );
 }
 
+class ScopedJniLocalFrame final {
+public:
+    ScopedJniLocalFrame(JNIEnv* env, jint capacity) noexcept
+        : env_(env),
+          active_(env_ != nullptr && env_->PushLocalFrame(capacity) == JNI_OK) {}
+
+    ~ScopedJniLocalFrame() noexcept {
+        if (active_) {
+            env_->PopLocalFrame(nullptr);
+        }
+    }
+
+    ScopedJniLocalFrame(const ScopedJniLocalFrame&) = delete;
+    ScopedJniLocalFrame& operator=(const ScopedJniLocalFrame&) = delete;
+
+    bool isActive() const noexcept {
+        return active_;
+    }
+
+private:
+    JNIEnv* env_;
+    bool active_;
+};
+
 void releaseGroupReferences(JNIEnv* env, std::vector<GroupArrays>& groups) {
     for (GroupArrays& group : groups) {
         if (group.parameters != nullptr) {
@@ -2999,7 +3023,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
 
-    if (gRuntime.device == VK_NULL_HANDLE ||
+    if (env == nullptr ||
+        gRuntime.device == VK_NULL_HANDLE ||
         parameterGroups == nullptr ||
         gradientGroups == nullptr ||
         firstMomentGroups == nullptr ||
@@ -3014,6 +3039,27 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         env->GetArrayLength(firstMomentGroups) != groupCount ||
         env->GetArrayLength(secondMomentGroups) != groupCount ||
         env->GetArrayLength(weightDecayByGroup) != groupCount) {
+        return JNI_FALSE;
+    }
+
+    constexpr size_t kLocalReferencesPerGroup = 4u;
+    constexpr size_t kAdditionalLocalReferences = 8u;
+    const size_t maximumLocalFrameCapacity =
+        static_cast<size_t>(std::numeric_limits<jint>::max());
+    const size_t groupCountSize = static_cast<size_t>(groupCount);
+    if (maximumLocalFrameCapacity < kAdditionalLocalReferences ||
+        groupCountSize >
+            (maximumLocalFrameCapacity - kAdditionalLocalReferences) /
+                kLocalReferencesPerGroup) {
+        logError("Vulkan AdamW group count exceeds the JNI local-frame capacity.");
+        return JNI_FALSE;
+    }
+
+    const size_t localFrameCapacity =
+        groupCountSize * kLocalReferencesPerGroup + kAdditionalLocalReferences;
+    ScopedJniLocalFrame localFrame(env, static_cast<jint>(localFrameCapacity));
+    if (!localFrame.isActive()) {
+        logError("Unable to reserve JNI local references for Vulkan AdamW groups.");
         return JNI_FALSE;
     }
 
@@ -3154,22 +3200,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
     const size_t maxPageElements =
         static_cast<size_t>(maxPageElementsDevice);
 
-    // Keep the transaction atomic with respect to model state. GPU work is
-    // performed one storage-buffer page at a time, but no Java tensor is
-    // changed until every page has completed and every result is finite.
-    std::vector<float> stagedParameters;
-    std::vector<float> stagedFirstMoments;
-    std::vector<float> stagedSecondMoments;
-    try {
-        stagedParameters.resize(totalElements);
-        stagedFirstMoments.resize(totalElements);
-        stagedSecondMoments.resize(totalElements);
-    } catch (const std::bad_alloc&) {
-        logError("Not enough host memory to retain the complete staged AdamW result.");
-        releaseGroupReferences(env, groups);
-        return JNI_FALSE;
-    }
-
+    // The input arrays are disposable FP32 transaction buffers owned by the Kotlin
+    // FP16 adapter. Each page is written back only after GPU completion and finite-value
+    // validation. The adapter publishes these arrays to model state only when every
+    // page succeeds, so a later page failure cannot partially commit the model.
     VkResult result = VK_SUCCESS;
     size_t pageOffset = 0u;
     size_t pageIndex = 0u;
@@ -3477,21 +3511,69 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             }
         }
 
-        std::copy_n(
-            pageOutputParameters,
-            pageElementCount,
-            stagedParameters.data() + pageOffset
-        );
-        std::copy_n(
-            pageOutputFirstMoments,
-            pageElementCount,
-            stagedFirstMoments.data() + pageOffset
-        );
-        std::copy_n(
-            pageOutputSecondMoments,
-            pageElementCount,
-            stagedSecondMoments.data() + pageOffset
-        );
+        for (const GroupArrays& group : groups) {
+            const size_t groupStart = group.packedOffset;
+            const size_t groupEnd =
+                groupStart + static_cast<size_t>(group.elementCount);
+            const size_t overlapStart = std::max(groupStart, pageOffset);
+            const size_t overlapEnd = std::min(groupEnd, pageEnd);
+            if (overlapStart >= overlapEnd) {
+                continue;
+            }
+
+            const size_t sourceOffset = overlapStart - groupStart;
+            const size_t pageLocalOffset = overlapStart - pageOffset;
+            const size_t overlapCount = overlapEnd - overlapStart;
+            if (sourceOffset > static_cast<size_t>(group.elementCount) ||
+                overlapCount >
+                    static_cast<size_t>(group.elementCount) - sourceOffset ||
+                overlapCount >
+                    static_cast<size_t>(std::numeric_limits<jsize>::max())) {
+                logError("Vulkan AdamW output page exceeds its destination group.");
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+
+            const jsize destinationIndex = static_cast<jsize>(sourceOffset);
+            const jsize copyCount = static_cast<jsize>(overlapCount);
+            const size_t pageElementOffset = pageLocalOffset;
+
+            env->SetFloatArrayRegion(
+                group.parameters,
+                destinationIndex,
+                copyCount,
+                pageOutputParameters + pageElementOffset
+            );
+            if (env->ExceptionCheck()) {
+                logError("Failed to store a validated Vulkan AdamW parameter page.");
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+
+            env->SetFloatArrayRegion(
+                group.firstMoments,
+                destinationIndex,
+                copyCount,
+                pageOutputFirstMoments + pageElementOffset
+            );
+            if (env->ExceptionCheck()) {
+                logError("Failed to store a validated Vulkan AdamW first-moment page.");
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+
+            env->SetFloatArrayRegion(
+                group.secondMoments,
+                destinationIndex,
+                copyCount,
+                pageOutputSecondMoments + pageElementOffset
+            );
+            if (env->ExceptionCheck()) {
+                logError("Failed to store a validated Vulkan AdamW second-moment page.");
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+        }
 
         pageOffset = pageEnd;
         ++pageIndex;
@@ -3501,18 +3583,6 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         logError("Vulkan AdamW did not process every storage-buffer page.");
         releaseGroupReferences(env, groups);
         return JNI_FALSE;
-    }
-
-    // Validate the complete result before mutating any Java model/optimizer
-    // arrays. Earlier pages remain only in host staging if a later page fails.
-    for (size_t index = 0u; index < totalElements; ++index) {
-        if (!std::isfinite(stagedParameters[index]) ||
-            !std::isfinite(stagedFirstMoments[index]) ||
-            !std::isfinite(stagedSecondMoments[index])) {
-            logError("Vulkan AdamW staged output contains a non-finite value.");
-            releaseGroupReferences(env, groups);
-            return JNI_FALSE;
-        }
     }
 
     if (timestampedAdamwPages > 0u) {
@@ -3528,44 +3598,6 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             } else {
                 gRuntime.timestampedDispatchCount = std::numeric_limits<uint64_t>::max();
             }
-        }
-    }
-
-    for (const GroupArrays& group : groups) {
-        const size_t offset = group.packedOffset;
-        const jsize count = group.elementCount;
-
-        env->SetFloatArrayRegion(
-            group.parameters,
-            0,
-            count,
-            stagedParameters.data() + offset
-        );
-        if (env->ExceptionCheck()) {
-            releaseGroupReferences(env, groups);
-            return JNI_FALSE;
-        }
-
-        env->SetFloatArrayRegion(
-            group.firstMoments,
-            0,
-            count,
-            stagedFirstMoments.data() + offset
-        );
-        if (env->ExceptionCheck()) {
-            releaseGroupReferences(env, groups);
-            return JNI_FALSE;
-        }
-
-        env->SetFloatArrayRegion(
-            group.secondMoments,
-            0,
-            count,
-            stagedSecondMoments.data() + offset
-        );
-        if (env->ExceptionCheck()) {
-            releaseGroupReferences(env, groups);
-            return JNI_FALSE;
         }
     }
 
@@ -5243,7 +5275,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinear(
         gRuntime.pipelineLayout,
         VK_SHADER_STAGE_COMPUTE_BIT,
         0u,
-        sizeof(LinearPushConstants),
+        sizeof(ResidentLinearPushConstants),
         &pushConstants
     );
     vkCmdDispatch(gRuntime.commandBuffer, workGroupCount, 1u, 1u);
@@ -7398,6 +7430,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
         return JNI_FALSE;
     }
 
+    // JNI_TRUE reports completed GPU execution, not transaction acceptance.
+    // Kotlin reads statusHandle through nativeDownloadTensor after this fence.
+    // That readback uses a compute-to-copy buffer barrier and invalidates
+    // non-coherent staging memory before the status bytes reach the CPU.
     uint64_t elapsedNanoseconds = 0u;
     if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
         gRuntime.lastAdamwGpuTimeNanoseconds = elapsedNanoseconds;

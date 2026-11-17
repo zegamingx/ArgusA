@@ -5469,6 +5469,9 @@ internal object VulkanTrainingBackend {
                 return false
             }
 
+            // The native call has waited for the compute fence. Read the status through
+            // the common Tensor Arena transfer path, which inserts the compute-to-copy
+            // dependency and invalidates non-coherent staging memory before CPU access.
             val statusBytes = ByteArray(Int.SIZE_BYTES)
             if (!downloadGpuTensor(statusTensor, statusBytes)) {
                 teardownRequired = true
@@ -5896,8 +5899,13 @@ internal object VulkanTrainingBackend {
         }
     }
 
+    /**
+     * Runs native AdamW only against disposable FP32 arrays created by the FP16 adapter.
+     * The adapter publishes them to model and optimizer state only after every GPU page
+     * completes successfully.
+     */
     @Synchronized
-    fun tryApplyAdamWUpdate(
+    private fun tryApplyAdamWUpdate(
         parameters: Array<FloatArray>,
         gradients: Array<FloatArray>,
         firstMoments: Array<FloatArray>,
