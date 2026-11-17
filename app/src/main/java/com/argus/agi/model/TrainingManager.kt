@@ -2326,6 +2326,8 @@ class TrainingManager(
                             // workspace headroom. Return the claim to durable QUEUED
                             // state without touching model/checkpoint/optimizer state.
                             prependPersistingQueueItems(listOf(firstItem))
+                            _currentTrainingItem.value = null
+                            _activeDocument.value = null
                             Log.i(
                                 TAG,
                                 "Training deferred: minimum context does not fit current memory headroom."
