@@ -2550,27 +2550,24 @@ class TrainingManager(
         return allItemsSucceeded
     }
 
-    private fun markTrainingItemFailed(item: TrainingData, reason: String?) {
+    private suspend fun markTrainingItemFailed(item: TrainingData, reason: String?) {
+        val repository = requireNotNull(repo) {
+            "A failed training item cannot be finalized without durable queue storage."
+        }
+        val existing = repository.getTrainingItem(item.id)
+        if (existing?.status == TrainingStatus.COMPLETED ||
+            existing?.status == TrainingStatus.FAILED) {
+            return
+        }
+
         val failed = item.copy(status = TrainingStatus.FAILED)
+        repository.markTrainingFailed(failed.id)
+        failed.documentId?.let { documentId ->
+            repository.markCorpusDocumentPartial(documentId)
+        }
         pushCompleted(failed)
         if (!reason.isNullOrBlank()) {
             Log.w(TAG, "Training item '${item.title}' failed: $reason")
-        }
-        scope.launch {
-            repo?.let { activeRepository ->
-                runSuspendCatching {
-                    activeRepository.markTrainingFailed(failed.id)
-                }.onFailure { error ->
-                    Log.w(TAG, "Failed to persist failed training item", error)
-                }
-                failed.documentId?.let { documentId ->
-                    runSuspendCatching {
-                        activeRepository.markCorpusDocumentPartial(documentId)
-                    }.onFailure { error ->
-                        Log.w(TAG, "Failed to mark failed corpus document partial", error)
-                    }
-                }
-            }
         }
     }
 
@@ -2579,6 +2576,22 @@ class TrainingManager(
         stepResult: NeuralTrainingStepResult,
         durationMs: Long
     ): Boolean {
+        val repository = requireNotNull(repo) {
+            "Training finalization requires durable local storage."
+        }
+        val persistedItem = repository.getTrainingItem(item.id)
+            ?: throw IllegalStateException(
+                "Training item '${item.id}' disappeared before finalization."
+            )
+        when (persistedItem.status) {
+            TrainingStatus.COMPLETED -> return true
+            TrainingStatus.FAILED -> return false
+            TrainingStatus.OPTIMIZER_COMMITTED -> Unit
+            else -> throw IllegalStateException(
+                "Training item '${item.id}' cannot be finalized from status ${persistedItem.status}."
+            )
+        }
+
         updateActiveDocumentEntering(item)
         val stepLoss = stepResult.loss
         // Invalid loss is a failed step, never a completed training item.
@@ -2588,19 +2601,33 @@ class TrainingManager(
             return false
         }
 
+        // Perform allocation-heavy finalization before the Room compare-and-set. If OOM
+        // occurs here, the durable row remains OPTIMIZER_COMMITTED and will be finalized
+        // again without another optimizer update.
         val reasoningSpans = REASONING_BLOCK_PATTERN.findAll(item.content)
             .map { it.groupValues[1] }
             .toList()
         val reasoningTokenCount = reasoningSpans.sumOf { reasoningText ->
             neuralEngine.tokenizer.encode(reasoningText, autoRegister = false).size.toLong()
         }
-
         val finished = item.copy(
             status = TrainingStatus.COMPLETED,
             finalLoss = stepLoss,
             stepDurationMs = durationMs
         )
 
+        val completionClaimed = repository.markTrainingCompleted(
+            finished.id,
+            stepLoss,
+            durationMs
+        )
+        if (!completionClaimed) {
+            return repository.getTrainingItem(finished.id)?.status == TrainingStatus.COMPLETED
+        }
+
+        // The Room status is durable before transient UI and telemetry updates. If one of
+        // those updates hits OOM, recovery sees COMPLETED and will not reapply metrics or
+        // re-run the model on this sample.
         _lossHistory.update { (it + stepLoss).takeLast(MAX_LOSS_HISTORY) }
         _totalStepsExecuted.update { it + 1 }
 
@@ -2667,31 +2694,25 @@ class TrainingManager(
         }
 
         pushCompleted(finished)
-        scope.launch {
-            repo?.let { repository ->
-                runSuspendCatching {
-                    repository.markTrainingCompleted(finished.id, stepLoss, durationMs)
-                }.onFailure { error ->
-                    Log.w(TAG, "Failed to persist completed training item", error)
+        if (
+            finished.documentId != null &&
+            finished.chunkIndex >= finished.totalChunks
+        ) {
+            try {
+                val document = repository.getCorpusDocument(finished.documentId)
+                if (document != null && document.chunkCount > 0) {
+                    val completedPasses = finished.totalChunks / document.chunkCount
+                    repository.markCorpusDocumentTrained(
+                        documentId = document.id,
+                        completedPassCount = completedPasses
+                    )
                 }
-
-                if (
-                    finished.documentId != null &&
-                    finished.chunkIndex >= finished.totalChunks
-                ) {
-                    runSuspendCatching {
-                        val document = repository.getCorpusDocument(finished.documentId)
-                        if (document != null && document.chunkCount > 0) {
-                            val completedPasses = finished.totalChunks / document.chunkCount
-                            repository.markCorpusDocumentTrained(
-                                documentId = document.id,
-                                completedPassCount = completedPasses
-                            )
-                        }
-                    }.onFailure { error ->
-                        Log.w(TAG, "Failed to update completed corpus document state", error)
-                    }
-                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: OutOfMemoryError) {
+                throw error
+            } catch (error: Throwable) {
+                Log.w(TAG, "Failed to update completed corpus document state", error)
             }
         }
         return true
