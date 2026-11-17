@@ -893,7 +893,12 @@ fun QueuedItemCard(item: TrainingData) {
     Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color.White.copy(alpha = 0.04f)).padding(10.dp)) {
         Column {
             Text(text = displayTrainingItemTitle(item.title), style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary)
-            Text(text = "Source: ${item.source} (${item.content.length} characters)", style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted)
+            val queueDescription = if (item.status == TrainingStatus.OPTIMIZER_COMMITTED) {
+                "Optimizer committed • finalization pending"
+            } else {
+                "Source: ${item.source} (${item.content.length} characters)"
+            }
+            Text(text = queueDescription, style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted)
         }
     }
 }
