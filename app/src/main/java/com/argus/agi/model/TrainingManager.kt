@@ -1508,6 +1508,131 @@ class TrainingManager(
     // Worker
     // =====================================================================
 
+    private suspend fun reconcilePersistedTrainingCommit(
+        repository: com.argus.agi.data.repository.ArgusRepository
+    ) {
+        val snapshot = TrainingCommitJournal.read(trainingCommitJournalFile) ?: return
+        val currentOptimizerStep = neuralEngine.optimizerStep
+
+        if (!snapshot.isCommitted) {
+            check(currentOptimizerStep == snapshot.baselineOptimizerStep) {
+                "A prepared training journal does not match the restored optimizer checkpoint."
+            }
+            TrainingCommitJournal.delete(trainingCommitJournalFile)
+            return
+        }
+
+        val committedOptimizerStep = requireNotNull(snapshot.committedOptimizerStep)
+        if (currentOptimizerStep < committedOptimizerStep) {
+            val committedIds = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                .mapTo(HashSet()) { it.id }
+            check(snapshot.entries.none { it.itemId in committedIds }) {
+                "Room marks a batch committed, but the restored checkpoint is older than its optimizer commit."
+            }
+            // The write-ahead journal reached COMMITTED, but the following checkpoint
+            // replacement did not. The only durable model state is the saved baseline.
+            TrainingCommitJournal.delete(trainingCommitJournalFile)
+            return
+        }
+
+        val committedItems = ArrayList<TrainingData>(snapshot.entries.size)
+        for (entry in snapshot.entries) {
+            val existing = repository.getTrainingItem(entry.itemId)
+                ?: throw IllegalStateException(
+                    "The committed training journal references a missing queue item: ${entry.itemId}."
+                )
+            if (
+                existing.status == TrainingStatus.COMPLETED ||
+                existing.status == TrainingStatus.FAILED
+            ) {
+                continue
+            }
+            val result = requireNotNull(entry.result) {
+                "A committed journal entry is missing its training result."
+            }
+            committedItems.add(
+                existing.copy(
+                    status = TrainingStatus.OPTIMIZER_COMMITTED,
+                    finalLoss = result.loss,
+                    stepDurationMs = entry.stepDurationMs
+                )
+            )
+        }
+        if (committedItems.isNotEmpty()) {
+            repository.markTrainingItemsOptimizerCommitted(committedItems)
+        }
+    }
+
+    private suspend fun deleteTrainingCommitJournalWhenResolved() {
+        val snapshot = TrainingCommitJournal.read(trainingCommitJournalFile) ?: return
+        if (!snapshot.isCommitted) return
+        val repository = repo ?: return
+        val pendingCommittedIds = repository.getOptimizerCommittedTrainingItemsSnapshot()
+            .asSequence()
+            .map(TrainingData::id)
+            .toHashSet()
+        if (snapshot.entries.none { entry -> entry.itemId in pendingCommittedIds }) {
+            TrainingCommitJournal.delete(trainingCommitJournalFile)
+        }
+    }
+
+    /**
+     * Requeues a pre-commit retry ahead of ordinary queued work. The earlier timestamp
+     * is persisted so the same priority survives an app restart.
+     */
+    private fun prependPersistingQueueItems(items: List<TrainingData>): List<TrainingData> {
+        if (items.isEmpty()) return emptyList()
+        synchronized(queueLock) {
+            val existingIds = _nextQueue.value.mapTo(HashSet()) { it.id }
+            val uniqueItems = items.filterNot { it.id in existingIds }
+            if (uniqueItems.isEmpty()) return emptyList()
+
+            val earliestExistingTimestamp = _nextQueue.value.minOfOrNull { it.timestamp }
+                ?: (System.currentTimeMillis() + 1L)
+            val firstTimestamp = (earliestExistingTimestamp - uniqueItems.size.toLong())
+                .coerceAtLeast(0L)
+            val orderedItems = uniqueItems.mapIndexed { index, item ->
+                item.copy(
+                    timestamp = firstTimestamp + index.toLong(),
+                    status = TrainingStatus.QUEUED
+                )
+            }
+            val persistingItems = orderedItems.map { item ->
+                item.copy(status = TrainingStatus.PERSISTING)
+            }
+            _nextQueue.value = persistingItems + _nextQueue.value
+
+            val sendResult = persistenceOperations.trySend(
+                QueuePersistenceOperation.Save(
+                    generation = queueGeneration,
+                    items = orderedItems
+                )
+            )
+            if (sendResult.isFailure) {
+                val itemIds = orderedItems.mapTo(HashSet(orderedItems.size)) { it.id }
+                _nextQueue.value = _nextQueue.value.filterNot { it.id in itemIds }
+                Log.e(TAG, "Training persistence worker rejected the high-priority OOM retry batch.")
+                return emptyList()
+            }
+            return orderedItems
+        }
+    }
+
+    private fun prependCommittedQueueItems(items: List<TrainingData>) {
+        if (items.isEmpty()) return
+        synchronized(queueLock) {
+            val queuedIds = _nextQueue.value.mapTo(HashSet()) { it.id }
+            val additions = items
+                .filterNot { it.id in queuedIds }
+                .map { it.copy(status = TrainingStatus.OPTIMIZER_COMMITTED) }
+                .sortedBy { it.timestamp }
+            if (additions.isNotEmpty()) {
+                _nextQueue.value = additions + _nextQueue.value
+                wakeupSignal.trySend(Unit)
+            }
+        }
+    }
+
     private fun startTrainingWorker() {
         workerJob = scope.launch {
             try {
