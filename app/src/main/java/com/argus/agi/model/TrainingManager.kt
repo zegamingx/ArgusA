@@ -2332,7 +2332,7 @@ class TrainingManager(
 
             if (first.status == TrainingStatus.OPTIMIZER_COMMITTED) {
                 _nextQueue.value = list.drop(1)
-                return@synchronized first to null
+                return@synchronized Triple(first, null, queueGeneration)
             }
             if (first.status != TrainingStatus.QUEUED) return@synchronized null
 
@@ -2348,12 +2348,12 @@ class TrainingManager(
             }
 
             _nextQueue.value = list.drop(1)
-            first to startCompletion
+            Triple(first, startCompletion, queueGeneration)
         } ?: return null
 
         val item = reservation.first
         val completion = reservation.second ?: return item
-        val reservationGeneration = synchronized(queueLock) { queueGeneration }
+        val reservationGeneration = reservation.third
 
         // A committed item is already durable and must go directly to finalization.
         // A queued item is not allowed to train until Room confirms TRAINING.
@@ -2364,6 +2364,7 @@ class TrainingManager(
                 // Never resurrect a queue item from an older generation.
                 if (
                     !closed &&
+                    queueGeneration == reservationGeneration &&
                     _nextQueue.value.none { queued -> queued.id == item.id }
                 ) {
                     _nextQueue.value = listOf(item) + _nextQueue.value
