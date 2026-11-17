@@ -4255,8 +4255,15 @@ class ArgusNeuralEngine private constructor(
             ) { "ARG5 vocabulary entry count is invalid." }
             require(savedTensorCount in 1..2048) { "ARG5 tensor count is invalid: $savedTensorCount." }
             require(architectureIdLength in 1..512) { "ARG5 architecture ID length is invalid." }
-            require(savedPayloadBytes >= architectureIdLength.toLong()) {
-                "ARG5 payload length is invalid."
+            val minimumPayloadBytes = Math.addExact(
+                architectureIdLength.toLong(),
+                TOKENIZER_FINGERPRINT_BYTES.toLong()
+            )
+            require(savedPayloadBytes >= minimumPayloadBytes) {
+                "ARG5 payload cannot contain its architecture ID and tokenizer fingerprint."
+            }
+            require(savedVocabSize == savedVocabularyEntryCount) {
+                "ARG5 vocabulary size does not match its entry count."
             }
             require(flags == 0) { "ARG5 checkpoint contains unsupported flags." }
             require(savedPayloadBytes >= 0L) {
