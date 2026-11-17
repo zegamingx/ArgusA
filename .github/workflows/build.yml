@@ -315,7 +315,7 @@ jobs:
           fetch-depth: 1
 
       - name: Verify Windows runner identity and pinned Android toolchain
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
           $ErrorActionPreference = 'Stop'
           $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -370,7 +370,7 @@ jobs:
           Write-Host 'Windows runner toolchain verification passed.'
 
       - name: Install and test CMake 4.5.0 compatibility launcher
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
           $ErrorActionPreference = 'Stop'
           $realCMake = Join-Path $env:CMAKE_HOME 'bin\cmake.exe'
@@ -524,14 +524,14 @@ jobs:
           Write-Host 'CMake 4.5.0 Windows compatibility launcher and -H to -S probe passed.'
 
       - name: Verify Gradle wrapper
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
           $ErrorActionPreference = 'Stop'
           & .\gradlew.bat --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run Android lint, unit tests and debug APK build
-        shell: powershell
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
           $ErrorActionPreference = 'Stop'
           & .\gradlew.bat --no-daemon --no-configuration-cache --max-workers=2 --stacktrace clean :app:lintDebug :app:testDebugUnitTest :app:assembleDebug
