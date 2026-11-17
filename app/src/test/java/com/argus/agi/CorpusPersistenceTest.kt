@@ -523,7 +523,7 @@ class CorpusPersistenceTest {
             }.exceptionOrNull()
 
             assertTrue(
-                "The stream must reject more than the bounded record count.",
+                "The stream must reject an oversized input before persistence.",
                 failure is IllegalArgumentException
             )
             assertTrue(
@@ -565,7 +565,7 @@ class CorpusPersistenceTest {
         try {
             manager.pauseTraining()
             val oversizedRecord = """{"instruction":"prompt","response":"${
-                "x".repeat(TrainingManager.MAX_STREAMED_JSON_VALUE_CHARACTERS + 1)
+                "x".repeat(256 * 1024 + 1)
             }"}"""
             val failure = runCatching {
                 manager.enqueueDocumentStream(
