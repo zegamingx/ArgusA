@@ -16,23 +16,18 @@ on:
       - "README.md"
       - ".github/workflows/build.yml"
   workflow_dispatch:
-    inputs:
-      publish_release:
-        description: "Publish the signed APK to the GitHub Release tag."
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: write
 
 concurrency:
-  group: argus-main-build-${{ github.ref }}
-  cancel-in-progress: true
+  group: argus-main-release
+  cancel-in-progress: false
 
 jobs:
   build-release:
-    name: Lint, test, sign and package APK
+    if: github.ref == 'refs/heads/main'
+    name: Lint, test, sign and publish APK
     runs-on: ubuntu-26.04
     timeout-minutes: 60
 
@@ -221,38 +216,70 @@ jobs:
           fi
           rmdir signing 2>/dev/null || true
 
-      # Release publication is an explicit workflow-dispatch action; ordinary main pushes only validate and build.
-      - name: Publish latest signed APK to GitHub Release tag
-        if: github.event_name == 'workflow_dispatch' && inputs.publish_release == true
+      # Every successful main build publishes the newly verified APK to the rolling Release channel.
+      - name: Automatically publish latest signed APK to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          apk_path="app/build/outputs/apk/release/app-release.apk"
           release_apk="ARGUS-v${VERSION_NAME}.apk"
-          cp "${apk_path}" "${release_apk}"
-          cp "${apk_path}" "ARGUS.apk"
+          release_apk_checksum="${release_apk}.sha256"
+          stable_apk="ARGUS.apk"
+          stable_apk_checksum="${stable_apk}.sha256"
 
-          # Upload directly to the 'Release' tag release page
+          # Reuse the APKs and SHA-256 manifests produced by the signature-verification step.
+          cp "dist/${release_apk}" "${release_apk}"
+          cp "dist/${release_apk_checksum}" "${release_apk_checksum}"
+          cp "dist/${stable_apk}" "${stable_apk}"
+          cp "dist/${stable_apk_checksum}" "${stable_apk_checksum}"
+
+          release_notes="Latest successfully verified Argus main build.
+          Version: v${VERSION_NAME}
+          Build: ${VERSION_BUILD}
+          Source commit: ${GITHUB_SHA}
+
+          This rolling release is updated automatically only after lint, unit tests, APK packaging and signing verification succeed."
+
           if gh release view "Release" >/dev/null 2>&1; then
-            echo "Updating existing Release tag with latest APK..."
-            gh release upload "Release" "${release_apk}" "ARGUS.apk" --clobber
-          else
-            echo "Creating Release tag and publishing latest APK..."
-            gh release create "Release" "${release_apk}" "ARGUS.apk" \
+            echo "Updating the rolling Release channel with the verified APK and checksums..."
+            gh release upload "Release" \
+              "${release_apk}" \
+              "${release_apk_checksum}" \
+              "${stable_apk}" \
+              "${stable_apk_checksum}" \
+              --clobber
+            gh release edit "Release" \
               --title "Argus Latest Release" \
-              --notes "Latest signed release APK for Argus (v${VERSION_NAME}). Automatically published from main build."
+              --notes "${release_notes}" \
+              --latest
+          else
+            echo "Creating the rolling Release channel..."
+            gh release create "Release" \
+              "${release_apk}" \
+              "${release_apk_checksum}" \
+              "${stable_apk}" \
+              "${stable_apk_checksum}" \
+              --target "${GITHUB_SHA}" \
+              --title "Argus Latest Release" \
+              --notes "${release_notes}" \
+              --latest
           fi
 
-          # Keep exactly one versioned APK plus the stable ARGUS.apk alias.
-          # The signing-key backup is stored in a separate release and is untouched.
-          stale_assets="$(gh release view "Release" --json assets --jq '.assets[].name' |
-            grep -E '^ARGUS-v[0-9]+\.[0-9]+\.[0-9]+\.apk$' || true)"
+          # Keep one versioned APK/checksum pair and the stable aliases.
+          # The signing-key backup lives under a separate tag and is untouched.
+          stale_assets="$(gh release view "Release" --json assets --jq '.assets[].name')"
           while IFS= read -r stale_asset; do
-            [[ -z "${stale_asset}" || "${stale_asset}" == "${release_apk}" ]] && continue
+            [[ -z "${stale_asset}" ]] && continue
+            [[ "${stale_asset}" == ARGUS-v* ]] || continue
+            case "${stale_asset}" in
+              *.apk|*.apk.sha256) ;;
+              *) continue ;;
+            esac
+            [[ "${stale_asset}" == "${release_apk}" ]] && continue
+            [[ "${stale_asset}" == "${release_apk_checksum}" ]] && continue
             echo "Removing superseded release asset: ${stale_asset}"
             gh release delete-asset "Release" "${stale_asset}" --yes
           done <<< "${stale_assets}"
 
-          echo "Successfully published APK to https://github.com/${{ github.repository }}/releases/tag/Release"
+          echo "Successfully published verified APKs to https://github.com/${{ github.repository }}/releases/tag/Release"
