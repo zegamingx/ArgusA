@@ -2157,8 +2157,8 @@ class TrainingManager(
 
                             if (committed || activeBatchRoomCommitted) {
                                 val repository = repo
-                                val pendingCommitted = repository?.getOptimizerCommittedTrainingItemsSnapshot()
-                                    ?.filter { pending -> activeItems.any { it.id == pending.id } }
+                                val pendingCommitted = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                                    .filter { pending -> activeItems.any { it.id == pending.id } }
                                     .orEmpty()
                                 prependCommittedQueueItems(pendingCommitted)
                                 _isTrainingPaused.value = true
