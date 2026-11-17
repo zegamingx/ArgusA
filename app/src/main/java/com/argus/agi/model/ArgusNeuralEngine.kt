@@ -1495,7 +1495,6 @@ class ArgusNeuralEngine private constructor(
                         val overlapTokens = min(24, runtimeContextLength - 1)
                         val stride = (runtimeContextLength - overlapTokens).coerceAtLeast(1)
                         var start = 0
-
                         while (start < tokens.size - 1) {
                             val end = min(start + runtimeContextLength, tokens.size)
                             val windowSequence = tokens.subList(start, end)
@@ -1539,8 +1538,8 @@ class ArgusNeuralEngine private constructor(
                 }
 
                 val expectedOptimizerUpdates = if (accumulator.targetCount > 0) 1 else 0
-                val firstTrainableSample = sampleResults.indexOfFirst {
-                    it.loss.isFinite() && it.predictionTargetCount > 0
+                val firstTrainableSample = sampleResults.indexOfFirst { sample ->
+                    sample.loss.isFinite() && sample.predictionTargetCount > 0
                 }
                 val reportedSamples = ArrayList<NeuralTrainingStepResult>(sampleResults.size)
                 sampleResults.forEachIndexed { index, sample ->
@@ -1554,24 +1553,17 @@ class ArgusNeuralEngine private constructor(
                         )
                     )
                 }
-                // Allocate the complete return value before the optimizer transaction.
-                // A successful AdamW commit must not be followed by result-list allocation.
+
+                // Allocate the full result before AdamW can commit. No result-list
+                // allocation is permitted after model parameters or moments are updated.
                 val completedBatch = NeuralTrainingBatchResult(
                     samples = reportedSamples,
                     optimizerUpdateCount = expectedOptimizerUpdates,
                     totalPredictionTargetCount = accumulator.targetCount
                 )
 
-                try {
-                    if (accumulator.targetCount > 0) {
-                        applyAccumulatedGradients(accumulator)
-                    }
-                } finally {
-                    val remainingResident = accumulator.resident
-                    if (remainingResident != null) {
-                        VulkanTrainingBackend.discardResidentGradientAccumulator(remainingResident)
-                        accumulator.resident = null
-                    }
+                if (accumulator.targetCount > 0) {
+                    applyAccumulatedGradients(accumulator)
                 }
 
                 val actualOptimizerUpdates = (adamStep - initialAdamStep).coerceAtLeast(0)
@@ -1583,6 +1575,16 @@ class ArgusNeuralEngine private constructor(
                 }
 
                 completedBatch
+            } finally {
+                // An exception before the optimizer commit must release the accumulated
+                // resident buffer. After a committed update, the manager's PREPARED
+                // journal/checkpoint recovery still decides whether to keep or roll back.
+                val remainingResident = accumulator.resident
+                if (remainingResident != null) {
+                    VulkanTrainingBackend.discardResidentGradientAccumulator(remainingResident)
+                    accumulator.resident = null
+                }
+            }
         }
 
         if (autoCheckpoint && shouldSaveCheckpoint) {
