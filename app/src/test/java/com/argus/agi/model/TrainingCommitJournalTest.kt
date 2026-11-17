@@ -79,6 +79,39 @@ class TrainingCommitJournalTest {
     }
 
     @Test
+    fun journalAcceptsOnlyExactBaselineOrCommittedOptimizerSteps() {
+        val snapshot = TrainingCommitJournalSnapshot(
+            baselineOptimizerStep = 41,
+            committedOptimizerStep = 42,
+            entries = listOf(
+                TrainingCommitJournalEntry(
+                    itemId = "item-a",
+                    result = NeuralTrainingStepResult(
+                        loss = 0.5f,
+                        inputTokenCount = 12,
+                        predictionTargetCount = 11,
+                        contextWindowCount = 1,
+                        optimizerUpdateCount = 1,
+                        vocabularySize = 128
+                    ),
+                    stepDurationMs = 10L
+                )
+            )
+        )
+
+        assertTrue(TrainingCommitJournal.isExactBaselineCheckpoint(snapshot, 41))
+        assertFalse(TrainingCommitJournal.isExactBaselineCheckpoint(snapshot, 40))
+        assertFalse(TrainingCommitJournal.isExactBaselineCheckpoint(snapshot, 42))
+
+        assertTrue(TrainingCommitJournal.isExactCommittedCheckpoint(snapshot, 42))
+        assertFalse(TrainingCommitJournal.isExactCommittedCheckpoint(snapshot, 41))
+        assertFalse(
+            "A checkpoint ahead of the recorded commit must not be accepted.",
+            TrainingCommitJournal.isExactCommittedCheckpoint(snapshot, 43)
+        )
+    }
+
+    @Test
     fun preparedJournalRejectsDuplicateOrOversizedBatches() {
         val directory = Files.createTempDirectory("argus-training-journal").toFile()
         val file = File(directory, TrainingCommitJournal.FILE_NAME)

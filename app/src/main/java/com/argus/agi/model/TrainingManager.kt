@@ -1663,9 +1663,11 @@ class TrainingManager(
         }
 
         val committedOptimizerStep = requireNotNull(snapshot.committedOptimizerStep)
-        if (currentOptimizerStep < committedOptimizerStep) {
-            check(currentOptimizerStep == snapshot.baselineOptimizerStep) {
-                "The committed training journal does not match either its baseline or committed checkpoint."
+        if (!TrainingCommitJournal.isExactCommittedCheckpoint(snapshot, currentOptimizerStep)) {
+            check(TrainingCommitJournal.isExactBaselineCheckpoint(snapshot, currentOptimizerStep)) {
+                "The model checkpoint optimizer step $currentOptimizerStep does not match " +
+                    "the journal baseline ${snapshot.baselineOptimizerStep} or committed " +
+                    "step $committedOptimizerStep."
             }
             val committedIds = repository.getOptimizerCommittedTrainingItemsSnapshot()
                 .mapTo(HashSet()) { it.id }
@@ -1680,7 +1682,10 @@ class TrainingManager(
             }
             check(
                 neuralEngine.loadCheckpointIfExists() &&
-                    neuralEngine.optimizerStep == snapshot.baselineOptimizerStep
+                    TrainingCommitJournal.isExactBaselineCheckpoint(
+                        snapshot,
+                        neuralEngine.optimizerStep
+                    )
             ) {
                 "The committed batch could not be rolled back to its exact saved baseline."
             }
@@ -1692,7 +1697,8 @@ class TrainingManager(
         }
 
         // Room must never publish COMMITTED until the exact model and optimizer
-        // state represented by this journal is durably saved.
+        // state represented by this journal is durably saved. A checkpoint that is
+        // ahead of the journal is an inconsistency, not a valid committed transaction.
         check(neuralEngine.saveCheckpoint()) {
             "The committed optimizer checkpoint could not be secured during recovery."
         }
@@ -1795,8 +1801,9 @@ class TrainingManager(
         val snapshot = TrainingCommitJournal.read(trainingCommitJournalFile) ?: return false
         if (!snapshot.isCommitted) return false
 
-        val committedOptimizerStep = requireNotNull(snapshot.committedOptimizerStep)
-        if (neuralEngine.optimizerStep < committedOptimizerStep) return false
+        if (!TrainingCommitJournal.isExactCommittedCheckpoint(snapshot, neuralEngine.optimizerStep)) {
+            return false
+        }
         check(neuralEngine.saveCheckpoint()) {
             "The optimizer committed the batch, but its checkpoint could not be secured."
         }

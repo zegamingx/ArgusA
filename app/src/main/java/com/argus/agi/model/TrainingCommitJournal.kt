@@ -47,6 +47,16 @@ internal object TrainingCommitJournal {
     private const val MAX_ITEMS = 8
     private const val MAX_ITEM_ID_BYTES = 128
 
+    fun isExactBaselineCheckpoint(
+        snapshot: TrainingCommitJournalSnapshot,
+        optimizerStep: Int
+    ): Boolean = optimizerStep == snapshot.baselineOptimizerStep
+
+    fun isExactCommittedCheckpoint(
+        snapshot: TrainingCommitJournalSnapshot,
+        optimizerStep: Int
+    ): Boolean = snapshot.isCommitted && optimizerStep == snapshot.committedOptimizerStep
+
     fun writePrepared(
         file: File,
         baselineOptimizerStep: Int,
