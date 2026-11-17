@@ -198,7 +198,8 @@ data class VulkanDeviceCapabilities(
     val memoryBudgetQueryAvailable: Boolean,
     val memoryBudgetHeapCount: Int,
     val memoryHeapBudgetBytes: List<Long>,
-    val memoryHeapUsageBytes: List<Long>
+    val memoryHeapUsageBytes: List<Long>,
+    val memoryHeapFlags: List<Int> = emptyList()
 ) {
     val apiVersion: String
         get() = "$apiVersionMajor.$apiVersionMinor.$apiVersionPatch"
@@ -207,6 +208,17 @@ data class VulkanDeviceCapabilities(
         get() = memoryHeapBudgetBytes.zip(memoryHeapUsageBytes) { budget, usage ->
             (budget - usage).coerceAtLeast(0L)
         }
+
+    /**
+     * Headroom for device-local heaps only. Older drivers may not expose heap flags;
+     * in that case retain the conservative all-heap calculation for compatibility.
+     */
+    val deviceLocalMemoryBudgetHeadroomBytes: List<Long>
+        get() = DeviceAdaptiveRuntimePolicy.deviceLocalHeapHeadroomBytes(
+            budgets = memoryHeapBudgetBytes,
+            usages = memoryHeapUsageBytes,
+            heapFlags = memoryHeapFlags
+        )
 
     val supportsComputeSubgroups: Boolean
         get() = subgroupSize > 0 && (subgroupSupportedStages and COMPUTE_SHADER_STAGE_BIT) != 0
@@ -447,6 +459,9 @@ data class VulkanDeviceCapabilities(
                 } ?: emptyList(),
                 memoryHeapUsageBytes = json.optJSONArray("memoryHeapUsageBytes")?.let { array ->
                     List(array.length()) { index -> array.optLong(index) }
+                } ?: emptyList(),
+                memoryHeapFlags = json.optJSONArray("memoryHeapFlags")?.let { array ->
+                    List(array.length()) { index -> array.optInt(index) }
                 } ?: emptyList()
             )
         }
@@ -463,6 +478,7 @@ data class VulkanDeviceCapabilities(
 internal object VulkanTrainingBackend {
 
     private const val TAG = "VulkanTrainingBackend"
+    private const val MEMORY_BUDGET_REFRESH_INTERVAL_NANOS = 5_000_000_000L
     private const val MIN_GPU_UPDATE_ELEMENTS = 49_152L
     private const val MIN_LINEAR_OPERATION_COUNT = 262_144L
 
@@ -561,6 +577,9 @@ internal object VulkanTrainingBackend {
 
     @Volatile
     private var residentAdamwReady = false
+
+    @Volatile
+    private var lastMemoryBudgetRefreshNanos = 0L
 
     internal val isResidentAdamWAvailable: Boolean
         get() = isRuntimeAvailable && residentActivationLinearReady && residentAdamwReady
@@ -802,15 +821,23 @@ internal object VulkanTrainingBackend {
     private fun calculateTotalTensorResidencyBudgetBytes(
         capabilities: VulkanDeviceCapabilities?
     ): Long {
-        val maximumAppHeap = Runtime.getRuntime().maxMemory().coerceAtLeast(0L)
-        val appBudget = maximumAppHeap / 4L
-        val reportedHeapHeadroom = capabilities?.memoryBudgetHeadroomBytes
-            ?.filter { it > 0L }
-            ?.minOrNull()
-        val gpuBudget = reportedHeapHeadroom?.div(3L) ?: appBudget
-        val descriptorRange = capabilities?.maxStorageBufferRangeBytes
-            ?.takeIf { it > 0L } ?: Long.MAX_VALUE
-        return minOf(appBudget, gpuBudget, descriptorRange).coerceAtLeast(0L)
+        val runtime = Runtime.getRuntime()
+        val maximumAppHeapBytes = runtime.maxMemory().coerceAtLeast(0L)
+        val availableAppHeapBytes = (
+            runtime.freeMemory() +
+                (maximumAppHeapBytes - runtime.totalMemory()).coerceAtLeast(0L)
+            ).coerceAtLeast(0L)
+        val deviceLocalHeadroomBytes =
+            capabilities?.deviceLocalMemoryBudgetHeadroomBytes?.minOrNull()
+        val maximumStorageBufferRangeBytes =
+            capabilities?.maxStorageBufferRangeBytes ?: 0L
+
+        return DeviceAdaptiveRuntimePolicy.calculateTensorArenaBudget(
+            maximumAppHeapBytes = maximumAppHeapBytes,
+            availableAppHeapBytes = availableAppHeapBytes,
+            deviceLocalHeadroomBytes = deviceLocalHeadroomBytes,
+            maximumStorageBufferRangeBytes = maximumStorageBufferRangeBytes
+        ).totalBytes
     }
 
     /**
@@ -1017,8 +1044,13 @@ internal object VulkanTrainingBackend {
      * Prepares the complete model parameter inventory in persistent Tensor Arena
      * allocations. The registry remains a read-only mirror of Kotlin-owned weights.
      */
-    private fun refreshModelTensorResidencyBudget() {
+    private fun refreshModelTensorResidencyBudget(force: Boolean = false) {
         if (!nativeReady) return
+        val nowNanos = System.nanoTime()
+        if (!force &&
+            nowNanos - lastMemoryBudgetRefreshNanos < MEMORY_BUDGET_REFRESH_INTERVAL_NANOS) {
+            return
+        }
         runCatching {
             VulkanDeviceCapabilities.fromJson(nativeGetDeviceCapabilities())
         }.onSuccess { capabilities ->
@@ -1029,10 +1061,13 @@ internal object VulkanTrainingBackend {
                 calculateActivationTensorResidencyBudgetBytes(capabilities)
             _optimizerStateResidencyBudgetBytes.value =
                 calculateOptimizerStateResidencyBudgetBytes(capabilities)
+            lastMemoryBudgetRefreshNanos = nowNanos
             Log.i(
                 TAG,
-                "Refreshed FP16 model-residency budget: " +
-                    "${_modelTensorResidencyBudgetBytes.value} bytes."
+                "Refreshed live Vulkan residency budgets: model=" +
+                    "${_modelTensorResidencyBudgetBytes.value}, activation=" +
+                    "${_activationTensorResidencyBudgetBytes.value}, optimizer=" +
+                    "${_optimizerStateResidencyBudgetBytes.value} bytes."
             )
         }.onFailure { error ->
             Log.w(
@@ -1047,6 +1082,7 @@ internal object VulkanTrainingBackend {
     fun synchronizeModelTensorResidency(
         tensors: List<VulkanModelParameterTensor>
     ): Boolean {
+        refreshModelTensorResidencyBudget()
         lastModelParameterInventory = tensors.toList()
         residencyRebuildPending = false
         _modelTensorResidencyReady.value = false
@@ -1197,7 +1233,7 @@ internal object VulkanTrainingBackend {
             return
         }
         if (!residencySuspended) return
-        refreshModelTensorResidencyBudget()
+        refreshModelTensorResidencyBudget(force = true)
         residencySuspended = false
         residencyBlockedAfterFailure = false
         residencyRebuildPending = lastModelParameterInventory.isNotEmpty()
@@ -5091,6 +5127,7 @@ internal object VulkanTrainingBackend {
         gradientClipFactor: Float,
         residentGradient: VulkanTensorAllocation? = null
     ): Boolean {
+        refreshModelTensorResidencyBudget()
         if (!isResidentAdamWAvailable ||
             parameters.isEmpty() ||
             parameters.size != gradients.size ||

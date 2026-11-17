@@ -1487,6 +1487,16 @@ class TrainingManager(
                     }
                 }
 
+                val thermalBatchLimit = DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
+                    configuredBatchSize = neuralEngine.config.trainingBatchSize,
+                    thermalStatus = deviceGuard.safetyState.value.thermalStatus
+                )
+                if (thermalBatchLimit == 0) {
+                    // Severe thermal states are normally blocked by DeviceGuard above.
+                    // Re-enter the safety wait instead of spinning or starting another batch.
+                    continue
+                }
+
                 val firstItem = popNext()
                 if (firstItem == null) {
                     if (_nextQueue.value.isEmpty()) {
@@ -1504,9 +1514,9 @@ class TrainingManager(
                     continue
                 }
 
-                val batchItems = ArrayList<TrainingData>(neuralEngine.config.trainingBatchSize)
+                val batchItems = ArrayList<TrainingData>(thermalBatchLimit)
                 batchItems += firstItem
-                while (batchItems.size < neuralEngine.config.trainingBatchSize) {
+                while (batchItems.size < thermalBatchLimit) {
                     val nextItem = popNext() ?: break
                     batchItems += nextItem
                 }

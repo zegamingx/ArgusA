@@ -82,7 +82,7 @@ class VulkanDeviceCapabilitiesTest {
               "deviceId": 123,
               "deviceType": 1,
               "memoryPropertiesAvailable": true,
-              "memoryHeapCount": 1,
+              "memoryHeapCount": 2,
               "memoryTypeCount": 3,
               "hostVisibleMemoryTypeCount": 2,
               "hostVisibleDeviceLocalMemoryTypeCount": 1,
@@ -92,6 +92,7 @@ class VulkanDeviceCapabilitiesTest {
               "memoryBudgetHeapCount": 2,
               "memoryHeapBudgetBytes": [1000, 2000],
               "memoryHeapUsageBytes": [250, 700],
+              "memoryHeapFlags": [0, 1],
               "apiVersionMajor": 1,
               "apiVersionMinor": 3,
               "apiVersionPatch": 278,
@@ -138,7 +139,7 @@ class VulkanDeviceCapabilitiesTest {
 
         assertEquals("Mali-G57", capabilities.deviceName)
         assertTrue(capabilities.memoryPropertiesAvailable)
-        assertEquals(1, capabilities.memoryHeapCount)
+        assertEquals(2, capabilities.memoryHeapCount)
         assertEquals(3, capabilities.memoryTypeCount)
         assertEquals(2, capabilities.hostVisibleMemoryTypeCount)
         assertEquals(1, capabilities.hostVisibleDeviceLocalMemoryTypeCount)
@@ -149,6 +150,8 @@ class VulkanDeviceCapabilitiesTest {
         assertEquals(listOf(1000L, 2000L), capabilities.memoryHeapBudgetBytes)
         assertEquals(listOf(250L, 700L), capabilities.memoryHeapUsageBytes)
         assertEquals(listOf(750L, 1300L), capabilities.memoryBudgetHeadroomBytes)
+        assertEquals(listOf(0, 1), capabilities.memoryHeapFlags)
+        assertEquals(listOf(1300L), capabilities.deviceLocalMemoryBudgetHeadroomBytes)
         assertEquals("1.3.278", capabilities.apiVersion)
         assertEquals(16, capabilities.subgroupSize)
         assertTrue(capabilities.supportsComputeSubgroups)
