@@ -56,6 +56,25 @@ interface CorpusDao {
         reviewedAtEpochMs: Long?
     ): Int
 
+    @Query(
+        """
+        UPDATE corpus_documents
+        SET rightsStatus = CASE
+            WHEN EXISTS (
+                SELECT 1 FROM corpus_sources
+                WHERE documentId = :documentId AND rightsStatus = 'LICENSE_REVIEWED'
+            ) THEN 'LICENSE_REVIEWED'
+            WHEN EXISTS (
+                SELECT 1 FROM corpus_sources
+                WHERE documentId = :documentId AND rightsStatus = 'USER_DECLARED'
+            ) THEN 'USER_DECLARED'
+            ELSE 'UNVERIFIED'
+        END
+        WHERE id = :documentId
+        """
+    )
+    suspend fun refreshDocumentRightsStatus(documentId: String): Int
+
     @Query("SELECT * FROM corpus_sources WHERE documentId = :documentId ORDER BY importedAtEpochMs ASC")
     suspend fun getSources(documentId: String): List<CorpusSourceEntity>
 

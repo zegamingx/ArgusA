@@ -631,6 +631,11 @@ class CorpusPersistenceTest {
             assertTrue(articleSource.userDeclarationText?.isNotBlank() == true)
             assertTrue((articleSource.userDeclaredAtEpochMs ?: 0L) > 0L)
             assertEquals(4, repository.getCorpusSources(document.id).size)
+            assertEquals(
+                "Document rights must be recomputed from all durable source declarations.",
+                "USER_DECLARED",
+                repository.getCorpusDocument(document.id)?.rightsStatus
+            )
 
             val reviewedText = "A reviewed license must retain durable provenance. ".repeat(10)
             val reviewedAt = System.currentTimeMillis()

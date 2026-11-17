@@ -329,6 +329,9 @@ class ArgusRepository(
                 userDeclaredAtEpochMs = sourceProvenance.userDeclaredAtEpochMs,
                 reviewedAtEpochMs = sourceProvenance.reviewedAtEpochMs
             )
+            check(corpusDao.refreshDocumentRightsStatus(storedDocumentId) == 1) {
+                "The corpus document's aggregate rights status could not be synchronized with its sources."
+            }
             insertedRowId != -1L
         }
     }
