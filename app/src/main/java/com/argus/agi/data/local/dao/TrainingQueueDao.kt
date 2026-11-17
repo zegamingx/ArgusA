@@ -54,6 +54,16 @@ interface TrainingQueueDao {
     )
     suspend fun markOptimizerCommitted(id: String, loss: Float?, duration: Long): Int
 
+    @Query(
+        "UPDATE training_items SET status = 'COMPLETED', finalLoss = :loss, " +
+            "stepDurationMs = :duration WHERE id = :id AND status = 'OPTIMIZER_COMMITTED'"
+    )
+    suspend fun markOptimizerCommittedCompleted(
+        id: String,
+        loss: Float,
+        duration: Long
+    ): Int
+
     @Query("SELECT * FROM training_items WHERE id = :id LIMIT 1")
     suspend fun getItem(id: String): TrainingItemEntity?
 
