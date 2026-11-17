@@ -471,19 +471,17 @@ data class VulkanDeviceCapabilities(
 /**
  * Optional Vulkan Compute backend for batched dense operations and AdamW updates.
  *
- * Dense forward and backward operations use Vulkan when the runtime passes its
- * numerical self-check and the workload is large enough.
- * All callers retain a numerically equivalent Kotlin fallback.
+ * Dense forward and backward operations use Vulkan whenever runtime readiness,
+ * enabled device capabilities, kernel availability, and resource checks permit it.
+ * Kotlin execution is reserved for unavailable, unsupported, or failed Vulkan paths.
  */
 internal object VulkanTrainingBackend {
 
     private const val TAG = "VulkanTrainingBackend"
     private const val MEMORY_BUDGET_REFRESH_INTERVAL_NANOS = 5_000_000_000L
-    private const val MIN_GPU_UPDATE_ELEMENTS = 49_152L
-    private const val MIN_LINEAR_OPERATION_COUNT = 262_144L
 
     internal fun recordCpuLinearTiming(operationCount: Long, elapsedNanoseconds: Long) {
-        AdaptiveComputeDispatchPolicy.recordCpu(
+        AdaptiveComputePerformanceMonitor.recordCpu(
             AdaptiveComputeOperation.LINEAR,
             operationCount,
             elapsedNanoseconds
@@ -491,7 +489,7 @@ internal object VulkanTrainingBackend {
     }
 
     internal fun recordCpuAdamWTiming(operationCount: Long, elapsedNanoseconds: Long) {
-        AdaptiveComputeDispatchPolicy.recordCpu(
+        AdaptiveComputePerformanceMonitor.recordCpu(
             AdaptiveComputeOperation.ADAMW,
             operationCount,
             elapsedNanoseconds
@@ -499,7 +497,7 @@ internal object VulkanTrainingBackend {
     }
 
     internal fun recordGpuAdamWTiming(operationCount: Long, elapsedNanoseconds: Long) {
-        AdaptiveComputeDispatchPolicy.recordGpu(
+        AdaptiveComputePerformanceMonitor.recordGpu(
             AdaptiveComputeOperation.ADAMW,
             operationCount,
             elapsedNanoseconds
@@ -1340,12 +1338,7 @@ internal object VulkanTrainingBackend {
                 Math.multiplyExact(outputColumns.toLong(), weightTensors.size.toLong())
             )
         }.getOrNull() ?: return false
-        if (!AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount,
-                MIN_LINEAR_OPERATION_COUNT
-            ) ||
-            !ensureModelTensorResidencyReady()) {
+        if (!ensureModelTensorResidencyReady()) {
             return false
         }
         val gpuStartNanos = System.nanoTime()
@@ -1422,7 +1415,7 @@ internal object VulkanTrainingBackend {
                 )
             }
         }
-        AdaptiveComputeDispatchPolicy.recordGpu(
+        AdaptiveComputePerformanceMonitor.recordGpu(
             AdaptiveComputeOperation.LINEAR,
             operationCount,
             System.nanoTime() - gpuStartNanos
@@ -4749,13 +4742,7 @@ internal object VulkanTrainingBackend {
         val operationCount = runCatching {
             Math.multiplyExact(inputElements, outputColumns.toLong())
         }.getOrNull() ?: return false
-        if (!isFp16ComputeAvailable ||
-            !AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount,
-                MIN_LINEAR_OPERATION_COUNT
-            ) ||
-            !ensureModelTensorResidencyReady()) {
+        if (!isFp16ComputeAvailable!ensureModelTensorResidencyReady()) {
             return false
         }
 
@@ -4817,7 +4804,7 @@ internal object VulkanTrainingBackend {
                 outputColumns
             )
         }
-        AdaptiveComputeDispatchPolicy.recordGpu(
+        AdaptiveComputePerformanceMonitor.recordGpu(
             AdaptiveComputeOperation.LINEAR,
             operationCount,
             System.nanoTime() - gpuStartNanos
@@ -4903,13 +4890,7 @@ internal object VulkanTrainingBackend {
                 outputColumns.toLong()
             )
         }.getOrNull() ?: return false
-        if (!isFp16ComputeAvailable ||
-            !AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount,
-                MIN_LINEAR_OPERATION_COUNT
-            ) ||
-            !ensureModelTensorResidencyReady()) {
+        if (!isFp16ComputeAvailable!ensureModelTensorResidencyReady()) {
             return false
         }
 
@@ -4992,7 +4973,7 @@ internal object VulkanTrainingBackend {
             }
         }
 
-        AdaptiveComputeDispatchPolicy.recordGpu(
+        AdaptiveComputePerformanceMonitor.recordGpu(
             AdaptiveComputeOperation.LINEAR,
             operationCount,
             System.nanoTime() - gpuStartNanos
@@ -5083,12 +5064,7 @@ internal object VulkanTrainingBackend {
             inputColumns.toLong() *
             outputColumns.toLong()
         if (!isRuntimeAvailable ||
-            disabledAfterRuntimeFailure ||
-            !AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount,
-                MIN_LINEAR_OPERATION_COUNT
-            )) {
+            disabledAfterRuntimeFailure) {
             return false
         }
 
@@ -5171,7 +5147,7 @@ internal object VulkanTrainingBackend {
                 )
             }
         }
-        AdaptiveComputeDispatchPolicy.recordGpu(
+        AdaptiveComputePerformanceMonitor.recordGpu(
             AdaptiveComputeOperation.LINEAR,
             operationCount,
             System.nanoTime() - gpuStartNanos
@@ -5265,12 +5241,7 @@ internal object VulkanTrainingBackend {
             }.getOrNull() ?: return false
         }
 
-        if (!AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.ADAMW,
-                totalActiveElements,
-                MIN_GPU_UPDATE_ELEMENTS
-            ) ||
-            totalActiveElements > Int.MAX_VALUE.toLong() ||
+        if (totalActiveElements > Int.MAX_VALUE.toLong() ||
             totalGradientBytes <= 0L ||
             totalGradientBytes > Int.MAX_VALUE.toLong()) {
             return false
@@ -5806,12 +5777,7 @@ internal object VulkanTrainingBackend {
             )
         }
 
-        if (!isRuntimeAvailable || disabledAfterRuntimeFailure ||
-            !AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.ADAMW,
-                totalElements,
-                MIN_GPU_UPDATE_ELEMENTS
-            )) {
+        if (!isRuntimeAvailable || disabledAfterRuntimeFailure) {
             _currentBackend = "Kotlin CPU"
             return false
         }
@@ -5951,12 +5917,7 @@ internal object VulkanTrainingBackend {
         }
 
         if (!isRuntimeAvailable ||
-            disabledAfterRuntimeFailure ||
-            !AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.ADAMW,
-                totalElements,
-                MIN_GPU_UPDATE_ELEMENTS
-            )) {
+            disabledAfterRuntimeFailure) {
             _currentBackend = "Kotlin CPU"
             return false
         }
@@ -5987,7 +5948,7 @@ internal object VulkanTrainingBackend {
 
         if (updated) {
             if (recordAdaptiveTiming) {
-                AdaptiveComputeDispatchPolicy.recordGpu(
+                AdaptiveComputePerformanceMonitor.recordGpu(
                     AdaptiveComputeOperation.ADAMW,
                     totalElements,
                     System.nanoTime() - gpuStartNanos

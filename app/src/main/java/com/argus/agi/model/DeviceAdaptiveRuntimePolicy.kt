@@ -272,15 +272,15 @@ internal enum class AdaptiveComputeOperation {
 }
 
 /**
- * Learns the end-to-end cost per operation from successful production workloads.
- * It keeps conservative bootstrap thresholds until enough CPU and GPU samples
- * exist, then selects Vulkan only when the measured GPU path is at least 5% faster.
+ * Passive execution telemetry for successful Vulkan work and explicit CPU fallback.
+ *
+ * This monitor must never select a backend. Vulkan eligibility is determined by
+ * runtime readiness, enabled device capabilities, kernel availability, and safe
+ * resource/shape checks at the operation call site. CPU timings are recorded only
+ * when a CPU fallback actually executes.
  */
-internal object AdaptiveComputeDispatchPolicy {
+internal object AdaptiveComputePerformanceMonitor {
 
-    private const val MIN_CALIBRATION_SAMPLES = 4
-    private const val CPU_PROBE_INTERVAL = 16
-    private const val REQUIRED_SPEEDUP = 0.95
     private const val EWMA_OLD_WEIGHT = 0.75
     private const val EWMA_NEW_WEIGHT = 0.25
 
@@ -294,9 +294,6 @@ internal object AdaptiveComputeDispatchPolicy {
     private data class Profile(
         var cpuSamples: Int = 0,
         var gpuSamples: Int = 0,
-        var cpuProbePending: Boolean = false,
-        var lastCpuProbeGpuSamples: Int = 0,
-        var lastGpuProbeCpuSamples: Int = 0,
         var cpuNanosecondsPerOperation: Double = 0.0,
         var gpuNanosecondsPerOperation: Double = 0.0
     )
@@ -307,55 +304,6 @@ internal object AdaptiveComputeDispatchPolicy {
     )
 
     private val profiles = HashMap<ProfileKey, Profile>()
-
-    @Synchronized
-    fun shouldUseGpu(
-        operation: AdaptiveComputeOperation,
-        operationCount: Long,
-        bootstrapMinimumOperationCount: Long
-    ): Boolean {
-        if (operationCount < bootstrapMinimumOperationCount) return false
-        val profile = profileFor(operation, operationCount)
-
-        // A CPU probe stays selected through every fallback layer until a real
-        // CPU timing sample is committed for this exact workload-size bucket.
-        if (profile.cpuProbePending) return false
-
-        // GPU needs initial samples first. Then periodically route one eligible
-        // workload through CPU so CPU cost is measured from a real fallback path.
-        if (profile.cpuSamples < MIN_CALIBRATION_SAMPLES) {
-            val nextCpuProbe = CPU_PROBE_INTERVAL * (profile.cpuSamples + 1)
-            if (profile.gpuSamples >= MIN_CALIBRATION_SAMPLES &&
-                profile.gpuSamples >= nextCpuProbe &&
-                profile.gpuSamples % CPU_PROBE_INTERVAL == 0 &&
-                profile.lastCpuProbeGpuSamples != profile.gpuSamples) {
-                profile.lastCpuProbeGpuSamples = profile.gpuSamples
-                profile.cpuProbePending = true
-                return false
-            }
-            return true
-        }
-
-        if (profile.gpuSamples < MIN_CALIBRATION_SAMPLES) return true
-        val gpuIsCompetitive = profile.gpuNanosecondsPerOperation <
-            profile.cpuNanosecondsPerOperation * REQUIRED_SPEEDUP
-        if (gpuIsCompetitive) {
-            if (profile.gpuSamples % CPU_PROBE_INTERVAL == 0 &&
-                profile.lastCpuProbeGpuSamples != profile.gpuSamples) {
-                profile.lastCpuProbeGpuSamples = profile.gpuSamples
-                profile.cpuProbePending = true
-                return false
-            }
-            return true
-        }
-
-        if (profile.cpuSamples % CPU_PROBE_INTERVAL == 0 &&
-            profile.lastGpuProbeCpuSamples != profile.cpuSamples) {
-            profile.lastGpuProbeCpuSamples = profile.cpuSamples
-            return true
-        }
-        return false
-    }
 
     @Synchronized
     fun recordCpu(
@@ -428,7 +376,6 @@ internal object AdaptiveComputeDispatchPolicy {
                 else profile.cpuNanosecondsPerOperation * EWMA_OLD_WEIGHT +
                     sample * EWMA_NEW_WEIGHT
             profile.cpuSamples++
-            profile.cpuProbePending = false
         }
     }
 }

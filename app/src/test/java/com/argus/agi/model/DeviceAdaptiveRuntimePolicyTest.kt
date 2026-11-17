@@ -266,68 +266,69 @@ class DeviceAdaptiveRuntimePolicyTest {
 }
 
 
-class AdaptiveComputeDispatchPolicyTest {
+class AdaptiveComputePerformanceMonitorTest {
 
     @Test
-    fun cpuCalibrationProbeStaysSelectedAcrossRepeatedGpuFallbackLayers() {
-        AdaptiveComputeDispatchPolicy.resetForTests()
-        repeat(16) {
-            AdaptiveComputeDispatchPolicy.recordGpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount = 300_000L,
-                elapsedNanoseconds = 2_000_000L
-            )
-        }
+    fun recordsCpuFallbackAndVulkanSamplesAsPassiveTelemetry() {
+        AdaptiveComputePerformanceMonitor.resetForTests()
 
-        assertFalse(
-            AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount = 300_000L,
-                bootstrapMinimumOperationCount = 262_144L
-            )
-        )
-        // A second GPU adapter path must not override the pending CPU probe.
-        assertFalse(
-            AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount = 300_000L,
-                bootstrapMinimumOperationCount = 262_144L
-            )
-        )
-
-        AdaptiveComputeDispatchPolicy.recordCpu(
+        AdaptiveComputePerformanceMonitor.recordCpu(
             AdaptiveComputeOperation.LINEAR,
             operationCount = 300_000L,
             elapsedNanoseconds = 3_000_000L
         )
-        assertTrue(
-            AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount = 300_000L,
-                bootstrapMinimumOperationCount = 262_144L
-            )
-        )
-    }
-
-    @Test
-    fun dispatchProfilesAreSeparatedByOperationSizeBucket() {
-        AdaptiveComputeDispatchPolicy.resetForTests()
-        AdaptiveComputeDispatchPolicy.recordGpu(
+        AdaptiveComputePerformanceMonitor.recordGpu(
             AdaptiveComputeOperation.LINEAR,
             operationCount = 300_000L,
             elapsedNanoseconds = 2_000_000L
         )
 
+        val snapshot = AdaptiveComputePerformanceMonitor.snapshot(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount = 300_000L
+        )
+        assertEquals(1, snapshot.cpuSamples)
+        assertEquals(1, snapshot.gpuSamples)
+        assertEquals(10.0, snapshot.cpuNanosecondsPerOperation!!, 0.0001)
+        assertEquals(2_000_000.0 / 300_000.0, snapshot.gpuNanosecondsPerOperation!!, 0.0001)
+    }
+
+    @Test
+    fun profilesAreSeparatedByOperationAndWorkloadSizeBucket() {
+        AdaptiveComputePerformanceMonitor.resetForTests()
+        AdaptiveComputePerformanceMonitor.recordGpu(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount = 300_000L,
+            elapsedNanoseconds = 2_000_000L
+        )
+        AdaptiveComputePerformanceMonitor.recordGpu(
+            AdaptiveComputeOperation.ADAMW,
+            operationCount = 300_000L,
+            elapsedNanoseconds = 1_000_000L
+        )
+        AdaptiveComputePerformanceMonitor.recordGpu(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount = 3_000_000L,
+            elapsedNanoseconds = 8_000_000L
+        )
+
         assertEquals(
             1,
-            AdaptiveComputeDispatchPolicy.snapshot(
+            AdaptiveComputePerformanceMonitor.snapshot(
                 AdaptiveComputeOperation.LINEAR,
                 operationCount = 300_000L
             ).gpuSamples
         )
         assertEquals(
-            0,
-            AdaptiveComputeDispatchPolicy.snapshot(
+            1,
+            AdaptiveComputePerformanceMonitor.snapshot(
+                AdaptiveComputeOperation.ADAMW,
+                operationCount = 300_000L
+            ).gpuSamples
+        )
+        assertEquals(
+            1,
+            AdaptiveComputePerformanceMonitor.snapshot(
                 AdaptiveComputeOperation.LINEAR,
                 operationCount = 3_000_000L
             ).gpuSamples
@@ -335,90 +336,45 @@ class AdaptiveComputeDispatchPolicyTest {
     }
 
     @Test
-    fun keepsConservativeBootstrapThresholdUntilBothBackendsAreMeasured() {
-        AdaptiveComputeDispatchPolicy.resetForTests()
-
-        assertFalse(
-            AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount = 100_000L,
-                bootstrapMinimumOperationCount = 262_144L
-            )
+    fun timingSamplesUseExponentialMovingAverage() {
+        AdaptiveComputePerformanceMonitor.resetForTests()
+        AdaptiveComputePerformanceMonitor.recordCpu(
+            AdaptiveComputeOperation.ADAMW,
+            operationCount = 100L,
+            elapsedNanoseconds = 1_000L
         )
-        assertTrue(
-            AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount = 300_000L,
-                bootstrapMinimumOperationCount = 262_144L
-            )
+        AdaptiveComputePerformanceMonitor.recordCpu(
+            AdaptiveComputeOperation.ADAMW,
+            operationCount = 100L,
+            elapsedNanoseconds = 2_000L
         )
-    }
 
-    @Test
-    fun selectsGpuOnlyAfterMeasuredEndToEndSpeedup() {
-        AdaptiveComputeDispatchPolicy.resetForTests()
-        repeat(4) {
-            AdaptiveComputeDispatchPolicy.recordCpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount = 300_000L,
-                elapsedNanoseconds = 3_000_000L
-            )
-            AdaptiveComputeDispatchPolicy.recordGpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount = 300_000L,
-                elapsedNanoseconds = 2_000_000L
-            )
-        }
-
-        assertTrue(
-            AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.LINEAR,
-                operationCount = 300_000L,
-                bootstrapMinimumOperationCount = 262_144L
-            )
+        val snapshot = AdaptiveComputePerformanceMonitor.snapshot(
+            AdaptiveComputeOperation.ADAMW,
+            operationCount = 100L
         )
-    }
-
-    @Test
-    fun selectsCpuWhenGpuEndToEndCostIsNotCompetitive() {
-        AdaptiveComputeDispatchPolicy.resetForTests()
-        repeat(4) {
-            AdaptiveComputeDispatchPolicy.recordCpu(
-                AdaptiveComputeOperation.ADAMW,
-                operationCount = 60_000L,
-                elapsedNanoseconds = 1_000_000L
-            )
-            AdaptiveComputeDispatchPolicy.recordGpu(
-                AdaptiveComputeOperation.ADAMW,
-                operationCount = 60_000L,
-                elapsedNanoseconds = 2_000_000L
-            )
-        }
-
-        assertFalse(
-            AdaptiveComputeDispatchPolicy.shouldUseGpu(
-                AdaptiveComputeOperation.ADAMW,
-                operationCount = 60_000L,
-                bootstrapMinimumOperationCount = 49_152L
-            )
-        )
+        assertEquals(2, snapshot.cpuSamples)
+        assertEquals(12.5, snapshot.cpuNanosecondsPerOperation!!, 0.0001)
     }
 
     @Test
     fun ignoresInvalidTimingSamples() {
-        AdaptiveComputeDispatchPolicy.resetForTests()
-        AdaptiveComputeDispatchPolicy.recordCpu(
+        AdaptiveComputePerformanceMonitor.resetForTests()
+        AdaptiveComputePerformanceMonitor.recordCpu(
             AdaptiveComputeOperation.LINEAR,
             operationCount = 100L,
             elapsedNanoseconds = 0L
         )
-        AdaptiveComputeDispatchPolicy.recordGpu(
+        AdaptiveComputePerformanceMonitor.recordGpu(
             AdaptiveComputeOperation.LINEAR,
             operationCount = -1L,
             elapsedNanoseconds = 1_000L
         )
 
-        val snapshot = AdaptiveComputeDispatchPolicy.snapshot(AdaptiveComputeOperation.LINEAR, operationCount = 100L)
+        val snapshot = AdaptiveComputePerformanceMonitor.snapshot(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount = 100L
+        )
         assertEquals(0, snapshot.cpuSamples)
         assertEquals(0, snapshot.gpuSamples)
     }
