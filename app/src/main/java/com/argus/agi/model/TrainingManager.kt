@@ -2453,6 +2453,9 @@ class TrainingManager(
         } catch (cancelled: CancellationException) {
             preparedTokenizerDocuments.remove(documentId)
             throw cancelled
+        } catch (error: OutOfMemoryError) {
+            preparedTokenizerDocuments.remove(documentId)
+            throw error
         } catch (error: Exception) {
             preparedTokenizerDocuments.remove(documentId)
             Log.w(TAG, "Tokenizer preparation failed for document $documentId; existing vocabulary will be used.", error)
