@@ -322,22 +322,40 @@ class TrainingManager(
 
     private fun resumeAfterCommittedQueueRefresh(forceTrainingOnce: Boolean = false) {
         scope.launch {
-            val committedItems = try {
-                repo?.getOptimizerCommittedTrainingItemsSnapshot().orEmpty()
-            } catch (error: Throwable) {
-                Log.e(TAG, "Cannot resume training until committed queue state is readable.", error)
+            val repository = repo
+            if (repository == null) {
                 _isTrainingPaused.value = true
+                Log.e(TAG, "Cannot resume training because durable queue storage is unavailable.")
                 return@launch
             }
-            prependCommittedQueueItems(committedItems)
-            synchronized(queueLock) {
-                oomRetryCounts.clear()
+            try {
+                // Recover a prepared/committed journal before moving any interrupted
+                // TRAINING row back to QUEUED. A committed optimizer step must first
+                // receive its checkpoint; a partial pre-commit step must roll back.
+                reconcilePersistedTrainingCommit(repository)
+                repository.recoverInterruptedTrainingItems()
+                val committedItems = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                val pendingItems = repository.getPendingQueueSnapshot()
+                prependCommittedQueueItems(committedItems)
+                prependPersistingQueueItems(pendingItems.filterNot { pending ->
+                    _nextQueue.value.any { current -> current.id == pending.id }
+                })
+                _currentTrainingItem.value = null
+                _activeDocument.value = null
+                synchronized(queueLock) {
+                    oomRetryCounts.clear()
+                }
+                if (forceTrainingOnce) {
+                    deviceGuard.setForceTrainingOverride(true)
+                }
+                _isTrainingPaused.value = false
+                wakeupSignal.trySend(Unit)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                Log.e(TAG, "Cannot resume training until checkpoint and queue recovery is complete.", error)
+                _isTrainingPaused.value = true
             }
-            if (forceTrainingOnce) {
-                deviceGuard.setForceTrainingOverride(true)
-            }
-            _isTrainingPaused.value = false
-            wakeupSignal.trySend(Unit)
         }
     }
 
@@ -1496,8 +1514,15 @@ class TrainingManager(
         val currentOptimizerStep = neuralEngine.optimizerStep
 
         if (!snapshot.isCommitted) {
-            check(currentOptimizerStep == snapshot.baselineOptimizerStep) {
-                "A prepared training journal does not match the restored optimizer checkpoint."
+            if (currentOptimizerStep != snapshot.baselineOptimizerStep) {
+                val residencyReleased = neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()
+                check(
+                    residencyReleased &&
+                        neuralEngine.loadCheckpointIfExists() &&
+                        neuralEngine.optimizerStep == snapshot.baselineOptimizerStep
+                ) {
+                    "The prepared training batch could not be rolled back to its exact optimizer baseline."
+                }
             }
             TrainingCommitJournal.delete(trainingCommitJournalFile)
             return
@@ -1517,6 +1542,12 @@ class TrainingManager(
             // replacement did not. The only durable model state is the exact saved baseline.
             TrainingCommitJournal.delete(trainingCommitJournalFile)
             return
+        }
+
+        // Room must never publish COMMITTED until the exact model and optimizer
+        // state represented by this journal is durably saved.
+        check(neuralEngine.saveCheckpoint()) {
+            "The committed optimizer checkpoint could not be secured during recovery."
         }
 
         val committedItems = ArrayList<TrainingData>(snapshot.entries.size)
