@@ -871,6 +871,7 @@ class TrainingManager(
                 if (record.isEmpty()) continue
                 if (!record.startsWith('{')) return null
 
+                validateStreamedJsonValueSizes(record)
                 val isJsonObject = runCatching {
                     org.json.JSONObject(record)
                 }.isSuccess
@@ -879,7 +880,6 @@ class TrainingManager(
                     "JSONL document exceeds the safe limit of " +
                         "$MAX_STREAMED_DOCUMENT_CHUNKS processed records."
                 }
-                validateStreamedJsonValueSizes(record)
 
                 foundRecord = true
                 val nextChunks = TextModalityProcessor.process(

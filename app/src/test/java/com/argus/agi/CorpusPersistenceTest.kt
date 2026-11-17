@@ -544,6 +544,58 @@ class CorpusPersistenceTest {
     }
 
     @Test
+    fun streamedJsonlRejectsOversizedRecordBeforePersistingAnyDocument() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(
+                context,
+                EngineConfig(maxSeqLen = 64)
+            ),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val oversizedRecord = """{"instruction":"prompt","response":"${
+                "x".repeat(TrainingManager.MAX_STREAMED_JSON_VALUE_CHARACTERS + 1)
+            }"}"""
+            val failure = runCatching {
+                manager.enqueueDocumentStream(
+                    source = "JSONL field-size regression",
+                    title = "Oversized JSONL record",
+                    reader = StringReader(oversizedRecord),
+                    chunkSize = 380,
+                    overlap = 0
+                )
+            }.exceptionOrNull()
+
+            assertTrue(
+                "A JSONL value above the per-record limit must be rejected.",
+                failure is IllegalArgumentException
+            )
+            assertTrue(repository.getCorpusDocuments().isEmpty())
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            assertTrue(
+                "The temporary spool must be deleted after JSON value rejection.",
+                context.cacheDir.listFiles().orEmpty().none { file ->
+                    file.name.startsWith("argus-ingest-")
+                }
+            )
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
+    @Test
     fun streamedPlainTextConversationIsProcessedOnlyAfterTheCompleteTranscriptArrives() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val database = Room.inMemoryDatabaseBuilder(
