@@ -308,6 +308,16 @@ class ArgusNeuralEngine private constructor(
     val layerCount = config.layerCount
     val isFullTrainingEnabled = config.isFullTrainingEnabled
 
+    @Volatile
+    private var checkpointStateVerified = false
+
+    /**
+     * True only after an existing checkpoint has been fully restored or a new
+     * checkpoint has been atomically written and verified on local storage.
+     */
+    val isCheckpointStateVerified: Boolean
+        get() = checkpointStateVerified
+
     val optimizerStep: Int
         get() = synchronized(modelLock) { adamStep }
 
@@ -571,12 +581,10 @@ class ArgusNeuralEngine private constructor(
                 )
             }.getOrNull()
 
-            // The tokenizer is moving to a new byte-level vocabulary contract.
-            // Old ARG3/ARG4 checkpoints are intentionally not restored; a fresh
-            // model must be initialized with the matching BYTE_LEVEL_BPE_V2 IDs.
-            val compatibleSavedConfig = savedConfig?.takeIf { saved ->
-                saved.tokenizerConfig.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2
-            }
+            // Token IDs are part of the checkpoint contract. Preserve the saved
+            // tokenizer algorithm and architecture for existing ARG3/ARG4 models.
+            // Fresh installations still receive the current BYTE_LEVEL_BPE_V2 default.
+            val compatibleSavedConfig = savedConfig
             val resolvedConfig = compatibleSavedConfig ?: requireNotNull(deviceConfig) {
                 "This device cannot currently allocate the minimum executable Argus model safely."
             }
@@ -3755,7 +3763,11 @@ class ArgusNeuralEngine private constructor(
                 writeArg4Checkpoint()
             }
             val file = File(context.filesDir, "argus_model_weights.bin")
-            file.isFile && file.length() >= ARG4_HEADER_SIZE.toLong()
+            val saved = file.isFile && file.length() >= ARG4_HEADER_SIZE.toLong()
+            if (saved) {
+                checkpointStateVerified = true
+            }
+            saved
         } catch (t: Throwable) {
             Log.e(TAG, "Checkpoint save failed", t)
             false
@@ -4504,9 +4516,11 @@ class ArgusNeuralEngine private constructor(
     }
 
     fun loadCheckpointIfExists(): Boolean {
+        checkpointStateVerified = false
         val file = File(context.filesDir, "argus_model_weights.bin")
         if (!file.isFile || file.length() < 4L) return false
-        return try {
+
+        val restored = try {
             val magic = FileInputStream(file).use { it.readFully(4) }
             when {
                 magic[0] == MAGIC_0 && magic[1] == MAGIC_1 &&
@@ -4526,6 +4540,9 @@ class ArgusNeuralEngine private constructor(
             Log.e(TAG, "Checkpoint header read failed", e)
             false
         }
+
+        checkpointStateVerified = restored
+        return restored
     }
 
     private fun InputStream.readFully(size: Int): ByteArray {

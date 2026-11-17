@@ -146,7 +146,8 @@ class GenesisModelManager(
         }
     }
 
-    fun hasCompletedGenesis(): Boolean = prefs.contains(KEY_ORIGIN_ID)
+    fun hasCompletedGenesis(): Boolean =
+        neuralEngine.isCheckpointStateVerified && prefs.contains(KEY_ORIGIN_ID)
 
     fun hasSeenBootAnimation(): Boolean = prefs.getBoolean(KEY_BOOT_SEEN, false)
 
@@ -458,6 +459,14 @@ class GenesisModelManager(
     }
 
     private fun loadIdentity(): GenesisIdentity? {
+        if (!neuralEngine.isCheckpointStateVerified) {
+            Log.w(
+                TAG,
+                "Stored Genesis identity ignored because no compatible checkpoint was restored or verified."
+            )
+            return null
+        }
+
         val originId = prefs.getString(KEY_ORIGIN_ID, null) ?: return null
         val birthTs = prefs.getLong(KEY_BIRTH_TS, 0L).takeIf { it > 0L }
             ?: System.currentTimeMillis()
