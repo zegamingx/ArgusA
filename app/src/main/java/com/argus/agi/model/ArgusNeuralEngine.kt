@@ -3113,8 +3113,7 @@ class ArgusNeuralEngine private constructor(
         // Validate every CPU update before mutating any authoritative model or
         // optimizer tensor. This keeps the fallback transactional without allocating
         // a second full copy of the model, first moments, or second moments.
-        val cpuOperationCount = gradients.sumOf { gradient -> gradient.size.toLong() }
-        val cpuStartNanos = System.nanoTime()
+        val cpuOperationCount = optimizerOperationCount
         for (groupIndex in parameters.indices) {
             val parameter = parameters[groupIndex]
             val gradient = gradients[groupIndex]
@@ -3192,7 +3191,7 @@ class ArgusNeuralEngine private constructor(
         }
         VulkanTrainingBackend.recordCpuAdamWTiming(
             cpuOperationCount,
-            System.nanoTime() - cpuStartNanos
+            System.nanoTime() - gpuDispatchStartNanos
         )
     }
 
