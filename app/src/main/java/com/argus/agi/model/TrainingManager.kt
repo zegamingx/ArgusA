@@ -1633,6 +1633,307 @@ class TrainingManager(
         }
     }
 
+    private suspend fun reconcilePersistedTrainingCommit(
+        repository: com.argus.agi.data.repository.ArgusRepository
+    ) {
+        val snapshot = TrainingCommitJournal.read(trainingCommitJournalFile) ?: return
+        val currentOptimizerStep = neuralEngine.optimizerStep
+
+        if (!snapshot.isCommitted) {
+            check(currentOptimizerStep == snapshot.baselineOptimizerStep) {
+                "A prepared training journal does not match the restored optimizer checkpoint."
+            }
+            TrainingCommitJournal.delete(trainingCommitJournalFile)
+            return
+        }
+
+        val committedOptimizerStep = requireNotNull(snapshot.committedOptimizerStep)
+        if (currentOptimizerStep < committedOptimizerStep) {
+            val committedIds = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                .mapTo(HashSet()) { it.id }
+            check(snapshot.entries.none { it.itemId in committedIds }) {
+                "Room marks a batch committed, but the restored checkpoint is older than its optimizer commit."
+            }
+            // The journal reached COMMITTED but the following checkpoint replacement did not.
+            // The baseline checkpoint remains the durable model and TRAINING rows can retry.
+            TrainingCommitJournal.delete(trainingCommitJournalFile)
+            return
+        }
+
+        val committedItems = ArrayList<TrainingData>(snapshot.entries.size)
+        for (entry in snapshot.entries) {
+            val existing = repository.getTrainingItem(entry.itemId)
+                ?: throw IllegalStateException(
+                    "The committed training journal references a missing queue item: ${entry.itemId}."
+                )
+            if (
+                existing.status == TrainingStatus.COMPLETED ||
+                existing.status == TrainingStatus.FAILED
+            ) {
+                continue
+            }
+            val result = requireNotNull(entry.result) {
+                "A committed journal entry is missing its training result."
+            }
+            committedItems.add(
+                existing.copy(
+                    status = TrainingStatus.OPTIMIZER_COMMITTED,
+                    finalLoss = result.loss,
+                    stepDurationMs = entry.stepDurationMs
+                )
+            )
+        }
+        if (committedItems.isNotEmpty()) {
+            repository.markTrainingItemsOptimizerCommitted(committedItems)
+        } else {
+            TrainingCommitJournal.delete(trainingCommitJournalFile)
+        }
+    }
+
+    private suspend fun ensureLiveBatchCommitPersisted(
+        activeItems: MutableList<TrainingData>
+    ): Boolean {
+        if (activeBatchRoomCommitted) return true
+        val snapshot = TrainingCommitJournal.read(trainingCommitJournalFile) ?: return false
+        if (!snapshot.isCommitted) return false
+
+        val committedOptimizerStep = requireNotNull(snapshot.committedOptimizerStep)
+        if (neuralEngine.optimizerStep < committedOptimizerStep) return false
+        check(neuralEngine.saveCheckpoint()) {
+            "The optimizer committed the batch, but its checkpoint could not be secured."
+        }
+
+        val repository = requireNotNull(repo) {
+            "The committed batch cannot be finalized without durable queue storage."
+        }
+        val entriesById = snapshot.entries.associateBy(TrainingCommitJournalEntry::itemId)
+        val committedItems = ArrayList<TrainingData>(activeItems.size)
+        for (index in activeItems.indices) {
+            val item = activeItems[index]
+            val entry = entriesById[item.id] ?: continue
+            val result = requireNotNull(entry.result) {
+                "The committed training journal is missing a sample result."
+            }
+            val committed = item.copy(
+                status = TrainingStatus.OPTIMIZER_COMMITTED,
+                finalLoss = result.loss,
+                stepDurationMs = entry.stepDurationMs
+            )
+            activeItems[index] = committed
+            committedItems.add(committed)
+        }
+        if (committedItems.isNotEmpty()) {
+            repository.markTrainingItemsOptimizerCommitted(committedItems)
+        }
+        activeBatchRoomCommitted = true
+        return true
+    }
+
+    private suspend fun handleTrainingOutOfMemory(
+        activeItems: MutableList<TrainingData>,
+        error: OutOfMemoryError
+    ) {
+        Log.e(
+            TAG,
+            "Training batch hit memory pressure; recovering from its durable optimizer transaction.",
+            error
+        )
+
+        val residencyReleased = runCatching {
+            neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()
+        }.getOrDefault(false)
+        if (!residencyReleased) {
+            _isTrainingPaused.value = true
+            Log.e(TAG, "Training paused because Vulkan state could not be safely released after OOM.")
+            return
+        }
+
+        val committed = runCatching {
+            ensureLiveBatchCommitPersisted(activeItems)
+        }.onFailure { recoveryError ->
+            Log.e(TAG, "Could not secure the committed optimizer transaction after OOM.", recoveryError)
+        }.getOrDefault(false)
+
+        if (committed) {
+            runCatching {
+                neuralEngine.resumeVulkanTensorResidencyAfterForeground()
+                val repository = requireNotNull(repo)
+                val activeIds = activeItems.mapTo(HashSet()) { it.id }
+                val pendingCommitted = repository
+                    .getOptimizerCommittedTrainingItemsSnapshot()
+                    .filter { item -> item.id in activeIds }
+                prependCommittedQueueItems(pendingCommitted)
+            }.onFailure { recoveryError ->
+                Log.e(TAG, "Committed training finalization could not be returned to the queue.", recoveryError)
+            }
+            _currentTrainingItem.value = null
+            _activeDocument.value = null
+            _isTrainingPaused.value = true
+            Log.w(
+                TAG,
+                "The optimizer commit was preserved. Training is paused so the remaining committed items can be finalized without retraining."
+            )
+            return
+        }
+
+        val journal = runCatching {
+            TrainingCommitJournal.read(trainingCommitJournalFile)
+        }.onFailure { journalError ->
+            Log.e(TAG, "Training commit journal could not be read during OOM recovery.", journalError)
+        }.getOrNull()
+        val baselineStep = activeBatchBaselineOptimizerStep
+            ?: journal?.baselineOptimizerStep
+
+        val repository = repo
+        val committedIdsInRoom = if (repository != null) {
+            runCatching {
+                repository.getOptimizerCommittedTrainingItemsSnapshot()
+                    .mapTo(HashSet()) { it.id }
+            }.getOrElse { roomError ->
+                Log.e(TAG, "Could not verify Room commit state during OOM recovery.", roomError)
+                _isTrainingPaused.value = true
+                return
+            }
+        } else {
+            emptySet()
+        }
+        if (activeItems.any { it.id in committedIdsInRoom }) {
+            _isTrainingPaused.value = true
+            Log.e(
+                TAG,
+                "Room already contains optimizer-committed items, but the corresponding model checkpoint could not be verified. The queue was left untouched."
+            )
+            return
+        }
+
+        val rolledBack = if (baselineStep == null) {
+            // OOM happened before the prepared journal was created and before the
+            // optimizer was invoked. No model transaction needs to be replayed.
+            true
+        } else {
+            runCatching {
+                neuralEngine.loadCheckpointIfExists() &&
+                    neuralEngine.optimizerStep == baselineStep
+            }.getOrDefault(false)
+        }
+        if (!rolledBack) {
+            _isTrainingPaused.value = true
+            Log.e(
+                TAG,
+                "Training paused because the model could not be restored to its pre-batch optimizer checkpoint."
+            )
+            return
+        }
+
+        runCatching {
+            TrainingCommitJournal.delete(trainingCommitJournalFile)
+            neuralEngine.resumeVulkanTensorResidencyAfterForeground()
+        }.onFailure { recoveryError ->
+            _isTrainingPaused.value = true
+            Log.e(TAG, "Training rollback completed but Vulkan/journal recovery did not finish.", recoveryError)
+            return
+        }
+
+        activeBatchBaselineOptimizerStep = null
+        activeBatchRoomCommitted = false
+        val requeued = prependPersistingQueueItems(
+            activeItems.map { item -> item.copy(status = TrainingStatus.QUEUED) }
+        )
+        _currentTrainingItem.value = null
+        _activeDocument.value = null
+
+        if (requeued.isEmpty()) {
+            _isTrainingPaused.value = true
+            Log.e(TAG, "OOM recovery could not persist the batch at the front of the queue.")
+            return
+        }
+
+        val shouldPauseForRepeatedOom = synchronized(queueLock) {
+            requeued.any { item ->
+                val retryCount = (oomRetryCounts[item.id] ?: 0) + 1
+                oomRetryCounts[item.id] = retryCount
+                oomRecoveryItemIds.add(item.id)
+                retryCount > 1
+            }
+        }
+        if (shouldPauseForRepeatedOom) {
+            _isTrainingPaused.value = true
+            Log.e(TAG, "The same training item hit OOM more than once. It was preserved for explicit user retry.")
+        } else {
+            Log.w(
+                TAG,
+                "The uncommitted batch was rolled back and moved to the front of the queue. Its retry is constrained to batch 1 and reduced context."
+            )
+        }
+    }
+
+    private suspend fun handleCommittedFinalizationOutOfMemory(
+        item: TrainingData,
+        error: OutOfMemoryError
+    ) {
+        Log.e(TAG, "Finalizing an already committed training item hit OOM; the item will not be retrained.", error)
+        val released = runCatching {
+            neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()
+        }.getOrDefault(false)
+        if (!released) {
+            _isTrainingPaused.value = true
+            return
+        }
+        runCatching {
+            neuralEngine.resumeVulkanTensorResidencyAfterForeground()
+            val repository = requireNotNull(repo)
+            val pending = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                .filter { committed -> committed.id == item.id }
+            prependCommittedQueueItems(pending)
+        }.onFailure { recoveryError ->
+            Log.e(TAG, "Committed item could not be returned to finalization queue.", recoveryError)
+        }
+        _currentTrainingItem.value = null
+        _activeDocument.value = null
+        _isTrainingPaused.value = true
+    }
+
+    private suspend fun processCommittedItem(item: TrainingData): Boolean {
+        val journalEntry = runCatching {
+            TrainingCommitJournal.read(trainingCommitJournalFile)
+                ?.takeIf(TrainingCommitJournalSnapshot::isCommitted)
+                ?.entries
+                ?.firstOrNull { entry -> entry.itemId == item.id }
+        }.getOrElse { error ->
+            Log.e(TAG, "Could not read committed result for '${item.id}'.", error)
+            throw error
+        }
+        val result = journalEntry?.result ?: NeuralTrainingStepResult(
+            loss = item.finalLoss ?: Float.NaN,
+            inputTokenCount = 0,
+            predictionTargetCount = 0,
+            contextWindowCount = 0,
+            optimizerUpdateCount = 0,
+            vocabularySize = neuralEngine.tokenizer.vocabSize
+        )
+        val duration = journalEntry?.stepDurationMs ?: item.stepDurationMs
+        val completed = processItem(item, result, duration)
+        deleteTrainingCommitJournalWhenResolved()
+        synchronized(queueLock) {
+            oomRecoveryItemIds.remove(item.id)
+            oomRetryCounts.remove(item.id)
+        }
+        return completed
+    }
+
+    private suspend fun deleteTrainingCommitJournalWhenResolved() {
+        val snapshot = TrainingCommitJournal.read(trainingCommitJournalFile) ?: return
+        if (!snapshot.isCommitted) return
+        val repository = repo ?: return
+        val pendingIds = repository.getOptimizerCommittedTrainingItemsSnapshot()
+            .mapTo(HashSet()) { it.id }
+        if (snapshot.entries.none { entry -> entry.itemId in pendingIds }) {
+            TrainingCommitJournal.delete(trainingCommitJournalFile)
+            activeBatchBaselineOptimizerStep = null
+            activeBatchRoomCommitted = false
+        }
+    }
+
     private fun startTrainingWorker() {
         workerJob = scope.launch {
             try {
