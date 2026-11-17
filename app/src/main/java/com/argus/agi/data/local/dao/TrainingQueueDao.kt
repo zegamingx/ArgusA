@@ -71,9 +71,9 @@ interface TrainingQueueDao {
     suspend fun markTrainingStarted(id: String): Int
 
     /**
-     * A process can die after a queue row is marked TRAINING but before completion is
-     * persisted. Requeue those rows on startup. This is at-least-once recovery: a chunk
-     * may be optimized again if the model checkpoint was saved before the process died.
+     * TrainingManager reconciles its checksummed optimizer-commit journal against the
+     * model checkpoint before calling this method. Remaining TRAINING rows are therefore
+     * pre-commit or legacy rows and can safely return to QUEUED for replay.
      */
     @Query("UPDATE training_items SET status = 'QUEUED' WHERE status = 'TRAINING'")
     suspend fun recoverInterruptedTrainingItems(): Int
