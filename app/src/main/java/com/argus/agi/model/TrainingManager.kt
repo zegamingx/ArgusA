@@ -677,9 +677,16 @@ class TrainingManager(
             BufferedOutputStream(FileOutputStream(stagingFile)).use { output ->
                 while (true) {
                     currentCoroutineContext().ensureActive()
-                    val readCount = reader.read(inputBuffer)
+                    var readCount = reader.read(inputBuffer)
+                    if (readCount == 0) {
+                        // Reader implementations should make progress for a non-empty buffer,
+                        // but handle a non-conforming zero-length read without spinning forever.
+                        val singleCharacter = reader.read()
+                        if (singleCharacter < 0) break
+                        inputBuffer[0] = singleCharacter.toChar()
+                        readCount = 1
+                    }
                     if (readCount < 0) break
-                    if (readCount == 0) continue
                     if (closed) return Pair(0, totalCharsRead)
 
                     val nextTotal = Math.addExact(totalCharsRead, readCount.toLong())
@@ -828,26 +835,43 @@ class TrainingManager(
         val byteBuffer = ByteArray(8 * 1024)
         val charBuffer = CharArray(byteBuffer.size / 2)
         var charactersRead = 0
+        var pendingHighByte = -1
 
         BufferedInputStream(FileInputStream(file)).use { input ->
             while (true) {
                 val byteCount = input.read(byteBuffer)
                 if (byteCount < 0) break
-                check(byteCount % 2 == 0) {
-                    "Temporary streamed-ingestion data ended in the middle of a UTF-16 code unit."
+                if (byteCount == 0) continue
+
+                var inputIndex = 0
+                var charCount = 0
+                if (pendingHighByte >= 0) {
+                    val lowByte = byteBuffer[inputIndex].toInt() and 0xFF
+                    charBuffer[charCount++] = ((pendingHighByte shl 8) or lowByte).toChar()
+                    pendingHighByte = -1
+                    inputIndex++
                 }
 
-                val charCount = byteCount / 2
-                for (index in 0 until charCount) {
-                    val high = byteBuffer[index * 2].toInt() and 0xFF
-                    val low = byteBuffer[index * 2 + 1].toInt() and 0xFF
-                    charBuffer[index] = ((high shl 8) or low).toChar()
+                while (inputIndex + 1 < byteCount) {
+                    val high = byteBuffer[inputIndex].toInt() and 0xFF
+                    val low = byteBuffer[inputIndex + 1].toInt() and 0xFF
+                    charBuffer[charCount++] = ((high shl 8) or low).toChar()
+                    inputIndex += 2
                 }
-                result.append(charBuffer, 0, charCount)
-                charactersRead = Math.addExact(charactersRead, charCount)
+
+                if (inputIndex < byteCount) {
+                    pendingHighByte = byteBuffer[inputIndex].toInt() and 0xFF
+                }
+                if (charCount > 0) {
+                    result.append(charBuffer, 0, charCount)
+                    charactersRead = Math.addExact(charactersRead, charCount)
+                }
             }
         }
 
+        check(pendingHighByte < 0) {
+            "Temporary streamed-ingestion data ended in the middle of a UTF-16 code unit."
+        }
         check(charactersRead == expectedCharacterCount) {
             "Temporary streamed-ingestion character count does not match the source stream."
         }
