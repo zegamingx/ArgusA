@@ -4742,7 +4742,7 @@ internal object VulkanTrainingBackend {
         val operationCount = runCatching {
             Math.multiplyExact(inputElements, outputColumns.toLong())
         }.getOrNull() ?: return false
-        if (!isFp16ComputeAvailable!ensureModelTensorResidencyReady()) {
+        if (!isFp16ComputeAvailable || !ensureModelTensorResidencyReady()) {
             return false
         }
 
@@ -4890,7 +4890,7 @@ internal object VulkanTrainingBackend {
                 outputColumns.toLong()
             )
         }.getOrNull() ?: return false
-        if (!isFp16ComputeAvailable!ensureModelTensorResidencyReady()) {
+        if (!isFp16ComputeAvailable || !ensureModelTensorResidencyReady()) {
             return false
         }
 

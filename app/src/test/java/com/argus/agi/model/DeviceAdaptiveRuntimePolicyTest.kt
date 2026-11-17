@@ -289,8 +289,10 @@ class AdaptiveComputePerformanceMonitorTest {
         )
         assertEquals(1, snapshot.cpuSamples)
         assertEquals(1, snapshot.gpuSamples)
-        assertEquals(10.0, snapshot.cpuNanosecondsPerOperation!!, 0.0001)
-        assertEquals(2_000_000.0 / 300_000.0, snapshot.gpuNanosecondsPerOperation!!, 0.0001)
+        val cpuNanosecondsPerOperation = requireNotNull(snapshot.cpuNanosecondsPerOperation)
+        assertEquals(10.0, cpuNanosecondsPerOperation, 0.0001)
+        val gpuNanosecondsPerOperation = requireNotNull(snapshot.gpuNanosecondsPerOperation)
+        assertEquals(2_000_000.0 / 300_000.0, gpuNanosecondsPerOperation, 0.0001)
     }
 
     @Test
@@ -354,7 +356,8 @@ class AdaptiveComputePerformanceMonitorTest {
             operationCount = 100L
         )
         assertEquals(2, snapshot.cpuSamples)
-        assertEquals(12.5, snapshot.cpuNanosecondsPerOperation!!, 0.0001)
+        val cpuNanosecondsPerOperation = requireNotNull(snapshot.cpuNanosecondsPerOperation)
+        assertEquals(12.5, cpuNanosecondsPerOperation, 0.0001)
     }
 
     @Test
