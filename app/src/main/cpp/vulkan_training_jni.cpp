@@ -2,9 +2,19 @@
 #include <android/log.h>
 #include <vulkan/vulkan.h>
 
+#if !defined(VK_KHR_synchronization2)
+#error "Argus requires Vulkan headers with VK_KHR_synchronization2 support."
+#endif
+
 #include "adamw_shader_spv.h"
 #include "linear_shader_spv.h"
 #include "linear_fp16_shader_spv.h"
+#include "linear_resident_shader_spv.h"
+#include "attention_resident_shader_spv.h"
+#include "swiglu_resident_shader_spv.h"
+#include "backward_resident_shader_spv.h"
+#include "adamw_resident_shader_spv.h"
+#include "tensor_arena_core.h"
 
 #include <algorithm>
 #include <array>
@@ -12,9 +22,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <limits>
+#include <initializer_list>
 #include <mutex>
 #include <new>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -54,40 +68,267 @@ struct LinearPushConstants {
     uint32_t weightOffset;
     uint32_t outputOffset;
     uint32_t transposeWeights;
+    uint32_t weightOffsetsTableOffset = std::numeric_limits<uint32_t>::max();
 };
 
-static_assert(sizeof(LinearPushConstants) == 36);
+static_assert(sizeof(LinearPushConstants) == 40);
 static_assert(offsetof(LinearPushConstants, transposeWeights) == 32);
+static_assert(offsetof(LinearPushConstants, weightOffsetsTableOffset) == 36);
+
+struct ResidentLinearPushConstants {
+    uint32_t inputBatchStrideWords;
+    uint32_t batchCount;
+    uint32_t rowsPerBatch;
+    uint32_t inputColumns;
+    uint32_t outputColumns;
+    uint32_t inputOffsetWords;
+    uint32_t weightOffsetHalf;
+    uint32_t outputOffsetWords;
+    uint32_t transposeWeights;
+    uint32_t weightOffsetsTableOffsetWords;
+};
+
+static_assert(sizeof(ResidentLinearPushConstants) == 40);
+static_assert(offsetof(ResidentLinearPushConstants, batchCount) == 4);
+static_assert(offsetof(ResidentLinearPushConstants, weightOffsetsTableOffsetWords) == 36);
+
+struct ResidentAttentionPushConstants {
+    uint32_t operation;
+    uint32_t sequenceLength;
+    uint32_t modelWidth;
+    uint32_t headCount;
+    uint32_t headDimension;
+    uint32_t qkvOffsetWords;
+    uint32_t scoreOffsetWords;
+    uint32_t attentionOutputOffsetWords;
+    uint32_t projectedOutputOffsetWords;
+    uint32_t residualOffsetWords;
+    uint32_t outputWeightOffsetHalf;
+    uint32_t normalizedOutputOffsetWords;
+};
+
+static_assert(sizeof(ResidentAttentionPushConstants) == 48);
+static_assert(offsetof(ResidentAttentionPushConstants, qkvOffsetWords) == 20);
+static_assert(offsetof(ResidentAttentionPushConstants, outputWeightOffsetHalf) == 40);
+static_assert(offsetof(ResidentAttentionPushConstants, normalizedOutputOffsetWords) == 44);
+
+struct ResidentSwiGluPushConstants {
+    uint32_t totalElementCount;
+    uint32_t gateOffsetWords;
+    uint32_t upOffsetWords;
+    uint32_t outputOffsetWords;
+};
+
+static_assert(sizeof(ResidentSwiGluPushConstants) == 16);
+static_assert(offsetof(ResidentSwiGluPushConstants, outputOffsetWords) == 12);
+
+struct ResidentBackwardPushConstants {
+    uint32_t operation;
+    uint32_t rows;
+    uint32_t columns;
+    uint32_t sequenceLength;
+    uint32_t input0OffsetWords;
+    uint32_t input1OffsetWords;
+    uint32_t input2OffsetWords;
+    uint32_t output0OffsetWords;
+    uint32_t output1OffsetWords;
+    float scale;
+    float epsilon;
+};
+
+static_assert(sizeof(ResidentBackwardPushConstants) == 44);
+static_assert(offsetof(ResidentBackwardPushConstants, input0OffsetWords) == 16);
+static_assert(offsetof(ResidentBackwardPushConstants, output0OffsetWords) == 28);
+static_assert(offsetof(ResidentBackwardPushConstants, scale) == 36);
+static_assert(offsetof(ResidentBackwardPushConstants, epsilon) == 40);
+
+struct ResidentAdamwPushConstants {
+    uint32_t operation;
+    uint32_t elementCount;
+    uint32_t pairCount;
+    uint32_t parameterOffsetWords;
+    uint32_t candidateParameterOffsetWords;
+    uint32_t gradientOffsetWords;
+    uint32_t gradientElementOffset;
+    uint32_t firstMomentOffsetWords;
+    uint32_t secondMomentOffsetWords;
+    uint32_t candidateFirstMomentOffsetWords;
+    uint32_t candidateSecondMomentOffsetWords;
+    uint32_t statusOffsetWords;
+    float learningRate;
+    float beta1;
+    float beta2;
+    float biasCorrection1;
+    float biasCorrection2;
+    float epsilon;
+    float gradientClipFactor;
+    float weightDecay;
+};
+
+static_assert(sizeof(ResidentAdamwPushConstants) == 80);
+static_assert(offsetof(ResidentAdamwPushConstants, parameterOffsetWords) == 12);
+static_assert(offsetof(ResidentAdamwPushConstants, candidateParameterOffsetWords) == 16);
+static_assert(offsetof(ResidentAdamwPushConstants, candidateFirstMomentOffsetWords) == 36);
+static_assert(offsetof(ResidentAdamwPushConstants, statusOffsetWords) == 44);
+static_assert(offsetof(ResidentAdamwPushConstants, learningRate) == 48);
+static_assert(offsetof(ResidentAdamwPushConstants, weightDecay) == 76);
+
+struct CooperativeMatrixCapability {
+    uint32_t mSize = 0;
+    uint32_t nSize = 0;
+    uint32_t kSize = 0;
+    uint32_t aType = 0;
+    uint32_t bType = 0;
+    uint32_t cType = 0;
+    uint32_t resultType = 0;
+    bool saturatingAccumulation = false;
+    uint32_t scope = 0;
+};
 
 struct VulkanRuntime {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties physicalDeviceProperties{};
+    VkPhysicalDeviceDriverProperties driverProperties{};
+    bool hasDriverProperties = false;
+    bool hasDeviceIdentityProperties = false;
+    std::array<uint8_t, VK_UUID_SIZE> deviceUuid{};
+    std::array<uint8_t, VK_UUID_SIZE> driverUuid{};
     VkPhysicalDeviceMemoryProperties memoryProperties{};
+    bool memoryPropertiesAvailable = false;
+    uint32_t hostVisibleMemoryTypeCount = 0;
+    uint32_t hostVisibleDeviceLocalMemoryTypeCount = 0;
+    bool memoryBudgetExtensionSupported = false;
+    bool memoryBudgetExtensionEnabled = false;
+    bool memoryBudgetQueryAvailable = false;
+    uint32_t memoryBudgetHeapCount = 0;
+    std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> memoryHeapBudget{};
+    std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> memoryHeapUsage{};
+#if defined(VK_VERSION_1_1)
+    PFN_vkGetPhysicalDeviceMemoryProperties2 getPhysicalDeviceMemoryProperties2 = nullptr;
+#endif
     VkDevice device = VK_NULL_HANDLE;
     VkQueue computeQueue = VK_NULL_HANDLE;
     uint32_t queueFamilyIndex = 0;
+    uint32_t computeQueueTimestampValidBits = 0;
+    uint32_t effectiveApiVersion = VK_API_VERSION_1_0;
     uint32_t maxComputeWorkGroupCountX = 0;
+    bool synchronization2ExtensionSupported = false;
+    bool synchronization2Supported = false;
+    bool synchronization2Enabled = false;
+    PFN_vkQueueSubmit2KHR queueSubmit2 = nullptr;
+    PFN_vkCmdPipelineBarrier2KHR cmdPipelineBarrier2 = nullptr;
+    PFN_vkCmdWriteTimestamp2KHR cmdWriteTimestamp2 = nullptr;
 
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    VkFence submissionFence = VK_NULL_HANDLE;
+    VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
+    bool timestampProfilingAvailable = false;
+    uint64_t timestampedDispatchCount = 0;
+    uint64_t lastAdamwGpuTimeNanoseconds = 0;
+    uint64_t lastLinearGpuTimeNanoseconds = 0;
+    uint64_t lastFp16LinearGpuTimeNanoseconds = 0;
+    uint64_t totalGpuTimeNanoseconds = 0;
 
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    VkDescriptorSet tensorArenaDescriptorSet = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipeline linearPipeline = VK_NULL_HANDLE;
     VkPipeline fp16LinearPipeline = VK_NULL_HANDLE;
+    VkPipeline residentLinearPipeline = VK_NULL_HANDLE;
+    VkPipeline residentAttentionPipeline = VK_NULL_HANDLE;
+    VkPipeline residentSwiGluPipeline = VK_NULL_HANDLE;
+    VkPipeline residentBackwardPipeline = VK_NULL_HANDLE;
+    VkPipeline residentAdamwPipeline = VK_NULL_HANDLE;
 
     uint32_t instanceApiVersion = VK_API_VERSION_1_0;
     bool supportsFp16Compute = false;
+    bool supportsShaderFloat16Feature = false;
+    bool supportsShaderInt8 = false;
+    bool supportsStorageBuffer16BitAccess = false;
+    bool supportsStorageBuffer8BitAccess = false;
+    bool shaderFloat16FeatureEnabled = false;
+    bool shaderInt8FeatureEnabled = false;
+    bool storageBuffer16BitAccessEnabled = false;
+    bool storageBuffer8BitAccessEnabled = false;
+
+    uint32_t subgroupSize = 0;
+    uint32_t subgroupSupportedStages = 0;
+    uint32_t subgroupSupportedOperations = 0;
+    bool subgroupQuadOperationsInAllStages = false;
+    bool supportsSubgroupSizeControl = false;
+    bool subgroupSizeControlEnabled = false;
+    bool supportsComputeFullSubgroups = false;
+    uint32_t minSubgroupSize = 0;
+    uint32_t maxSubgroupSize = 0;
+    uint32_t maxComputeWorkgroupSubgroups = 0;
+    uint32_t requiredSubgroupSizeStages = 0;
+
+    bool supportsShaderIntegerDotProduct = false;
+    bool shaderIntegerDotProductEnabled = false;
+    bool integerDotProduct8BitUnsignedAccelerated = false;
+    bool integerDotProduct8BitSignedAccelerated = false;
+    bool integerDotProduct8BitMixedSignednessAccelerated = false;
+    bool integerDotProduct4x8BitPackedUnsignedAccelerated = false;
+    bool integerDotProduct4x8BitPackedSignedAccelerated = false;
+    bool integerDotProduct4x8BitPackedMixedSignednessAccelerated = false;
+
+    bool hasCooperativeMatrixExtension = false;
+    bool supportsCooperativeMatrix = false;
+    bool cooperativeMatrixEnabled = false;
+    bool supportsCooperativeMatrixRobustBufferAccess = false;
+    uint32_t cooperativeMatrixSupportedStages = 0;
+    std::vector<CooperativeMatrixCapability> cooperativeMatrixTypes;
+
+    bool armTensorsExtensionSupported = false;
+    bool armTensorsFeatureQueryAvailable = false;
+    bool armTensorsFeatureSupported = false;
+    bool armTensorNonPackedSupported = false;
+    bool armTensorShaderAccessSupported = false;
+    bool armTensorDynamicIndexingSupported = false;
+    bool armTensorNonUniformIndexingSupported = false;
+    bool armTensorUpdateAfterBindSupported = false;
+    bool armTensorDeviceFeaturesEnabled = false;
+    uint32_t shaderTensorSupportedStages = 0;
+    uint32_t armTensorMaxDimensionCount = 0;
+    uint64_t armTensorMaxElements = 0;
+    uint64_t armTensorMaxPerDimensionElements = 0;
+    int64_t armTensorMaxStride = 0;
+    uint64_t armTensorMaxSizeBytes = 0;
+    uint32_t armTensorMaxShaderAccessArrayLength = 0;
+    uint32_t armTensorMaxShaderAccessSizeBytes = 0;
+    uint32_t armTensorMaxDescriptorSetStorageTensors = 0;
+    uint32_t armTensorMaxPerStageDescriptorSetStorageTensors = 0;
+    bool armTensorNonUniformIndexingNative = false;
+
+    // ARM shader-core values are telemetry only; no vendor shader feature is enabled.
+    bool armShaderCorePropertiesExtensionSupported = false;
+    bool armShaderCoreBuiltinsExtensionSupported = false;
+    bool armShaderCoreBuiltinsFeatureQueryAvailable = false;
+    bool armShaderCoreBuiltinsFeatureSupported = false;
+    bool armShaderCoreBuiltinsFeatureEnabled = false;
+    uint32_t armShaderCoreCount = 0;
+    uint32_t armShaderWarpsPerCore = 0;
+    uint32_t armShaderFmaRate = 0;
+    uint32_t armShaderPixelRate = 0;
+    uint32_t armShaderTexelRate = 0;
 
     VkBuffer storageBuffer = VK_NULL_HANDLE;
     VkDeviceMemory storageMemory = VK_NULL_HANDLE;
     VkDeviceSize storageCapacity = 0;
     void* mappedStorage = nullptr;
     bool hostCoherent = false;
+
+    // Persistent model tensor storage; storageBuffer remains the mapped staging buffer.
+    VkBuffer tensorArenaBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory tensorArenaMemory = VK_NULL_HANDLE;
+    VkDeviceSize tensorArenaCapacity = 0;
+    bool tensorArenaDeviceLocal = false;
+    argus::vulkan::TensorArenaCore tensorArena;
 };
 
 struct GroupArrays {
@@ -99,6 +340,7 @@ struct GroupArrays {
     size_t packedOffset = 0;
     float weightDecay = 0.0f;
 };
+
 
 struct AdamwSegment {
     uint32_t elementOffset = 0;
@@ -123,6 +365,83 @@ void logError(const char* message, VkResult result = VK_SUCCESS) {
     }
 }
 
+bool hasDeviceExtension(
+    const std::vector<VkExtensionProperties>& extensions,
+    const char* extensionName
+) {
+    return std::any_of(
+        extensions.begin(),
+        extensions.end(),
+        [extensionName](const VkExtensionProperties& extension) {
+            return std::strcmp(extension.extensionName, extensionName) == 0;
+        }
+    );
+}
+
+std::string escapeJsonString(const char* value) {
+    std::string escaped;
+    if (value == nullptr) {
+        return escaped;
+    }
+
+    for (const unsigned char character : std::string(value)) {
+        switch (character) {
+            case '"':
+                escaped += "\\\"";
+                break;
+            case '\\':
+                escaped += "\\\\";
+                break;
+            case '\b':
+                escaped += "\\b";
+                break;
+            case '\f':
+                escaped += "\\f";
+                break;
+            case '\n':
+                escaped += "\\n";
+                break;
+            case '\r':
+                escaped += "\\r";
+                break;
+            case '\t':
+                escaped += "\\t";
+                break;
+            default:
+                if (character < 0x20u) {
+                    char buffer[7]{};
+                    std::snprintf(
+                        buffer,
+                        sizeof(buffer),
+                        "\\u%04X",
+                        static_cast<unsigned int>(character)
+                    );
+                    escaped += buffer;
+                } else {
+                    escaped += static_cast<char>(character);
+                }
+                break;
+        }
+    }
+    return escaped;
+}
+
+std::string formatUuid(const uint8_t* uuid) {
+    if (uuid == nullptr) {
+        return {};
+    }
+
+    static constexpr char kHexDigits[] = "0123456789ABCDEF";
+    std::string formatted;
+    formatted.reserve(VK_UUID_SIZE * 2u);
+    for (size_t index = 0u; index < VK_UUID_SIZE; ++index) {
+        const uint8_t value = uuid[index];
+        formatted.push_back(kHexDigits[(value >> 4u) & 0x0Fu]);
+        formatted.push_back(kHexDigits[value & 0x0Fu]);
+    }
+    return formatted;
+}
+
 uint32_t calculateDispatchGroupCount(uint64_t requiredGroupCount) {
     const uint32_t deviceGroupLimit = gRuntime.maxComputeWorkGroupCountX;
     if (requiredGroupCount == 0u || deviceGroupLimit == 0u) {
@@ -143,6 +462,8 @@ uint32_t calculateDispatchWorkGroupCount(uint64_t invocationCount) {
         1u + (invocationCount - 1u) / kLocalWorkGroupSize;
     return calculateDispatchGroupCount(requiredGroups);
 }
+
+void destroyTensorArena();
 
 void destroyStorageBuffer() {
     if (gRuntime.device == VK_NULL_HANDLE) {
@@ -172,8 +493,24 @@ void destroyStorageBuffer() {
 void destroyRuntime() {
     if (gRuntime.device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(gRuntime.device);
+        destroyTensorArena();
         destroyStorageBuffer();
 
+        if (gRuntime.residentAdamwPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(gRuntime.device, gRuntime.residentAdamwPipeline, nullptr);
+        }
+        if (gRuntime.residentBackwardPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(gRuntime.device, gRuntime.residentBackwardPipeline, nullptr);
+        }
+        if (gRuntime.residentSwiGluPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(gRuntime.device, gRuntime.residentSwiGluPipeline, nullptr);
+        }
+        if (gRuntime.residentAttentionPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(gRuntime.device, gRuntime.residentAttentionPipeline, nullptr);
+        }
+        if (gRuntime.residentLinearPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(gRuntime.device, gRuntime.residentLinearPipeline, nullptr);
+        }
         if (gRuntime.fp16LinearPipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(gRuntime.device, gRuntime.fp16LinearPipeline, nullptr);
         }
@@ -196,6 +533,12 @@ void destroyRuntime() {
                 nullptr
             );
         }
+        if (gRuntime.timestampQueryPool != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(gRuntime.device, gRuntime.timestampQueryPool, nullptr);
+        }
+        if (gRuntime.submissionFence != VK_NULL_HANDLE) {
+            vkDestroyFence(gRuntime.device, gRuntime.submissionFence, nullptr);
+        }
         if (gRuntime.commandPool != VK_NULL_HANDLE) {
             vkDestroyCommandPool(gRuntime.device, gRuntime.commandPool, nullptr);
         }
@@ -210,8 +553,94 @@ void destroyRuntime() {
     gRuntime = VulkanRuntime{};
 }
 
+
+void refreshMemoryBudget() {
+#if defined(VK_EXT_memory_budget) && defined(VK_VERSION_1_1)
+    if (!gRuntime.memoryBudgetQueryAvailable ||
+        gRuntime.getPhysicalDeviceMemoryProperties2 == nullptr ||
+        gRuntime.physicalDevice == VK_NULL_HANDLE) {
+        return;
+    }
+
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budgetProperties{};
+    budgetProperties.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+
+    VkPhysicalDeviceMemoryProperties2 properties2{};
+    properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    properties2.pNext = &budgetProperties;
+
+    gRuntime.getPhysicalDeviceMemoryProperties2(
+        gRuntime.physicalDevice,
+        &properties2
+    );
+
+    gRuntime.memoryProperties = properties2.memoryProperties;
+    gRuntime.memoryPropertiesAvailable =
+        gRuntime.memoryProperties.memoryHeapCount > 0u &&
+        gRuntime.memoryProperties.memoryTypeCount > 0u;
+    gRuntime.memoryBudgetHeapCount = gRuntime.memoryProperties.memoryHeapCount;
+    gRuntime.memoryHeapBudget = {};
+    gRuntime.memoryHeapUsage = {};
+
+    for (uint32_t heapIndex = 0;
+         heapIndex < gRuntime.memoryBudgetHeapCount;
+         ++heapIndex) {
+        gRuntime.memoryHeapBudget[heapIndex] = budgetProperties.heapBudget[heapIndex];
+        gRuntime.memoryHeapUsage[heapIndex] = budgetProperties.heapUsage[heapIndex];
+    }
+#endif
+}
+
+bool hasMemoryBudgetHeadroom(uint32_t memoryTypeIndex, VkDeviceSize requiredBytes) {
+    if (!gRuntime.memoryBudgetQueryAvailable ||
+        memoryTypeIndex >= gRuntime.memoryProperties.memoryTypeCount) {
+        return true;
+    }
+
+    const uint32_t heapIndex =
+        gRuntime.memoryProperties.memoryTypes[memoryTypeIndex].heapIndex;
+    if (heapIndex >= gRuntime.memoryBudgetHeapCount ||
+        heapIndex >= VK_MAX_MEMORY_HEAPS) {
+        return true;
+    }
+
+    const VkDeviceSize budget = gRuntime.memoryHeapBudget[heapIndex];
+    const VkDeviceSize usage = gRuntime.memoryHeapUsage[heapIndex];
+    // A missing or inconsistent report is advisory-only. Let Vulkan's allocator
+    // return the authoritative allocation result in that case.
+    if (budget == 0u || usage > budget) {
+        return true;
+    }
+
+    const VkDeviceSize remainingBudget = budget - usage;
+    const VkDeviceSize minimumReserve = 1024u * 1024u;
+    const VkDeviceSize proportionalReserve = budget / 10u;
+    const VkDeviceSize reserve = std::min(
+        budget / 4u,
+        std::max(minimumReserve, proportionalReserve)
+    );
+    if (requiredBytes <= remainingBudget &&
+        remainingBudget - requiredBytes >= reserve) {
+        return true;
+    }
+
+    __android_log_print(
+        ANDROID_LOG_WARN,
+        kLogTag,
+        "Vulkan allocation deferred: request=%llu, heap headroom=%llu, budget=%llu, usage=%llu.",
+        static_cast<unsigned long long>(requiredBytes),
+        static_cast<unsigned long long>(remainingBudget),
+        static_cast<unsigned long long>(budget),
+        static_cast<unsigned long long>(usage)
+    );
+    return false;
+}
+
 bool createStorageBuffer(VkDeviceSize requiredBytes) {
     if (gRuntime.device == VK_NULL_HANDLE ||
+        !gRuntime.memoryPropertiesAvailable ||
+        gRuntime.memoryProperties.memoryTypeCount == 0u ||
         requiredBytes == 0 ||
         requiredBytes > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange) {
         return false;
@@ -222,7 +651,9 @@ bool createStorageBuffer(VkDeviceSize requiredBytes) {
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = requiredBytes;
-    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VkResult result = vkCreateBuffer(
@@ -243,11 +674,14 @@ bool createStorageBuffer(VkDeviceSize requiredBytes) {
         gRuntime.storageBuffer,
         &requirements
     );
+    refreshMemoryBudget();
 
     uint32_t selectedMemoryType = std::numeric_limits<uint32_t>::max();
     bool selectedMemoryIsCoherent = false;
-    uint32_t fallbackMemoryType = std::numeric_limits<uint32_t>::max();
+    int selectedMemoryScore = -1;
 
+    // Prefer host-visible/device-local memory on UMA GPUs while preserving
+    // coherent and cached-memory preferences for safe CPU readback.
     for (uint32_t index = 0;
          index < gRuntime.memoryProperties.memoryTypeCount;
          ++index) {
@@ -257,29 +691,36 @@ bool createStorageBuffer(VkDeviceSize requiredBytes) {
 
         const VkMemoryPropertyFlags flags =
             gRuntime.memoryProperties.memoryTypes[index].propertyFlags;
-
         if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0u) {
             continue;
         }
 
-        if (fallbackMemoryType == std::numeric_limits<uint32_t>::max()) {
-            fallbackMemoryType = index;
-        }
-
+        int score = 0;
         if ((flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u) {
-            selectedMemoryType = index;
-            selectedMemoryIsCoherent = true;
-            break;
+            score += 4;
         }
-    }
+        if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0u) {
+            score += 2;
+        }
+        if ((flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0u) {
+            score += 1;
+        }
 
-    if (selectedMemoryType == std::numeric_limits<uint32_t>::max()) {
-        selectedMemoryType = fallbackMemoryType;
-        selectedMemoryIsCoherent = false;
+        if (score > selectedMemoryScore) {
+            selectedMemoryType = index;
+            selectedMemoryScore = score;
+            selectedMemoryIsCoherent =
+                (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u;
+        }
     }
 
     if (selectedMemoryType == std::numeric_limits<uint32_t>::max()) {
         logError("No host-visible Vulkan memory type is available.");
+        destroyStorageBuffer();
+        return false;
+    }
+    if (!hasMemoryBudgetHeadroom(selectedMemoryType, requirements.size)) {
+        logError("Vulkan storage allocation exceeds the currently reported memory-heap budget.");
         destroyStorageBuffer();
         return false;
     }
@@ -356,22 +797,666 @@ bool createStorageBuffer(VkDeviceSize requiredBytes) {
 }
 
 bool ensureStorageBuffer(VkDeviceSize requiredBytes) {
+    const VkDeviceSize maximumRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    if (requiredBytes == 0u || requiredBytes > maximumRange) {
+        return false;
+    }
+
     if (gRuntime.storageBuffer != VK_NULL_HANDLE &&
         gRuntime.storageCapacity >= requiredBytes) {
-        return requiredBytes <=
-            gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+        return true;
+    }
+
+    // Geometric growth amortizes allocation churn as tensor workload sizes change.
+    // Fall back to the exact requested capacity when additional headroom cannot be allocated.
+    if (gRuntime.storageCapacity > 0u) {
+        const VkDeviceSize growth = std::max<VkDeviceSize>(
+            gRuntime.storageCapacity / 2u,
+            4096u
+        );
+        const VkDeviceSize remainingRange = maximumRange - gRuntime.storageCapacity;
+        const VkDeviceSize grownCapacity = growth > remainingRange
+            ? maximumRange
+            : gRuntime.storageCapacity + growth;
+        const VkDeviceSize targetCapacity =
+            std::max(requiredBytes, grownCapacity);
+
+        if (targetCapacity > requiredBytes &&
+            createStorageBuffer(targetCapacity)) {
+            return true;
+        }
     }
 
     return createStorageBuffer(requiredBytes);
+}
+
+bool submitAndWait(const char* operation) {
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.computeQueue == VK_NULL_HANDLE ||
+        gRuntime.submissionFence == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr) {
+        logError(operation);
+        return false;
+    }
+
+    VkResult result = vkResetFences(
+        gRuntime.device,
+        1,
+        &gRuntime.submissionFence
+    );
+    if (result != VK_SUCCESS) {
+        logError(operation, result);
+        return false;
+    }
+
+    VkCommandBufferSubmitInfoKHR commandBufferInfo{};
+    commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO_KHR;
+    commandBufferInfo.commandBuffer = gRuntime.commandBuffer;
+    commandBufferInfo.deviceMask = 0u;
+
+    VkSubmitInfo2KHR submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2_KHR;
+    submitInfo.commandBufferInfoCount = 1u;
+    submitInfo.pCommandBufferInfos = &commandBufferInfo;
+
+    result = gRuntime.queueSubmit2(
+        gRuntime.computeQueue,
+        1u,
+        &submitInfo,
+        gRuntime.submissionFence
+    );
+    if (result != VK_SUCCESS) {
+        logError(operation, result);
+        return false;
+    }
+
+    result = vkWaitForFences(
+        gRuntime.device,
+        1,
+        &gRuntime.submissionFence,
+        VK_TRUE,
+        std::numeric_limits<uint64_t>::max()
+    );
+    if (result != VK_SUCCESS) {
+        logError(operation, result);
+        // Error-only recovery before caller releases or reuses mapped resources.
+        const VkResult recoveryResult = vkQueueWaitIdle(gRuntime.computeQueue);
+        if (recoveryResult != VK_SUCCESS) {
+            logError("Vulkan queue-idle recovery after fence failure also failed.", recoveryResult);
+        }
+        return false;
+    }
+
+    return true;
+}
+
+
+bool alignArenaSize(VkDeviceSize value, VkDeviceSize alignment, VkDeviceSize& output) {
+    if (alignment == 0u) return false;
+    const VkDeviceSize remainder = value % alignment;
+    const VkDeviceSize padding = remainder == 0u ? 0u : alignment - remainder;
+    if (value > std::numeric_limits<VkDeviceSize>::max() - padding) return false;
+    output = value + padding;
+    return true;
+}
+
+void destroyTensorArena() {
+    if (gRuntime.device != VK_NULL_HANDLE) {
+        if (gRuntime.tensorArenaBuffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(gRuntime.device, gRuntime.tensorArenaBuffer, nullptr);
+        }
+        if (gRuntime.tensorArenaMemory != VK_NULL_HANDLE) {
+            vkFreeMemory(gRuntime.device, gRuntime.tensorArenaMemory, nullptr);
+        }
+    }
+    gRuntime.tensorArenaBuffer = VK_NULL_HANDLE;
+    gRuntime.tensorArenaMemory = VK_NULL_HANDLE;
+    gRuntime.tensorArenaCapacity = 0u;
+    gRuntime.tensorArenaDeviceLocal = false;
+    gRuntime.tensorArena.reset();
+}
+
+bool copyBufferSync(
+    VkBuffer source,
+    VkBuffer destination,
+    VkDeviceSize sourceCapacity,
+    VkDeviceSize destinationCapacity,
+    VkDeviceSize sourceOffset,
+    VkDeviceSize destinationOffset,
+    VkDeviceSize size,
+    bool sourceHostWritten,
+    bool destinationHostReadable
+) {
+    if (source == VK_NULL_HANDLE || destination == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        !argus::vulkan::TensorArenaCore::isValidCopyRange(
+            sourceCapacity, sourceOffset, destinationCapacity, destinationOffset, size
+        )) {
+        logError("Vulkan buffer copy rejected: invalid handles, alignment, or buffer range.");
+        return false;
+    }
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0);
+    if (result != VK_SUCCESS) return false;
+
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &begin);
+    if (result != VK_SUCCESS) return false;
+
+    VkBufferMemoryBarrier2KHR before[2]{};
+    before[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    before[0].srcStageMask =
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        (sourceHostWritten ? VK_PIPELINE_STAGE_2_HOST_BIT_KHR : 0u);
+    before[0].srcAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        (sourceHostWritten ? VK_ACCESS_2_HOST_WRITE_BIT_KHR : 0u);
+    before[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    before[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+    before[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before[0].buffer = source;
+    before[0].offset = sourceOffset;
+    before[0].size = size;
+
+    // The destination range may have been read or written by an earlier GPU dispatch.
+    before[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    before[1].srcStageMask =
+        VK_PIPELINE_STAGE_2_HOST_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    before[1].srcAccessMask =
+        VK_ACCESS_2_HOST_WRITE_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    before[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    before[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    before[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before[1].buffer = destination;
+    before[1].offset = destinationOffset;
+    before[1].size = size;
+
+    VkDependencyInfoKHR beforeDependency{};
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeDependency.bufferMemoryBarrierCount = 2u;
+    beforeDependency.pBufferMemoryBarriers = before;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
+
+    VkBufferCopy region{};
+    region.srcOffset = sourceOffset;
+    region.dstOffset = destinationOffset;
+    region.size = size;
+    vkCmdCopyBuffer(gRuntime.commandBuffer, source, destination, 1, &region);
+
+    VkBufferMemoryBarrier2KHR after{};
+    after.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    after.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    after.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    after.dstStageMask = destinationHostReadable
+        ? VK_PIPELINE_STAGE_2_HOST_BIT_KHR
+        : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    after.dstAccessMask = destinationHostReadable
+        ? VK_ACCESS_2_HOST_READ_BIT_KHR
+        : (VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR);
+    after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    after.buffer = destination;
+    after.offset = destinationOffset;
+    after.size = size;
+
+    VkDependencyInfoKHR afterDependency{};
+    afterDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    afterDependency.bufferMemoryBarrierCount = 1u;
+    afterDependency.pBufferMemoryBarriers = &after;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &afterDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) return false;
+    return submitAndWait("Vulkan tensor-arena transfer failed.");
+}
+
+bool createArenaBacking(
+    VkDeviceSize capacity,
+    VkBuffer& buffer,
+    VkDeviceMemory& memory,
+    bool& deviceLocal
+) {
+    buffer = VK_NULL_HANDLE;
+    memory = VK_NULL_HANDLE;
+    deviceLocal = false;
+    if (gRuntime.device == VK_NULL_HANDLE || !gRuntime.memoryPropertiesAvailable) return false;
+
+    VkBufferCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    info.size = capacity;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkResult result = vkCreateBuffer(gRuntime.device, &info, nullptr, &buffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to create the Vulkan tensor-arena buffer.", result);
+        return false;
+    }
+
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(gRuntime.device, buffer, &requirements);
+    refreshMemoryBudget();
+
+    std::vector<uint32_t> candidates;
+    try {
+        for (uint32_t index = 0u;
+             index < gRuntime.memoryProperties.memoryTypeCount;
+             ++index) {
+            if ((requirements.memoryTypeBits & (1u << index)) != 0u) {
+                candidates.push_back(index);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        vkDestroyBuffer(gRuntime.device, buffer, nullptr);
+        buffer = VK_NULL_HANDLE;
+        return false;
+    }
+    // Vulkan exposes at most VK_MAX_MEMORY_TYPES (32) candidates. A small
+    // stable insertion sort avoids comparator-template edge cases in older
+    // Android NDK libc++ while keeping the preferred memory types first.
+    const auto memoryTypeScore = [](uint32_t index) noexcept -> uint32_t {
+        const VkMemoryPropertyFlags flags =
+            gRuntime.memoryProperties.memoryTypes[index].propertyFlags;
+        return
+            ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0u ? 100u : 0u) +
+            ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u ? 20u : 0u) +
+            ((flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u ? 5u : 0u);
+    };
+    for (size_t index = 1u; index < candidates.size(); ++index) {
+        const uint32_t candidate = candidates[index];
+        const uint32_t candidateScore = memoryTypeScore(candidate);
+        size_t insertionIndex = index;
+        while (insertionIndex > 0u &&
+               candidateScore > memoryTypeScore(candidates[insertionIndex - 1u])) {
+            candidates[insertionIndex] = candidates[insertionIndex - 1u];
+            --insertionIndex;
+        }
+        candidates[insertionIndex] = candidate;
+    }
+
+    for (uint32_t index : candidates) {
+        if (!hasMemoryBudgetHeadroom(index, requirements.size)) continue;
+        VkMemoryAllocateInfo allocation{};
+        allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = index;
+        VkDeviceMemory candidate = VK_NULL_HANDLE;
+        result = vkAllocateMemory(gRuntime.device, &allocation, nullptr, &candidate);
+        if (result != VK_SUCCESS) continue;
+        result = vkBindBufferMemory(gRuntime.device, buffer, candidate, 0u);
+        if (result != VK_SUCCESS) {
+            vkFreeMemory(gRuntime.device, candidate, nullptr);
+            continue;
+        }
+        memory = candidate;
+        deviceLocal =
+            (gRuntime.memoryProperties.memoryTypes[index].propertyFlags &
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0u;
+        return true;
+    }
+
+    logError("No eligible Vulkan memory type could back the tensor arena.");
+    vkDestroyBuffer(gRuntime.device, buffer, nullptr);
+    buffer = VK_NULL_HANDLE;
+    return false;
+}
+
+void updateTensorArenaDescriptorSet(VkBuffer buffer, VkDeviceSize range) {
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        buffer == VK_NULL_HANDLE ||
+        range == 0u) {
+        return;
+    }
+
+    VkDescriptorBufferInfo descriptorInfo{};
+    descriptorInfo.buffer = buffer;
+    descriptorInfo.offset = 0u;
+    descriptorInfo.range = range;
+
+    VkWriteDescriptorSet descriptorWrite{};
+    descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrite.dstSet = gRuntime.tensorArenaDescriptorSet;
+    descriptorWrite.dstBinding = 0u;
+    descriptorWrite.dstArrayElement = 0u;
+    descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    descriptorWrite.descriptorCount = 1u;
+    descriptorWrite.pBufferInfo = &descriptorInfo;
+
+    vkUpdateDescriptorSets(gRuntime.device, 1u, &descriptorWrite, 0u, nullptr);
+}
+
+void updateTensorArenaDescriptorSet() {
+    updateTensorArenaDescriptorSet(
+        gRuntime.tensorArenaBuffer,
+        gRuntime.tensorArenaCapacity
+    );
+}
+
+bool growTensorArena(VkDeviceSize additionalBytes) {
+    const VkDeviceSize alignment = std::max<VkDeviceSize>(
+        4u, gRuntime.physicalDeviceProperties.limits.minStorageBufferOffsetAlignment
+    );
+    const VkDeviceSize oldCapacity = gRuntime.tensorArenaCapacity;
+    if (additionalBytes == 0u ||
+        oldCapacity > std::numeric_limits<VkDeviceSize>::max() - additionalBytes) {
+        return false;
+    }
+    const VkDeviceSize maximumRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    const VkDeviceSize maximumCapacity = maximumRange - (maximumRange % alignment);
+    VkDeviceSize minimumCapacity = 0u;
+    if (!alignArenaSize(oldCapacity + additionalBytes, alignment, minimumCapacity) ||
+        minimumCapacity > maximumCapacity) {
+        return false;
+    }
+    VkDeviceSize targetCapacity = minimumCapacity;
+    if (oldCapacity == 0u) {
+        targetCapacity = std::max<VkDeviceSize>(targetCapacity, 1024u * 1024u);
+    } else {
+        const VkDeviceSize growth = std::max<VkDeviceSize>(oldCapacity / 2u, 1024u * 1024u);
+        if (oldCapacity <= std::numeric_limits<VkDeviceSize>::max() - growth) {
+            targetCapacity = std::max(targetCapacity, oldCapacity + growth);
+        }
+    }
+    if (!alignArenaSize(targetCapacity, alignment, targetCapacity)) return false;
+    targetCapacity = std::min(targetCapacity, maximumCapacity);
+    if (targetCapacity < minimumCapacity || targetCapacity > maximumRange) {
+        return false;
+    }
+
+    if (!gRuntime.tensorArena.prepareCapacityExtension()) {
+        logError("Not enough host memory to prepare the Vulkan tensor-arena capacity update.");
+        return false;
+    }
+
+    VkBuffer nextBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory nextMemory = VK_NULL_HANDLE;
+    bool nextDeviceLocal = false;
+    VkDeviceSize createdCapacity = targetCapacity;
+    bool created = createArenaBacking(
+        targetCapacity, nextBuffer, nextMemory, nextDeviceLocal
+    );
+    if (!created && targetCapacity != minimumCapacity) {
+        createdCapacity = minimumCapacity;
+        created = createArenaBacking(
+            minimumCapacity, nextBuffer, nextMemory, nextDeviceLocal
+        );
+    }
+    if (!created) return false;
+
+    if (gRuntime.tensorArenaBuffer != VK_NULL_HANDLE) {
+        const VkResult idle = vkDeviceWaitIdle(gRuntime.device);
+        if (idle != VK_SUCCESS) {
+            vkDestroyBuffer(gRuntime.device, nextBuffer, nullptr);
+            vkFreeMemory(gRuntime.device, nextMemory, nullptr);
+            logError("Vulkan device did not become idle before preserving tensor data.", idle);
+            return false;
+        }
+        if (!copyBufferSync(
+                gRuntime.tensorArenaBuffer, nextBuffer,
+                oldCapacity, createdCapacity,
+                0u, 0u, oldCapacity, false, false
+            )) {
+            vkDestroyBuffer(gRuntime.device, nextBuffer, nullptr);
+            vkFreeMemory(gRuntime.device, nextMemory, nullptr);
+            logError("Could not preserve live tensors while growing the Vulkan arena.");
+            return false;
+        }
+    }
+
+    if (!gRuntime.tensorArena.extendCapacity(oldCapacity, createdCapacity)) {
+        vkDestroyBuffer(gRuntime.device, nextBuffer, nullptr);
+        vkFreeMemory(gRuntime.device, nextMemory, nullptr);
+        logError("Could not commit the tensor-arena free range after buffer growth.");
+        return false;
+    }
+
+    const VkBuffer previousBuffer = gRuntime.tensorArenaBuffer;
+    const VkDeviceMemory previousMemory = gRuntime.tensorArenaMemory;
+    gRuntime.tensorArenaBuffer = nextBuffer;
+    gRuntime.tensorArenaMemory = nextMemory;
+    gRuntime.tensorArenaCapacity = createdCapacity;
+    gRuntime.tensorArenaDeviceLocal = nextDeviceLocal;
+    updateTensorArenaDescriptorSet();
+
+    if (previousBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(gRuntime.device, previousBuffer, nullptr);
+        vkFreeMemory(gRuntime.device, previousMemory, nullptr);
+    }
+    return true;
+}
+
+using TensorArenaAllocation = argus::vulkan::TensorArenaCore::Allocation;
+
+struct ScopedTensorArenaAllocation final {
+    explicit ScopedTensorArenaAllocation(uint64_t allocationToken) noexcept
+        : token(allocationToken) {}
+
+    ~ScopedTensorArenaAllocation() {
+        if (token != 0u) gRuntime.tensorArena.release(token);
+    }
+
+    ScopedTensorArenaAllocation(const ScopedTensorArenaAllocation&) = delete;
+    ScopedTensorArenaAllocation& operator=(const ScopedTensorArenaAllocation&) = delete;
+
+    uint64_t token;
+};
+
+TensorArenaAllocation* findArenaAllocation(jlong rawHandle) {
+    if (rawHandle == 0) return nullptr;
+    return gRuntime.tensorArena.find(static_cast<uint64_t>(rawHandle));
+}
+
+jlong allocateArenaTensor(VkDeviceSize logicalSize) {
+    if (logicalSize == 0u ||
+        logicalSize > static_cast<VkDeviceSize>(std::numeric_limits<jsize>::max()) ||
+        logicalSize > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange) {
+        return 0;
+    }
+    VkDeviceSize allocatedSize = 0u;
+    if (!alignArenaSize(logicalSize, 4u, allocatedSize)) return 0;
+    const VkDeviceSize offsetAlignment = std::max<VkDeviceSize>(
+        4u, gRuntime.physicalDeviceProperties.limits.minStorageBufferOffsetAlignment
+    );
+    const VkDeviceSize maxRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    uint64_t token = 0U;
+    if (gRuntime.tensorArena.tryAllocate(logicalSize, maxRange, offsetAlignment, token)) {
+        return static_cast<jlong>(token);
+    }
+    if (!growTensorArena(allocatedSize) ||
+        !gRuntime.tensorArena.tryAllocate(logicalSize, maxRange, offsetAlignment, token)) {
+        return 0;
+    }
+    return static_cast<jlong>(token);
+}
+
+bool syncStagingMemory(bool invalidate) {
+    if (gRuntime.hostCoherent) return true;
+    VkMappedMemoryRange range{};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = gRuntime.storageMemory;
+    range.offset = 0u;
+    range.size = VK_WHOLE_SIZE;
+    const VkResult result = invalidate
+        ? vkInvalidateMappedMemoryRanges(gRuntime.device, 1u, &range)
+        : vkFlushMappedMemoryRanges(gRuntime.device, 1u, &range);
+    if (result != VK_SUCCESS) {
+        logError(invalidate ? "Failed to invalidate Vulkan tensor staging memory."
+                            : "Failed to flush Vulkan tensor staging memory.", result);
+        return false;
+    }
+    return true;
+}
+
+bool transferTensorBytes(
+    JNIEnv* env,
+    TensorArenaAllocation& allocation,
+    jbyteArray array,
+    bool upload
+) {
+    if (array == nullptr ||
+        env->GetArrayLength(array) != static_cast<jsize>(allocation.logicalSize)) {
+        return false;
+    }
+    const VkDeviceSize chunkLimit = std::min<VkDeviceSize>(
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange,
+        8u * 1024u * 1024u
+    ) & ~VkDeviceSize{3u};
+    if (chunkLimit < 4u) return false;
+
+    VkDeviceSize cursor = 0u;
+    while (cursor < allocation.allocatedSize) {
+        const VkDeviceSize chunk = std::min(allocation.allocatedSize - cursor, chunkLimit);
+        const VkDeviceSize actual = cursor < allocation.logicalSize
+            ? std::min(chunk, allocation.logicalSize - cursor)
+            : 0u;
+        if (!ensureStorageBuffer(chunk) || gRuntime.mappedStorage == nullptr) return false;
+
+        auto* mapped = static_cast<jbyte*>(gRuntime.mappedStorage);
+        if (upload) {
+            std::memset(mapped, 0, static_cast<size_t>(chunk));
+            if (actual > 0u) {
+                env->GetByteArrayRegion(
+                    array, static_cast<jsize>(cursor), static_cast<jsize>(actual), mapped
+                );
+                if (env->ExceptionCheck()) return false;
+            }
+            if (!syncStagingMemory(false) ||
+                !copyBufferSync(
+                    gRuntime.storageBuffer, gRuntime.tensorArenaBuffer,
+                    gRuntime.storageCapacity, gRuntime.tensorArenaCapacity,
+                    0u, allocation.offset + cursor, chunk, true, false
+                )) return false;
+        } else {
+            if (!copyBufferSync(
+                    gRuntime.tensorArenaBuffer, gRuntime.storageBuffer,
+                    gRuntime.tensorArenaCapacity, gRuntime.storageCapacity,
+                    allocation.offset + cursor, 0u, chunk, false, true
+                ) || !syncStagingMemory(true)) return false;
+            if (actual > 0u) {
+                env->SetByteArrayRegion(
+                    array, static_cast<jsize>(cursor), static_cast<jsize>(actual), mapped
+                );
+                if (env->ExceptionCheck()) return false;
+            }
+        }
+        cursor += chunk;
+    }
+    return true;
+}
+
+
+
+bool beginGpuTimestampCapture(VkCommandBuffer commandBuffer) {
+    if (!gRuntime.timestampProfilingAvailable ||
+        gRuntime.timestampQueryPool == VK_NULL_HANDLE ||
+        commandBuffer == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    vkCmdResetQueryPool(
+        commandBuffer,
+        gRuntime.timestampQueryPool,
+        0,
+        2
+    );
+    gRuntime.cmdWriteTimestamp2(
+        commandBuffer,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,
+        gRuntime.timestampQueryPool,
+        0
+    );
+    return true;
+}
+
+void endGpuTimestampCapture(VkCommandBuffer commandBuffer, bool captureStarted) {
+    if (!captureStarted) {
+        return;
+    }
+
+    gRuntime.cmdWriteTimestamp2(
+        commandBuffer,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,
+        gRuntime.timestampQueryPool,
+        1
+    );
+}
+
+bool readGpuTimestampDurationNanoseconds(uint64_t& durationNanoseconds) {
+    durationNanoseconds = 0;
+    if (!gRuntime.timestampProfilingAvailable ||
+        gRuntime.timestampQueryPool == VK_NULL_HANDLE ||
+        gRuntime.computeQueueTimestampValidBits == 0u) {
+        return false;
+    }
+
+    std::array<uint64_t, 2> timestamps{};
+    const VkResult result = vkGetQueryPoolResults(
+        gRuntime.device,
+        gRuntime.timestampQueryPool,
+        0,
+        static_cast<uint32_t>(timestamps.size()),
+        sizeof(timestamps),
+        timestamps.data(),
+        sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT
+    );
+    if (result != VK_SUCCESS) {
+        logError("Vulkan GPU timestamp results are unavailable.", result);
+        return false;
+    }
+
+    const uint32_t validBits = gRuntime.computeQueueTimestampValidBits;
+    uint64_t tickDelta = timestamps[1] - timestamps[0];
+    if (validBits < 64u) {
+        const uint64_t validMask = (uint64_t{1} << validBits) - 1u;
+        tickDelta &= validMask;
+    }
+
+    const double elapsedNanoseconds =
+        static_cast<double>(tickDelta) *
+        static_cast<double>(gRuntime.physicalDeviceProperties.limits.timestampPeriod);
+    if (!std::isfinite(elapsedNanoseconds) ||
+        elapsedNanoseconds < 0.0 ||
+        elapsedNanoseconds > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+        return false;
+    }
+
+    durationNanoseconds = static_cast<uint64_t>(elapsedNanoseconds);
+    return true;
+}
+
+void recordGpuTiming(uint64_t durationNanoseconds, uint64_t& operationDuration) {
+    operationDuration = durationNanoseconds;
+    if (std::numeric_limits<uint64_t>::max() - gRuntime.totalGpuTimeNanoseconds >=
+        durationNanoseconds) {
+        gRuntime.totalGpuTimeNanoseconds += durationNanoseconds;
+    } else {
+        gRuntime.totalGpuTimeNanoseconds = std::numeric_limits<uint64_t>::max();
+    }
+    if (gRuntime.timestampedDispatchCount < std::numeric_limits<uint64_t>::max()) {
+        ++gRuntime.timestampedDispatchCount;
+    }
 }
 
 bool initializeRuntime() {
     VkApplicationInfo applicationInfo{};
     applicationInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     applicationInfo.pApplicationName = "Argus";
-    applicationInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+    applicationInfo.applicationVersion = VK_MAKE_API_VERSION(0, 1, 0, 0);
     applicationInfo.pEngineName = "Argus On-Device Trainer";
-    applicationInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+    applicationInfo.engineVersion = VK_MAKE_API_VERSION(0, 1, 0, 0);
     uint32_t loaderApiVersion = VK_API_VERSION_1_0;
     const auto enumerateInstanceVersion =
         reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
@@ -383,7 +1468,15 @@ bool initializeRuntime() {
             loaderApiVersion = reportedVersion;
         }
     }
+#if defined(VK_VERSION_1_4)
+    gRuntime.instanceApiVersion = std::min(loaderApiVersion, VK_API_VERSION_1_4);
+#elif defined(VK_VERSION_1_3)
+    gRuntime.instanceApiVersion = std::min(loaderApiVersion, VK_API_VERSION_1_3);
+#elif defined(VK_VERSION_1_2)
     gRuntime.instanceApiVersion = std::min(loaderApiVersion, VK_API_VERSION_1_2);
+#else
+    gRuntime.instanceApiVersion = loaderApiVersion;
+#endif
     applicationInfo.apiVersion = gRuntime.instanceApiVersion;
 
     VkInstanceCreateInfo instanceInfo{};
@@ -488,6 +1581,7 @@ bool initializeRuntime() {
                 bestScore = score;
                 gRuntime.physicalDevice = candidate;
                 gRuntime.queueFamilyIndex = familyIndex;
+                gRuntime.computeQueueTimestampValidBits = family.timestampValidBits;
                 gRuntime.physicalDeviceProperties = properties;
             }
         }
@@ -502,6 +1596,650 @@ bool initializeRuntime() {
         gRuntime.physicalDevice,
         &gRuntime.memoryProperties
     );
+    if (gRuntime.memoryProperties.memoryHeapCount == 0u ||
+        gRuntime.memoryProperties.memoryTypeCount == 0u) {
+        logError("Selected Vulkan physical device exposed no usable memory heaps or memory types.");
+        return false;
+    }
+    gRuntime.memoryPropertiesAvailable = true;
+    for (uint32_t memoryTypeIndex = 0;
+         memoryTypeIndex < gRuntime.memoryProperties.memoryTypeCount;
+         ++memoryTypeIndex) {
+        const VkMemoryPropertyFlags memoryFlags =
+            gRuntime.memoryProperties.memoryTypes[memoryTypeIndex].propertyFlags;
+        const bool hostVisible =
+            (memoryFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+        if (hostVisible) {
+            ++gRuntime.hostVisibleMemoryTypeCount;
+            if ((memoryFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0u) {
+                ++gRuntime.hostVisibleDeviceLocalMemoryTypeCount;
+            }
+        }
+    }
+    __android_log_print(
+        ANDROID_LOG_INFO,
+        kLogTag,
+        "Vulkan memory properties: %u heaps, %u types, %u host-visible, %u host-visible/device-local.",
+        gRuntime.memoryProperties.memoryHeapCount,
+        gRuntime.memoryProperties.memoryTypeCount,
+        gRuntime.hostVisibleMemoryTypeCount,
+        gRuntime.hostVisibleDeviceLocalMemoryTypeCount
+    );
+
+    uint32_t extensionCount = 0;
+    VkResult extensionResult = vkEnumerateDeviceExtensionProperties(
+        gRuntime.physicalDevice,
+        nullptr,
+        &extensionCount,
+        nullptr
+    );
+    std::vector<VkExtensionProperties> deviceExtensions;
+    if (extensionResult == VK_SUCCESS && extensionCount > 0u) {
+        try {
+            deviceExtensions.resize(extensionCount);
+        } catch (const std::bad_alloc&) {
+            logError("Not enough memory to enumerate Vulkan device extensions.");
+            return false;
+        }
+
+        extensionResult = vkEnumerateDeviceExtensionProperties(
+            gRuntime.physicalDevice,
+            nullptr,
+            &extensionCount,
+            deviceExtensions.data()
+        );
+        if (extensionResult != VK_SUCCESS && extensionResult != VK_INCOMPLETE) {
+            deviceExtensions.clear();
+            logError("Vulkan device-extension enumeration failed.", extensionResult);
+        } else {
+            deviceExtensions.resize(extensionCount);
+        }
+    } else if (extensionResult != VK_SUCCESS) {
+        logError("Vulkan device-extension count query failed.", extensionResult);
+    }
+
+    const uint32_t physicalApiVersion = gRuntime.physicalDeviceProperties.apiVersion;
+    const uint32_t effectiveApiVersion = std::min(
+        gRuntime.instanceApiVersion,
+        physicalApiVersion
+    );
+    gRuntime.effectiveApiVersion = effectiveApiVersion;
+    const bool physicalSupportsVulkan11 = effectiveApiVersion >= VK_API_VERSION_1_1;
+    const bool physicalSupportsVulkan12 = effectiveApiVersion >= VK_API_VERSION_1_2;
+#if defined(VK_VERSION_1_3)
+    const bool physicalSupportsVulkan13 = effectiveApiVersion >= VK_API_VERSION_1_3;
+#else
+    const bool physicalSupportsVulkan13 = false;
+#endif
+
+#if defined(VK_EXT_memory_budget) && defined(VK_VERSION_1_1)
+    gRuntime.memoryBudgetExtensionSupported =
+        effectiveApiVersion >= VK_API_VERSION_1_1 &&
+        hasDeviceExtension(deviceExtensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+#else
+    gRuntime.memoryBudgetExtensionSupported = false;
+#endif
+
+#if defined(VK_EXT_subgroup_size_control)
+    const bool hasSubgroupSizeControlExtension = hasDeviceExtension(
+        deviceExtensions,
+        VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME
+    );
+#else
+    const bool hasSubgroupSizeControlExtension = false;
+#endif
+
+#if defined(VK_KHR_shader_integer_dot_product)
+    const bool hasIntegerDotProductExtension = hasDeviceExtension(
+        deviceExtensions,
+        VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME
+    );
+#else
+    const bool hasIntegerDotProductExtension = false;
+#endif
+
+    gRuntime.synchronization2ExtensionSupported = hasDeviceExtension(
+        deviceExtensions,
+        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME
+    );
+    const bool querySynchronization2 =
+        physicalSupportsVulkan13 ||
+        (physicalSupportsVulkan11 && gRuntime.synchronization2ExtensionSupported);
+
+#if defined(VK_KHR_cooperative_matrix)
+    gRuntime.hasCooperativeMatrixExtension = hasDeviceExtension(
+        deviceExtensions,
+        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME
+    );
+#endif
+
+    // This remains capability telemetry until Argus has an ARM tensor pipeline.
+    gRuntime.armTensorsExtensionSupported =
+        physicalSupportsVulkan13 &&
+        hasDeviceExtension(deviceExtensions, "VK_ARM_tensors");
+#if defined(VK_ARM_tensors)
+    gRuntime.armTensorsFeatureQueryAvailable =
+        gRuntime.armTensorsExtensionSupported;
+#else
+    gRuntime.armTensorsFeatureQueryAvailable = false;
+#endif
+
+#if defined(VK_ARM_shader_core_properties)
+    gRuntime.armShaderCorePropertiesExtensionSupported = hasDeviceExtension(
+        deviceExtensions,
+        VK_ARM_SHADER_CORE_PROPERTIES_EXTENSION_NAME
+    );
+#endif
+
+#if defined(VK_ARM_shader_core_builtins)
+    gRuntime.armShaderCoreBuiltinsExtensionSupported = hasDeviceExtension(
+        deviceExtensions,
+        VK_ARM_SHADER_CORE_BUILTINS_EXTENSION_NAME
+    );
+    const bool queryArmShaderCoreBuiltins =
+        gRuntime.armShaderCoreBuiltinsExtensionSupported;
+#else
+    const bool queryArmShaderCoreBuiltins = false;
+#endif
+
+    // Query extension and promoted-core features before creating the logical device.
+    // Synchronization2 is required by the native submit, barrier, and timestamp path.
+    // FP16 is enabled only when supported; other capabilities remain telemetry until
+    // their matching shader kernels and logical-device feature chains are implemented.
+    VkPhysicalDeviceFeatures2 supportedFeatures{};
+    supportedFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    void** featureChainTail = &supportedFeatures.pNext;
+
+    auto appendFeature = [&featureChainTail](auto& feature) {
+        feature.pNext = nullptr;
+        *featureChainTail = &feature;
+        featureChainTail = &feature.pNext;
+    };
+
+    VkPhysicalDeviceShaderFloat16Int8Features supportedShaderFloat16{};
+    // The current FP16 kernel is compiled for the Vulkan 1.2 core path.
+    // Do not activate the extension-only feature on Vulkan 1.1 devices until
+    // the extension is explicitly enabled in VkDeviceCreateInfo.
+    const bool queryShaderFloat16 = physicalSupportsVulkan12;
+    if (queryShaderFloat16) {
+        supportedShaderFloat16.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+        appendFeature(supportedShaderFloat16);
+    }
+
+#if defined(VK_VERSION_1_1)
+    VkPhysicalDevice16BitStorageFeatures supportedStorage16{};
+    if (physicalSupportsVulkan11) {
+        supportedStorage16.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+        appendFeature(supportedStorage16);
+    }
+#endif
+
+#if defined(VK_VERSION_1_2)
+    VkPhysicalDevice8BitStorageFeatures supportedStorage8{};
+    if (physicalSupportsVulkan12) {
+        supportedStorage8.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
+        appendFeature(supportedStorage8);
+    }
+#endif
+
+    VkPhysicalDeviceSynchronization2FeaturesKHR supportedSynchronization2{};
+    if (querySynchronization2) {
+        supportedSynchronization2.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
+        appendFeature(supportedSynchronization2);
+    }
+
+#if defined(VK_VERSION_1_3)
+    VkPhysicalDeviceSubgroupSizeControlFeatures supportedSubgroupSizeControl{};
+    const bool querySubgroupSizeControl =
+        physicalSupportsVulkan13 || hasSubgroupSizeControlExtension;
+    if (querySubgroupSizeControl) {
+        supportedSubgroupSizeControl.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
+        appendFeature(supportedSubgroupSizeControl);
+    }
+
+    VkPhysicalDeviceShaderIntegerDotProductFeatures supportedIntegerDotProduct{};
+    const bool queryIntegerDotProduct =
+        physicalSupportsVulkan13 || hasIntegerDotProductExtension;
+    if (queryIntegerDotProduct) {
+        supportedIntegerDotProduct.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+        appendFeature(supportedIntegerDotProduct);
+    }
+#else
+    const bool querySubgroupSizeControl = hasSubgroupSizeControlExtension;
+    const bool queryIntegerDotProduct = hasIntegerDotProductExtension;
+#if defined(VK_EXT_subgroup_size_control)
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT supportedSubgroupSizeControl{};
+    if (querySubgroupSizeControl) {
+        supportedSubgroupSizeControl.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT;
+        appendFeature(supportedSubgroupSizeControl);
+    }
+#endif
+#if defined(VK_KHR_shader_integer_dot_product)
+    VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR supportedIntegerDotProduct{};
+    if (queryIntegerDotProduct) {
+        supportedIntegerDotProduct.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
+        appendFeature(supportedIntegerDotProduct);
+    }
+#endif
+#endif
+
+#if defined(VK_KHR_cooperative_matrix)
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR supportedCooperativeMatrix{};
+    if (gRuntime.hasCooperativeMatrixExtension) {
+        supportedCooperativeMatrix.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+        appendFeature(supportedCooperativeMatrix);
+    }
+#endif
+
+#if defined(VK_ARM_tensors)
+    VkPhysicalDeviceTensorFeaturesARM supportedArmTensorFeatures{};
+    if (gRuntime.armTensorsFeatureQueryAvailable) {
+        supportedArmTensorFeatures.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TENSOR_FEATURES_ARM;
+        appendFeature(supportedArmTensorFeatures);
+    }
+#endif
+
+#if defined(VK_ARM_shader_core_builtins)
+    VkPhysicalDeviceShaderCoreBuiltinsFeaturesARM supportedArmShaderCoreBuiltins{};
+    if (queryArmShaderCoreBuiltins) {
+        supportedArmShaderCoreBuiltins.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_BUILTINS_FEATURES_ARM;
+        appendFeature(supportedArmShaderCoreBuiltins);
+    }
+#endif
+
+    const auto getPhysicalDeviceFeatures2 =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+            vkGetInstanceProcAddr(gRuntime.instance, "vkGetPhysicalDeviceFeatures2")
+        );
+    const bool features2Available =
+        gRuntime.instanceApiVersion >= VK_API_VERSION_1_1 &&
+        physicalSupportsVulkan11 &&
+        getPhysicalDeviceFeatures2 != nullptr;
+
+    if (features2Available) {
+        getPhysicalDeviceFeatures2(gRuntime.physicalDevice, &supportedFeatures);
+        gRuntime.synchronization2Supported =
+            querySynchronization2 &&
+            supportedSynchronization2.synchronization2 == VK_TRUE;
+        gRuntime.supportsShaderFloat16Feature =
+            queryShaderFloat16 && supportedShaderFloat16.shaderFloat16 == VK_TRUE;
+        gRuntime.supportsFp16Compute = gRuntime.supportsShaderFloat16Feature;
+        gRuntime.supportsShaderInt8 =
+            queryShaderFloat16 && supportedShaderFloat16.shaderInt8 == VK_TRUE;
+#if defined(VK_VERSION_1_1)
+        gRuntime.supportsStorageBuffer16BitAccess =
+            physicalSupportsVulkan11 &&
+            supportedStorage16.storageBuffer16BitAccess == VK_TRUE;
+#endif
+#if defined(VK_VERSION_1_2)
+        gRuntime.supportsStorageBuffer8BitAccess =
+            physicalSupportsVulkan12 &&
+            supportedStorage8.storageBuffer8BitAccess == VK_TRUE;
+#endif
+#if defined(VK_VERSION_1_3)
+        gRuntime.supportsSubgroupSizeControl =
+            querySubgroupSizeControl &&
+            supportedSubgroupSizeControl.subgroupSizeControl == VK_TRUE;
+        gRuntime.supportsComputeFullSubgroups =
+            querySubgroupSizeControl &&
+            supportedSubgroupSizeControl.computeFullSubgroups == VK_TRUE;
+        gRuntime.supportsShaderIntegerDotProduct =
+            queryIntegerDotProduct &&
+            supportedIntegerDotProduct.shaderIntegerDotProduct == VK_TRUE;
+#else
+#if defined(VK_EXT_subgroup_size_control)
+        gRuntime.supportsSubgroupSizeControl =
+            querySubgroupSizeControl &&
+            supportedSubgroupSizeControl.subgroupSizeControl == VK_TRUE;
+        gRuntime.supportsComputeFullSubgroups =
+            querySubgroupSizeControl &&
+            supportedSubgroupSizeControl.computeFullSubgroups == VK_TRUE;
+#endif
+#if defined(VK_KHR_shader_integer_dot_product)
+        gRuntime.supportsShaderIntegerDotProduct =
+            queryIntegerDotProduct &&
+            supportedIntegerDotProduct.shaderIntegerDotProduct == VK_TRUE;
+#endif
+#endif
+#if defined(VK_KHR_cooperative_matrix)
+        gRuntime.supportsCooperativeMatrix =
+            gRuntime.hasCooperativeMatrixExtension &&
+            supportedCooperativeMatrix.cooperativeMatrix == VK_TRUE;
+        gRuntime.supportsCooperativeMatrixRobustBufferAccess =
+            gRuntime.hasCooperativeMatrixExtension &&
+            supportedCooperativeMatrix.cooperativeMatrixRobustBufferAccess == VK_TRUE;
+#endif
+#if defined(VK_ARM_tensors)
+        if (gRuntime.armTensorsFeatureQueryAvailable) {
+            gRuntime.armTensorsFeatureSupported =
+                supportedArmTensorFeatures.tensors == VK_TRUE;
+            gRuntime.armTensorNonPackedSupported =
+                supportedArmTensorFeatures.tensorNonPacked == VK_TRUE;
+            gRuntime.armTensorShaderAccessSupported =
+                supportedArmTensorFeatures.shaderTensorAccess == VK_TRUE;
+            gRuntime.armTensorDynamicIndexingSupported =
+                supportedArmTensorFeatures.shaderStorageTensorArrayDynamicIndexing == VK_TRUE;
+            gRuntime.armTensorNonUniformIndexingSupported =
+                supportedArmTensorFeatures.shaderStorageTensorArrayNonUniformIndexing == VK_TRUE;
+            gRuntime.armTensorUpdateAfterBindSupported =
+                supportedArmTensorFeatures.descriptorBindingStorageTensorUpdateAfterBind == VK_TRUE;
+        }
+#endif
+        gRuntime.armShaderCoreBuiltinsFeatureQueryAvailable =
+            queryArmShaderCoreBuiltins && features2Available;
+#if defined(VK_ARM_shader_core_builtins)
+        if (gRuntime.armShaderCoreBuiltinsFeatureQueryAvailable) {
+            gRuntime.armShaderCoreBuiltinsFeatureSupported =
+                supportedArmShaderCoreBuiltins.shaderCoreBuiltins == VK_TRUE;
+        }
+#endif
+    } else {
+        gRuntime.supportsFp16Compute = false;
+        gRuntime.supportsShaderInt8 = false;
+        gRuntime.supportsStorageBuffer8BitAccess = false;
+    }
+
+    // Properties are queried separately from features. A supported bit is not
+    // treated as accelerated hardware unless the matching property says so.
+    const auto getPhysicalDeviceProperties2 =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            vkGetInstanceProcAddr(gRuntime.instance, "vkGetPhysicalDeviceProperties2")
+        );
+    const bool properties2Available =
+        gRuntime.instanceApiVersion >= VK_API_VERSION_1_1 &&
+        physicalSupportsVulkan11 &&
+        getPhysicalDeviceProperties2 != nullptr;
+
+    if (properties2Available) {
+        VkPhysicalDeviceProperties2 properties2{};
+        properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        void** propertyChainTail = &properties2.pNext;
+
+        auto appendProperty = [&propertyChainTail](auto& property) {
+            property.pNext = nullptr;
+            *propertyChainTail = &property;
+            propertyChainTail = &property.pNext;
+        };
+
+        VkPhysicalDeviceSubgroupProperties subgroupProperties{};
+        subgroupProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+        appendProperty(subgroupProperties);
+
+        VkPhysicalDeviceDriverProperties driverProperties{};
+        if (physicalSupportsVulkan12) {
+            driverProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+            appendProperty(driverProperties);
+        }
+
+#if defined(VK_VERSION_1_3)
+        VkPhysicalDeviceSubgroupSizeControlProperties subgroupSizeProperties{};
+        if (querySubgroupSizeControl) {
+            subgroupSizeProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+            appendProperty(subgroupSizeProperties);
+        }
+
+        VkPhysicalDeviceShaderIntegerDotProductProperties integerDotProductProperties{};
+        if (queryIntegerDotProduct) {
+            integerDotProductProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
+            appendProperty(integerDotProductProperties);
+        }
+#else
+#if defined(VK_EXT_subgroup_size_control)
+        VkPhysicalDeviceSubgroupSizeControlPropertiesEXT subgroupSizeProperties{};
+        if (querySubgroupSizeControl) {
+            subgroupSizeProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT;
+            appendProperty(subgroupSizeProperties);
+        }
+#endif
+#if defined(VK_KHR_shader_integer_dot_product)
+        VkPhysicalDeviceShaderIntegerDotProductPropertiesKHR integerDotProductProperties{};
+        if (queryIntegerDotProduct) {
+            integerDotProductProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES_KHR;
+            appendProperty(integerDotProductProperties);
+        }
+#endif
+#endif
+
+#if defined(VK_KHR_cooperative_matrix)
+        VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperativeMatrixProperties{};
+        if (gRuntime.hasCooperativeMatrixExtension) {
+            cooperativeMatrixProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+            appendProperty(cooperativeMatrixProperties);
+        }
+#endif
+
+#if defined(VK_VERSION_1_1)
+        VkPhysicalDeviceIDProperties idProperties{};
+        idProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+        appendProperty(idProperties);
+#endif
+
+#if defined(VK_ARM_tensors)
+        VkPhysicalDeviceTensorPropertiesARM armTensorProperties{};
+        if (gRuntime.armTensorsFeatureQueryAvailable) {
+            armTensorProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TENSOR_PROPERTIES_ARM;
+            appendProperty(armTensorProperties);
+        }
+#endif
+
+#if defined(VK_ARM_shader_core_properties)
+        VkPhysicalDeviceShaderCorePropertiesARM armShaderCoreProperties{};
+        if (gRuntime.armShaderCorePropertiesExtensionSupported) {
+            armShaderCoreProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_ARM;
+            appendProperty(armShaderCoreProperties);
+        }
+#endif
+
+#if defined(VK_ARM_shader_core_builtins)
+        VkPhysicalDeviceShaderCoreBuiltinsPropertiesARM armShaderCoreBuiltinsProperties{};
+        if (gRuntime.armShaderCoreBuiltinsExtensionSupported) {
+            armShaderCoreBuiltinsProperties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_BUILTINS_PROPERTIES_ARM;
+            appendProperty(armShaderCoreBuiltinsProperties);
+        }
+#endif
+
+        getPhysicalDeviceProperties2(gRuntime.physicalDevice, &properties2);
+        gRuntime.physicalDeviceProperties = properties2.properties;
+        gRuntime.subgroupSize = subgroupProperties.subgroupSize;
+        gRuntime.subgroupSupportedStages = subgroupProperties.supportedStages;
+        gRuntime.subgroupSupportedOperations = subgroupProperties.supportedOperations;
+        gRuntime.subgroupQuadOperationsInAllStages =
+            subgroupProperties.quadOperationsInAllStages == VK_TRUE;
+
+        if (physicalSupportsVulkan12) {
+            gRuntime.driverProperties = driverProperties;
+            gRuntime.hasDriverProperties =
+                driverProperties.driverName[0] != '\0' ||
+                driverProperties.driverInfo[0] != '\0';
+        }
+
+#if defined(VK_VERSION_1_1)
+        std::copy_n(idProperties.deviceUUID, VK_UUID_SIZE, gRuntime.deviceUuid.begin());
+        std::copy_n(idProperties.driverUUID, VK_UUID_SIZE, gRuntime.driverUuid.begin());
+        gRuntime.hasDeviceIdentityProperties = true;
+#endif
+
+#if defined(VK_VERSION_1_3)
+        if (querySubgroupSizeControl) {
+            gRuntime.minSubgroupSize = subgroupSizeProperties.minSubgroupSize;
+            gRuntime.maxSubgroupSize = subgroupSizeProperties.maxSubgroupSize;
+            gRuntime.maxComputeWorkgroupSubgroups =
+                subgroupSizeProperties.maxComputeWorkgroupSubgroups;
+            gRuntime.requiredSubgroupSizeStages =
+                subgroupSizeProperties.requiredSubgroupSizeStages;
+        }
+        if (queryIntegerDotProduct) {
+            gRuntime.integerDotProduct8BitUnsignedAccelerated =
+                integerDotProductProperties.integerDotProduct8BitUnsignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct8BitSignedAccelerated =
+                integerDotProductProperties.integerDotProduct8BitSignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct8BitMixedSignednessAccelerated =
+                integerDotProductProperties.integerDotProduct8BitMixedSignednessAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct4x8BitPackedUnsignedAccelerated =
+                integerDotProductProperties.integerDotProduct4x8BitPackedUnsignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct4x8BitPackedSignedAccelerated =
+                integerDotProductProperties.integerDotProduct4x8BitPackedSignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct4x8BitPackedMixedSignednessAccelerated =
+                integerDotProductProperties.integerDotProduct4x8BitPackedMixedSignednessAccelerated == VK_TRUE;
+        }
+#else
+#if defined(VK_EXT_subgroup_size_control)
+        if (querySubgroupSizeControl) {
+            gRuntime.minSubgroupSize = subgroupSizeProperties.minSubgroupSize;
+            gRuntime.maxSubgroupSize = subgroupSizeProperties.maxSubgroupSize;
+            gRuntime.maxComputeWorkgroupSubgroups =
+                subgroupSizeProperties.maxComputeWorkgroupSubgroups;
+            gRuntime.requiredSubgroupSizeStages =
+                subgroupSizeProperties.requiredSubgroupSizeStages;
+        }
+#endif
+#if defined(VK_KHR_shader_integer_dot_product)
+        if (queryIntegerDotProduct) {
+            gRuntime.integerDotProduct8BitUnsignedAccelerated =
+                integerDotProductProperties.integerDotProduct8BitUnsignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct8BitSignedAccelerated =
+                integerDotProductProperties.integerDotProduct8BitSignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct8BitMixedSignednessAccelerated =
+                integerDotProductProperties.integerDotProduct8BitMixedSignednessAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct4x8BitPackedUnsignedAccelerated =
+                integerDotProductProperties.integerDotProduct4x8BitPackedUnsignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct4x8BitPackedSignedAccelerated =
+                integerDotProductProperties.integerDotProduct4x8BitPackedSignedAccelerated == VK_TRUE;
+            gRuntime.integerDotProduct4x8BitPackedMixedSignednessAccelerated =
+                integerDotProductProperties.integerDotProduct4x8BitPackedMixedSignednessAccelerated == VK_TRUE;
+        }
+#endif
+#endif
+
+#if defined(VK_KHR_cooperative_matrix)
+        if (gRuntime.hasCooperativeMatrixExtension) {
+            gRuntime.cooperativeMatrixSupportedStages =
+                cooperativeMatrixProperties.cooperativeMatrixSupportedStages;
+        }
+#endif
+#if defined(VK_ARM_tensors)
+        if (gRuntime.armTensorsFeatureQueryAvailable) {
+            gRuntime.shaderTensorSupportedStages =
+                armTensorProperties.shaderTensorSupportedStages;
+            gRuntime.armTensorMaxDimensionCount =
+                armTensorProperties.maxTensorDimensionCount;
+            gRuntime.armTensorMaxElements = armTensorProperties.maxTensorElements;
+            gRuntime.armTensorMaxPerDimensionElements =
+                armTensorProperties.maxPerDimensionTensorElements;
+            gRuntime.armTensorMaxStride = armTensorProperties.maxTensorStride;
+            gRuntime.armTensorMaxSizeBytes = armTensorProperties.maxTensorSize;
+            gRuntime.armTensorMaxShaderAccessArrayLength =
+                armTensorProperties.maxTensorShaderAccessArrayLength;
+            gRuntime.armTensorMaxShaderAccessSizeBytes =
+                armTensorProperties.maxTensorShaderAccessSize;
+            gRuntime.armTensorMaxDescriptorSetStorageTensors =
+                armTensorProperties.maxDescriptorSetStorageTensors;
+            gRuntime.armTensorMaxPerStageDescriptorSetStorageTensors =
+                armTensorProperties.maxPerStageDescriptorSetStorageTensors;
+            gRuntime.armTensorNonUniformIndexingNative =
+                armTensorProperties.shaderStorageTensorArrayNonUniformIndexingNative == VK_TRUE;
+        }
+#endif
+#if defined(VK_ARM_shader_core_properties)
+        if (gRuntime.armShaderCorePropertiesExtensionSupported) {
+            gRuntime.armShaderFmaRate = armShaderCoreProperties.fmaRate;
+            gRuntime.armShaderPixelRate = armShaderCoreProperties.pixelRate;
+            gRuntime.armShaderTexelRate = armShaderCoreProperties.texelRate;
+        }
+#endif
+#if defined(VK_ARM_shader_core_builtins)
+        if (gRuntime.armShaderCoreBuiltinsExtensionSupported) {
+            gRuntime.armShaderCoreCount = armShaderCoreBuiltinsProperties.shaderCoreCount;
+            gRuntime.armShaderWarpsPerCore = armShaderCoreBuiltinsProperties.shaderWarpsPerCore;
+        }
+#endif
+    }
+
+#if defined(VK_KHR_cooperative_matrix)
+    if (gRuntime.supportsCooperativeMatrix) {
+        const auto getCooperativeMatrixProperties =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+                vkGetInstanceProcAddr(
+                    gRuntime.instance,
+                    "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"
+                )
+            );
+        if (getCooperativeMatrixProperties != nullptr) {
+            uint32_t matrixPropertyCount = 0;
+            VkResult matrixResult = getCooperativeMatrixProperties(
+                gRuntime.physicalDevice,
+                &matrixPropertyCount,
+                nullptr
+            );
+            if (matrixResult == VK_SUCCESS && matrixPropertyCount > 0u) {
+                std::vector<VkCooperativeMatrixPropertiesKHR> matrixProperties;
+                try {
+                    matrixProperties.resize(matrixPropertyCount);
+                } catch (const std::bad_alloc&) {
+                    logError("Not enough memory to enumerate cooperative-matrix configurations.");
+                    return false;
+                }
+
+                for (auto& matrixProperty : matrixProperties) {
+                    matrixProperty.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                }
+
+                matrixResult = getCooperativeMatrixProperties(
+                    gRuntime.physicalDevice,
+                    &matrixPropertyCount,
+                    matrixProperties.data()
+                );
+                if (matrixResult == VK_SUCCESS || matrixResult == VK_INCOMPLETE) {
+                    matrixProperties.resize(matrixPropertyCount);
+                    gRuntime.cooperativeMatrixTypes.reserve(matrixProperties.size());
+                    for (const auto& matrixProperty : matrixProperties) {
+                        gRuntime.cooperativeMatrixTypes.push_back({
+                            matrixProperty.MSize,
+                            matrixProperty.NSize,
+                            matrixProperty.KSize,
+                            static_cast<uint32_t>(matrixProperty.AType),
+                            static_cast<uint32_t>(matrixProperty.BType),
+                            static_cast<uint32_t>(matrixProperty.CType),
+                            static_cast<uint32_t>(matrixProperty.ResultType),
+                            matrixProperty.saturatingAccumulation == VK_TRUE,
+                            static_cast<uint32_t>(matrixProperty.scope)
+                        });
+                    }
+                } else {
+                    logError("Cooperative-matrix configuration query failed.", matrixResult);
+                }
+            } else if (matrixResult != VK_SUCCESS) {
+                logError("Cooperative-matrix configuration count query failed.", matrixResult);
+            }
+        }
+    }
+#endif
+
+    if (!gRuntime.synchronization2Supported) {
+        logError(
+            "The Vulkan device does not support Synchronization2; using the Kotlin compute fallback."
+        );
+        return false;
+    }
 
     const float queuePriority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo{};
@@ -510,48 +2248,46 @@ bool initializeRuntime() {
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &queuePriority;
 
-    // The packed FP16 shader uses uint32 storage words and performs
-    // half-precision arithmetic only in function-local values. It requires
-    // shaderFloat16, not 16-bit storage-buffer access.
-    VkPhysicalDeviceShaderFloat16Int8Features supportedShaderFloat16{};
-    VkPhysicalDeviceFeatures2 supportedFeatures{};
-    if (gRuntime.instanceApiVersion >= VK_API_VERSION_1_1 &&
-        gRuntime.physicalDeviceProperties.apiVersion >= VK_API_VERSION_1_2) {
-        supportedShaderFloat16.sType =
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
-        supportedFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-        supportedFeatures.pNext = &supportedShaderFloat16;
-
-        const auto getPhysicalDeviceFeatures2 =
-            reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
-                vkGetInstanceProcAddr(gRuntime.instance, "vkGetPhysicalDeviceFeatures2")
-            );
-        if (getPhysicalDeviceFeatures2 != nullptr) {
-            getPhysicalDeviceFeatures2(gRuntime.physicalDevice, &supportedFeatures);
-            gRuntime.supportsFp16Compute =
-                supportedShaderFloat16.shaderFloat16 == VK_TRUE;
-        }
-    }
-
-    VkPhysicalDeviceFeatures deviceFeatures{};
-    VkPhysicalDeviceShaderFloat16Int8Features enabledShaderFloat16{};
     VkPhysicalDeviceFeatures2 enabledFeatures{};
+    VkPhysicalDeviceShaderFloat16Int8Features enabledShaderFloat16{};
+    VkPhysicalDeviceSynchronization2FeaturesKHR enabledSynchronization2{};
+    std::vector<const char*> enabledDeviceExtensions;
+#if defined(VK_EXT_memory_budget)
+    if (gRuntime.memoryBudgetExtensionSupported) {
+        enabledDeviceExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    }
+#endif
+    if (gRuntime.effectiveApiVersion < VK_API_VERSION_1_3 &&
+        gRuntime.synchronization2ExtensionSupported) {
+        enabledDeviceExtensions.push_back(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+    }
 
     VkDeviceCreateInfo deviceInfo{};
     deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
+    deviceInfo.enabledExtensionCount =
+        static_cast<uint32_t>(enabledDeviceExtensions.size());
+    deviceInfo.ppEnabledExtensionNames = enabledDeviceExtensions.empty()
+        ? nullptr
+        : enabledDeviceExtensions.data();
+    enabledFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    enabledSynchronization2.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
+    enabledSynchronization2.synchronization2 = VK_TRUE;
+    void** enabledFeatureChainTail = &enabledFeatures.pNext;
     if (gRuntime.supportsFp16Compute) {
         enabledShaderFloat16.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
         enabledShaderFloat16.shaderFloat16 = VK_TRUE;
-        enabledFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-        enabledFeatures.pNext = &enabledShaderFloat16;
-        deviceInfo.pNext = &enabledFeatures;
-        deviceInfo.pEnabledFeatures = nullptr;
-    } else {
-        deviceInfo.pEnabledFeatures = &deviceFeatures;
+        enabledShaderFloat16.pNext = nullptr;
+        *enabledFeatureChainTail = &enabledShaderFloat16;
+        enabledFeatureChainTail = &enabledShaderFloat16.pNext;
     }
+    *enabledFeatureChainTail = &enabledSynchronization2;
+    enabledSynchronization2.pNext = nullptr;
+    deviceInfo.pNext = &enabledFeatures;
+    deviceInfo.pEnabledFeatures = nullptr;
 
     result = vkCreateDevice(
         gRuntime.physicalDevice,
@@ -563,6 +2299,55 @@ bool initializeRuntime() {
         logError("Vulkan logical-device creation failed.", result);
         return false;
     }
+
+    gRuntime.shaderFloat16FeatureEnabled =
+        enabledShaderFloat16.shaderFloat16 == VK_TRUE;
+    gRuntime.shaderInt8FeatureEnabled =
+        enabledShaderFloat16.shaderInt8 == VK_TRUE;
+    gRuntime.synchronization2Enabled =
+        enabledSynchronization2.synchronization2 == VK_TRUE;
+
+    const bool useCoreSynchronization2 =
+        gRuntime.effectiveApiVersion >= VK_API_VERSION_1_3;
+    const char* queueSubmit2Name = useCoreSynchronization2 ? "vkQueueSubmit2" : "vkQueueSubmit2KHR";
+    const char* pipelineBarrier2Name = useCoreSynchronization2 ? "vkCmdPipelineBarrier2" : "vkCmdPipelineBarrier2KHR";
+    const char* writeTimestamp2Name = useCoreSynchronization2 ? "vkCmdWriteTimestamp2" : "vkCmdWriteTimestamp2KHR";
+    gRuntime.queueSubmit2 = reinterpret_cast<PFN_vkQueueSubmit2KHR>(
+        vkGetDeviceProcAddr(gRuntime.device, queueSubmit2Name)
+    );
+    gRuntime.cmdPipelineBarrier2 = reinterpret_cast<PFN_vkCmdPipelineBarrier2KHR>(
+        vkGetDeviceProcAddr(gRuntime.device, pipelineBarrier2Name)
+    );
+    gRuntime.cmdWriteTimestamp2 = reinterpret_cast<PFN_vkCmdWriteTimestamp2KHR>(
+        vkGetDeviceProcAddr(gRuntime.device, writeTimestamp2Name)
+    );
+    if (!gRuntime.synchronization2Enabled ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        gRuntime.cmdWriteTimestamp2 == nullptr) {
+        logError("Vulkan Synchronization2 was enabled but one or more required device entry points are unavailable.");
+        return false;
+    }
+
+#if defined(VK_EXT_memory_budget) && defined(VK_VERSION_1_1)
+    gRuntime.memoryBudgetExtensionEnabled = gRuntime.memoryBudgetExtensionSupported;
+    if (gRuntime.memoryBudgetExtensionEnabled) {
+        gRuntime.getPhysicalDeviceMemoryProperties2 =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+                vkGetInstanceProcAddr(
+                    gRuntime.instance,
+                    "vkGetPhysicalDeviceMemoryProperties2"
+                )
+            );
+        gRuntime.memoryBudgetQueryAvailable =
+            gRuntime.getPhysicalDeviceMemoryProperties2 != nullptr;
+        if (!gRuntime.memoryBudgetQueryAvailable) {
+            logError(
+                "VK_EXT_memory_budget was enabled but vkGetPhysicalDeviceMemoryProperties2 is unavailable."
+            );
+        }
+    }
+#endif
 
     vkGetDeviceQueue(
         gRuntime.device,
@@ -610,6 +2395,41 @@ bool initializeRuntime() {
         return false;
     }
 
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    result = vkCreateFence(
+        gRuntime.device,
+        &fenceInfo,
+        nullptr,
+        &gRuntime.submissionFence
+    );
+    if (result != VK_SUCCESS) {
+        logError("Vulkan submission-fence creation failed.", result);
+        return false;
+    }
+
+    if (gRuntime.computeQueueTimestampValidBits > 0u &&
+        gRuntime.physicalDeviceProperties.limits.timestampPeriod > 0.0f) {
+        VkQueryPoolCreateInfo timestampPoolInfo{};
+        timestampPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        timestampPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        timestampPoolInfo.queryCount = 2;
+        const VkResult timestampPoolResult = vkCreateQueryPool(
+            gRuntime.device,
+            &timestampPoolInfo,
+            nullptr,
+            &gRuntime.timestampQueryPool
+        );
+        if (timestampPoolResult == VK_SUCCESS) {
+            gRuntime.timestampProfilingAvailable = true;
+        } else {
+            logError(
+                "Vulkan timestamp query pool could not be created; GPU profiling is disabled.",
+                timestampPoolResult
+            );
+        }
+    }
+
     VkDescriptorSetLayoutBinding storageBinding{};
     storageBinding.binding = 0;
     storageBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -637,7 +2457,13 @@ bool initializeRuntime() {
     pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushConstantRange.offset = 0;
     pushConstantRange.size = static_cast<uint32_t>(
-        std::max(sizeof(AdamwPushConstants), sizeof(LinearPushConstants))
+        std::max({
+            sizeof(AdamwPushConstants),
+            sizeof(LinearPushConstants),
+            sizeof(ResidentAttentionPushConstants),
+            sizeof(ResidentBackwardPushConstants),
+            sizeof(ResidentAdamwPushConstants)
+        })
     );
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
@@ -748,6 +2574,202 @@ bool initializeRuntime() {
         return false;
     }
 
+    // This kernel uses packed uint loads and unpackHalf2x16. It therefore supports
+    // FP16 model storage without requiring the optional shaderFloat16 device feature.
+    VkShaderModuleCreateInfo residentShaderInfo{};
+    residentShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    residentShaderInfo.codeSize = kArgusResidentLinearShaderSpvSize;
+    residentShaderInfo.pCode =
+        reinterpret_cast<const uint32_t*>(kArgusResidentLinearShaderSpv);
+
+    VkShaderModule residentShaderModule = VK_NULL_HANDLE;
+    VkResult residentResult = vkCreateShaderModule(
+        gRuntime.device,
+        &residentShaderInfo,
+        nullptr,
+        &residentShaderModule
+    );
+    if (residentResult == VK_SUCCESS) {
+        VkPipelineShaderStageCreateInfo residentShaderStage{};
+        residentShaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        residentShaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        residentShaderStage.module = residentShaderModule;
+        residentShaderStage.pName = "main";
+
+        VkComputePipelineCreateInfo residentPipelineInfo{};
+        residentPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        residentPipelineInfo.stage = residentShaderStage;
+        residentPipelineInfo.layout = gRuntime.pipelineLayout;
+
+        residentResult = vkCreateComputePipelines(
+            gRuntime.device,
+            VK_NULL_HANDLE,
+            1u,
+            &residentPipelineInfo,
+            nullptr,
+            &gRuntime.residentLinearPipeline
+        );
+    }
+    if (residentShaderModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(gRuntime.device, residentShaderModule, nullptr);
+    }
+    if (residentResult != VK_SUCCESS) {
+        gRuntime.residentLinearPipeline = VK_NULL_HANDLE;
+        logError(
+            "Resident activation-linear pipeline is unavailable; existing Vulkan paths remain active.",
+            residentResult
+        );
+    }
+
+    VkShaderModuleCreateInfo attentionShaderInfo{};
+    attentionShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    attentionShaderInfo.codeSize = kArgusResidentAttentionShaderSpvSize;
+    attentionShaderInfo.pCode =
+        reinterpret_cast<const uint32_t*>(kArgusResidentAttentionShaderSpv);
+
+    VkShaderModule attentionShaderModule = VK_NULL_HANDLE;
+    VkResult attentionResult = vkCreateShaderModule(
+        gRuntime.device, &attentionShaderInfo, nullptr, &attentionShaderModule
+    );
+    if (attentionResult == VK_SUCCESS) {
+        VkPipelineShaderStageCreateInfo attentionShaderStage{};
+        attentionShaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        attentionShaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        attentionShaderStage.module = attentionShaderModule;
+        attentionShaderStage.pName = "main";
+
+        VkComputePipelineCreateInfo attentionPipelineInfo{};
+        attentionPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        attentionPipelineInfo.stage = attentionShaderStage;
+        attentionPipelineInfo.layout = gRuntime.pipelineLayout;
+
+        attentionResult = vkCreateComputePipelines(
+            gRuntime.device, VK_NULL_HANDLE, 1u, &attentionPipelineInfo,
+            nullptr, &gRuntime.residentAttentionPipeline
+        );
+    }
+    if (attentionShaderModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(gRuntime.device, attentionShaderModule, nullptr);
+    }
+    if (attentionResult != VK_SUCCESS) {
+        gRuntime.residentAttentionPipeline = VK_NULL_HANDLE;
+        logError(
+            "Resident causal-attention pipeline is unavailable; the verified Kotlin fallback remains active.",
+            attentionResult
+        );
+    }
+
+    VkShaderModuleCreateInfo swigluShaderInfo{};
+    swigluShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    swigluShaderInfo.codeSize = kArgusResidentSwiGluShaderSpvSize;
+    swigluShaderInfo.pCode = reinterpret_cast<const uint32_t*>(kArgusResidentSwiGluShaderSpv);
+    VkShaderModule swigluShaderModule = VK_NULL_HANDLE;
+    VkResult swigluResult = vkCreateShaderModule(
+        gRuntime.device, &swigluShaderInfo, nullptr, &swigluShaderModule
+    );
+    if (swigluResult == VK_SUCCESS) {
+        VkPipelineShaderStageCreateInfo swigluShaderStage{};
+        swigluShaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        swigluShaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        swigluShaderStage.module = swigluShaderModule;
+        swigluShaderStage.pName = "main";
+        VkComputePipelineCreateInfo swigluPipelineInfo{};
+        swigluPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        swigluPipelineInfo.stage = swigluShaderStage;
+        swigluPipelineInfo.layout = gRuntime.pipelineLayout;
+        swigluResult = vkCreateComputePipelines(
+            gRuntime.device, VK_NULL_HANDLE, 1u, &swigluPipelineInfo,
+            nullptr, &gRuntime.residentSwiGluPipeline
+        );
+    }
+    if (swigluShaderModule != VK_NULL_HANDLE) vkDestroyShaderModule(gRuntime.device, swigluShaderModule, nullptr);
+    if (swigluResult != VK_SUCCESS) {
+        gRuntime.residentSwiGluPipeline = VK_NULL_HANDLE;
+        logError(
+            "Resident SwiGLU pipeline is unavailable; the Kotlin activation fallback remains active.",
+            swigluResult
+        );
+    }
+
+    VkShaderModuleCreateInfo backwardShaderInfo{};
+    backwardShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    backwardShaderInfo.codeSize = kArgusResidentBackwardShaderSpvSize;
+    backwardShaderInfo.pCode =
+        reinterpret_cast<const uint32_t*>(kArgusResidentBackwardShaderSpv);
+    VkShaderModule backwardShaderModule = VK_NULL_HANDLE;
+    VkResult backwardResult = vkCreateShaderModule(
+        gRuntime.device, &backwardShaderInfo, nullptr, &backwardShaderModule
+    );
+    if (backwardResult == VK_SUCCESS) {
+        VkPipelineShaderStageCreateInfo backwardShaderStage{};
+        backwardShaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        backwardShaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        backwardShaderStage.module = backwardShaderModule;
+        backwardShaderStage.pName = "main";
+
+        VkComputePipelineCreateInfo backwardPipelineInfo{};
+        backwardPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        backwardPipelineInfo.stage = backwardShaderStage;
+        backwardPipelineInfo.layout = gRuntime.pipelineLayout;
+        backwardResult = vkCreateComputePipelines(
+            gRuntime.device, VK_NULL_HANDLE, 1u, &backwardPipelineInfo,
+            nullptr, &gRuntime.residentBackwardPipeline
+        );
+    }
+    if (backwardShaderModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(gRuntime.device, backwardShaderModule, nullptr);
+    }
+    if (backwardResult != VK_SUCCESS) {
+        gRuntime.residentBackwardPipeline = VK_NULL_HANDLE;
+        logError(
+            "Resident backward pipeline is unavailable; Kotlin backward fallback remains active.",
+            backwardResult
+        );
+    }
+
+    VkShaderModuleCreateInfo residentAdamwShaderInfo{};
+    residentAdamwShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    residentAdamwShaderInfo.codeSize = kArgusResidentAdamwShaderSpvSize;
+    residentAdamwShaderInfo.pCode =
+        reinterpret_cast<const uint32_t*>(kArgusResidentAdamwShaderSpv);
+    VkShaderModule residentAdamwShaderModule = VK_NULL_HANDLE;
+    VkResult residentAdamwResult = vkCreateShaderModule(
+        gRuntime.device,
+        &residentAdamwShaderInfo,
+        nullptr,
+        &residentAdamwShaderModule
+    );
+    if (residentAdamwResult == VK_SUCCESS) {
+        VkPipelineShaderStageCreateInfo residentAdamwShaderStage{};
+        residentAdamwShaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        residentAdamwShaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        residentAdamwShaderStage.module = residentAdamwShaderModule;
+        residentAdamwShaderStage.pName = "main";
+
+        VkComputePipelineCreateInfo residentAdamwPipelineInfo{};
+        residentAdamwPipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        residentAdamwPipelineInfo.stage = residentAdamwShaderStage;
+        residentAdamwPipelineInfo.layout = gRuntime.pipelineLayout;
+        residentAdamwResult = vkCreateComputePipelines(
+            gRuntime.device,
+            VK_NULL_HANDLE,
+            1u,
+            &residentAdamwPipelineInfo,
+            nullptr,
+            &gRuntime.residentAdamwPipeline
+        );
+    }
+    if (residentAdamwShaderModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(gRuntime.device, residentAdamwShaderModule, nullptr);
+    }
+    if (residentAdamwResult != VK_SUCCESS) {
+        gRuntime.residentAdamwPipeline = VK_NULL_HANDLE;
+        logError(
+            "Resident FP16 AdamW pipeline is unavailable; the staged optimizer fallback remains active.",
+            residentAdamwResult
+        );
+    }
+
     if (gRuntime.supportsFp16Compute) {
         VkShaderModuleCreateInfo fp16ShaderInfo{};
         fp16ShaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -794,12 +2816,12 @@ bool initializeRuntime() {
 
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 1;
+    poolSize.descriptorCount = 2u;
 
     VkDescriptorPoolCreateInfo descriptorPoolInfo{};
     descriptorPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    descriptorPoolInfo.maxSets = 1;
-    descriptorPoolInfo.poolSizeCount = 1;
+    descriptorPoolInfo.maxSets = 2u;
+    descriptorPoolInfo.poolSizeCount = 1u;
     descriptorPoolInfo.pPoolSizes = &poolSize;
 
     result = vkCreateDescriptorPool(
@@ -813,30 +2835,38 @@ bool initializeRuntime() {
         return false;
     }
 
+    const std::array<VkDescriptorSetLayout, 2> setLayouts{
+        gRuntime.descriptorSetLayout,
+        gRuntime.descriptorSetLayout
+    };
+    std::array<VkDescriptorSet, 2> descriptorSets{};
+
     VkDescriptorSetAllocateInfo descriptorSetInfo{};
     descriptorSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     descriptorSetInfo.descriptorPool = gRuntime.descriptorPool;
-    descriptorSetInfo.descriptorSetCount = 1;
-    descriptorSetInfo.pSetLayouts = &gRuntime.descriptorSetLayout;
+    descriptorSetInfo.descriptorSetCount = static_cast<uint32_t>(descriptorSets.size());
+    descriptorSetInfo.pSetLayouts = setLayouts.data();
 
     result = vkAllocateDescriptorSets(
         gRuntime.device,
         &descriptorSetInfo,
-        &gRuntime.descriptorSet
+        descriptorSets.data()
     );
     if (result != VK_SUCCESS) {
         logError("Vulkan descriptor-set allocation failed.", result);
         return false;
     }
+    gRuntime.descriptorSet = descriptorSets[0];
+    gRuntime.tensorArenaDescriptorSet = descriptorSets[1];
 
     __android_log_print(
         ANDROID_LOG_INFO,
         kLogTag,
         "Initialized Vulkan optimizer on %s (API %u.%u.%u).",
         gRuntime.physicalDeviceProperties.deviceName,
-        VK_VERSION_MAJOR(gRuntime.physicalDeviceProperties.apiVersion),
-        VK_VERSION_MINOR(gRuntime.physicalDeviceProperties.apiVersion),
-        VK_VERSION_PATCH(gRuntime.physicalDeviceProperties.apiVersion)
+        VK_API_VERSION_MAJOR(gRuntime.physicalDeviceProperties.apiVersion),
+        VK_API_VERSION_MINOR(gRuntime.physicalDeviceProperties.apiVersion),
+        VK_API_VERSION_PATCH(gRuntime.physicalDeviceProperties.apiVersion)
     );
 
     return true;
@@ -901,6 +2931,30 @@ uint16_t floatToHalf(float value) {
         halfMantissa
     );
 }
+
+class ScopedJniLocalFrame final {
+public:
+    ScopedJniLocalFrame(JNIEnv* env, jint capacity) noexcept
+        : env_(env),
+          active_(env_ != nullptr && env_->PushLocalFrame(capacity) == JNI_OK) {}
+
+    ~ScopedJniLocalFrame() noexcept {
+        if (active_) {
+            env_->PopLocalFrame(nullptr);
+        }
+    }
+
+    ScopedJniLocalFrame(const ScopedJniLocalFrame&) = delete;
+    ScopedJniLocalFrame& operator=(const ScopedJniLocalFrame&) = delete;
+
+    bool isActive() const noexcept {
+        return active_;
+    }
+
+private:
+    JNIEnv* env_;
+    bool active_;
+};
 
 void releaseGroupReferences(JNIEnv* env, std::vector<GroupArrays>& groups) {
     for (GroupArrays& group : groups) {
@@ -969,7 +3023,8 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
 
-    if (gRuntime.device == VK_NULL_HANDLE ||
+    if (env == nullptr ||
+        gRuntime.device == VK_NULL_HANDLE ||
         parameterGroups == nullptr ||
         gradientGroups == nullptr ||
         firstMomentGroups == nullptr ||
@@ -984,6 +3039,27 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         env->GetArrayLength(firstMomentGroups) != groupCount ||
         env->GetArrayLength(secondMomentGroups) != groupCount ||
         env->GetArrayLength(weightDecayByGroup) != groupCount) {
+        return JNI_FALSE;
+    }
+
+    constexpr size_t kLocalReferencesPerGroup = 4u;
+    constexpr size_t kAdditionalLocalReferences = 8u;
+    const size_t maximumLocalFrameCapacity =
+        static_cast<size_t>(std::numeric_limits<jint>::max());
+    const size_t groupCountSize = static_cast<size_t>(groupCount);
+    if (maximumLocalFrameCapacity < kAdditionalLocalReferences ||
+        groupCountSize >
+            (maximumLocalFrameCapacity - kAdditionalLocalReferences) /
+                kLocalReferencesPerGroup) {
+        logError("Vulkan AdamW group count exceeds the JNI local-frame capacity.");
+        return JNI_FALSE;
+    }
+
+    const size_t localFrameCapacity =
+        groupCountSize * kLocalReferencesPerGroup + kAdditionalLocalReferences;
+    ScopedJniLocalFrame localFrame(env, static_cast<jint>(localFrameCapacity));
+    if (!localFrame.isActive()) {
+        logError("Unable to reserve JNI local references for Vulkan AdamW groups.");
         return JNI_FALSE;
     }
 
@@ -1124,25 +3200,15 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
     const size_t maxPageElements =
         static_cast<size_t>(maxPageElementsDevice);
 
-    // Keep the transaction atomic with respect to model state. GPU work is
-    // performed one storage-buffer page at a time, but no Java tensor is
-    // changed until every page has completed and every result is finite.
-    std::vector<float> stagedParameters;
-    std::vector<float> stagedFirstMoments;
-    std::vector<float> stagedSecondMoments;
-    try {
-        stagedParameters.resize(totalElements);
-        stagedFirstMoments.resize(totalElements);
-        stagedSecondMoments.resize(totalElements);
-    } catch (const std::bad_alloc&) {
-        logError("Not enough host memory to retain the complete staged AdamW result.");
-        releaseGroupReferences(env, groups);
-        return JNI_FALSE;
-    }
-
+    // The input arrays are disposable FP32 transaction buffers owned by the Kotlin
+    // FP16 adapter. Each page is written back only after GPU completion and finite-value
+    // validation. The adapter publishes these arrays to model state only when every
+    // page succeeds, so a later page failure cannot partially commit the model.
     VkResult result = VK_SUCCESS;
     size_t pageOffset = 0u;
     size_t pageIndex = 0u;
+    uint64_t adamwGpuTimeNanoseconds = 0u;
+    uint64_t timestampedAdamwPages = 0u;
     const size_t pageCount =
         1u + (totalElements - 1u) / maxPageElements;
 
@@ -1274,24 +3340,20 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
         }
+        const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
 
-        VkMemoryBarrier hostToComputeBarrier{};
-        hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        hostToComputeBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        VkMemoryBarrier2KHR hostToComputeBarrier{};
+        hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+        hostToComputeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+        hostToComputeBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
+        hostToComputeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
         hostToComputeBarrier.dstAccessMask =
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(
-            gRuntime.commandBuffer,
-            VK_PIPELINE_STAGE_HOST_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0,
-            1,
-            &hostToComputeBarrier,
-            0,
-            nullptr,
-            0,
-            nullptr
-        );
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+        VkDependencyInfoKHR hostToComputeDependency{};
+        hostToComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+        hostToComputeDependency.memoryBarrierCount = 1u;
+        hostToComputeDependency.pMemoryBarriers = &hostToComputeBarrier;
+        gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &hostToComputeDependency);
 
         vkCmdBindPipeline(
             gRuntime.commandBuffer,
@@ -1374,22 +3436,19 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             return JNI_FALSE;
         }
 
-        VkMemoryBarrier computeToHostBarrier{};
-        computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        computeToHostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        computeToHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        vkCmdPipelineBarrier(
-            gRuntime.commandBuffer,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_HOST_BIT,
-            0,
-            1,
-            &computeToHostBarrier,
-            0,
-            nullptr,
-            0,
-            nullptr
-        );
+        VkMemoryBarrier2KHR computeToHostBarrier{};
+        computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+        computeToHostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        computeToHostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+        computeToHostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+        computeToHostBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR;
+        VkDependencyInfoKHR computeToHostDependency{};
+        computeToHostDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+        computeToHostDependency.memoryBarrierCount = 1u;
+        computeToHostDependency.pMemoryBarriers = &computeToHostBarrier;
+        gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &computeToHostDependency);
+
+        endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
 
         result = vkEndCommandBuffer(gRuntime.commandBuffer);
         if (result != VK_SUCCESS) {
@@ -1398,30 +3457,23 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             return JNI_FALSE;
         }
 
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
-        result = vkQueueSubmit(
-            gRuntime.computeQueue,
-            1,
-            &submitInfo,
-            VK_NULL_HANDLE
-        );
-        if (result != VK_SUCCESS) {
-            logError("Vulkan AdamW page queue submission failed.", result);
+        // The mapped page is read back before reuse, so completion remains synchronous.
+        // A fence targets this dispatch instead of idling the entire queue.
+        if (!submitAndWait("Vulkan AdamW page submission or fence wait failed.")) {
             releaseGroupReferences(env, groups);
             return JNI_FALSE;
         }
-
-        // This is deliberately synchronous while the single mapped page is
-        // reused. Replacing it with fences alone would not remove the
-        // dependency on reading each page back before the next page overwrites it.
-        result = vkQueueWaitIdle(gRuntime.computeQueue);
-        if (result != VK_SUCCESS) {
-            logError("Vulkan AdamW page queue did not complete.", result);
-            releaseGroupReferences(env, groups);
-            return JNI_FALSE;
+        if (timestampCapture) {
+            uint64_t pageDurationNanoseconds = 0u;
+            if (readGpuTimestampDurationNanoseconds(pageDurationNanoseconds)) {
+                if (std::numeric_limits<uint64_t>::max() - adamwGpuTimeNanoseconds >=
+                    pageDurationNanoseconds) {
+                    adamwGpuTimeNanoseconds += pageDurationNanoseconds;
+                } else {
+                    adamwGpuTimeNanoseconds = std::numeric_limits<uint64_t>::max();
+                }
+                ++timestampedAdamwPages;
+            }
         }
 
         if (!gRuntime.hostCoherent) {
@@ -1459,21 +3511,69 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
             }
         }
 
-        std::copy_n(
-            pageOutputParameters,
-            pageElementCount,
-            stagedParameters.data() + pageOffset
-        );
-        std::copy_n(
-            pageOutputFirstMoments,
-            pageElementCount,
-            stagedFirstMoments.data() + pageOffset
-        );
-        std::copy_n(
-            pageOutputSecondMoments,
-            pageElementCount,
-            stagedSecondMoments.data() + pageOffset
-        );
+        for (const GroupArrays& group : groups) {
+            const size_t groupStart = group.packedOffset;
+            const size_t groupEnd =
+                groupStart + static_cast<size_t>(group.elementCount);
+            const size_t overlapStart = std::max(groupStart, pageOffset);
+            const size_t overlapEnd = std::min(groupEnd, pageEnd);
+            if (overlapStart >= overlapEnd) {
+                continue;
+            }
+
+            const size_t sourceOffset = overlapStart - groupStart;
+            const size_t pageLocalOffset = overlapStart - pageOffset;
+            const size_t overlapCount = overlapEnd - overlapStart;
+            if (sourceOffset > static_cast<size_t>(group.elementCount) ||
+                overlapCount >
+                    static_cast<size_t>(group.elementCount) - sourceOffset ||
+                overlapCount >
+                    static_cast<size_t>(std::numeric_limits<jsize>::max())) {
+                logError("Vulkan AdamW output page exceeds its destination group.");
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+
+            const jsize destinationIndex = static_cast<jsize>(sourceOffset);
+            const jsize copyCount = static_cast<jsize>(overlapCount);
+            const size_t pageElementOffset = pageLocalOffset;
+
+            env->SetFloatArrayRegion(
+                group.parameters,
+                destinationIndex,
+                copyCount,
+                pageOutputParameters + pageElementOffset
+            );
+            if (env->ExceptionCheck()) {
+                logError("Failed to store a validated Vulkan AdamW parameter page.");
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+
+            env->SetFloatArrayRegion(
+                group.firstMoments,
+                destinationIndex,
+                copyCount,
+                pageOutputFirstMoments + pageElementOffset
+            );
+            if (env->ExceptionCheck()) {
+                logError("Failed to store a validated Vulkan AdamW first-moment page.");
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+
+            env->SetFloatArrayRegion(
+                group.secondMoments,
+                destinationIndex,
+                copyCount,
+                pageOutputSecondMoments + pageElementOffset
+            );
+            if (env->ExceptionCheck()) {
+                logError("Failed to store a validated Vulkan AdamW second-moment page.");
+                releaseGroupReferences(env, groups);
+                return JNI_FALSE;
+            }
+        }
 
         pageOffset = pageEnd;
         ++pageIndex;
@@ -1485,53 +3585,19 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
         return JNI_FALSE;
     }
 
-    // Validate the complete result before mutating any Java model/optimizer
-    // arrays. Earlier pages remain only in host staging if a later page fails.
-    for (size_t index = 0u; index < totalElements; ++index) {
-        if (!std::isfinite(stagedParameters[index]) ||
-            !std::isfinite(stagedFirstMoments[index]) ||
-            !std::isfinite(stagedSecondMoments[index])) {
-            logError("Vulkan AdamW staged output contains a non-finite value.");
-            releaseGroupReferences(env, groups);
-            return JNI_FALSE;
-        }
-    }
-
-    for (const GroupArrays& group : groups) {
-        const size_t offset = group.packedOffset;
-        const jsize count = group.elementCount;
-
-        env->SetFloatArrayRegion(
-            group.parameters,
-            0,
-            count,
-            stagedParameters.data() + offset
+    if (timestampedAdamwPages > 0u) {
+        recordGpuTiming(
+            adamwGpuTimeNanoseconds,
+            gRuntime.lastAdamwGpuTimeNanoseconds
         );
-        if (env->ExceptionCheck()) {
-            releaseGroupReferences(env, groups);
-            return JNI_FALSE;
-        }
-
-        env->SetFloatArrayRegion(
-            group.firstMoments,
-            0,
-            count,
-            stagedFirstMoments.data() + offset
-        );
-        if (env->ExceptionCheck()) {
-            releaseGroupReferences(env, groups);
-            return JNI_FALSE;
-        }
-
-        env->SetFloatArrayRegion(
-            group.secondMoments,
-            0,
-            count,
-            stagedSecondMoments.data() + offset
-        );
-        if (env->ExceptionCheck()) {
-            releaseGroupReferences(env, groups);
-            return JNI_FALSE;
+        if (timestampedAdamwPages > 1u) {
+            const uint64_t additionalSamples = timestampedAdamwPages - 1u;
+            if (std::numeric_limits<uint64_t>::max() - gRuntime.timestampedDispatchCount >=
+                additionalSamples) {
+                gRuntime.timestampedDispatchCount += additionalSamples;
+            } else {
+                gRuntime.timestampedDispatchCount = std::numeric_limits<uint64_t>::max();
+            }
         }
     }
 
@@ -1697,25 +3763,20 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         logError("Failed to begin the Vulkan linear command buffer.", result);
         return JNI_FALSE;
     }
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
 
-    VkMemoryBarrier hostToComputeBarrier{};
-    hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    hostToComputeBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    VkMemoryBarrier2KHR hostToComputeBarrier{};
+    hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    hostToComputeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    hostToComputeBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
+    hostToComputeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
     hostToComputeBarrier.dstAccessMask =
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-
-    vkCmdPipelineBarrier(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0,
-        1,
-        &hostToComputeBarrier,
-        0,
-        nullptr,
-        0,
-        nullptr
-    );
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR hostToComputeDependency{};
+    hostToComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    hostToComputeDependency.memoryBarrierCount = 1u;
+    hostToComputeDependency.pMemoryBarriers = &hostToComputeBarrier;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &hostToComputeDependency);
 
     vkCmdBindPipeline(
         gRuntime.commandBuffer,
@@ -1761,23 +3822,19 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         1
     );
 
-    VkMemoryBarrier computeToHostBarrier{};
-    computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    computeToHostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    computeToHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    VkMemoryBarrier2KHR computeToHostBarrier{};
+    computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    computeToHostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    computeToHostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    computeToHostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    computeToHostBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR;
+    VkDependencyInfoKHR computeToHostDependency{};
+    computeToHostDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    computeToHostDependency.memoryBarrierCount = 1u;
+    computeToHostDependency.pMemoryBarriers = &computeToHostBarrier;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &computeToHostDependency);
 
-    vkCmdPipelineBarrier(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        0,
-        1,
-        &computeToHostBarrier,
-        0,
-        nullptr,
-        0,
-        nullptr
-    );
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
 
     result = vkEndCommandBuffer(gRuntime.commandBuffer);
     if (result != VK_SUCCESS) {
@@ -1785,21 +3842,14 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         return JNI_FALSE;
     }
 
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
-
-    result = vkQueueSubmit(gRuntime.computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    if (result != VK_SUCCESS) {
-        logError("Vulkan linear queue submission failed.", result);
+    if (!submitAndWait("Vulkan linear submission or fence wait failed.")) {
         return JNI_FALSE;
     }
-
-    result = vkQueueWaitIdle(gRuntime.computeQueue);
-    if (result != VK_SUCCESS) {
-        logError("Vulkan linear queue did not complete.", result);
-        return JNI_FALSE;
+    if (timestampCapture) {
+        uint64_t durationNanoseconds = 0u;
+        if (readGpuTimestampDurationNanoseconds(durationNanoseconds)) {
+            recordGpuTiming(durationNanoseconds, gRuntime.lastLinearGpuTimeNanoseconds);
+        }
     }
 
     if (!gRuntime.hostCoherent) {
@@ -2048,24 +4098,20 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         logError("Failed to begin the Vulkan FP16 linear command buffer.", result);
         return JNI_FALSE;
     }
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
 
-    VkMemoryBarrier hostToComputeBarrier{};
-    hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    hostToComputeBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    VkMemoryBarrier2KHR hostToComputeBarrier{};
+    hostToComputeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    hostToComputeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    hostToComputeBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
+    hostToComputeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
     hostToComputeBarrier.dstAccessMask =
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0,
-        1,
-        &hostToComputeBarrier,
-        0,
-        nullptr,
-        0,
-        nullptr
-    );
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR hostToComputeDependency{};
+    hostToComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    hostToComputeDependency.memoryBarrierCount = 1u;
+    hostToComputeDependency.pMemoryBarriers = &hostToComputeBarrier;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &hostToComputeDependency);
 
     vkCmdBindPipeline(
         gRuntime.commandBuffer,
@@ -2109,22 +4155,19 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         1
     );
 
-    VkMemoryBarrier computeToHostBarrier{};
-    computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    computeToHostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    computeToHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(
-        gRuntime.commandBuffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        0,
-        1,
-        &computeToHostBarrier,
-        0,
-        nullptr,
-        0,
-        nullptr
-    );
+    VkMemoryBarrier2KHR computeToHostBarrier{};
+    computeToHostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    computeToHostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    computeToHostBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    computeToHostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    computeToHostBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR;
+    VkDependencyInfoKHR computeToHostDependency{};
+    computeToHostDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    computeToHostDependency.memoryBarrierCount = 1u;
+    computeToHostDependency.pMemoryBarriers = &computeToHostBarrier;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &computeToHostDependency);
+
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
 
     result = vkEndCommandBuffer(gRuntime.commandBuffer);
     if (result != VK_SUCCESS) {
@@ -2132,20 +4175,14 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         return JNI_FALSE;
     }
 
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &gRuntime.commandBuffer;
-    result = vkQueueSubmit(gRuntime.computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    if (result != VK_SUCCESS) {
-        logError("Vulkan FP16 linear queue submission failed.", result);
+    if (!submitAndWait("Vulkan FP16 linear submission or fence wait failed.")) {
         return JNI_FALSE;
     }
-
-    result = vkQueueWaitIdle(gRuntime.computeQueue);
-    if (result != VK_SUCCESS) {
-        logError("Vulkan FP16 linear queue did not complete.", result);
-        return JNI_FALSE;
+    if (timestampCapture) {
+        uint64_t durationNanoseconds = 0u;
+        if (readGpuTimestampDurationNanoseconds(durationNanoseconds)) {
+            recordGpuTiming(durationNanoseconds, gRuntime.lastFp16LinearGpuTimeNanoseconds);
+        }
     }
 
     if (!gRuntime.hostCoherent) {
@@ -2187,6 +4224,824 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
     return JNI_TRUE;
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
+    JNIEnv* env,
+    jobject,
+    jfloatArray inputArray,
+    jlongArray weightHandleArray,
+    jfloatArray outputArray,
+    jint rowCount,
+    jint batchCount,
+    jint rowsPerBatch,
+    jint inputColumns,
+    jint outputColumns,
+    jboolean transposeWeights
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        !gRuntime.supportsFp16Compute ||
+        gRuntime.fp16LinearPipeline == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        inputArray == nullptr ||
+        weightHandleArray == nullptr ||
+        outputArray == nullptr ||
+        rowCount <= 0 ||
+        batchCount <= 0 ||
+        rowsPerBatch <= 0 ||
+        static_cast<uint64_t>(batchCount) * static_cast<uint64_t>(rowsPerBatch) !=
+            static_cast<uint64_t>(rowCount) ||
+        inputColumns <= 0 ||
+        outputColumns <= 0) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t rows = static_cast<uint64_t>(rowCount);
+    const uint64_t batches = static_cast<uint64_t>(batchCount);
+    const uint64_t rowsInBatch = static_cast<uint64_t>(rowsPerBatch);
+    const uint64_t inputWidth = static_cast<uint64_t>(inputColumns);
+    const uint64_t outputWidth = static_cast<uint64_t>(outputColumns);
+    const uint64_t maximumArrayElements =
+        static_cast<uint64_t>(std::numeric_limits<jsize>::max());
+
+    if (rows > maximumArrayElements / inputWidth ||
+        rows > maximumArrayElements / outputWidth ||
+        inputWidth > maximumArrayElements / outputWidth) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t inputElements = rows * inputWidth;
+    const uint64_t outputElements = rows * outputWidth;
+    const uint64_t weightElements = inputWidth * outputWidth;
+    if (inputElements > std::numeric_limits<uint32_t>::max() ||
+        outputElements > std::numeric_limits<uint32_t>::max() ||
+        weightElements > maximumArrayElements ||
+        weightElements > std::numeric_limits<uint32_t>::max()) {
+        return JNI_FALSE;
+    }
+
+    if (env->GetArrayLength(inputArray) != static_cast<jsize>(inputElements) ||
+        env->GetArrayLength(outputArray) != static_cast<jsize>(outputElements) ||
+        env->GetArrayLength(weightHandleArray) != batchCount ||
+        env->ExceptionCheck()) {
+        return JNI_FALSE;
+    }
+
+    std::vector<jlong> weightHandles;
+    try {
+        weightHandles.resize(static_cast<size_t>(batches));
+    } catch (const std::bad_alloc&) {
+        logError("Persistent FP16 batch handle staging allocation failed.");
+        return JNI_FALSE;
+    }
+    env->GetLongArrayRegion(
+        weightHandleArray,
+        0,
+        batchCount,
+        weightHandles.data()
+    );
+    if (env->ExceptionCheck()) return JNI_FALSE;
+
+    const uint64_t weightByteCount64 = weightElements * sizeof(uint16_t);
+    const uint64_t inputByteCount64 = inputElements * sizeof(uint16_t);
+    const uint64_t outputByteCount64 = outputElements * sizeof(float);
+    if (weightByteCount64 == 0u ||
+        inputByteCount64 == 0u ||
+        outputByteCount64 == 0u ||
+        weightByteCount64 > std::numeric_limits<VkDeviceSize>::max() ||
+        inputByteCount64 > std::numeric_limits<VkDeviceSize>::max() ||
+        outputByteCount64 > std::numeric_limits<VkDeviceSize>::max()) {
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize weightByteCount = static_cast<VkDeviceSize>(weightByteCount64);
+    const VkDeviceSize inputByteCount = static_cast<VkDeviceSize>(inputByteCount64);
+    const VkDeviceSize outputByteCount = static_cast<VkDeviceSize>(outputByteCount64);
+
+    VkDeviceSize inputPaddedBytes = 0u;
+    if (!alignArenaSize(inputByteCount, 4u, inputPaddedBytes)) {
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize tableByteCount =
+        static_cast<VkDeviceSize>(batches * sizeof(uint32_t));
+    if (inputPaddedBytes > std::numeric_limits<VkDeviceSize>::max() - outputByteCount ||
+        inputPaddedBytes + outputByteCount >
+            std::numeric_limits<VkDeviceSize>::max() - tableByteCount ||
+        inputPaddedBytes > std::numeric_limits<VkDeviceSize>::max() - tableByteCount) {
+        return JNI_FALSE;
+    }
+    const VkDeviceSize scratchByteCount =
+        inputPaddedBytes + outputByteCount + tableByteCount;
+    const VkDeviceSize inputAndTableByteCount =
+        inputPaddedBytes + tableByteCount;
+
+    const VkDeviceSize maximumStorageRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    if (weightByteCount > maximumStorageRange ||
+        scratchByteCount > maximumStorageRange ||
+        inputAndTableByteCount > maximumStorageRange ||
+        outputByteCount > maximumStorageRange) {
+        return JNI_FALSE;
+    }
+
+    constexpr uint64_t kTileRows = 8u;
+    constexpr uint64_t kTileColumns = 16u;
+    const uint64_t tileRowsPerBatch = 1u + (rowsInBatch - 1u) / kTileRows;
+    const uint64_t tileColumnsPerBatch = 1u + (outputWidth - 1u) / kTileColumns;
+    if (tileRowsPerBatch > std::numeric_limits<uint64_t>::max() / tileColumnsPerBatch) {
+        return JNI_FALSE;
+    }
+    const uint64_t tilesPerBatch = tileRowsPerBatch * tileColumnsPerBatch;
+    if (batches > std::numeric_limits<uint64_t>::max() / tilesPerBatch) {
+        return JNI_FALSE;
+    }
+    const uint64_t totalTileCount = batches * tilesPerBatch;
+    const uint32_t workGroupCount = calculateDispatchGroupCount(totalTileCount);
+    if (workGroupCount == 0u) {
+        logError("Persistent batched FP16 linear dispatch has no available workgroups.");
+        return JNI_FALSE;
+    }
+
+    const jlong scratchHandle = allocateArenaTensor(scratchByteCount);
+    if (scratchHandle == 0) {
+        logError("Persistent batched FP16 linear scratch allocation failed.");
+        return JNI_FALSE;
+    }
+    ScopedTensorArenaAllocation scratchRelease(static_cast<uint64_t>(scratchHandle));
+    TensorArenaAllocation* scratchAllocation =
+        findArenaAllocation(static_cast<uint64_t>(scratchHandle));
+    if (scratchAllocation == nullptr ||
+        scratchAllocation->logicalSize < scratchByteCount) {
+        logError("Persistent batched FP16 linear scratch allocation is invalid.");
+        return JNI_FALSE;
+    }
+
+    std::vector<TensorArenaAllocation*> weightAllocations;
+    try {
+        weightAllocations.reserve(static_cast<size_t>(batches));
+    } catch (const std::bad_alloc&) {
+        logError("Persistent FP16 batch allocation metadata staging failed.");
+        return JNI_FALSE;
+    }
+
+    for (uint64_t batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+        const jlong handle = weightHandles[static_cast<size_t>(batchIndex)];
+        if (handle <= 0) {
+            logError("Persistent FP16 batch contains an invalid tensor handle.");
+            return JNI_FALSE;
+        }
+        TensorArenaAllocation* allocation =
+            findArenaAllocation(static_cast<uint64_t>(handle));
+        if (allocation == nullptr ||
+            allocation->logicalSize < weightByteCount ||
+            (allocation->offset & 1u) != 0u ||
+            allocation->offset / 2u > std::numeric_limits<uint32_t>::max() ||
+            weightElements - 1u >
+                std::numeric_limits<uint32_t>::max() - allocation->offset / 2u) {
+            logError("Persistent FP16 batch references an invalid, undersized, or shader-unaddressable weight allocation.");
+            return JNI_FALSE;
+        }
+        weightAllocations.push_back(allocation);
+    }
+
+    const VkDeviceSize scratchEnd = scratchAllocation->offset + scratchByteCount;
+    const VkDeviceSize offsetTableByteOffset =
+        scratchAllocation->offset + inputPaddedBytes + outputByteCount;
+    if (scratchEnd < scratchAllocation->offset ||
+        (scratchAllocation->offset & 3u) != 0u ||
+        scratchAllocation->offset / 2u > std::numeric_limits<uint32_t>::max() ||
+        (scratchAllocation->offset + inputPaddedBytes) / 4u >
+            std::numeric_limits<uint32_t>::max() ||
+        offsetTableByteOffset / 4u > std::numeric_limits<uint32_t>::max() ||
+        offsetTableByteOffset / 4u + batches - 1u >
+            std::numeric_limits<uint32_t>::max()) {
+        logError("Persistent batched FP16 scratch offsets exceed shader address limits.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t maximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    const uint64_t inputOffsetHalf = scratchAllocation->offset / 2u;
+    const uint64_t outputOffsetWords =
+        (scratchAllocation->offset + inputPaddedBytes) / 4u;
+    const uint64_t offsetTableWordIndex = offsetTableByteOffset / 4u;
+    if (inputElements - 1u > maximumShaderIndex - inputOffsetHalf ||
+        outputElements - 1u > maximumShaderIndex - outputOffsetWords ||
+        batches - 1u > maximumShaderIndex - offsetTableWordIndex) {
+        logError("Persistent batched FP16 tensor ranges exceed 32-bit shader indexing.");
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize stagingCapacity = std::max(inputAndTableByteCount, outputByteCount);
+    if (!ensureStorageBuffer(stagingCapacity) || gRuntime.mappedStorage == nullptr) {
+        logError("Persistent batched FP16 staging-buffer allocation failed.");
+        return JNI_FALSE;
+    }
+
+    auto* mappedWords = static_cast<uint32_t*>(gRuntime.mappedStorage);
+    std::memset(mappedWords, 0, static_cast<size_t>(inputAndTableByteCount));
+
+    constexpr size_t kInputConversionChunkElements = 8192u;
+    std::array<jfloat, kInputConversionChunkElements> inputChunk{};
+    for (uint64_t chunkOffset = 0u;
+         chunkOffset < inputElements;
+         chunkOffset += kInputConversionChunkElements) {
+        const size_t chunkCount = static_cast<size_t>(
+            std::min<uint64_t>(
+                kInputConversionChunkElements,
+                inputElements - chunkOffset
+            )
+        );
+        env->GetFloatArrayRegion(
+            inputArray,
+            static_cast<jsize>(chunkOffset),
+            static_cast<jsize>(chunkCount),
+            inputChunk.data()
+        );
+        if (env->ExceptionCheck()) return JNI_FALSE;
+
+        for (size_t localIndex = 0u; localIndex < chunkCount; localIndex += 2u) {
+            const uint64_t absoluteIndex = chunkOffset + localIndex;
+            const float firstValue = inputChunk[localIndex];
+            if (!std::isfinite(firstValue)) {
+                logError("Persistent batched FP16 input contains a non-finite activation.");
+                return JNI_FALSE;
+            }
+            const uint16_t lowHalf = floatToHalf(firstValue);
+            if ((lowHalf & 0x7C00u) == 0x7C00u) {
+                logError("Persistent batched FP16 input exceeds the finite binary16 range.");
+                return JNI_FALSE;
+            }
+
+            uint32_t packed = static_cast<uint32_t>(lowHalf);
+            if (localIndex + 1u < chunkCount) {
+                const float secondValue = inputChunk[localIndex + 1u];
+                if (!std::isfinite(secondValue)) {
+                    logError("Persistent batched FP16 input contains a non-finite activation.");
+                    return JNI_FALSE;
+                }
+                const uint16_t highHalf = floatToHalf(secondValue);
+                if ((highHalf & 0x7C00u) == 0x7C00u) {
+                    logError("Persistent batched FP16 input exceeds the finite binary16 range.");
+                    return JNI_FALSE;
+                }
+                packed |= static_cast<uint32_t>(highHalf) << 16u;
+            }
+            mappedWords[absoluteIndex >> 1u] = packed;
+        }
+    }
+
+    auto* offsetTableWords = mappedWords + inputPaddedBytes / sizeof(uint32_t);
+    for (uint64_t batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+        const VkDeviceSize halfOffset =
+            weightAllocations[static_cast<size_t>(batchIndex)]->offset / 2u;
+        if (halfOffset > std::numeric_limits<uint32_t>::max()) return JNI_FALSE;
+        offsetTableWords[batchIndex] = static_cast<uint32_t>(halfOffset);
+    }
+
+    if (!syncStagingMemory(false)) return JNI_FALSE;
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset the persistent batched FP16 command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin the persistent batched FP16 command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkBufferMemoryBarrier2KHR beforeInputCopy[2]{};
+    beforeInputCopy[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    beforeInputCopy[0].srcStageMask =
+        VK_PIPELINE_STAGE_2_HOST_BIT_KHR | VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    beforeInputCopy[0].srcAccessMask =
+        VK_ACCESS_2_HOST_WRITE_BIT_KHR |
+        VK_ACCESS_2_HOST_READ_BIT_KHR |
+        VK_ACCESS_2_TRANSFER_READ_BIT_KHR |
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    beforeInputCopy[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    beforeInputCopy[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+    beforeInputCopy[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeInputCopy[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeInputCopy[0].buffer = gRuntime.storageBuffer;
+    beforeInputCopy[0].offset = 0u;
+    beforeInputCopy[0].size = inputAndTableByteCount;
+
+    beforeInputCopy[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    beforeInputCopy[1].srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeInputCopy[1].srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeInputCopy[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    beforeInputCopy[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    beforeInputCopy[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeInputCopy[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeInputCopy[1].buffer = gRuntime.tensorArenaBuffer;
+    beforeInputCopy[1].offset = scratchAllocation->offset;
+    beforeInputCopy[1].size = scratchByteCount;
+
+    VkDependencyInfoKHR beforeInputDependency{};
+    beforeInputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeInputDependency.bufferMemoryBarrierCount = 2u;
+    beforeInputDependency.pBufferMemoryBarriers = beforeInputCopy;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeInputDependency);
+
+    VkBufferCopy inputAndTableCopies[2]{};
+    inputAndTableCopies[0].srcOffset = 0u;
+    inputAndTableCopies[0].dstOffset = scratchAllocation->offset;
+    inputAndTableCopies[0].size = inputPaddedBytes;
+    inputAndTableCopies[1].srcOffset = inputPaddedBytes;
+    inputAndTableCopies[1].dstOffset = offsetTableByteOffset;
+    inputAndTableCopies[1].size = tableByteCount;
+    vkCmdCopyBuffer(
+        gRuntime.commandBuffer,
+        gRuntime.storageBuffer,
+        gRuntime.tensorArenaBuffer,
+        2u,
+        inputAndTableCopies
+    );
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR beforeComputeDependency{};
+    beforeComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeComputeDependency.memoryBarrierCount = 1u;
+    beforeComputeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeComputeDependency);
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.fp16LinearPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0u,
+        1u,
+        &gRuntime.tensorArenaDescriptorSet,
+        0u,
+        nullptr
+    );
+
+    const LinearPushConstants pushConstants{
+        static_cast<uint32_t>(rowCount),
+        static_cast<uint32_t>(batchCount),
+        static_cast<uint32_t>(rowsPerBatch),
+        static_cast<uint32_t>(inputColumns),
+        static_cast<uint32_t>(outputColumns),
+        static_cast<uint32_t>(inputOffsetHalf),
+        0u,
+        static_cast<uint32_t>(outputOffsetWords),
+        transposeWeights == JNI_TRUE ? 1u : 0u,
+        static_cast<uint32_t>(offsetTableWordIndex)
+    };
+    vkCmdPushConstants(
+        gRuntime.commandBuffer,
+        gRuntime.pipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(LinearPushConstants),
+        &pushConstants
+    );
+    vkCmdDispatch(gRuntime.commandBuffer, workGroupCount, 1u, 1u);
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    VkBufferMemoryBarrier2KHR outputToCopy{};
+    outputToCopy.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    outputToCopy.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    outputToCopy.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    outputToCopy.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    outputToCopy.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+    outputToCopy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputToCopy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputToCopy.buffer = gRuntime.tensorArenaBuffer;
+    outputToCopy.offset = scratchAllocation->offset + inputPaddedBytes;
+    outputToCopy.size = outputByteCount;
+
+    VkBufferMemoryBarrier2KHR stagingBeforeOutput{};
+    stagingBeforeOutput.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    stagingBeforeOutput.srcStageMask =
+        VK_PIPELINE_STAGE_2_HOST_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    stagingBeforeOutput.srcAccessMask =
+        VK_ACCESS_2_HOST_READ_BIT_KHR |
+        VK_ACCESS_2_HOST_WRITE_BIT_KHR |
+        VK_ACCESS_2_TRANSFER_READ_BIT_KHR |
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    stagingBeforeOutput.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    stagingBeforeOutput.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    stagingBeforeOutput.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    stagingBeforeOutput.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    stagingBeforeOutput.buffer = gRuntime.storageBuffer;
+    stagingBeforeOutput.offset = 0u;
+    stagingBeforeOutput.size = outputByteCount;
+
+    VkBufferMemoryBarrier2KHR outputBarriers[2]{};
+    outputBarriers[0] = outputToCopy;
+    outputBarriers[1] = stagingBeforeOutput;
+    VkDependencyInfoKHR outputDependency{};
+    outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    outputDependency.bufferMemoryBarrierCount = 2u;
+    outputDependency.pBufferMemoryBarriers = outputBarriers;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputDependency);
+
+    VkBufferCopy outputCopy{};
+    outputCopy.srcOffset = scratchAllocation->offset + inputPaddedBytes;
+    outputCopy.dstOffset = 0u;
+    outputCopy.size = outputByteCount;
+    vkCmdCopyBuffer(
+        gRuntime.commandBuffer,
+        gRuntime.tensorArenaBuffer,
+        gRuntime.storageBuffer,
+        1u,
+        &outputCopy
+    );
+
+    VkBufferMemoryBarrier2KHR outputToHost{};
+    outputToHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    outputToHost.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    outputToHost.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    outputToHost.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    outputToHost.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT_KHR;
+    outputToHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputToHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputToHost.buffer = gRuntime.storageBuffer;
+    outputToHost.offset = 0u;
+    outputToHost.size = outputByteCount;
+
+    VkDependencyInfoKHR outputToHostDependency{};
+    outputToHostDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    outputToHostDependency.bufferMemoryBarrierCount = 1u;
+    outputToHostDependency.pBufferMemoryBarriers = &outputToHost;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputToHostDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish the persistent batched FP16 command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Persistent batched FP16 submission or fence wait failed.")) {
+        return JNI_FALSE;
+    }
+    if (timestampCapture) {
+        uint64_t durationNanoseconds = 0u;
+        if (readGpuTimestampDurationNanoseconds(durationNanoseconds)) {
+            recordGpuTiming(durationNanoseconds, gRuntime.lastFp16LinearGpuTimeNanoseconds);
+        }
+    }
+    if (!syncStagingMemory(true)) return JNI_FALSE;
+
+    const auto* outputValues = static_cast<const float*>(gRuntime.mappedStorage);
+    for (uint64_t index = 0u; index < outputElements; ++index) {
+        if (!std::isfinite(outputValues[index])) {
+            logError("Persistent batched FP16 linear kernel produced a non-finite result.");
+            return JNI_FALSE;
+        }
+    }
+    env->SetFloatArrayRegion(
+        outputArray,
+        0,
+        static_cast<jsize>(outputElements),
+        outputValues
+    );
+    if (env->ExceptionCheck()) return JNI_FALSE;
+    return JNI_TRUE;
+}
+
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDriverInfo(
+    JNIEnv* env,
+    jobject
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.physicalDevice == VK_NULL_HANDLE) {
+        return env->NewStringUTF("Vulkan driver unavailable");
+    }
+
+    const VkPhysicalDeviceProperties& properties =
+        gRuntime.physicalDeviceProperties;
+    char driverInfo[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE +
+                    VK_MAX_DRIVER_NAME_SIZE +
+                    VK_MAX_DRIVER_INFO_SIZE + 32]{};
+
+    if (gRuntime.hasDriverProperties) {
+        const char* driverName =
+            gRuntime.driverProperties.driverName[0] != '\0'
+                ? gRuntime.driverProperties.driverName
+                : "Vulkan driver";
+        const char* details =
+            gRuntime.driverProperties.driverInfo[0] != '\0'
+                ? gRuntime.driverProperties.driverInfo
+                : "version details unavailable";
+        std::snprintf(
+            driverInfo,
+            sizeof(driverInfo),
+            "%s | %s: %s",
+            properties.deviceName,
+            driverName,
+            details
+        );
+    } else {
+        std::snprintf(
+            driverInfo,
+            sizeof(driverInfo),
+            "%s | vendor-defined driver version 0x%08X",
+            properties.deviceName,
+            properties.driverVersion
+        );
+    }
+    return env->NewStringUTF(driverInfo);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
+    JNIEnv* env,
+    jobject
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.physicalDevice == VK_NULL_HANDLE) {
+        return env->NewStringUTF("{}");
+    }
+
+    refreshMemoryBudget();
+    const VkPhysicalDeviceProperties& properties = gRuntime.physicalDeviceProperties;
+    std::ostringstream json;
+    json << "{"
+         << "\"deviceName\":\"" << escapeJsonString(properties.deviceName) << "\","
+         << "\"vendorId\":" << properties.vendorID << ","
+         << "\"deviceId\":" << properties.deviceID << ","
+         << "\"deviceType\":" << static_cast<uint32_t>(properties.deviceType) << ","
+         << "\"memoryPropertiesAvailable\":"
+         << (gRuntime.memoryPropertiesAvailable ? "true" : "false") << ","
+         << "\"memoryHeapCount\":" << gRuntime.memoryProperties.memoryHeapCount << ","
+         << "\"memoryTypeCount\":" << gRuntime.memoryProperties.memoryTypeCount << ","
+         << "\"hostVisibleMemoryTypeCount\":" << gRuntime.hostVisibleMemoryTypeCount << ","
+         << "\"hostVisibleDeviceLocalMemoryTypeCount\":"
+         << gRuntime.hostVisibleDeviceLocalMemoryTypeCount << ","
+         << "\"memoryBudgetExtensionSupported\":"
+         << (gRuntime.memoryBudgetExtensionSupported ? "true" : "false") << ","
+         << "\"memoryBudgetExtensionEnabled\":"
+         << (gRuntime.memoryBudgetExtensionEnabled ? "true" : "false") << ","
+         << "\"memoryBudgetQueryAvailable\":"
+         << (gRuntime.memoryBudgetQueryAvailable ? "true" : "false") << ","
+         << "\"memoryBudgetHeapCount\":" << gRuntime.memoryBudgetHeapCount << ","
+         << "\"memoryHeapBudgetBytes\":[";
+    for (uint32_t heapIndex = 0; heapIndex < gRuntime.memoryBudgetHeapCount; ++heapIndex) {
+        if (heapIndex > 0u) json << ",";
+        json << gRuntime.memoryHeapBudget[heapIndex];
+    }
+    json << "],\"memoryHeapFlags\":[";
+    for (uint32_t heapIndex = 0; heapIndex < gRuntime.memoryBudgetHeapCount; ++heapIndex) {
+        if (heapIndex > 0u) json << ",";
+        const uint32_t heapFlags =
+            heapIndex < gRuntime.memoryProperties.memoryHeapCount
+                ? gRuntime.memoryProperties.memoryHeaps[heapIndex].flags
+                : 0u;
+        json << heapFlags;
+    }
+    json << "],\"memoryHeapUsageBytes\":[";
+    for (uint32_t heapIndex = 0; heapIndex < gRuntime.memoryBudgetHeapCount; ++heapIndex) {
+        if (heapIndex > 0u) json << ",";
+        json << gRuntime.memoryHeapUsage[heapIndex];
+    }
+    json << "],"
+         << "\"apiVersionMajor\":" << VK_API_VERSION_MAJOR(properties.apiVersion) << ","
+         << "\"apiVersionMinor\":" << VK_API_VERSION_MINOR(properties.apiVersion) << ","
+         << "\"apiVersionPatch\":" << VK_API_VERSION_PATCH(properties.apiVersion) << ","
+         << "\"effectiveApiVersionMajor\":" << VK_API_VERSION_MAJOR(gRuntime.effectiveApiVersion) << ","
+         << "\"effectiveApiVersionMinor\":" << VK_API_VERSION_MINOR(gRuntime.effectiveApiVersion) << ","
+         << "\"effectiveApiVersionPatch\":" << VK_API_VERSION_PATCH(gRuntime.effectiveApiVersion) << ","
+         << "\"synchronization2ExtensionSupported\":"
+         << (gRuntime.synchronization2ExtensionSupported ? "true" : "false") << ","
+         << "\"synchronization2Supported\":"
+         << (gRuntime.synchronization2Supported ? "true" : "false") << ","
+         << "\"synchronization2Enabled\":"
+         << (gRuntime.synchronization2Enabled ? "true" : "false") << ","
+         << "\"driverName\":\"" << escapeJsonString(
+                gRuntime.hasDriverProperties ? gRuntime.driverProperties.driverName : ""
+            ) << "\","
+         << "\"driverInfo\":\"" << escapeJsonString(
+                gRuntime.hasDriverProperties ? gRuntime.driverProperties.driverInfo : ""
+            ) << "\","
+         << "\"driverVersionRaw\":" << properties.driverVersion << ","
+         << "\"deviceIdentityPropertiesAvailable\":"
+         << (gRuntime.hasDeviceIdentityProperties ? "true" : "false") << ","
+         << "\"deviceUUID\":\"" << formatUuid(
+                gRuntime.hasDeviceIdentityProperties ? gRuntime.deviceUuid.data() : nullptr
+            ) << "\","
+         << "\"driverUUID\":\"" << formatUuid(
+                gRuntime.hasDeviceIdentityProperties ? gRuntime.driverUuid.data() : nullptr
+            ) << "\","
+         << "\"pipelineCacheUUID\":\"" << formatUuid(properties.pipelineCacheUUID) << "\","
+         << "\"armShaderCorePropertiesExtensionSupported\":"
+         << (gRuntime.armShaderCorePropertiesExtensionSupported ? "true" : "false") << ","
+         << "\"armShaderCoreBuiltinsExtensionSupported\":"
+         << (gRuntime.armShaderCoreBuiltinsExtensionSupported ? "true" : "false") << ","
+         << "\"armShaderCoreBuiltinsFeatureQueryAvailable\":"
+         << (gRuntime.armShaderCoreBuiltinsFeatureQueryAvailable ? "true" : "false") << ","
+         << "\"armShaderCoreBuiltinsFeatureSupported\":"
+         << (gRuntime.armShaderCoreBuiltinsFeatureSupported ? "true" : "false") << ","
+         << "\"armShaderCoreBuiltinsFeatureEnabled\":"
+         << (gRuntime.armShaderCoreBuiltinsFeatureEnabled ? "true" : "false") << ","
+         << "\"armShaderCoreCount\":" << gRuntime.armShaderCoreCount << ","
+         << "\"armShaderWarpsPerCore\":" << gRuntime.armShaderWarpsPerCore << ","
+         << "\"armShaderFmaRate\":" << gRuntime.armShaderFmaRate << ","
+         << "\"armShaderPixelRate\":" << gRuntime.armShaderPixelRate << ","
+         << "\"armShaderTexelRate\":" << gRuntime.armShaderTexelRate << ","
+         << "\"armTensorsExtensionSupported\":"
+         << (gRuntime.armTensorsExtensionSupported ? "true" : "false") << ","
+         << "\"armTensorsFeatureQueryAvailable\":"
+         << (gRuntime.armTensorsFeatureQueryAvailable ? "true" : "false") << ","
+         << "\"armTensorsFeatureSupported\":"
+         << (gRuntime.armTensorsFeatureSupported ? "true" : "false") << ","
+         << "\"armTensorNonPackedSupported\":"
+         << (gRuntime.armTensorNonPackedSupported ? "true" : "false") << ","
+         << "\"armTensorShaderAccessSupported\":"
+         << (gRuntime.armTensorShaderAccessSupported ? "true" : "false") << ","
+         << "\"armTensorDynamicIndexingSupported\":"
+         << (gRuntime.armTensorDynamicIndexingSupported ? "true" : "false") << ","
+         << "\"armTensorNonUniformIndexingSupported\":"
+         << (gRuntime.armTensorNonUniformIndexingSupported ? "true" : "false") << ","
+         << "\"armTensorUpdateAfterBindSupported\":"
+         << (gRuntime.armTensorUpdateAfterBindSupported ? "true" : "false") << ","
+         << "\"armTensorDeviceFeaturesEnabled\":"
+         << (gRuntime.armTensorDeviceFeaturesEnabled ? "true" : "false") << ","
+         << "\"shaderTensorSupportedStages\":" << gRuntime.shaderTensorSupportedStages << ","
+         << "\"armTensorMaxDimensionCount\":" << gRuntime.armTensorMaxDimensionCount << ","
+         << "\"armTensorMaxElements\":" << gRuntime.armTensorMaxElements << ","
+         << "\"armTensorMaxPerDimensionElements\":"
+         << gRuntime.armTensorMaxPerDimensionElements << ","
+         << "\"armTensorMaxStride\":" << gRuntime.armTensorMaxStride << ","
+         << "\"armTensorMaxSizeBytes\":" << gRuntime.armTensorMaxSizeBytes << ","
+         << "\"armTensorMaxShaderAccessArrayLength\":"
+         << gRuntime.armTensorMaxShaderAccessArrayLength << ","
+         << "\"armTensorMaxShaderAccessSizeBytes\":"
+         << gRuntime.armTensorMaxShaderAccessSizeBytes << ","
+         << "\"armTensorMaxDescriptorSetStorageTensors\":"
+         << gRuntime.armTensorMaxDescriptorSetStorageTensors << ","
+         << "\"armTensorMaxPerStageDescriptorSetStorageTensors\":"
+         << gRuntime.armTensorMaxPerStageDescriptorSetStorageTensors << ","
+         << "\"armTensorNonUniformIndexingNative\":"
+         << (gRuntime.armTensorNonUniformIndexingNative ? "true" : "false") << ","
+         << "\"maxComputeWorkGroupInvocations\":"
+         << properties.limits.maxComputeWorkGroupInvocations << ","
+         << "\"maxComputeWorkGroupSizeX\":"
+         << properties.limits.maxComputeWorkGroupSize[0] << ","
+         << "\"maxComputeWorkGroupSizeY\":"
+         << properties.limits.maxComputeWorkGroupSize[1] << ","
+         << "\"maxComputeWorkGroupSizeZ\":"
+         << properties.limits.maxComputeWorkGroupSize[2] << ","
+         << "\"maxComputeWorkGroupCountX\":"
+         << properties.limits.maxComputeWorkGroupCount[0] << ","
+         << "\"maxComputeWorkGroupCountY\":"
+         << properties.limits.maxComputeWorkGroupCount[1] << ","
+         << "\"maxComputeWorkGroupCountZ\":"
+         << properties.limits.maxComputeWorkGroupCount[2] << ","
+         << "\"maxComputeSharedMemoryBytes\":"
+         << properties.limits.maxComputeSharedMemorySize << ","
+         << "\"maxStorageBufferRangeBytes\":"
+         << properties.limits.maxStorageBufferRange << ","
+         << "\"timestampPeriodNanoseconds\":"
+         << properties.limits.timestampPeriod << ","
+         << "\"timestampComputeAndGraphics\":"
+         << (properties.limits.timestampComputeAndGraphics == VK_TRUE ? "true" : "false") << ","
+         << "\"computeQueueTimestampValidBits\":"
+         << gRuntime.computeQueueTimestampValidBits << ","
+         << "\"computeTimestampQueriesSupported\":"
+         << (gRuntime.computeQueueTimestampValidBits > 0u ? "true" : "false") << ","
+         << "\"subgroupSize\":" << gRuntime.subgroupSize << ","
+         << "\"subgroupSupportedStages\":" << gRuntime.subgroupSupportedStages << ","
+         << "\"subgroupSupportedOperations\":" << gRuntime.subgroupSupportedOperations << ","
+         << "\"subgroupQuadOperationsInAllStages\":"
+         << (gRuntime.subgroupQuadOperationsInAllStages ? "true" : "false") << ","
+         << "\"subgroupSizeControl\":"
+         << (gRuntime.supportsSubgroupSizeControl ? "true" : "false") << ","
+         << "\"subgroupSizeControlEnabled\":"
+         << (gRuntime.subgroupSizeControlEnabled ? "true" : "false") << ","
+         << "\"computeFullSubgroups\":"
+         << (gRuntime.supportsComputeFullSubgroups ? "true" : "false") << ","
+         << "\"minSubgroupSize\":" << gRuntime.minSubgroupSize << ","
+         << "\"maxSubgroupSize\":" << gRuntime.maxSubgroupSize << ","
+         << "\"maxComputeWorkgroupSubgroups\":"
+         << gRuntime.maxComputeWorkgroupSubgroups << ","
+         << "\"requiredSubgroupSizeStages\":" << gRuntime.requiredSubgroupSizeStages << ","
+         << "\"shaderFloat16\":" << (gRuntime.supportsFp16Compute ? "true" : "false") << ","
+         << "\"shaderFloat16FeatureSupported\":"
+         << (gRuntime.supportsShaderFloat16Feature ? "true" : "false") << ","
+         << "\"shaderFloat16FeatureEnabled\":"
+         << (gRuntime.shaderFloat16FeatureEnabled ? "true" : "false") << ","
+         << "\"shaderInt8\":" << (gRuntime.supportsShaderInt8 ? "true" : "false") << ","
+         << "\"shaderInt8FeatureEnabled\":"
+         << (gRuntime.shaderInt8FeatureEnabled ? "true" : "false") << ","
+         << "\"storageBuffer16BitAccess\":"
+         << (gRuntime.supportsStorageBuffer16BitAccess ? "true" : "false") << ","
+         << "\"storageBuffer16BitAccessEnabled\":"
+         << (gRuntime.storageBuffer16BitAccessEnabled ? "true" : "false") << ","
+         << "\"storageBuffer8BitAccess\":"
+         << (gRuntime.supportsStorageBuffer8BitAccess ? "true" : "false") << ","
+         << "\"storageBuffer8BitAccessEnabled\":"
+         << (gRuntime.storageBuffer8BitAccessEnabled ? "true" : "false") << ","
+         << "\"shaderIntegerDotProduct\":"
+         << (gRuntime.supportsShaderIntegerDotProduct ? "true" : "false") << ","
+         << "\"shaderIntegerDotProductEnabled\":"
+         << (gRuntime.shaderIntegerDotProductEnabled ? "true" : "false") << ","
+         << "\"integerDotProduct8BitUnsignedAccelerated\":"
+         << (gRuntime.integerDotProduct8BitUnsignedAccelerated ? "true" : "false") << ","
+         << "\"integerDotProduct8BitSignedAccelerated\":"
+         << (gRuntime.integerDotProduct8BitSignedAccelerated ? "true" : "false") << ","
+         << "\"integerDotProduct8BitMixedSignednessAccelerated\":"
+         << (gRuntime.integerDotProduct8BitMixedSignednessAccelerated ? "true" : "false") << ","
+         << "\"integerDotProduct4x8BitPackedUnsignedAccelerated\":"
+         << (gRuntime.integerDotProduct4x8BitPackedUnsignedAccelerated ? "true" : "false") << ","
+         << "\"integerDotProduct4x8BitPackedSignedAccelerated\":"
+         << (gRuntime.integerDotProduct4x8BitPackedSignedAccelerated ? "true" : "false") << ","
+         << "\"integerDotProduct4x8BitPackedMixedSignednessAccelerated\":"
+         << (gRuntime.integerDotProduct4x8BitPackedMixedSignednessAccelerated ? "true" : "false") << ","
+         << "\"cooperativeMatrixExtension\":"
+         << (gRuntime.hasCooperativeMatrixExtension ? "true" : "false") << ","
+         << "\"cooperativeMatrix\":"
+         << (gRuntime.supportsCooperativeMatrix ? "true" : "false") << ","
+         << "\"cooperativeMatrixEnabled\":"
+         << (gRuntime.cooperativeMatrixEnabled ? "true" : "false") << ","
+         << "\"cooperativeMatrixRobustBufferAccess\":"
+         << (gRuntime.supportsCooperativeMatrixRobustBufferAccess ? "true" : "false") << ","
+         << "\"cooperativeMatrixSupportedStages\":"
+         << gRuntime.cooperativeMatrixSupportedStages << ","
+         << "\"cooperativeMatrixTypes\":[";
+
+    for (size_t index = 0; index < gRuntime.cooperativeMatrixTypes.size(); ++index) {
+        const auto& matrix = gRuntime.cooperativeMatrixTypes[index];
+        if (index > 0u) {
+            json << ",";
+        }
+        json << "{"
+             << "\"mSize\":" << matrix.mSize << ","
+             << "\"nSize\":" << matrix.nSize << ","
+             << "\"kSize\":" << matrix.kSize << ","
+             << "\"aType\":" << matrix.aType << ","
+             << "\"bType\":" << matrix.bType << ","
+             << "\"cType\":" << matrix.cType << ","
+             << "\"resultType\":" << matrix.resultType << ","
+             << "\"saturatingAccumulation\":"
+             << (matrix.saturatingAccumulation ? "true" : "false") << ","
+             << "\"scope\":" << matrix.scope
+             << "}";
+    }
+
+    json << "]}";
+    const std::string payload = json.str();
+    return env->NewStringUTF(payload.c_str());
+}
+
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetGpuPerformanceMetrics(
+    JNIEnv* env,
+    jobject
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    std::ostringstream json;
+    json << "{"
+         << "\"timestampProfilingAvailable\":"
+         << (gRuntime.timestampProfilingAvailable ? "true" : "false") << ","
+         << "\"timestampedDispatchCount\":" << gRuntime.timestampedDispatchCount << ","
+         << "\"lastAdamwGpuTimeNanoseconds\":" << gRuntime.lastAdamwGpuTimeNanoseconds << ","
+         << "\"lastLinearGpuTimeNanoseconds\":" << gRuntime.lastLinearGpuTimeNanoseconds << ","
+         << "\"lastFp16LinearGpuTimeNanoseconds\":" << gRuntime.lastFp16LinearGpuTimeNanoseconds << ","
+         << "\"totalGpuTimeNanoseconds\":" << gRuntime.totalGpuTimeNanoseconds
+         << "}";
+    const std::string payload = json.str();
+    return env->NewStringUTF(payload.c_str());
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_argus_agi_model_VulkanTrainingBackend_nativeDestroy(
     JNIEnv*,
@@ -2194,4 +5049,2396 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeDestroy(
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
     destroyRuntime();
+}
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeClearTensorArena(
+    JNIEnv*, jobject
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.device == VK_NULL_HANDLE) return JNI_FALSE;
+
+    if (gRuntime.tensorArenaBuffer == VK_NULL_HANDLE) {
+        gRuntime.tensorArena.reset();
+        return JNI_TRUE;
+    }
+
+    const VkResult idle = vkDeviceWaitIdle(gRuntime.device);
+    if (idle != VK_SUCCESS) {
+        logError("Vulkan device did not become idle before clearing the tensor arena.", idle);
+        return JNI_FALSE;
+    }
+
+    // Persistent FP16 dispatch is suspended by the Kotlin backend before this call.
+    // Rebind descriptor set 1 to the still-live staging buffer before destroying the arena.
+    if (gRuntime.storageBuffer == VK_NULL_HANDLE || gRuntime.storageCapacity == 0u) {
+        logError("Cannot clear the Vulkan tensor arena without a valid fallback storage buffer.");
+        return JNI_FALSE;
+    }
+    const VkDeviceSize maxStorageBufferRange = static_cast<VkDeviceSize>(
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange
+    );
+    const VkDeviceSize fallbackRange = std::min(
+        gRuntime.storageCapacity,
+        maxStorageBufferRange
+    );
+    if (fallbackRange == 0u) return JNI_FALSE;
+
+    updateTensorArenaDescriptorSet(gRuntime.storageBuffer, fallbackRange);
+    destroyTensorArena();
+    refreshMemoryBudget();
+    return JNI_TRUE;
+}
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinear(
+    JNIEnv*,
+    jobject,
+    jlong inputHandle,
+    jlong weightHandle,
+    jlong outputHandle,
+    jint rowCount,
+    jint inputColumns,
+    jint outputColumns,
+    jboolean transposeWeights
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.residentLinearPipeline == VK_NULL_HANDLE ||
+        inputHandle <= 0 ||
+        weightHandle <= 0 ||
+        outputHandle <= 0 ||
+        inputHandle == weightHandle ||
+        inputHandle == outputHandle ||
+        weightHandle == outputHandle ||
+        rowCount <= 0 ||
+        inputColumns <= 0 ||
+        outputColumns <= 0 ||
+        (transposeWeights != JNI_TRUE && transposeWeights != JNI_FALSE)) {
+        return JNI_FALSE;
+    }
+
+    TensorArenaAllocation* inputAllocation = findArenaAllocation(inputHandle);
+    TensorArenaAllocation* weightAllocation = findArenaAllocation(weightHandle);
+    TensorArenaAllocation* outputAllocation = findArenaAllocation(outputHandle);
+    if (inputAllocation == nullptr ||
+        weightAllocation == nullptr ||
+        outputAllocation == nullptr) {
+        logError("Resident linear dispatch references an unknown Tensor Arena allocation.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t rows = static_cast<uint64_t>(rowCount);
+    const uint64_t inputWidth = static_cast<uint64_t>(inputColumns);
+    const uint64_t outputWidth = static_cast<uint64_t>(outputColumns);
+    if (rows > std::numeric_limits<uint64_t>::max() / inputWidth ||
+        rows > std::numeric_limits<uint64_t>::max() / outputWidth ||
+        inputWidth > std::numeric_limits<uint64_t>::max() / outputWidth) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t inputElements = rows * inputWidth;
+    const uint64_t outputElements = rows * outputWidth;
+    const uint64_t weightElements = inputWidth * outputWidth;
+    constexpr uint64_t kMaximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    if (inputElements == 0u ||
+        outputElements == 0u ||
+        weightElements == 0u ||
+        inputElements > kMaximumShaderIndex ||
+        outputElements > kMaximumShaderIndex ||
+        weightElements > kMaximumShaderIndex) {
+        logError("Resident linear tensor dimensions exceed 32-bit shader indexing.");
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize inputByteCount =
+        static_cast<VkDeviceSize>(inputElements * sizeof(float));
+    const VkDeviceSize outputByteCount =
+        static_cast<VkDeviceSize>(outputElements * sizeof(float));
+    const VkDeviceSize weightByteCount =
+        static_cast<VkDeviceSize>(weightElements * sizeof(uint16_t));
+
+    if (inputAllocation->logicalSize < inputByteCount ||
+        weightAllocation->logicalSize < weightByteCount ||
+        outputAllocation->logicalSize < outputByteCount ||
+        (inputAllocation->offset & 3u) != 0u ||
+        (outputAllocation->offset & 3u) != 0u ||
+        (weightAllocation->offset & 1u) != 0u ||
+        inputAllocation->offset > gRuntime.tensorArenaCapacity ||
+        weightAllocation->offset > gRuntime.tensorArenaCapacity ||
+        outputAllocation->offset > gRuntime.tensorArenaCapacity ||
+        inputByteCount > gRuntime.tensorArenaCapacity - inputAllocation->offset ||
+        weightByteCount > gRuntime.tensorArenaCapacity - weightAllocation->offset ||
+        outputByteCount > gRuntime.tensorArenaCapacity - outputAllocation->offset) {
+        logError("Resident linear tensor allocation is undersized, misaligned, or outside the arena.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t inputOffsetWords = inputAllocation->offset / sizeof(uint32_t);
+    const uint64_t weightOffsetHalf = weightAllocation->offset / sizeof(uint16_t);
+    const uint64_t outputOffsetWords = outputAllocation->offset / sizeof(uint32_t);
+    if (inputOffsetWords > kMaximumShaderIndex ||
+        weightOffsetHalf > kMaximumShaderIndex ||
+        outputOffsetWords > kMaximumShaderIndex ||
+        inputElements - 1u > kMaximumShaderIndex - inputOffsetWords ||
+        weightElements - 1u > kMaximumShaderIndex - weightOffsetHalf ||
+        outputElements - 1u > kMaximumShaderIndex - outputOffsetWords) {
+        logError("Resident linear tensor ranges exceed 32-bit shader addressability.");
+        return JNI_FALSE;
+    }
+
+    constexpr uint64_t kTileRows = 8u;
+    constexpr uint64_t kTileColumns = 16u;
+    const uint64_t tileRows = 1u + (rows - 1u) / kTileRows;
+    const uint64_t tileColumns = 1u + (outputWidth - 1u) / kTileColumns;
+    if (tileRows > std::numeric_limits<uint64_t>::max() / tileColumns) {
+        return JNI_FALSE;
+    }
+    const uint64_t totalTileCount = tileRows * tileColumns;
+    const uint32_t workGroupCount = calculateDispatchGroupCount(totalTileCount);
+    if (workGroupCount == 0u) {
+        logError("Resident linear dispatch has no available workgroups.");
+        return JNI_FALSE;
+    }
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset resident linear command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin resident linear command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+
+    VkDependencyInfoKHR beforeDependency{};
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeDependency.memoryBarrierCount = 1u;
+    beforeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.residentLinearPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0u,
+        1u,
+        &gRuntime.tensorArenaDescriptorSet,
+        0u,
+        nullptr
+    );
+
+    const ResidentLinearPushConstants pushConstants{
+        0u,
+        1u,
+        static_cast<uint32_t>(rowCount),
+        static_cast<uint32_t>(inputColumns),
+        static_cast<uint32_t>(outputColumns),
+        static_cast<uint32_t>(inputOffsetWords),
+        static_cast<uint32_t>(weightOffsetHalf),
+        static_cast<uint32_t>(outputOffsetWords),
+        transposeWeights == JNI_TRUE ? 1u : 0u,
+        std::numeric_limits<uint32_t>::max()
+    };
+    vkCmdPushConstants(
+        gRuntime.commandBuffer,
+        gRuntime.pipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(ResidentLinearPushConstants),
+        &pushConstants
+    );
+    vkCmdDispatch(gRuntime.commandBuffer, workGroupCount, 1u, 1u);
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    // Make the FP32 output available to the next resident compute dispatch.
+    VkMemoryBarrier2KHR afterCompute{};
+    afterCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    afterCompute.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    afterCompute.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    afterCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    afterCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR afterDependency{};
+    afterDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    afterDependency.memoryBarrierCount = 1u;
+    afterDependency.pMemoryBarriers = &afterCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &afterDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish resident linear command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Resident Vulkan linear dispatch failed.")) {
+        return JNI_FALSE;
+    }
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastLinearGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
+}
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinearBatch(
+    JNIEnv* env,
+    jobject,
+    jlong inputHandle,
+    jlongArray weightHandleArray,
+    jlong outputHandle,
+    jint rowsPerBatch,
+    jint inputColumns,
+    jint outputColumns,
+    jboolean transposeWeights
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (env == nullptr ||
+        gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.residentLinearPipeline == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        inputHandle <= 0 ||
+        outputHandle <= 0 ||
+        inputHandle == outputHandle ||
+        weightHandleArray == nullptr ||
+        rowsPerBatch <= 0 ||
+        inputColumns <= 0 ||
+        outputColumns <= 0 ||
+        (transposeWeights != JNI_TRUE && transposeWeights != JNI_FALSE)) {
+        return JNI_FALSE;
+    }
+
+    const jsize batchCountValue = env->GetArrayLength(weightHandleArray);
+    if (env->ExceptionCheck() || batchCountValue < 2 || batchCountValue > 8) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t batches = static_cast<uint64_t>(batchCountValue);
+    const uint64_t rows = static_cast<uint64_t>(rowsPerBatch);
+    const uint64_t inputWidth = static_cast<uint64_t>(inputColumns);
+    const uint64_t outputWidth = static_cast<uint64_t>(outputColumns);
+    constexpr uint64_t kMaximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+
+    if (rows > std::numeric_limits<uint64_t>::max() / inputWidth ||
+        rows > std::numeric_limits<uint64_t>::max() / outputWidth ||
+        inputWidth > std::numeric_limits<uint64_t>::max() / outputWidth ||
+        batches > std::numeric_limits<uint64_t>::max() / rows ||
+        batches * rows > std::numeric_limits<uint64_t>::max() / outputWidth) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t inputElements = rows * inputWidth;
+    const uint64_t outputElements = batches * rows * outputWidth;
+    const uint64_t weightElements = inputWidth * outputWidth;
+    if (inputElements == 0u ||
+        outputElements == 0u ||
+        weightElements == 0u ||
+        inputElements > kMaximumShaderIndex ||
+        outputElements > kMaximumShaderIndex ||
+        weightElements > kMaximumShaderIndex) {
+        logError("Resident projection-set dimensions exceed 32-bit shader indexing.");
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize inputByteCount =
+        static_cast<VkDeviceSize>(inputElements * sizeof(float));
+    const VkDeviceSize outputByteCount =
+        static_cast<VkDeviceSize>(outputElements * sizeof(float));
+    const VkDeviceSize weightByteCount =
+        static_cast<VkDeviceSize>(weightElements * sizeof(uint16_t));
+    const VkDeviceSize tableByteCount =
+        static_cast<VkDeviceSize>(batches * sizeof(uint32_t));
+    const VkDeviceSize maximumStorageRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    if (inputByteCount == 0u ||
+        outputByteCount == 0u ||
+        weightByteCount == 0u ||
+        tableByteCount == 0u ||
+        inputByteCount > maximumStorageRange ||
+        outputByteCount > maximumStorageRange ||
+        weightByteCount > maximumStorageRange ||
+        tableByteCount > maximumStorageRange) {
+        return JNI_FALSE;
+    }
+
+    TensorArenaAllocation* inputAllocation =
+        findArenaAllocation(static_cast<uint64_t>(inputHandle));
+    TensorArenaAllocation* outputAllocation =
+        findArenaAllocation(static_cast<uint64_t>(outputHandle));
+    if (inputAllocation == nullptr || outputAllocation == nullptr) {
+        logError("Resident projection set references an unknown input or output allocation.");
+        return JNI_FALSE;
+    }
+
+    std::vector<jlong> weightHandles;
+    std::vector<TensorArenaAllocation*> weightAllocations;
+    try {
+        weightHandles.resize(batches);
+        weightAllocations.reserve(batches);
+    } catch (const std::bad_alloc&) {
+        logError("Resident projection-set metadata allocation failed.");
+        return JNI_FALSE;
+    }
+    env->GetLongArrayRegion(
+        weightHandleArray,
+        0,
+        batchCountValue,
+        weightHandles.data()
+    );
+    if (env->ExceptionCheck()) return JNI_FALSE;
+
+    if (inputAllocation->logicalSize < inputByteCount ||
+        outputAllocation->logicalSize < outputByteCount ||
+        (inputAllocation->offset & 3u) != 0u ||
+        (outputAllocation->offset & 3u) != 0u ||
+        inputAllocation->offset > gRuntime.tensorArenaCapacity ||
+        outputAllocation->offset > gRuntime.tensorArenaCapacity ||
+        inputByteCount > gRuntime.tensorArenaCapacity - inputAllocation->offset ||
+        outputByteCount > gRuntime.tensorArenaCapacity - outputAllocation->offset) {
+        logError("Resident projection-set input/output allocation is undersized or outside the arena.");
+        return JNI_FALSE;
+    }
+
+    for (uint64_t batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+        const jlong handle = weightHandles[static_cast<size_t>(batchIndex)];
+        if (handle <= 0 ||
+            handle == inputHandle ||
+            handle == outputHandle) {
+            logError("Resident projection set contains an invalid or aliased weight handle.");
+            return JNI_FALSE;
+        }
+        for (uint64_t previous = 0u; previous < batchIndex; ++previous) {
+            if (weightHandles[static_cast<size_t>(previous)] == handle) {
+                logError("Resident projection set contains duplicate weight handles.");
+                return JNI_FALSE;
+            }
+        }
+
+        TensorArenaAllocation* allocation =
+            findArenaAllocation(static_cast<uint64_t>(handle));
+        if (allocation == nullptr ||
+            allocation->logicalSize < weightByteCount ||
+            (allocation->offset & 1u) != 0u ||
+            allocation->offset > gRuntime.tensorArenaCapacity ||
+            weightByteCount > gRuntime.tensorArenaCapacity - allocation->offset ||
+            allocation->offset / sizeof(uint16_t) > kMaximumShaderIndex ||
+            weightElements - 1u >
+                kMaximumShaderIndex - allocation->offset / sizeof(uint16_t)) {
+            logError("Resident projection-set weight allocation is invalid or shader-unaddressable.");
+            return JNI_FALSE;
+        }
+        weightAllocations.push_back(allocation);
+    }
+
+    const jlong tableHandle = allocateArenaTensor(tableByteCount);
+    if (tableHandle == 0) {
+        logError("Resident projection-set weight-offset table allocation failed.");
+        return JNI_FALSE;
+    }
+    ScopedTensorArenaAllocation tableRelease(static_cast<uint64_t>(tableHandle));
+    TensorArenaAllocation* tableAllocation =
+        findArenaAllocation(static_cast<uint64_t>(tableHandle));
+    if (tableAllocation == nullptr ||
+        tableAllocation->logicalSize < tableByteCount ||
+        (tableAllocation->offset & 3u) != 0u ||
+        tableAllocation->offset > gRuntime.tensorArenaCapacity ||
+        tableByteCount > gRuntime.tensorArenaCapacity - tableAllocation->offset) {
+        logError("Resident projection-set weight-offset table allocation is invalid.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t inputOffsetWords =
+        inputAllocation->offset / sizeof(uint32_t);
+    const uint64_t outputOffsetWords =
+        outputAllocation->offset / sizeof(uint32_t);
+    const uint64_t tableOffsetWords =
+        tableAllocation->offset / sizeof(uint32_t);
+    if (inputOffsetWords > kMaximumShaderIndex ||
+        outputOffsetWords > kMaximumShaderIndex ||
+        tableOffsetWords > kMaximumShaderIndex ||
+        inputElements - 1u > kMaximumShaderIndex - inputOffsetWords ||
+        outputElements - 1u > kMaximumShaderIndex - outputOffsetWords ||
+        batches - 1u > kMaximumShaderIndex - tableOffsetWords) {
+        logError("Resident projection-set offsets exceed 32-bit shader addressability.");
+        return JNI_FALSE;
+    }
+
+    if (!ensureStorageBuffer(tableByteCount) ||
+        gRuntime.mappedStorage == nullptr) {
+        logError("Resident projection-set offset-table staging allocation failed.");
+        return JNI_FALSE;
+    }
+    auto* offsetTable = static_cast<uint32_t*>(gRuntime.mappedStorage);
+    for (uint64_t batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+        offsetTable[batchIndex] = static_cast<uint32_t>(
+            weightAllocations[static_cast<size_t>(batchIndex)]->offset /
+            sizeof(uint16_t)
+        );
+    }
+    if (!syncStagingMemory(false)) return JNI_FALSE;
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset resident projection-set command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin resident projection-set command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkBufferMemoryBarrier2KHR beforeCopy[2]{};
+    beforeCopy[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    beforeCopy[0].srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT_KHR;
+    beforeCopy[0].srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT_KHR;
+    beforeCopy[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    beforeCopy[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+    beforeCopy[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCopy[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCopy[0].buffer = gRuntime.storageBuffer;
+    beforeCopy[0].offset = 0u;
+    beforeCopy[0].size = tableByteCount;
+
+    beforeCopy[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    beforeCopy[1].srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCopy[1].srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCopy[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    beforeCopy[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    beforeCopy[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCopy[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    beforeCopy[1].buffer = gRuntime.tensorArenaBuffer;
+    beforeCopy[1].offset = tableAllocation->offset;
+    beforeCopy[1].size = tableByteCount;
+
+    VkDependencyInfoKHR beforeCopyDependency{};
+    beforeCopyDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeCopyDependency.bufferMemoryBarrierCount = 2u;
+    beforeCopyDependency.pBufferMemoryBarriers = beforeCopy;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeCopyDependency);
+
+    VkBufferCopy tableCopy{};
+    tableCopy.srcOffset = 0u;
+    tableCopy.dstOffset = tableAllocation->offset;
+    tableCopy.size = tableByteCount;
+    vkCmdCopyBuffer(
+        gRuntime.commandBuffer,
+        gRuntime.storageBuffer,
+        gRuntime.tensorArenaBuffer,
+        1u,
+        &tableCopy
+    );
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR beforeComputeDependency{};
+    beforeComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeComputeDependency.memoryBarrierCount = 1u;
+    beforeComputeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeComputeDependency);
+
+    constexpr uint64_t kTileRows = 8u;
+    constexpr uint64_t kTileColumns = 16u;
+    const uint64_t tileRowsPerBatch = 1u + (rows - 1u) / kTileRows;
+    const uint64_t tileColumnsPerBatch = 1u + (outputWidth - 1u) / kTileColumns;
+    if (tileRowsPerBatch > std::numeric_limits<uint64_t>::max() / tileColumnsPerBatch ||
+        batches > std::numeric_limits<uint64_t>::max() /
+            (tileRowsPerBatch * tileColumnsPerBatch)) {
+        return JNI_FALSE;
+    }
+    const uint64_t totalTileCount =
+        batches * tileRowsPerBatch * tileColumnsPerBatch;
+    const uint32_t workGroupCount = calculateDispatchGroupCount(totalTileCount);
+    if (workGroupCount == 0u) {
+        logError("Resident projection-set dispatch has no available workgroups.");
+        return JNI_FALSE;
+    }
+
+    const ResidentLinearPushConstants pushConstants{
+        0u,
+        static_cast<uint32_t>(batches),
+        static_cast<uint32_t>(rowsPerBatch),
+        static_cast<uint32_t>(inputColumns),
+        static_cast<uint32_t>(outputColumns),
+        static_cast<uint32_t>(inputOffsetWords),
+        0u,
+        static_cast<uint32_t>(outputOffsetWords),
+        transposeWeights == JNI_TRUE ? 1u : 0u,
+        static_cast<uint32_t>(tableOffsetWords)
+    };
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.residentLinearPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0u,
+        1u,
+        &gRuntime.tensorArenaDescriptorSet,
+        0u,
+        nullptr
+    );
+    vkCmdPushConstants(
+        gRuntime.commandBuffer,
+        gRuntime.pipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(ResidentLinearPushConstants),
+        &pushConstants
+    );
+    vkCmdDispatch(gRuntime.commandBuffer, workGroupCount, 1u, 1u);
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    VkMemoryBarrier2KHR afterCompute{};
+    afterCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    afterCompute.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    afterCompute.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    afterCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    afterCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR afterComputeDependency{};
+    afterComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    afterComputeDependency.memoryBarrierCount = 1u;
+    afterComputeDependency.pMemoryBarriers = &afterCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &afterComputeDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish resident projection-set command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Resident projection-set queue submission or fence wait failed.")) {
+        return JNI_FALSE;
+    }
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastLinearGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
+}
+
+
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentSwiGlu(
+    JNIEnv*, jobject, jlong gateHandle, jlong upHandle, jlong outputHandle, jint rows, jint columns
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.device == VK_NULL_HANDLE || gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE || gRuntime.residentSwiGluPipeline == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE || gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr || gateHandle <= 0 || upHandle <= 0 || outputHandle <= 0 ||
+        rows <= 0 || columns <= 0 || gateHandle == upHandle || gateHandle == outputHandle || upHandle == outputHandle) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t rowCount = static_cast<uint64_t>(rows);
+    const uint64_t columnCount = static_cast<uint64_t>(columns);
+    constexpr uint64_t kMaximumShaderIndex = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    if (rowCount > std::numeric_limits<uint64_t>::max() / columnCount) return JNI_FALSE;
+    const uint64_t elementCount = rowCount * columnCount;
+    if (elementCount == 0u || elementCount > kMaximumShaderIndex) {
+        logError("Resident SwiGLU dimensions exceed 32-bit shader indexing.");
+        return JNI_FALSE;
+    }
+    const VkDeviceSize tensorByteCount = static_cast<VkDeviceSize>(elementCount * sizeof(float));
+    if (tensorByteCount > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange) {
+        logError("Resident SwiGLU tensors exceed maxStorageBufferRange.");
+        return JNI_FALSE;
+    }
+
+    TensorArenaAllocation* gateAllocation = findArenaAllocation(static_cast<uint64_t>(gateHandle));
+    TensorArenaAllocation* upAllocation = findArenaAllocation(static_cast<uint64_t>(upHandle));
+    TensorArenaAllocation* outputAllocation = findArenaAllocation(static_cast<uint64_t>(outputHandle));
+    if (gateAllocation == nullptr || upAllocation == nullptr || outputAllocation == nullptr) {
+        logError("Resident SwiGLU references an unknown Tensor Arena allocation.");
+        return JNI_FALSE;
+    }
+    if (gateAllocation->logicalSize < tensorByteCount || upAllocation->logicalSize < tensorByteCount ||
+        outputAllocation->logicalSize < tensorByteCount) {
+        logError("Resident SwiGLU allocation sizes do not match the requested tensor shape.");
+        return JNI_FALSE;
+    }
+
+    const TensorArenaAllocation* allocations[] = {gateAllocation, upAllocation, outputAllocation};
+    for (const TensorArenaAllocation* allocation : allocations) {
+        if ((allocation->offset & 3u) != 0u || allocation->offset > gRuntime.tensorArenaCapacity ||
+            tensorByteCount > gRuntime.tensorArenaCapacity - allocation->offset) {
+            logError("Resident SwiGLU FP32 tensor is misaligned or outside Tensor Arena.");
+            return JNI_FALSE;
+        }
+    }
+
+    const uint64_t gateOffsetWords = gateAllocation->offset / sizeof(uint32_t);
+    const uint64_t upOffsetWords = upAllocation->offset / sizeof(uint32_t);
+    const uint64_t outputOffsetWords = outputAllocation->offset / sizeof(uint32_t);
+    if (gateOffsetWords > kMaximumShaderIndex || upOffsetWords > kMaximumShaderIndex ||
+        outputOffsetWords > kMaximumShaderIndex || elementCount - 1u > kMaximumShaderIndex - gateOffsetWords ||
+        elementCount - 1u > kMaximumShaderIndex - upOffsetWords ||
+        elementCount - 1u > kMaximumShaderIndex - outputOffsetWords) {
+        logError("Resident SwiGLU offsets exceed 32-bit shader addressability.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t requiredGroupCount = 1u + (elementCount - 1u) / kLocalWorkGroupSize;
+    if (requiredGroupCount == 0u || requiredGroupCount > gRuntime.maxComputeWorkGroupCountX) {
+        logError("Resident SwiGLU dimensions exceed the device workgroup-count limit.");
+        return JNI_FALSE;
+    }
+    const uint32_t groupCount = static_cast<uint32_t>(requiredGroupCount);
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) { logError("Failed to reset resident SwiGLU command buffer.", result); return JNI_FALSE; }
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) { logError("Failed to begin resident SwiGLU command buffer.", result); return JNI_FALSE; }
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR;
+    VkDependencyInfoKHR beforeDependency{};
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeDependency.memoryBarrierCount = 1u;
+    beforeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
+
+    vkCmdBindPipeline(gRuntime.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, gRuntime.residentSwiGluPipeline);
+    vkCmdBindDescriptorSets(gRuntime.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, gRuntime.pipelineLayout,
+        0u, 1u, &gRuntime.tensorArenaDescriptorSet, 0u, nullptr);
+    const ResidentSwiGluPushConstants parameters{static_cast<uint32_t>(elementCount),
+        static_cast<uint32_t>(gateOffsetWords), static_cast<uint32_t>(upOffsetWords),
+        static_cast<uint32_t>(outputOffsetWords)};
+    vkCmdPushConstants(gRuntime.commandBuffer, gRuntime.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+        0u, sizeof(ResidentSwiGluPushConstants), &parameters);
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    vkCmdDispatch(gRuntime.commandBuffer, groupCount, 1u, 1u);
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    VkBufferMemoryBarrier2KHR outputBarrier{};
+    outputBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+    outputBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    outputBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    outputBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    outputBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+    outputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputBarrier.buffer = gRuntime.tensorArenaBuffer;
+    outputBarrier.offset = outputAllocation->offset;
+    outputBarrier.size = tensorByteCount;
+    VkDependencyInfoKHR outputDependency{};
+    outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    outputDependency.bufferMemoryBarrierCount = 1u;
+    outputDependency.pBufferMemoryBarriers = &outputBarrier;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) { logError("Failed to finish resident SwiGLU command buffer.", result); return JNI_FALSE; }
+    if (!submitAndWait("Resident SwiGLU submission or fence wait failed.")) return JNI_FALSE;
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastLinearGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
+}
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
+    JNIEnv*,
+    jobject,
+    jlong qkvHandle,
+    jlong scoreHandle,
+    jlong attentionOutputHandle,
+    jlong projectedOutputHandle,
+    jlong normalizedOutputHandle,
+    jlong residualHandle,
+    jlong outputWeightHandle,
+    jint sequenceLength,
+    jint modelWidth,
+    jint headCount,
+    jint headDimension
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.residentAttentionPipeline == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        qkvHandle <= 0 || scoreHandle <= 0 ||
+        attentionOutputHandle <= 0 || projectedOutputHandle <= 0 ||
+        normalizedOutputHandle <= 0 || residualHandle <= 0 || outputWeightHandle <= 0 ||
+        sequenceLength <= 0 || modelWidth <= 0 ||
+        headCount <= 0 || headDimension <= 0 ||
+        static_cast<uint64_t>(headCount) * static_cast<uint64_t>(headDimension) !=
+            static_cast<uint64_t>(modelWidth)) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t sequence = static_cast<uint64_t>(sequenceLength);
+    const uint64_t width = static_cast<uint64_t>(modelWidth);
+    const uint64_t heads = static_cast<uint64_t>(headCount);
+    const uint64_t headWidth = static_cast<uint64_t>(headDimension);
+    constexpr uint64_t kMaximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+
+    if (sequence > std::numeric_limits<uint64_t>::max() / width ||
+        sequence > std::numeric_limits<uint64_t>::max() / sequence ||
+        heads > std::numeric_limits<uint64_t>::max() / sequence ||
+        heads * sequence > std::numeric_limits<uint64_t>::max() / sequence ||
+        width > std::numeric_limits<uint64_t>::max() / width) {
+        return JNI_FALSE;
+    }
+
+    const uint64_t sequenceWidthElements = sequence * width;
+    if (sequenceWidthElements > std::numeric_limits<uint64_t>::max() / 3u) {
+        return JNI_FALSE;
+    }
+    const uint64_t qkvElements = sequenceWidthElements * 3u;
+    const uint64_t scoreElements = heads * sequence * sequence;
+    const uint64_t activationElements = sequenceWidthElements;
+    const uint64_t weightElements = width * width;
+    if (qkvElements == 0u || scoreElements == 0u ||
+        activationElements == 0u || weightElements == 0u ||
+        qkvElements > kMaximumShaderIndex ||
+        scoreElements > kMaximumShaderIndex ||
+        activationElements > kMaximumShaderIndex ||
+        weightElements > kMaximumShaderIndex) {
+        logError("Resident attention dimensions exceed 32-bit shader indexing.");
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize qkvByteCount = static_cast<VkDeviceSize>(qkvElements * sizeof(float));
+    const VkDeviceSize scoreByteCount = static_cast<VkDeviceSize>(scoreElements * sizeof(float));
+    const VkDeviceSize activationByteCount =
+        static_cast<VkDeviceSize>(activationElements * sizeof(float));
+    const VkDeviceSize weightByteCount =
+        static_cast<VkDeviceSize>(weightElements * sizeof(uint16_t));
+    const VkDeviceSize maximumStorageRange =
+        gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange;
+    if (qkvByteCount > maximumStorageRange ||
+        scoreByteCount > maximumStorageRange ||
+        activationByteCount > maximumStorageRange ||
+        weightByteCount > maximumStorageRange) {
+        logError("Resident attention tensors exceed maxStorageBufferRange.");
+        return JNI_FALSE;
+    }
+
+    const jlong handles[] = {
+        qkvHandle, scoreHandle, attentionOutputHandle,
+        projectedOutputHandle, normalizedOutputHandle, residualHandle, outputWeightHandle
+    };
+    for (size_t index = 0u; index < 7u; ++index) {
+        for (size_t previous = 0u; previous < index; ++previous) {
+            if (handles[index] == handles[previous]) {
+                logError("Resident attention tensors must use distinct arena allocations.");
+                return JNI_FALSE;
+            }
+        }
+    }
+
+    TensorArenaAllocation* qkvAllocation =
+        findArenaAllocation(static_cast<uint64_t>(qkvHandle));
+    TensorArenaAllocation* scoreAllocation =
+        findArenaAllocation(static_cast<uint64_t>(scoreHandle));
+    TensorArenaAllocation* attentionOutputAllocation =
+        findArenaAllocation(static_cast<uint64_t>(attentionOutputHandle));
+    TensorArenaAllocation* projectedOutputAllocation =
+        findArenaAllocation(static_cast<uint64_t>(projectedOutputHandle));
+    TensorArenaAllocation* normalizedOutputAllocation =
+        findArenaAllocation(static_cast<uint64_t>(normalizedOutputHandle));
+    TensorArenaAllocation* residualAllocation =
+        findArenaAllocation(static_cast<uint64_t>(residualHandle));
+    TensorArenaAllocation* outputWeightAllocation =
+        findArenaAllocation(static_cast<uint64_t>(outputWeightHandle));
+
+    if (qkvAllocation == nullptr || scoreAllocation == nullptr ||
+        attentionOutputAllocation == nullptr || projectedOutputAllocation == nullptr ||
+        normalizedOutputAllocation == nullptr || residualAllocation == nullptr ||
+        outputWeightAllocation == nullptr) {
+        logError("Resident attention references an unknown Tensor Arena allocation.");
+        return JNI_FALSE;
+    }
+
+    if (qkvAllocation->logicalSize < qkvByteCount ||
+        scoreAllocation->logicalSize < scoreByteCount ||
+        attentionOutputAllocation->logicalSize < activationByteCount ||
+        projectedOutputAllocation->logicalSize < activationByteCount ||
+        normalizedOutputAllocation->logicalSize < activationByteCount ||
+        residualAllocation->logicalSize < activationByteCount ||
+        outputWeightAllocation->logicalSize < weightByteCount) {
+        logError("Resident attention allocation sizes do not match requested tensor shapes.");
+        return JNI_FALSE;
+    }
+
+    const TensorArenaAllocation* floatAllocations[] = {
+        qkvAllocation, scoreAllocation, attentionOutputAllocation,
+        projectedOutputAllocation, normalizedOutputAllocation, residualAllocation
+    };
+    const VkDeviceSize floatByteCounts[] = {
+        qkvByteCount, scoreByteCount, activationByteCount,
+        activationByteCount, activationByteCount, activationByteCount
+    };
+    for (size_t index = 0u; index < 6u; ++index) {
+        const TensorArenaAllocation& allocation = *floatAllocations[index];
+        if ((allocation.offset & 3u) != 0u ||
+            allocation.offset > gRuntime.tensorArenaCapacity ||
+            floatByteCounts[index] > gRuntime.tensorArenaCapacity - allocation.offset) {
+            logError("Resident attention FP32 allocation is misaligned or outside Tensor Arena.");
+            return JNI_FALSE;
+        }
+    }
+    if ((outputWeightAllocation->offset & 1u) != 0u ||
+        outputWeightAllocation->offset > gRuntime.tensorArenaCapacity ||
+        weightByteCount > gRuntime.tensorArenaCapacity - outputWeightAllocation->offset) {
+        logError("Resident attention FP16 output weights are misaligned or outside Tensor Arena.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t qkvOffsetWords = qkvAllocation->offset / sizeof(uint32_t);
+    const uint64_t scoreOffsetWords = scoreAllocation->offset / sizeof(uint32_t);
+    const uint64_t attentionOutputOffsetWords =
+        attentionOutputAllocation->offset / sizeof(uint32_t);
+    const uint64_t projectedOutputOffsetWords =
+        projectedOutputAllocation->offset / sizeof(uint32_t);
+    const uint64_t normalizedOutputOffsetWords =
+        normalizedOutputAllocation->offset / sizeof(uint32_t);
+    const uint64_t residualOffsetWords = residualAllocation->offset / sizeof(uint32_t);
+    const uint64_t outputWeightOffsetHalf =
+        outputWeightAllocation->offset / sizeof(uint16_t);
+    const uint64_t maximumIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    if (qkvOffsetWords > maximumIndex || scoreOffsetWords > maximumIndex ||
+        attentionOutputOffsetWords > maximumIndex ||
+        projectedOutputOffsetWords > maximumIndex ||
+        normalizedOutputOffsetWords > maximumIndex ||
+        residualOffsetWords > maximumIndex || outputWeightOffsetHalf > maximumIndex ||
+        qkvElements - 1u > maximumIndex - qkvOffsetWords ||
+        scoreElements - 1u > maximumIndex - scoreOffsetWords ||
+        activationElements - 1u > maximumIndex - attentionOutputOffsetWords ||
+        activationElements - 1u > maximumIndex - projectedOutputOffsetWords ||
+        activationElements - 1u > maximumIndex - normalizedOutputOffsetWords ||
+        activationElements - 1u > maximumIndex - residualOffsetWords ||
+        weightElements - 1u > maximumIndex - outputWeightOffsetHalf) {
+        logError("Resident attention tensor indices exceed 32-bit shader addressability.");
+        return JNI_FALSE;
+    }
+
+    const uint32_t scoreGroups = calculateDispatchWorkGroupCount(scoreElements);
+    const uint32_t softmaxGroups = calculateDispatchWorkGroupCount(heads * sequence);
+    const uint32_t activationGroups = calculateDispatchWorkGroupCount(activationElements);
+    const uint32_t layerNormGroups = static_cast<uint32_t>(sequence);
+    if (scoreGroups == 0u || softmaxGroups == 0u || activationGroups == 0u ||
+        layerNormGroups == 0u ||
+        sequence > static_cast<uint64_t>(gRuntime.maxComputeWorkGroupCountX)) {
+        logError("Resident attention graph has no available compute workgroups.");
+        return JNI_FALSE;
+    }
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset resident attention command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin resident attention command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR beforeDependency{};
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeDependency.memoryBarrierCount = 1u;
+    beforeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
+
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.residentAttentionPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0u,
+        1u,
+        &gRuntime.tensorArenaDescriptorSet,
+        0u,
+        nullptr
+    );
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    const uint32_t groupCounts[] = {
+        scoreGroups, softmaxGroups, activationGroups, activationGroups, layerNormGroups
+    };
+    VkMemoryBarrier2KHR betweenStages{};
+    betweenStages.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    betweenStages.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    betweenStages.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    betweenStages.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    betweenStages.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR betweenDependency{};
+    betweenDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    betweenDependency.memoryBarrierCount = 1u;
+    betweenDependency.pMemoryBarriers = &betweenStages;
+
+    for (uint32_t operation = 0u; operation < 5u; ++operation) {
+        const ResidentAttentionPushConstants parameters{
+            operation,
+            static_cast<uint32_t>(sequence),
+            static_cast<uint32_t>(width),
+            static_cast<uint32_t>(heads),
+            static_cast<uint32_t>(headWidth),
+            static_cast<uint32_t>(qkvOffsetWords),
+            static_cast<uint32_t>(scoreOffsetWords),
+            static_cast<uint32_t>(attentionOutputOffsetWords),
+            static_cast<uint32_t>(projectedOutputOffsetWords),
+            static_cast<uint32_t>(residualOffsetWords),
+            static_cast<uint32_t>(outputWeightOffsetHalf),
+            static_cast<uint32_t>(normalizedOutputOffsetWords)
+        };
+        vkCmdPushConstants(
+            gRuntime.commandBuffer,
+            gRuntime.pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0u,
+            sizeof(ResidentAttentionPushConstants),
+            &parameters
+        );
+        vkCmdDispatch(gRuntime.commandBuffer, groupCounts[operation], 1u, 1u);
+        if (operation != 4u) {
+            gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &betweenDependency);
+        }
+    }
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    VkBufferMemoryBarrier2KHR outputBarriers[4]{};
+    const TensorArenaAllocation* outputAllocations[] = {
+        scoreAllocation, attentionOutputAllocation, projectedOutputAllocation,
+        normalizedOutputAllocation
+    };
+    const VkDeviceSize outputSizes[] = {
+        scoreByteCount, activationByteCount, activationByteCount, activationByteCount
+    };
+    for (size_t index = 0u; index < 4u; ++index) {
+        outputBarriers[index].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+        outputBarriers[index].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        outputBarriers[index].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+        outputBarriers[index].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+        outputBarriers[index].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+        outputBarriers[index].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outputBarriers[index].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outputBarriers[index].buffer = gRuntime.tensorArenaBuffer;
+        outputBarriers[index].offset = outputAllocations[index]->offset;
+        outputBarriers[index].size = outputSizes[index];
+    }
+    VkDependencyInfoKHR outputDependency{};
+    outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    outputDependency.bufferMemoryBarrierCount = 4u;
+    outputDependency.pBufferMemoryBarriers = outputBarriers;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish resident attention command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Resident attention graph submission or fence wait failed.")) {
+        return JNI_FALSE;
+    }
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastLinearGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentResidualLayerNorm(
+    JNIEnv*,
+    jobject,
+    jlong downHandle,
+    jlong residualHandle,
+    jlong projectedHandle,
+    jlong normalizedHandle,
+    jint rows,
+    jint columns
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.residentAttentionPipeline == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        downHandle <= 0 || residualHandle <= 0 ||
+        projectedHandle <= 0 || normalizedHandle <= 0 ||
+        rows <= 0 || columns <= 0) {
+        return JNI_FALSE;
+    }
+
+    const jlong handles[] = {
+        downHandle, residualHandle, projectedHandle, normalizedHandle
+    };
+    for (size_t index = 0u; index < 4u; ++index) {
+        for (size_t previous = 0u; previous < index; ++previous) {
+            if (handles[index] == handles[previous]) {
+                logError("Resident residual LayerNorm requires four distinct tensor allocations.");
+                return JNI_FALSE;
+            }
+        }
+    }
+
+    const uint64_t rowCount = static_cast<uint64_t>(rows);
+    const uint64_t columnCount = static_cast<uint64_t>(columns);
+    constexpr uint64_t kMaximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    if (rowCount > std::numeric_limits<uint64_t>::max() / columnCount) {
+        return JNI_FALSE;
+    }
+    const uint64_t elementCount = rowCount * columnCount;
+    if (elementCount == 0u || elementCount > kMaximumShaderIndex ||
+        rowCount > static_cast<uint64_t>(gRuntime.maxComputeWorkGroupCountX)) {
+        logError("Resident residual LayerNorm dimensions exceed Vulkan dispatch limits.");
+        return JNI_FALSE;
+    }
+
+    const VkDeviceSize tensorByteCount =
+        static_cast<VkDeviceSize>(elementCount * sizeof(float));
+    if (tensorByteCount > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange) {
+        logError("Resident residual LayerNorm tensors exceed maxStorageBufferRange.");
+        return JNI_FALSE;
+    }
+
+    TensorArenaAllocation* downAllocation =
+        findArenaAllocation(static_cast<uint64_t>(downHandle));
+    TensorArenaAllocation* residualAllocation =
+        findArenaAllocation(static_cast<uint64_t>(residualHandle));
+    TensorArenaAllocation* projectedAllocation =
+        findArenaAllocation(static_cast<uint64_t>(projectedHandle));
+    TensorArenaAllocation* normalizedAllocation =
+        findArenaAllocation(static_cast<uint64_t>(normalizedHandle));
+    if (downAllocation == nullptr || residualAllocation == nullptr ||
+        projectedAllocation == nullptr || normalizedAllocation == nullptr) {
+        logError("Resident residual LayerNorm references an unknown Tensor Arena allocation.");
+        return JNI_FALSE;
+    }
+
+    const TensorArenaAllocation* allocations[] = {
+        downAllocation, residualAllocation, projectedAllocation, normalizedAllocation
+    };
+    for (const TensorArenaAllocation* allocation : allocations) {
+        if (allocation->logicalSize < tensorByteCount ||
+            (allocation->offset & 3u) != 0u ||
+            allocation->offset > gRuntime.tensorArenaCapacity ||
+            tensorByteCount > gRuntime.tensorArenaCapacity - allocation->offset) {
+            logError("Resident residual LayerNorm tensor size, alignment, or arena range is invalid.");
+            return JNI_FALSE;
+        }
+    }
+
+    const uint64_t downOffsetWords = downAllocation->offset / sizeof(uint32_t);
+    const uint64_t residualOffsetWords = residualAllocation->offset / sizeof(uint32_t);
+    const uint64_t projectedOffsetWords = projectedAllocation->offset / sizeof(uint32_t);
+    const uint64_t normalizedOffsetWords = normalizedAllocation->offset / sizeof(uint32_t);
+    if (downOffsetWords > kMaximumShaderIndex ||
+        residualOffsetWords > kMaximumShaderIndex ||
+        projectedOffsetWords > kMaximumShaderIndex ||
+        normalizedOffsetWords > kMaximumShaderIndex ||
+        elementCount - 1u > kMaximumShaderIndex - downOffsetWords ||
+        elementCount - 1u > kMaximumShaderIndex - residualOffsetWords ||
+        elementCount - 1u > kMaximumShaderIndex - projectedOffsetWords ||
+        elementCount - 1u > kMaximumShaderIndex - normalizedOffsetWords) {
+        logError("Resident residual LayerNorm offsets exceed 32-bit shader addressability.");
+        return JNI_FALSE;
+    }
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset resident residual LayerNorm command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin resident residual LayerNorm command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR beforeDependency{};
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeDependency.memoryBarrierCount = 1u;
+    beforeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
+
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.residentAttentionPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0u,
+        1u,
+        &gRuntime.tensorArenaDescriptorSet,
+        0u,
+        nullptr
+    );
+
+    const ResidentAttentionPushConstants parameters{
+        5u,
+        static_cast<uint32_t>(rowCount),
+        static_cast<uint32_t>(columnCount),
+        1u,
+        1u,
+        0u,
+        0u,
+        static_cast<uint32_t>(downOffsetWords),
+        static_cast<uint32_t>(projectedOffsetWords),
+        static_cast<uint32_t>(residualOffsetWords),
+        0u,
+        static_cast<uint32_t>(normalizedOffsetWords)
+    };
+    vkCmdPushConstants(
+        gRuntime.commandBuffer,
+        gRuntime.pipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(ResidentAttentionPushConstants),
+        &parameters
+    );
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    vkCmdDispatch(gRuntime.commandBuffer, static_cast<uint32_t>(rowCount), 1u, 1u);
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    VkBufferMemoryBarrier2KHR outputBarriers[2]{};
+    const TensorArenaAllocation* outputAllocations[] = {
+        projectedAllocation, normalizedAllocation
+    };
+    for (size_t index = 0u; index < 2u; ++index) {
+        outputBarriers[index].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+        outputBarriers[index].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        outputBarriers[index].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+        outputBarriers[index].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+        outputBarriers[index].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+        outputBarriers[index].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outputBarriers[index].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outputBarriers[index].buffer = gRuntime.tensorArenaBuffer;
+        outputBarriers[index].offset = outputAllocations[index]->offset;
+        outputBarriers[index].size = tensorByteCount;
+    }
+    VkDependencyInfoKHR outputDependency{};
+    outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    outputDependency.bufferMemoryBarrierCount = 2u;
+    outputDependency.pBufferMemoryBarriers = outputBarriers;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish resident residual LayerNorm command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Resident residual LayerNorm submission or fence wait failed.")) {
+        return JNI_FALSE;
+    }
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastLinearGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
+}
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentBackward(
+    JNIEnv*,
+    jobject,
+    jint operation,
+    jlong input0Handle,
+    jlong input1Handle,
+    jlong input2Handle,
+    jlong output0Handle,
+    jlong output1Handle,
+    jint rows,
+    jint columns,
+    jint sequenceLength,
+    jfloat scale,
+    jfloat epsilon
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.residentBackwardPipeline == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        rows <= 0 || columns <= 0 ||
+        !std::isfinite(scale) || !std::isfinite(epsilon) || epsilon <= 0.0f) {
+        return JNI_FALSE;
+    }
+
+    constexpr jint kCrossEntropyBackward = 0;
+    constexpr jint kSwiGluBackward = 1;
+    constexpr jint kLayerNormBackward = 2;
+    constexpr jint kCausalSoftmaxBackward = 3;
+    constexpr jint kEmbeddingGradient = 4;
+    constexpr jint kAccumulateGradient = 5;
+    constexpr jint kScaleGradient = 6;
+    constexpr jint kGradientNormPartial = 7;
+    constexpr jint kGradientNormFinal = 8;
+    constexpr jint kNormalizeAndClipGradient = 10;
+
+    const uint64_t rowCount = static_cast<uint64_t>(rows);
+    const uint64_t columnCount = static_cast<uint64_t>(columns);
+    constexpr uint64_t kMaximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    if (rowCount > std::numeric_limits<uint64_t>::max() / columnCount) {
+        return JNI_FALSE;
+    }
+    const uint64_t matrixElements = rowCount * columnCount;
+    if (matrixElements == 0u || matrixElements > kMaximumShaderIndex) {
+        logError("Resident backward dimensions exceed 32-bit shader indexing.");
+        return JNI_FALSE;
+    }
+
+    uint64_t input0Elements = 0u;
+    uint64_t input1Elements = 0u;
+    uint64_t input2Elements = 0u;
+    uint64_t output0Elements = 0u;
+    uint64_t output1Elements = 0u;
+    uint64_t firstDispatchGroups = 0u;
+    uint64_t secondDispatchGroups = 0u;
+    bool embeddingTwoPass = false;
+
+    switch (operation) {
+        case kCrossEntropyBackward:
+            if (sequenceLength < 0 ||
+                static_cast<uint64_t>(sequenceLength) + 1u >= rowCount) {
+                return JNI_FALSE;
+            }
+            input0Elements = matrixElements;
+            input1Elements = rowCount;
+            output0Elements = matrixElements;
+            output1Elements = rowCount * 2u;
+            firstDispatchGroups = rowCount;
+            break;
+        case kSwiGluBackward:
+            input0Elements = matrixElements;
+            input1Elements = matrixElements;
+            input2Elements = matrixElements;
+            output0Elements = matrixElements;
+            output1Elements = matrixElements;
+            firstDispatchGroups = 1u + (matrixElements - 1u) / kLocalWorkGroupSize;
+            break;
+        case kLayerNormBackward:
+            input0Elements = matrixElements;
+            input1Elements = matrixElements;
+            output0Elements = matrixElements;
+            firstDispatchGroups = rowCount;
+            break;
+        case kCausalSoftmaxBackward:
+            if (sequenceLength <= 1 ||
+                columnCount != static_cast<uint64_t>(sequenceLength)) {
+                return JNI_FALSE;
+            }
+            input0Elements = matrixElements;
+            input1Elements = matrixElements;
+            output0Elements = matrixElements;
+            firstDispatchGroups = rowCount;
+            break;
+        case kEmbeddingGradient:
+            if (sequenceLength <= 0 ||
+                static_cast<uint64_t>(sequenceLength) > kMaximumShaderIndex ||
+                static_cast<uint64_t>(sequenceLength) >
+                    std::numeric_limits<uint64_t>::max() / columnCount) {
+                return JNI_FALSE;
+            }
+            input0Elements = static_cast<uint64_t>(sequenceLength);
+            input1Elements = static_cast<uint64_t>(sequenceLength) * columnCount;
+            output0Elements = matrixElements;
+            firstDispatchGroups = 1u + (matrixElements - 1u) / kLocalWorkGroupSize;
+            secondDispatchGroups = 1u +
+                (input1Elements - 1u) / kLocalWorkGroupSize;
+            embeddingTwoPass = true;
+            break;
+        case kAccumulateGradient:
+            if (columnCount != 1u) return JNI_FALSE;
+            input0Elements = rowCount;
+            input1Elements = rowCount;
+            output0Elements = rowCount;
+            firstDispatchGroups = 1u + (rowCount - 1u) / kLocalWorkGroupSize;
+            break;
+        case kScaleGradient:
+            if (columnCount != 1u) return JNI_FALSE;
+            input0Elements = rowCount;
+            output0Elements = rowCount;
+            firstDispatchGroups = 1u + (rowCount - 1u) / kLocalWorkGroupSize;
+            break;
+        case kGradientNormPartial:
+            if (columnCount != 1u) return JNI_FALSE;
+            input0Elements = rowCount;
+            output0Elements = 1u + (rowCount - 1u) / 4096u;
+            firstDispatchGroups = output0Elements;
+            break;
+        case kGradientNormFinal:
+            if (columnCount != 1u) return JNI_FALSE;
+            input0Elements = rowCount;
+            output0Elements = 1u;
+            firstDispatchGroups = 1u;
+            break;
+        case kNormalizeAndClipGradient:
+            if (columnCount != 1u) return JNI_FALSE;
+            input0Elements = rowCount;
+            input1Elements = 1u;
+            output0Elements = rowCount;
+            firstDispatchGroups = 1u + (rowCount - 1u) / kLocalWorkGroupSize;
+            break;
+        default:
+            return JNI_FALSE;
+    }
+
+    const auto validateTensor = [&](jlong handle, uint64_t elementCount) -> TensorArenaAllocation* {
+        if (handle <= 0 || elementCount == 0u ||
+            elementCount > kMaximumShaderIndex ||
+            elementCount > std::numeric_limits<VkDeviceSize>::max() / sizeof(float)) {
+            return nullptr;
+        }
+        TensorArenaAllocation* allocation =
+            findArenaAllocation(static_cast<uint64_t>(handle));
+        if (allocation == nullptr) return nullptr;
+
+        const VkDeviceSize requiredBytes =
+            static_cast<VkDeviceSize>(elementCount * sizeof(float));
+        if (requiredBytes > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange ||
+            allocation->logicalSize < requiredBytes ||
+            (allocation->offset & 3u) != 0u ||
+            allocation->offset > gRuntime.tensorArenaCapacity ||
+            requiredBytes > gRuntime.tensorArenaCapacity - allocation->offset) {
+            return nullptr;
+        }
+
+        const uint64_t offsetWords = allocation->offset / sizeof(uint32_t);
+        if (offsetWords > kMaximumShaderIndex ||
+            elementCount - 1u > kMaximumShaderIndex - offsetWords) {
+            return nullptr;
+        }
+        return allocation;
+    };
+
+    TensorArenaAllocation* input0Allocation = validateTensor(input0Handle, input0Elements);
+    TensorArenaAllocation* input1Allocation =
+        input1Elements == 0u ? nullptr : validateTensor(input1Handle, input1Elements);
+    TensorArenaAllocation* input2Allocation =
+        input2Elements == 0u ? nullptr : validateTensor(input2Handle, input2Elements);
+    TensorArenaAllocation* output0Allocation = validateTensor(output0Handle, output0Elements);
+    TensorArenaAllocation* output1Allocation =
+        output1Elements == 0u ? nullptr : validateTensor(output1Handle, output1Elements);
+
+    if (input0Allocation == nullptr ||
+        (input1Elements > 0u && input1Allocation == nullptr) ||
+        (input2Elements > 0u && input2Allocation == nullptr) ||
+        output0Allocation == nullptr ||
+        (output1Elements > 0u && output1Allocation == nullptr)) {
+        logError("Resident backward dispatch references an invalid or undersized Tensor Arena allocation.");
+        return JNI_FALSE;
+    }
+
+    const jlong handles[] = {
+        input0Handle,
+        input1Elements > 0u ? input1Handle : 0,
+        input2Elements > 0u ? input2Handle : 0,
+        output0Handle,
+        output1Elements > 0u ? output1Handle : 0
+    };
+    for (size_t index = 0u; index < 5u; ++index) {
+        if (handles[index] == 0) continue;
+        for (size_t previous = 0u; previous < index; ++previous) {
+            if (handles[index] == handles[previous]) {
+                logError("Resident backward inputs and outputs must use distinct allocations.");
+                return JNI_FALSE;
+            }
+        }
+    }
+
+    if (firstDispatchGroups == 0u ||
+        firstDispatchGroups > gRuntime.maxComputeWorkGroupCountX ||
+        (embeddingTwoPass &&
+            (secondDispatchGroups == 0u ||
+             secondDispatchGroups > gRuntime.maxComputeWorkGroupCountX))) {
+        logError("Resident backward dispatch exceeds the device workgroup-count limit.");
+        return JNI_FALSE;
+    }
+
+    const auto offsetWords = [](const TensorArenaAllocation* allocation) -> uint32_t {
+        return allocation == nullptr
+            ? 0u
+            : static_cast<uint32_t>(allocation->offset / sizeof(uint32_t));
+    };
+
+    const ResidentBackwardPushConstants parameters{
+        static_cast<uint32_t>(operation),
+        static_cast<uint32_t>(rowCount),
+        static_cast<uint32_t>(columnCount),
+        static_cast<uint32_t>(sequenceLength),
+        offsetWords(input0Allocation),
+        offsetWords(input1Allocation),
+        offsetWords(input2Allocation),
+        offsetWords(output0Allocation),
+        offsetWords(output1Allocation),
+        scale,
+        epsilon
+    };
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset resident backward command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin resident backward command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR beforeDependency{};
+    beforeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeDependency.memoryBarrierCount = 1u;
+    beforeDependency.pMemoryBarriers = &beforeCompute;
+
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeDependency);
+    vkCmdBindPipeline(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.residentBackwardPipeline
+    );
+    vkCmdBindDescriptorSets(
+        gRuntime.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gRuntime.pipelineLayout,
+        0u,
+        1u,
+        &gRuntime.tensorArenaDescriptorSet,
+        0u,
+        nullptr
+    );
+
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+    if (embeddingTwoPass) {
+        ResidentBackwardPushConstants clearParameters = parameters;
+        clearParameters.operation = 4u;
+        vkCmdPushConstants(
+            gRuntime.commandBuffer, gRuntime.pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+            sizeof(ResidentBackwardPushConstants), &clearParameters
+        );
+        vkCmdDispatch(
+            gRuntime.commandBuffer,
+            static_cast<uint32_t>(firstDispatchGroups), 1u, 1u
+        );
+
+        VkMemoryBarrier2KHR clearBarrier{};
+        clearBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+        clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        clearBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+        clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        clearBarrier.dstAccessMask =
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+        VkDependencyInfoKHR clearDependency{};
+        clearDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+        clearDependency.memoryBarrierCount = 1u;
+        clearDependency.pMemoryBarriers = &clearBarrier;
+        gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &clearDependency);
+
+        ResidentBackwardPushConstants scatterParameters = parameters;
+        scatterParameters.operation = 9u;
+        vkCmdPushConstants(
+            gRuntime.commandBuffer, gRuntime.pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+            sizeof(ResidentBackwardPushConstants), &scatterParameters
+        );
+        vkCmdDispatch(
+            gRuntime.commandBuffer,
+            static_cast<uint32_t>(secondDispatchGroups), 1u, 1u
+        );
+    } else {
+        vkCmdPushConstants(
+            gRuntime.commandBuffer,
+            gRuntime.pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0u,
+            sizeof(ResidentBackwardPushConstants),
+            &parameters
+        );
+        vkCmdDispatch(
+            gRuntime.commandBuffer,
+            static_cast<uint32_t>(firstDispatchGroups),
+            1u,
+            1u
+        );
+    }
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    VkBufferMemoryBarrier2KHR outputBarriers[2]{};
+    uint32_t outputBarrierCount = 1u;
+    const TensorArenaAllocation* outputAllocations[] = {
+        output0Allocation, output1Allocation
+    };
+    const uint64_t outputElements[] = {
+        output0Elements, output1Elements
+    };
+    if (output1Allocation != nullptr) outputBarrierCount = 2u;
+    for (uint32_t index = 0u; index < outputBarrierCount; ++index) {
+        outputBarriers[index].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2_KHR;
+        outputBarriers[index].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        outputBarriers[index].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+        outputBarriers[index].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+        outputBarriers[index].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+        outputBarriers[index].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outputBarriers[index].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outputBarriers[index].buffer = gRuntime.tensorArenaBuffer;
+        outputBarriers[index].offset = outputAllocations[index]->offset;
+        outputBarriers[index].size =
+            static_cast<VkDeviceSize>(outputElements[index] * sizeof(float));
+    }
+    VkDependencyInfoKHR outputDependency{};
+    outputDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    outputDependency.bufferMemoryBarrierCount = outputBarrierCount;
+    outputDependency.pBufferMemoryBarriers = outputBarriers;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &outputDependency);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish resident backward command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Resident backward submission or fence wait failed.")) {
+        return JNI_FALSE;
+    }
+
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastLinearGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeAllocateTensor(
+    JNIEnv*, jobject, jlong byteCount
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.device == VK_NULL_HANDLE || byteCount <= 0) return 0;
+    return allocateArenaTensor(static_cast<VkDeviceSize>(byteCount));
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeUploadTensor(
+    JNIEnv* env, jobject, jlong tensorHandle, jbyteArray source
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.device == VK_NULL_HANDLE || gRuntime.tensorArenaBuffer == VK_NULL_HANDLE) {
+        return JNI_FALSE;
+    }
+    TensorArenaAllocation* allocation = findArenaAllocation(tensorHandle);
+    return allocation != nullptr && transferTensorBytes(env, *allocation, source, true)
+        ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeDownloadTensor(
+    JNIEnv* env, jobject, jlong tensorHandle, jbyteArray destination
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    if (gRuntime.device == VK_NULL_HANDLE || gRuntime.tensorArenaBuffer == VK_NULL_HANDLE) {
+        return JNI_FALSE;
+    }
+    TensorArenaAllocation* allocation = findArenaAllocation(tensorHandle);
+    return allocation != nullptr && transferTensorBytes(env, *allocation, destination, false)
+        ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeReleaseTensor(
+    JNIEnv*, jobject, jlong tensorHandle
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    return gRuntime.tensorArena.release(static_cast<uint64_t>(tensorHandle))
+        ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetTensorArenaMetrics(
+    JNIEnv* env, jobject
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+    std::ostringstream json;
+    json << "{"
+         << "\"capacityBytes\":" << gRuntime.tensorArena.capacityBytes() << ","
+         << "\"allocatedBytes\":" << gRuntime.tensorArena.allocatedBytes() << ","
+         << "\"activeAllocationCount\":" << gRuntime.tensorArena.activeAllocationCount() << ","
+         << "\"deviceLocalMemory\":"
+         << (gRuntime.tensorArenaDeviceLocal ? "true" : "false")
+         << "}";
+    const std::string payload = json.str();
+    return env->NewStringUTF(payload.c_str());
+}
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
+    JNIEnv* env,
+    jobject,
+    jlongArray parameterHandles,
+    jlongArray candidateParameterHandles,
+    jlong gradientHandle,
+    jlongArray firstMomentHandles,
+    jlongArray secondMomentHandles,
+    jlongArray candidateFirstMomentHandles,
+    jlongArray candidateSecondMomentHandles,
+    jintArray activeElementCounts,
+    jfloatArray weightDecayByGroup,
+    jfloat learningRate,
+    jfloat beta1,
+    jfloat beta2,
+    jfloat biasCorrection1,
+    jfloat biasCorrection2,
+    jfloat epsilon,
+    jfloat gradientClipFactor,
+    jlong statusHandle
+) {
+    std::lock_guard<std::mutex> lock(gRuntimeMutex);
+
+    if (gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+        gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
+        gRuntime.residentAdamwPipeline == VK_NULL_HANDLE ||
+        gRuntime.commandBuffer == VK_NULL_HANDLE ||
+        gRuntime.queueSubmit2 == nullptr ||
+        gRuntime.cmdPipelineBarrier2 == nullptr ||
+        parameterHandles == nullptr ||
+        candidateParameterHandles == nullptr ||
+        firstMomentHandles == nullptr ||
+        secondMomentHandles == nullptr ||
+        candidateFirstMomentHandles == nullptr ||
+        candidateSecondMomentHandles == nullptr ||
+        activeElementCounts == nullptr ||
+        weightDecayByGroup == nullptr ||
+        gradientHandle <= 0 ||
+        statusHandle <= 0 ||
+        !std::isfinite(learningRate) || learningRate < 0.0f ||
+        !std::isfinite(beta1) || beta1 < 0.0f || beta1 >= 1.0f ||
+        !std::isfinite(beta2) || beta2 < 0.0f || beta2 >= 1.0f ||
+        !std::isfinite(biasCorrection1) || biasCorrection1 <= 0.0f ||
+        !std::isfinite(biasCorrection2) || biasCorrection2 <= 0.0f ||
+        !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        !std::isfinite(gradientClipFactor) ||
+        gradientClipFactor < 0.0f || gradientClipFactor > 1.0f) {
+        return JNI_FALSE;
+    }
+
+    const jsize groupCount = env->GetArrayLength(parameterHandles);
+    if (env->ExceptionCheck() || groupCount <= 0 ||
+        env->GetArrayLength(candidateParameterHandles) != groupCount ||
+        env->GetArrayLength(firstMomentHandles) != groupCount ||
+        env->GetArrayLength(secondMomentHandles) != groupCount ||
+        env->GetArrayLength(candidateFirstMomentHandles) != groupCount ||
+        env->GetArrayLength(candidateSecondMomentHandles) != groupCount ||
+        env->GetArrayLength(activeElementCounts) != groupCount ||
+        env->GetArrayLength(weightDecayByGroup) != groupCount) {
+        return JNI_FALSE;
+    }
+
+    std::vector<jlong> parameterHandleValues;
+    std::vector<jlong> candidateParameterHandleValues;
+    std::vector<jlong> firstMomentHandleValues;
+    std::vector<jlong> secondMomentHandleValues;
+    std::vector<jlong> candidateFirstMomentHandleValues;
+    std::vector<jlong> candidateSecondMomentHandleValues;
+    std::vector<jint> elementCounts;
+    std::vector<jfloat> weightDecayValues;
+    try {
+        const size_t count = static_cast<size_t>(groupCount);
+        parameterHandleValues.resize(count);
+        candidateParameterHandleValues.resize(count);
+        firstMomentHandleValues.resize(count);
+        secondMomentHandleValues.resize(count);
+        candidateFirstMomentHandleValues.resize(count);
+        candidateSecondMomentHandleValues.resize(count);
+        elementCounts.resize(count);
+        weightDecayValues.resize(count);
+    } catch (const std::bad_alloc&) {
+        return JNI_FALSE;
+    }
+
+    env->GetLongArrayRegion(
+        parameterHandles, 0, groupCount, parameterHandleValues.data()
+    );
+    env->GetLongArrayRegion(
+        candidateParameterHandles, 0, groupCount, candidateParameterHandleValues.data()
+    );
+    env->GetLongArrayRegion(
+        firstMomentHandles, 0, groupCount, firstMomentHandleValues.data()
+    );
+    env->GetLongArrayRegion(
+        secondMomentHandles, 0, groupCount, secondMomentHandleValues.data()
+    );
+    env->GetLongArrayRegion(
+        candidateFirstMomentHandles,
+        0,
+        groupCount,
+        candidateFirstMomentHandleValues.data()
+    );
+    env->GetLongArrayRegion(
+        candidateSecondMomentHandles,
+        0,
+        groupCount,
+        candidateSecondMomentHandleValues.data()
+    );
+    env->GetIntArrayRegion(
+        activeElementCounts, 0, groupCount, elementCounts.data()
+    );
+    env->GetFloatArrayRegion(
+        weightDecayByGroup, 0, groupCount, weightDecayValues.data()
+    );
+    if (env->ExceptionCheck()) return JNI_FALSE;
+
+    TensorArenaAllocation* gradientAllocation = findArenaAllocation(gradientHandle);
+    TensorArenaAllocation* statusAllocation = findArenaAllocation(statusHandle);
+    if (gradientAllocation == nullptr || statusAllocation == nullptr ||
+        gradientAllocation->logicalSize == 0u ||
+        statusAllocation->logicalSize < sizeof(uint32_t) ||
+        (gradientAllocation->offset & 3u) != 0u ||
+        (statusAllocation->offset & 3u) != 0u) {
+        logError("Resident AdamW gradient or status allocation is invalid.");
+        return JNI_FALSE;
+    }
+
+    constexpr uint64_t kMaximumShaderIndex =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    const uint64_t gradientOffsetWords =
+        gradientAllocation->offset / sizeof(uint32_t);
+    const uint64_t statusOffsetWords =
+        statusAllocation->offset / sizeof(uint32_t);
+    if (gradientOffsetWords > kMaximumShaderIndex ||
+        statusOffsetWords > kMaximumShaderIndex) {
+        logError("Resident AdamW gradient or status offset exceeds shader indexing.");
+        return JNI_FALSE;
+    }
+
+    uint64_t totalGradientElements = 0u;
+    uint64_t allocatedPairCount = 0u;
+    std::vector<TensorArenaAllocation*> parameterAllocations;
+    std::vector<TensorArenaAllocation*> candidateParameterAllocations;
+    std::vector<TensorArenaAllocation*> firstMomentAllocations;
+    std::vector<TensorArenaAllocation*> secondMomentAllocations;
+    std::vector<TensorArenaAllocation*> candidateFirstMomentAllocations;
+    std::vector<TensorArenaAllocation*> candidateSecondMomentAllocations;
+    try {
+        const size_t count = static_cast<size_t>(groupCount);
+        parameterAllocations.reserve(count);
+        candidateParameterAllocations.reserve(count);
+        firstMomentAllocations.reserve(count);
+        secondMomentAllocations.reserve(count);
+        candidateFirstMomentAllocations.reserve(count);
+        candidateSecondMomentAllocations.reserve(count);
+    } catch (const std::bad_alloc&) {
+        return JNI_FALSE;
+    }
+
+    std::vector<jlong> uniqueHandles;
+    try {
+        uniqueHandles.reserve(static_cast<size_t>(groupCount) * 6u + 2u);
+    } catch (const std::bad_alloc&) {
+        return JNI_FALSE;
+    }
+    uniqueHandles.push_back(gradientHandle);
+    uniqueHandles.push_back(statusHandle);
+
+    for (jsize index = 0; index < groupCount; ++index) {
+        const size_t groupIndex = static_cast<size_t>(index);
+        const jlong parameterHandle = parameterHandleValues[groupIndex];
+        const jlong candidateParameterHandle = candidateParameterHandleValues[groupIndex];
+        const jlong firstMomentHandle = firstMomentHandleValues[groupIndex];
+        const jlong secondMomentHandle = secondMomentHandleValues[groupIndex];
+        const jlong candidateFirstMomentHandle =
+            candidateFirstMomentHandleValues[groupIndex];
+        const jlong candidateSecondMomentHandle =
+            candidateSecondMomentHandleValues[groupIndex];
+        const jint rawElementCount = elementCounts[groupIndex];
+        const jfloat weightDecay = weightDecayValues[groupIndex];
+
+        if (parameterHandle <= 0 || candidateParameterHandle <= 0 ||
+            firstMomentHandle <= 0 || secondMomentHandle <= 0 ||
+            candidateFirstMomentHandle <= 0 ||
+            candidateSecondMomentHandle <= 0 ||
+            rawElementCount <= 0 ||
+            !std::isfinite(weightDecay) || weightDecay < 0.0f) {
+            logError("Resident AdamW group handles, dimensions, or weight decay are invalid.");
+            return JNI_FALSE;
+        }
+
+        const jlong groupHandles[] = {
+            parameterHandle,
+            candidateParameterHandle,
+            firstMomentHandle,
+            secondMomentHandle,
+            candidateFirstMomentHandle,
+            candidateSecondMomentHandle
+        };
+        for (jlong handle : groupHandles) {
+            if (std::find(uniqueHandles.begin(), uniqueHandles.end(), handle) !=
+                uniqueHandles.end()) {
+                logError("Resident AdamW tensor handles must be unique.");
+                return JNI_FALSE;
+            }
+            uniqueHandles.push_back(handle);
+        }
+
+        TensorArenaAllocation* parameterAllocation =
+            findArenaAllocation(parameterHandle);
+        TensorArenaAllocation* candidateParameterAllocation =
+            findArenaAllocation(candidateParameterHandle);
+        TensorArenaAllocation* firstMomentAllocation =
+            findArenaAllocation(firstMomentHandle);
+        TensorArenaAllocation* secondMomentAllocation =
+            findArenaAllocation(secondMomentHandle);
+        TensorArenaAllocation* candidateFirstMomentAllocation =
+            findArenaAllocation(candidateFirstMomentHandle);
+        TensorArenaAllocation* candidateSecondMomentAllocation =
+            findArenaAllocation(candidateSecondMomentHandle);
+        if (parameterAllocation == nullptr ||
+            candidateParameterAllocation == nullptr ||
+            firstMomentAllocation == nullptr ||
+            secondMomentAllocation == nullptr ||
+            candidateFirstMomentAllocation == nullptr ||
+            candidateSecondMomentAllocation == nullptr) {
+            logError("Resident AdamW references an unknown Tensor Arena allocation.");
+            return JNI_FALSE;
+        }
+
+        const uint64_t elementCount = static_cast<uint64_t>(rawElementCount);
+        if ((parameterAllocation->logicalSize % sizeof(uint16_t)) != 0u) {
+            logError("Resident AdamW FP16 parameter capacity is not element-aligned.");
+            return JNI_FALSE;
+        }
+        const uint64_t parameterCapacity =
+            parameterAllocation->logicalSize / sizeof(uint16_t);
+        if (parameterCapacity == 0u ||
+            parameterCapacity > std::numeric_limits<uint64_t>::max() / sizeof(float) ||
+            elementCount > parameterCapacity) {
+            logError("Resident AdamW active gradient prefix exceeds its parameter capacity.");
+            return JNI_FALSE;
+        }
+        const uint64_t parameterBytes =
+            parameterCapacity * sizeof(uint16_t);
+        const uint64_t packedParameterBytes =
+            ((parameterCapacity + 1u) / 2u) * sizeof(uint32_t);
+        const uint64_t momentBytes = parameterCapacity * sizeof(float);
+        if (parameterAllocation->logicalSize < parameterBytes ||
+            parameterAllocation->allocatedSize < packedParameterBytes ||
+            candidateParameterAllocation->logicalSize != parameterAllocation->logicalSize ||
+            candidateParameterAllocation->allocatedSize != parameterAllocation->allocatedSize ||
+            firstMomentAllocation->logicalSize != momentBytes ||
+            secondMomentAllocation->logicalSize != momentBytes ||
+            candidateFirstMomentAllocation->logicalSize != momentBytes ||
+            candidateSecondMomentAllocation->logicalSize != momentBytes ||
+            candidateFirstMomentAllocation->allocatedSize != firstMomentAllocation->allocatedSize ||
+            candidateSecondMomentAllocation->allocatedSize != secondMomentAllocation->allocatedSize ||
+            (parameterAllocation->offset & 3u) != 0u ||
+            (candidateParameterAllocation->offset & 3u) != 0u ||
+            (firstMomentAllocation->offset & 3u) != 0u ||
+            (secondMomentAllocation->offset & 3u) != 0u ||
+            (candidateFirstMomentAllocation->offset & 3u) != 0u ||
+            (candidateSecondMomentAllocation->offset & 3u) != 0u) {
+            logError("Resident AdamW tensor sizes or alignments do not match the active prefix.");
+            return JNI_FALSE;
+        }
+
+        const uint64_t parameterOffsetWords =
+            parameterAllocation->offset / sizeof(uint32_t);
+        const uint64_t candidateParameterOffsetWords =
+            candidateParameterAllocation->offset / sizeof(uint32_t);
+        const uint64_t firstMomentOffsetWords =
+            firstMomentAllocation->offset / sizeof(uint32_t);
+        const uint64_t secondMomentOffsetWords =
+            secondMomentAllocation->offset / sizeof(uint32_t);
+        const uint64_t candidateFirstMomentOffsetWords =
+            candidateFirstMomentAllocation->offset / sizeof(uint32_t);
+        const uint64_t candidateSecondMomentOffsetWords =
+            candidateSecondMomentAllocation->offset / sizeof(uint32_t);
+        const uint64_t pairCount = (elementCount + 1u) / 2u;
+        if (parameterOffsetWords > kMaximumShaderIndex ||
+            candidateParameterOffsetWords > kMaximumShaderIndex ||
+            firstMomentOffsetWords > kMaximumShaderIndex ||
+            secondMomentOffsetWords > kMaximumShaderIndex ||
+            candidateFirstMomentOffsetWords > kMaximumShaderIndex ||
+            candidateSecondMomentOffsetWords > kMaximumShaderIndex ||
+            pairCount - 1u > kMaximumShaderIndex - parameterOffsetWords ||
+            pairCount - 1u > kMaximumShaderIndex - candidateParameterOffsetWords ||
+            elementCount - 1u > kMaximumShaderIndex - firstMomentOffsetWords ||
+            elementCount - 1u > kMaximumShaderIndex - secondMomentOffsetWords ||
+            elementCount - 1u > kMaximumShaderIndex - candidateFirstMomentOffsetWords ||
+            elementCount - 1u > kMaximumShaderIndex - candidateSecondMomentOffsetWords ||
+            totalGradientElements > kMaximumShaderIndex ||
+            parameterCapacity > kMaximumShaderIndex - totalGradientElements) {
+            logError("Resident AdamW tensor offsets exceed 32-bit shader addressability.");
+            return JNI_FALSE;
+        }
+
+        totalGradientElements += parameterCapacity;
+        allocatedPairCount += pairCount;
+        parameterAllocations.push_back(parameterAllocation);
+        candidateParameterAllocations.push_back(candidateParameterAllocation);
+        firstMomentAllocations.push_back(firstMomentAllocation);
+        secondMomentAllocations.push_back(secondMomentAllocation);
+        candidateFirstMomentAllocations.push_back(candidateFirstMomentAllocation);
+        candidateSecondMomentAllocations.push_back(candidateSecondMomentAllocation);
+    }
+
+    if (totalGradientElements == 0u ||
+        totalGradientElements > std::numeric_limits<uint64_t>::max() / sizeof(float) ||
+        totalGradientElements * sizeof(float) > gradientAllocation->logicalSize ||
+        totalGradientElements * sizeof(float) > gRuntime.physicalDeviceProperties.limits.maxStorageBufferRange ||
+        gradientOffsetWords > kMaximumShaderIndex ||
+        totalGradientElements - 1u > kMaximumShaderIndex - gradientOffsetWords ||
+        allocatedPairCount == 0u) {
+        logError("Resident AdamW gradient staging allocation is too small or exceeds device limits.");
+        return JNI_FALSE;
+    }
+
+    const uint64_t maximumWorkGroups =
+        gRuntime.maxComputeWorkGroupCountX;
+    if (maximumWorkGroups == 0u) return JNI_FALSE;
+
+    VkResult result = vkResetCommandBuffer(gRuntime.commandBuffer, 0u);
+    if (result != VK_SUCCESS) {
+        logError("Failed to reset resident AdamW command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(gRuntime.commandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) {
+        logError("Failed to begin resident AdamW command buffer.", result);
+        return JNI_FALSE;
+    }
+
+    VkMemoryBarrier2KHR beforeCompute{};
+    beforeCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    beforeCompute.srcStageMask =
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.srcAccessMask =
+        VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    beforeCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    beforeCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR beforeComputeDependency{};
+    beforeComputeDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    beforeComputeDependency.memoryBarrierCount = 1u;
+    beforeComputeDependency.pMemoryBarriers = &beforeCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &beforeComputeDependency);
+
+    // Clone each complete parameter allocation before any update dispatch. This preserves
+    // inactive vocabulary-capacity rows when the gradient only covers the active prefix.
+    VkMemoryBarrier2KHR computeToParameterCopy{};
+    computeToParameterCopy.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    computeToParameterCopy.srcStageMask =
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    computeToParameterCopy.srcAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    computeToParameterCopy.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    computeToParameterCopy.dstAccessMask =
+        VK_ACCESS_2_TRANSFER_READ_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    VkDependencyInfoKHR computeToParameterCopyDependency{};
+    computeToParameterCopyDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    computeToParameterCopyDependency.memoryBarrierCount = 1u;
+    computeToParameterCopyDependency.pMemoryBarriers = &computeToParameterCopy;
+    gRuntime.cmdPipelineBarrier2(
+        gRuntime.commandBuffer,
+        &computeToParameterCopyDependency
+    );
+
+    for (size_t index = 0u; index < parameterAllocations.size(); ++index) {
+        const TensorArenaAllocation* source = parameterAllocations[index];
+        const TensorArenaAllocation* destination = candidateParameterAllocations[index];
+        if (source->allocatedSize == 0u ||
+            source->allocatedSize != destination->allocatedSize ||
+            source->offset == destination->offset) {
+            logError("Resident AdamW candidate parameter clone range is invalid.");
+            return JNI_FALSE;
+        }
+        VkBufferCopy parameterCopy{};
+        parameterCopy.srcOffset = source->offset;
+        parameterCopy.dstOffset = destination->offset;
+        parameterCopy.size = source->allocatedSize;
+        vkCmdCopyBuffer(
+            gRuntime.commandBuffer,
+            gRuntime.tensorArenaBuffer,
+            gRuntime.tensorArenaBuffer,
+            1u,
+            &parameterCopy
+        );
+
+        const TensorArenaAllocation* sourceFirst = firstMomentAllocations[index];
+        const TensorArenaAllocation* destinationFirst = candidateFirstMomentAllocations[index];
+        const TensorArenaAllocation* sourceSecond = secondMomentAllocations[index];
+        const TensorArenaAllocation* destinationSecond = candidateSecondMomentAllocations[index];
+        if (sourceFirst->allocatedSize == 0u ||
+            sourceFirst->allocatedSize != destinationFirst->allocatedSize ||
+            sourceFirst->offset == destinationFirst->offset ||
+            sourceSecond->allocatedSize == 0u ||
+            sourceSecond->allocatedSize != destinationSecond->allocatedSize ||
+            sourceSecond->offset == destinationSecond->offset) {
+            logError("Resident AdamW candidate moment clone range is invalid.");
+            return JNI_FALSE;
+        }
+
+        VkBufferCopy firstMomentCopy{};
+        firstMomentCopy.srcOffset = sourceFirst->offset;
+        firstMomentCopy.dstOffset = destinationFirst->offset;
+        firstMomentCopy.size = sourceFirst->allocatedSize;
+        vkCmdCopyBuffer(
+            gRuntime.commandBuffer,
+            gRuntime.tensorArenaBuffer,
+            gRuntime.tensorArenaBuffer,
+            1u,
+            &firstMomentCopy
+        );
+
+        VkBufferCopy secondMomentCopy{};
+        secondMomentCopy.srcOffset = sourceSecond->offset;
+        secondMomentCopy.dstOffset = destinationSecond->offset;
+        secondMomentCopy.size = sourceSecond->allocatedSize;
+        vkCmdCopyBuffer(
+            gRuntime.commandBuffer,
+            gRuntime.tensorArenaBuffer,
+            gRuntime.tensorArenaBuffer,
+            1u,
+            &secondMomentCopy
+        );
+    }
+
+    VkMemoryBarrier2KHR parameterCopyToCompute{};
+    parameterCopyToCompute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    parameterCopyToCompute.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    parameterCopyToCompute.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    parameterCopyToCompute.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    parameterCopyToCompute.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR parameterCopyDependency{};
+    parameterCopyDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    parameterCopyDependency.memoryBarrierCount = 1u;
+    parameterCopyDependency.pMemoryBarriers = &parameterCopyToCompute;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &parameterCopyDependency);
+
+    const uint64_t gradientLogicalWords =
+        gradientAllocation->offset / sizeof(uint32_t);
+    uint64_t gradientElementOffset = 0u;
+    const bool timestampCapture = beginGpuTimestampCapture(gRuntime.commandBuffer);
+
+    auto dispatchGroup = [&](size_t groupIndex, uint32_t operation) -> bool {
+        const uint64_t elementCount =
+            static_cast<uint64_t>(elementCounts[groupIndex]);
+        const uint64_t pairCount = (elementCount + 1u) / 2u;
+        const uint64_t parameterOffsetWords =
+            parameterAllocations[groupIndex]->offset / sizeof(uint32_t);
+        const uint64_t candidateParameterOffsetWords =
+            candidateParameterAllocations[groupIndex]->offset / sizeof(uint32_t);
+        const uint64_t firstMomentOffsetWords =
+            firstMomentAllocations[groupIndex]->offset / sizeof(uint32_t);
+        const uint64_t secondMomentOffsetWords =
+            secondMomentAllocations[groupIndex]->offset / sizeof(uint32_t);
+        const uint64_t candidateFirstMomentOffsetWords =
+            candidateFirstMomentAllocations[groupIndex]->offset / sizeof(uint32_t);
+        const uint64_t candidateSecondMomentOffsetWords =
+            candidateSecondMomentAllocations[groupIndex]->offset / sizeof(uint32_t);
+        const uint64_t requiredGroups =
+            1u + (pairCount - 1u) / kLocalWorkGroupSize;
+        const uint32_t dispatchGroups =
+            calculateDispatchGroupCount(requiredGroups);
+        if (dispatchGroups == 0u ||
+            parameterOffsetWords > kMaximumShaderIndex ||
+            candidateParameterOffsetWords > kMaximumShaderIndex ||
+            firstMomentOffsetWords > kMaximumShaderIndex ||
+            secondMomentOffsetWords > kMaximumShaderIndex ||
+            candidateFirstMomentOffsetWords > kMaximumShaderIndex ||
+            candidateSecondMomentOffsetWords > kMaximumShaderIndex ||
+            gradientElementOffset > kMaximumShaderIndex) {
+            return false;
+        }
+
+        const ResidentAdamwPushConstants pushConstants{
+            operation,
+            static_cast<uint32_t>(elementCount),
+            static_cast<uint32_t>(pairCount),
+            static_cast<uint32_t>(parameterOffsetWords),
+            static_cast<uint32_t>(candidateParameterOffsetWords),
+            static_cast<uint32_t>(gradientLogicalWords),
+            static_cast<uint32_t>(gradientElementOffset),
+            static_cast<uint32_t>(firstMomentOffsetWords),
+            static_cast<uint32_t>(secondMomentOffsetWords),
+            static_cast<uint32_t>(candidateFirstMomentOffsetWords),
+            static_cast<uint32_t>(candidateSecondMomentOffsetWords),
+            static_cast<uint32_t>(statusOffsetWords),
+            learningRate,
+            beta1,
+            beta2,
+            biasCorrection1,
+            biasCorrection2,
+            epsilon,
+            gradientClipFactor,
+            weightDecayValues[groupIndex]
+        };
+        vkCmdBindPipeline(
+            gRuntime.commandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            gRuntime.residentAdamwPipeline
+        );
+        vkCmdBindDescriptorSets(
+            gRuntime.commandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            gRuntime.pipelineLayout,
+            0u,
+            1u,
+            &gRuntime.tensorArenaDescriptorSet,
+            0u,
+            nullptr
+        );
+        vkCmdPushConstants(
+            gRuntime.commandBuffer,
+            gRuntime.pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0u,
+            sizeof(ResidentAdamwPushConstants),
+            &pushConstants
+        );
+        vkCmdDispatch(gRuntime.commandBuffer, dispatchGroups, 1u, 1u);
+        // M4 stores one full-capacity gradient segment per parameter group. The active
+        // prefix controls how many elements AdamW updates; the next group starts after
+        // the complete parameter capacity, not after this group's active prefix.
+        gradientElementOffset +=
+            parameterAllocations[groupIndex]->logicalSize / sizeof(uint16_t);
+        return true;
+    };
+
+    for (jsize index = 0; index < groupCount; ++index) {
+        if (!dispatchGroup(static_cast<size_t>(index), 0u)) {
+            logError("Resident AdamW validation dispatch could not be recorded.");
+            return JNI_FALSE;
+        }
+    }
+
+    VkMemoryBarrier2KHR validationToUpdate{};
+    validationToUpdate.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    validationToUpdate.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    validationToUpdate.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    validationToUpdate.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    validationToUpdate.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    VkDependencyInfoKHR validationToUpdateDependency{};
+    validationToUpdateDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    validationToUpdateDependency.memoryBarrierCount = 1u;
+    validationToUpdateDependency.pMemoryBarriers = &validationToUpdate;
+    gRuntime.cmdPipelineBarrier2(
+        gRuntime.commandBuffer,
+        &validationToUpdateDependency
+    );
+
+    gradientElementOffset = 0u;
+    for (jsize index = 0; index < groupCount; ++index) {
+        if (!dispatchGroup(static_cast<size_t>(index), 1u)) {
+            logError("Resident AdamW update dispatch could not be recorded.");
+            return JNI_FALSE;
+        }
+    }
+
+    VkMemoryBarrier2KHR afterUpdate{};
+    afterUpdate.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR;
+    afterUpdate.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    afterUpdate.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR;
+    afterUpdate.dstStageMask =
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR |
+        VK_PIPELINE_STAGE_2_COPY_BIT_KHR;
+    afterUpdate.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR |
+        VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+    VkDependencyInfoKHR afterUpdateDependency{};
+    afterUpdateDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR;
+    afterUpdateDependency.memoryBarrierCount = 1u;
+    afterUpdateDependency.pMemoryBarriers = &afterUpdate;
+    gRuntime.cmdPipelineBarrier2(gRuntime.commandBuffer, &afterUpdateDependency);
+    endGpuTimestampCapture(gRuntime.commandBuffer, timestampCapture);
+
+    result = vkEndCommandBuffer(gRuntime.commandBuffer);
+    if (result != VK_SUCCESS) {
+        logError("Failed to finish resident AdamW command buffer.", result);
+        return JNI_FALSE;
+    }
+    if (!submitAndWait("Resident AdamW queue submission or fence wait failed.")) {
+        return JNI_FALSE;
+    }
+
+    // JNI_TRUE reports completed GPU execution, not transaction acceptance.
+    // Kotlin reads statusHandle through nativeDownloadTensor after this fence.
+    // That readback uses a compute-to-copy buffer barrier and invalidates
+    // non-coherent staging memory before the status bytes reach the CPU.
+    uint64_t elapsedNanoseconds = 0u;
+    if (readGpuTimestampDurationNanoseconds(elapsedNanoseconds)) {
+        gRuntime.lastAdamwGpuTimeNanoseconds = elapsedNanoseconds;
+        gRuntime.totalGpuTimeNanoseconds += elapsedNanoseconds;
+        ++gRuntime.timestampedDispatchCount;
+    }
+    return JNI_TRUE;
 }

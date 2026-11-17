@@ -8,9 +8,7 @@ import org.junit.Test
 class VulkanAdamwAdapterTest {
 
     @Test
-    fun disabledVulkanLeavesFp16WeightsAndFp32MomentsUntouchedForCpuFallback() {
-        VulkanTrainingBackend.disableForCurrentSession()
-
+    fun uninitializedVulkanLeavesFp16WeightsAndFp32MomentsUntouchedForCpuFallback() {
         val parameters = arrayOf(
             Float16ParameterArray.fromFloatArray(floatArrayOf(0.25f, -0.5f, 0.75f)),
             Float16ParameterArray.fromFloatArray(floatArrayOf(1.0f, -1.0f, 0.125f))
@@ -56,8 +54,6 @@ class VulkanAdamwAdapterTest {
 
     @Test
     fun rejectsMomentCapacityThatDoesNotMatchFp16ParameterCapacity() {
-        VulkanTrainingBackend.disableForCurrentSession()
-
         val parameters = arrayOf(Float16ParameterArray.fromFloatArray(floatArrayOf(0.5f, -0.25f)))
         val gradients = arrayOf(floatArrayOf(0.1f, -0.1f))
         val firstMoments = arrayOf(floatArrayOf(0f))

@@ -106,6 +106,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             ArgusTheme {
                 val initializationState by argusApp.coreInitializationState.collectAsState()
+                val initializationProgress by argusApp.coreInitializationProgress.collectAsState()
                 val runtimeDiagnostics by argusApp.runtimeDiagnostics.collectAsState()
                 val context = LocalContext.current
                 Column(modifier = Modifier.fillMaxSize()) {
@@ -113,8 +114,9 @@ class MainActivity : ComponentActivity() {
                         when (val state = initializationState) {
                             ArgusCoreInitializationState.Initializing ->
                                 com.argus.agi.ui.components.ArgusModernLoadingScreen(
-                                    title = "A . R . G . U . S",
-                                    subtitle = "INITIALIZING THE LOCAL MODEL & TRAINING RUNTIME..."
+                                    title = "ARGUS",
+                                    subtitle = initializationProgress.status,
+                                    driverInfo = initializationProgress.driverInfo
                                 )
                             ArgusCoreInitializationState.Ready -> MainScreen(viewModel = viewModel)
                             is ArgusCoreInitializationState.Failed ->

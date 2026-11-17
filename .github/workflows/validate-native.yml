@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - master
     paths:
       - "app/**"
       - "gradle/**"
@@ -14,6 +13,7 @@ on:
       - "gradle.properties"
       - "version.properties"
       - "tools/cmake-compat/**"
+      - "tools/native-tests/**"
       - ".github/workflows/validate-native.yml"
   pull_request:
     branches:
@@ -27,6 +27,7 @@ on:
       - "gradle.properties"
       - "version.properties"
       - "tools/cmake-compat/**"
+      - "tools/native-tests/**"
       - ".github/workflows/validate-native.yml"
   workflow_dispatch:
 
@@ -105,6 +106,17 @@ jobs:
           test -n "${glslc_path}"
           test -x "${glslc_path}"
           echo "NDK r30, CMake ${cmake_version}, and NDK glslc are ready."
+# Host-side regression coverage for allocator handles and bounded Vulkan buffer transfers.
+      - name: Run Tensor Arena host unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          c++ -std=c++23 -Wall -Wextra -Wpedantic -Werror \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -O2 \
+            tools/native-tests/tensor_arena_core_test.cpp \
+            -o "${RUNNER_TEMP}/argus-tensor-arena-core-test"
+          "${RUNNER_TEMP}/argus-tensor-arena-core-test"
+
       - name: Verify Gradle and Java toolchain
         run: |
           chmod +x gradlew

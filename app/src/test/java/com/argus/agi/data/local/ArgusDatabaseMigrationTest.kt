@@ -2,6 +2,8 @@ package com.argus.agi.data.local
 
 import android.content.Context
 import androidx.room.Room
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -114,12 +116,91 @@ class ArgusDatabaseMigrationTest {
             legacy.version = 1
         }
 
+        val migrationWithRetainedCorpus = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                ArgusDatabase.MIGRATION_1_2.migrate(db)
+
+                db.execSQL(
+                    """
+                    INSERT INTO `corpus_documents` (
+                        `id`, `contentFingerprint`, `fingerprintAlgorithm`, `source`,
+                        `title`, `language`, `canonicalUrl`, `characterCount`,
+                        `chunkCount`, `datasetSplit`, `validationText`, `plannedEpochs`,
+                        `rightsStatus`, `status`, `createdAtEpochMs`,
+                        `lastTrainedAtEpochMs`, `completedPassCount`
+                    ) VALUES (
+                        'legacy-doc', 'legacy-fingerprint', 'SHA256_UTF16_BE', 'legacy-import',
+                        'Legacy article', 'en', 'https://example.org/legacy', 20,
+                        1, 'TRAIN', NULL, 1, 'UNVERIFIED', 'PENDING', 200, NULL, 0
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    INSERT INTO `corpus_sources` (
+                        `id`, `documentId`, `source`, `canonicalUrl`,
+                        `language`, `rightsStatus`, `importedAtEpochMs`
+                    ) VALUES (
+                        'legacy-source', 'legacy-doc',
+                        'web_article|rights_declared_by_user=true',
+                        'https://example.org/legacy', 'en', 'USER_DECLARED', 300
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    INSERT INTO `corpus_chunks` (
+                        `id`, `documentId`, `chunkIndex`, `content`, `characterCount`
+                    ) VALUES (
+                        'legacy-chunk', 'legacy-doc', 1, 'legacy chunk content', 20
+                    )
+                    """.trimIndent()
+                )
+
+                db.execSQL(
+                    """
+                    INSERT INTO `corpus_documents` (
+                        `id`, `contentFingerprint`, `fingerprintAlgorithm`, `source`,
+                        `title`, `language`, `canonicalUrl`, `characterCount`,
+                        `chunkCount`, `datasetSplit`, `validationText`, `plannedEpochs`,
+                        `rightsStatus`, `status`, `createdAtEpochMs`,
+                        `lastTrainedAtEpochMs`, `completedPassCount`
+                    ) VALUES (
+                        'unverified-doc', 'unverified-fingerprint', 'SHA256_UTF16_BE',
+                        'legacy-import', 'Unverified legacy source', 'en', NULL, 20,
+                        1, 'TRAIN', NULL, 1, 'LICENSE_REVIEWED', 'PENDING', 400, NULL, 0
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    INSERT INTO `corpus_sources` (
+                        `id`, `documentId`, `source`, `canonicalUrl`,
+                        `language`, `rightsStatus`, `importedAtEpochMs`
+                    ) VALUES (
+                        'unverified-source', 'unverified-doc', 'legacy-license-source',
+                        NULL, 'en', 'LICENSE_REVIEWED', 500
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    INSERT INTO `corpus_chunks` (
+                        `id`, `documentId`, `chunkIndex`, `content`, `characterCount`
+                    ) VALUES (
+                        'unverified-chunk', 'unverified-doc', 1, 'legacy unverified chunk', 23
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         val migrated = Room.databaseBuilder(
             context,
             ArgusDatabase::class.java,
             databaseName
         )
-            .addMigrations(ArgusDatabase.MIGRATION_1_2)
+            .addMigrations(migrationWithRetainedCorpus, ArgusDatabase.MIGRATION_2_3)
             .allowMainThreadQueries()
             .build()
 
@@ -147,15 +228,91 @@ class ArgusDatabaseMigrationTest {
                 assertNull(cursor.getString(1))
             }
 
-            assertEquals(2, database.version)
+            assertEquals(3, database.version)
+
+            database.query(
+                "SELECT `title`, `rightsStatus` FROM `corpus_documents` WHERE `id` = 'legacy-doc'"
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals("Legacy article", cursor.getString(0))
+                assertEquals(
+                    "A document's aggregate rights must be promoted from its surviving user-declared source.",
+                    "USER_DECLARED",
+                    cursor.getString(1)
+                )
+            }
+            database.query(
+                "SELECT `rightsStatus`, `userDeclarationText`, " +
+                    "`userDeclaredAtEpochMs`, `licenseIdentifier` " +
+                    "FROM `corpus_sources` WHERE `id` = 'legacy-source'"
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals("USER_DECLARED", cursor.getString(0))
+                assertEquals(
+                    "Legacy explicit user approval recorded at import time.",
+                    cursor.getString(1)
+                )
+                assertEquals(300L, cursor.getLong(2))
+                assertNull(cursor.getString(3))
+            }
+            database.query(
+                "SELECT `content` FROM `corpus_chunks` WHERE `id` = 'legacy-chunk'"
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals("legacy chunk content", cursor.getString(0))
+            }
+
+            database.query(
+                "SELECT `rightsStatus` FROM `corpus_documents` WHERE `id` = 'unverified-doc'"
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals("UNVERIFIED", cursor.getString(0))
+            }
+            database.query(
+                "SELECT `rightsStatus` FROM `corpus_sources` WHERE `id` = 'unverified-source'"
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals("UNVERIFIED", cursor.getString(0))
+            }
+            database.query(
+                "SELECT `content` FROM `corpus_chunks` WHERE `id` = 'unverified-chunk'"
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals("legacy unverified chunk", cursor.getString(0))
+            }
             database.query("SELECT COUNT(*) FROM `corpus_documents`").use { cursor ->
                 assertTrue(cursor.moveToFirst())
-                assertEquals(0, cursor.getInt(0))
+                assertEquals(2, cursor.getInt(0))
             }
             database.query("SELECT COUNT(*) FROM `corpus_sources`").use { cursor ->
                 assertTrue(cursor.moveToFirst())
-                assertEquals(0, cursor.getInt(0))
+                assertEquals(2, cursor.getInt(0))
             }
+            database.query("SELECT COUNT(*) FROM `corpus_chunks`").use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(2, cursor.getInt(0))
+            }
+
+            val sourceColumns = buildSet {
+                database.query("PRAGMA table_info(`corpus_sources`)").use { cursor ->
+                    val nameIndex = cursor.getColumnIndexOrThrow("name")
+                    while (cursor.moveToNext()) {
+                        add(cursor.getString(nameIndex))
+                    }
+                }
+            }
+            assertTrue(sourceColumns.containsAll(
+                setOf(
+                    "licenseIdentifier",
+                    "licenseName",
+                    "licenseUrl",
+                    "attributionText",
+                    "rightsEvidenceUrl",
+                    "userDeclarationText",
+                    "userDeclaredAtEpochMs",
+                    "reviewedAtEpochMs"
+                )
+            ))
         } finally {
             migrated.close()
             context.deleteDatabase(databaseName)

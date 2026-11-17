@@ -12,6 +12,17 @@ class Float16ParameterArray(size: Int) {
 
     private val storage: ShortArray
 
+    @Volatile
+    private var currentMutationVersion: Long = 0L
+
+    /** Changes whenever the authoritative Kotlin parameter storage is mutated. */
+    internal val mutationVersion: Long
+        get() = currentMutationVersion
+
+    private fun markModified() {
+        currentMutationVersion += 1L
+    }
+
     init {
         require(size >= 0) { "Parameter-array size cannot be negative." }
         storage = ShortArray(size)
@@ -25,19 +36,26 @@ class Float16ParameterArray(size: Int) {
 
     operator fun get(index: Int): Float = Float16Codec.toFloat(storage[index])
 
+    @Synchronized
     operator fun set(index: Int, value: Float) {
         storage[index] = Float16Codec.fromFiniteFloat(value)
+        markModified()
     }
 
+    @Synchronized
     fun fill(value: Float) {
         storage.fill(Float16Codec.fromFiniteFloat(value))
+        if (storage.isNotEmpty()) markModified()
     }
 
+    @Synchronized
     fun copyFrom(source: Float16ParameterArray) {
         require(source.size == size) { "FP16 parameter-array sizes must match." }
         System.arraycopy(source.storage, 0, storage, 0, size)
+        if (size > 0) markModified()
     }
 
+    @Synchronized
     fun copyFrom(
         source: Float16ParameterArray,
         sourceOffset: Int,
@@ -54,12 +72,81 @@ class Float16ParameterArray(size: Int) {
             "FP16 destination range exceeds its parameter array."
         }
         System.arraycopy(source.storage, sourceOffset, storage, destinationOffset, length)
+        if (length > 0) markModified()
     }
 
     fun toFloatArray(): FloatArray = FloatArray(size) { index -> get(index) }
 
     /** Returns a defensive copy of the underlying IEEE-754 binary16 values. */
     fun toShortArray(): ShortArray = storage.copyOf()
+
+    /** Returns the binary16 payload in explicit little-endian byte order for Vulkan. */
+    @Synchronized
+    internal fun toLittleEndianByteArray(): ByteArray {
+        val byteCount = Math.multiplyExact(storage.size, Short.SIZE_BYTES)
+        return ByteArray(byteCount).also { bytes ->
+            for (index in storage.indices) {
+                val value = storage[index].toInt() and 0xFFFF
+                val byteOffset = index * Short.SIZE_BYTES
+                bytes[byteOffset] = value.toByte()
+                bytes[byteOffset + 1] = (value ushr 8).toByte()
+            }
+        }
+    }
+
+    /** Validates a GPU readback before changing the authoritative host parameter array. */
+    internal fun validateLittleEndianPrefix(source: ByteArray, elementCount: Int) {
+        require(elementCount in 0..storage.size) {
+            "FP16 readback prefix exceeds the parameter-array capacity."
+        }
+        val requiredBytes = Math.multiplyExact(elementCount, Short.SIZE_BYTES)
+        require(source.size >= requiredBytes) {
+            "FP16 readback does not contain the complete active parameter prefix."
+        }
+        for (index in 0 until elementCount) {
+            val byteOffset = index * Short.SIZE_BYTES
+            val encoded = (
+                (source[byteOffset].toInt() and 0xFF) or
+                    ((source[byteOffset + 1].toInt() and 0xFF) shl 8)
+                ).toShort()
+            require(Float16Codec.toFloat(encoded).isFinite()) {
+                "GPU AdamW returned a non-finite FP16 parameter at index $index."
+            }
+        }
+    }
+
+    /** Commits one validated GPU readback and advances the model mutation revision once. */
+    @Synchronized
+    internal fun copyPrefixFromLittleEndianByteArray(source: ByteArray, elementCount: Int) {
+        validateLittleEndianPrefix(source, elementCount)
+        for (index in 0 until elementCount) {
+            val byteOffset = index * Short.SIZE_BYTES
+            storage[index] = (
+                (source[byteOffset].toInt() and 0xFF) or
+                    ((source[byteOffset + 1].toInt() and 0xFF) shl 8)
+                ).toShort()
+        }
+        if (elementCount > 0) markModified()
+    }
+
+    @Synchronized
+    internal fun copyPrefixFromLittleEndianByteArrayIfRevision(
+        source: ByteArray,
+        elementCount: Int,
+        expectedMutationVersion: Long
+    ): Long? {
+        if (currentMutationVersion != expectedMutationVersion) return null
+        validateLittleEndianPrefix(source, elementCount)
+        for (index in 0 until elementCount) {
+            val byteOffset = index * Short.SIZE_BYTES
+            storage[index] = (
+                (source[byteOffset].toInt() and 0xFF) or
+                    ((source[byteOffset + 1].toInt() and 0xFF) shl 8)
+                ).toShort()
+        }
+        if (elementCount > 0) markModified()
+        return currentMutationVersion
+    }
 
     companion object {
         fun fromFloatArray(values: FloatArray): Float16ParameterArray =

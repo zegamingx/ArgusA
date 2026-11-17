@@ -123,6 +123,46 @@ argus_compile_shader(
     "vulkan1.2"
 )
 
+argus_compile_shader(
+    "${CMAKE_CURRENT_SOURCE_DIR}/linear_resident.comp"
+    "linear_resident.comp.spv"
+    "linear_resident_shader_spv.h"
+    "kArgusResidentLinearShaderSpv"
+    "kArgusResidentLinearShaderSpvSize"
+)
+
+argus_compile_shader(
+    "${CMAKE_CURRENT_SOURCE_DIR}/attention_resident.comp"
+    "attention_resident.comp.spv"
+    "attention_resident_shader_spv.h"
+    "kArgusResidentAttentionShaderSpv"
+    "kArgusResidentAttentionShaderSpvSize"
+)
+
+argus_compile_shader(
+    "${CMAKE_CURRENT_SOURCE_DIR}/swiglu_resident.comp"
+    "swiglu_resident.comp.spv"
+    "swiglu_resident_shader_spv.h"
+    "kArgusResidentSwiGluShaderSpv"
+    "kArgusResidentSwiGluShaderSpvSize"
+)
+
+argus_compile_shader(
+    "${CMAKE_CURRENT_SOURCE_DIR}/backward_resident.comp"
+    "backward_resident.comp.spv"
+    "backward_resident_shader_spv.h"
+    "kArgusResidentBackwardShaderSpv"
+    "kArgusResidentBackwardShaderSpvSize"
+)
+
+argus_compile_shader(
+    "${CMAKE_CURRENT_SOURCE_DIR}/adamw_resident.comp"
+    "adamw_resident.comp.spv"
+    "adamw_resident_shader_spv.h"
+    "kArgusResidentAdamwShaderSpv"
+    "kArgusResidentAdamwShaderSpvSize"
+)
+
 get_property(
     ARGUS_SHADER_HEADERS
     GLOBAL

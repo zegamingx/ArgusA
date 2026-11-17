@@ -137,13 +137,15 @@ data class EngineConfig(
             totalRamGb: Int,
             maxHeapMb: Long,
             availableRamGb: Float = totalRamGb.toFloat(),
-            cpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+            cpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
+            vulkanSupported: Boolean = true
         ): EngineConfig {
             val profile = ArgusDeviceModelPolicy.select(
                 totalRamGb = totalRamGb,
                 maxHeapMb = maxHeapMb,
                 availableRamGb = availableRamGb,
-                cpuCores = cpuCores
+                cpuCores = cpuCores,
+                vulkanSupported = vulkanSupported
             )
             val tier = profile.tier
             val shape = selectExecutableShape(
@@ -306,24 +308,68 @@ class ArgusNeuralEngine private constructor(
     val layerCount = config.layerCount
     val isFullTrainingEnabled = config.isFullTrainingEnabled
 
+    @Volatile
+    private var checkpointStateVerified = false
+
+    /**
+     * True only after an existing checkpoint has been fully restored or a new
+     * checkpoint has been atomically written and verified on local storage.
+     */
+    val isCheckpointStateVerified: Boolean
+        get() = checkpointStateVerified
+
+    val optimizerStep: Int
+        get() = synchronized(modelLock) { adamStep }
+
     val optimizerBackend: String
         get() = VulkanTrainingBackend.currentBackend
     val isVulkanRuntimeReady: Boolean
         get() = VulkanTrainingBackend.isRuntimeAvailable
     val computeBackendStatus: StateFlow<String>
         get() = VulkanTrainingBackend.runtimeStatus
-    val isVulkanEnabledForCurrentSession: StateFlow<Boolean>
-        get() = VulkanTrainingBackend.isVulkanEnabledForCurrentSession
-    val isVulkanInitializationInProgress: StateFlow<Boolean>
-        get() = VulkanTrainingBackend.isInitializingRuntime
-    val canInitializeVulkanForCurrentSession: StateFlow<Boolean>
-        get() = VulkanTrainingBackend.canInitializeForCurrentSession
+    val vulkanInitializationProgress: StateFlow<VulkanInitializationProgress>
+        get() = VulkanTrainingBackend.initializationProgress
+    val vulkanDeviceCapabilities: StateFlow<VulkanDeviceCapabilities?>
+        get() = VulkanTrainingBackend.deviceCapabilities
+    val vulkanGpuPerformanceMetrics: StateFlow<VulkanGpuPerformanceMetrics>
+        get() = VulkanTrainingBackend.gpuPerformanceMetrics
+    val vulkanModelTensorResidencyReady: StateFlow<Boolean>
+        get() = VulkanTrainingBackend.modelTensorResidencyReady
 
-    fun enableVulkanForCurrentSession(): Boolean =
-        VulkanTrainingBackend.enableForCurrentSession()
+    fun initializeOptionalVulkanRuntime(): Boolean {
+        val runtimeReady = VulkanTrainingBackend.initializeAfterModelReady()
+        if (!runtimeReady) return false
+        synchronizeVulkanModelTensorResidency("model initialization")
+        return true
+    }
 
-    fun disableVulkanForCurrentSession() =
-        VulkanTrainingBackend.disableForCurrentSession()
+    fun releaseVulkanTensorResidencyForMemoryPressure(): Boolean =
+        VulkanTrainingBackend.releaseModelTensorResidencyForMemoryPressure()
+
+    fun resumeVulkanTensorResidencyAfterForeground() {
+        VulkanTrainingBackend.resumeModelTensorResidencyAfterForeground()
+    }
+
+    fun resetOptionalVulkanRuntimeForRetry() {
+        VulkanTrainingBackend.resetRuntimeForRetry()
+    }
+
+    private fun synchronizeVulkanModelTensorResidency(reason: String) {
+        if (!VulkanTrainingBackend.isFp16ComputeAvailable &&
+            !VulkanTrainingBackend.isResidentActivationLinearAvailable) {
+            return
+        }
+        val synchronized = VulkanTrainingBackend.synchronizeModelTensorResidency(
+            currentNamedParameterTensors()
+        )
+        if (!synchronized) {
+            Log.w(
+                TAG,
+                "Complete FP16 model residency was not established after $reason; " +
+                    "the verified FP32 Vulkan path or Kotlin CPU fallback remains active."
+            )
+        }
+    }
 
     val checkpointInterval: Int
         get() = CHECKPOINT_INTERVAL
@@ -445,7 +491,8 @@ class ArgusNeuralEngine private constructor(
     private val modelLock = Any()
 
     private class BatchGradientAccumulator(
-        val gradients: Array<FloatArray>
+        val gradients: Array<FloatArray>,
+        var resident: VulkanResidentGradientAccumulator? = null
     ) {
         var targetCount: Int = 0
     }
@@ -504,7 +551,8 @@ class ArgusNeuralEngine private constructor(
             totalRamGb: Int,
             maxHeapMb: Long,
             availableRamGb: Float = totalRamGb.toFloat(),
-            cpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+            cpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
+            vulkanSupported: Boolean = true
         ): EngineConfig {
             val checkpoint = File(context.filesDir, "argus_model_weights.bin")
             val savedConfig = runCatching {
@@ -528,16 +576,15 @@ class ArgusNeuralEngine private constructor(
                     totalRamGb = totalRamGb,
                     maxHeapMb = maxHeapMb,
                     availableRamGb = availableRamGb,
-                    cpuCores = cpuCores
+                    cpuCores = cpuCores,
+                    vulkanSupported = vulkanSupported
                 )
             }.getOrNull()
 
-            // The tokenizer is moving to a new byte-level vocabulary contract.
-            // Old ARG3/ARG4 checkpoints are intentionally not restored; a fresh
-            // model must be initialized with the matching BYTE_LEVEL_BPE_V2 IDs.
-            val compatibleSavedConfig = savedConfig?.takeIf { saved ->
-                saved.tokenizerConfig.algorithm == ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2
-            }
+            // Token IDs are part of the checkpoint contract. Preserve the saved
+            // tokenizer algorithm and architecture for existing ARG3/ARG4 models.
+            // Fresh installations still receive the current BYTE_LEVEL_BPE_V2 default.
+            val compatibleSavedConfig = savedConfig
             val resolvedConfig = compatibleSavedConfig ?: requireNotNull(deviceConfig) {
                 "This device cannot currently allocate the minimum executable Argus model safely."
             }
@@ -883,6 +930,9 @@ class ArgusNeuralEngine private constructor(
 
     private fun resizeVocabCapacityTo(targetCap: Int) {
         if (targetCap <= 0 || targetCap == vocabCap) return
+        check(VulkanTrainingBackend.synchronizeTrainingStateMirrors()) {
+            "GPU model weights and optimizer moments must be recovered before vocabulary capacity changes."
+        }
         requireSafeVocabularyCapacity(targetCap)
         val targetElements = Math.multiplyExact(targetCap, dModel)
         val newEmbed = Float16ParameterArray(targetElements)
@@ -914,6 +964,7 @@ class ArgusNeuralEngine private constructor(
         mHead = newMHead
         vHead = newVHead
         vocabCap = targetCap
+        synchronizeVulkanModelTensorResidency("vocabulary-capacity replacement")
     }
 
     // =====================================================================
@@ -930,6 +981,9 @@ class ArgusNeuralEngine private constructor(
         generationContext.ensureActive()
         synchronized(modelLock) {
             generationContext.ensureActive()
+            check(VulkanTrainingBackend.synchronizeModelParameterMirrors()) {
+                "GPU-resident model weights could not be recovered before CPU autoregressive inference."
+            }
             val formattedPrompt = formatGenerationPrompt(prompt, reasoningMode)
 
             // PENTING: autoRegister = false saat inference agar kamus token stabil
@@ -1382,7 +1436,14 @@ class ArgusNeuralEngine private constructor(
      * Activations are released between samples; only the accumulated parameter gradients
      * remain resident. The accepted batch size is strictly bounded to 1..8.
      */
-    fun trainBatchDetailed(texts: List<String>): NeuralTrainingBatchResult {
+    fun trainBatchDetailed(
+        texts: List<String>,
+        runtimeContextLength: Int = maxSeqLen,
+        autoCheckpoint: Boolean = true
+    ): NeuralTrainingBatchResult {
+        require(runtimeContextLength in 2..maxSeqLen) {
+            "Runtime context length must be between 2 and the configured model context."
+        }
         require(texts.size in 1..8) {
             "Training batch size must be between 1 and 8."
         }
@@ -1390,7 +1451,11 @@ class ArgusNeuralEngine private constructor(
             require(texts.size == 1) {
                 "This legacy checkpoint requires single-sample compatibility training."
             }
-            return trainSingleSampleSequential(texts.single())
+            return trainSingleSampleSequential(
+                text = texts.single(),
+                runtimeContextLength = runtimeContextLength,
+                autoCheckpoint = autoCheckpoint
+            )
         }
 
         var shouldSaveCheckpoint = false
@@ -1400,116 +1465,137 @@ class ArgusNeuralEngine private constructor(
             val accumulator = createBatchGradientAccumulator()
             val sampleResults = ArrayList<NeuralTrainingStepResult>(texts.size)
 
-            for (text in texts) {
-                val tokens = tokenizer.encode(text, autoRegister = false)
-                if (tokens.size < 2) {
-                    sampleResults += NeuralTrainingStepResult(
-                        loss = Float.NaN,
-                        inputTokenCount = tokens.size,
-                        predictionTargetCount = 0,
-                        contextWindowCount = 0,
-                        optimizerUpdateCount = 0,
-                        vocabularySize = tokenizer.vocabSize
-                    )
-                    continue
-                }
-
-                ensureVocabCapacity(tokenizer.vocabSize)
-                val currentVocab = tokenizer.vocabSize
-                var contextWindowCount = 0
-                var predictionTargetCount = 0
-                var weightedLoss = 0f
-                var trainedTargets = 0
-
-                if (tokens.size <= maxSeqLen) {
-                    val windowLoss = trainSingleWindow(
-                        seq = tokens,
-                        currentVocab = currentVocab,
-                        gradientAccumulator = accumulator
-                    )
-                    if (windowLoss.isFinite()) {
-                        contextWindowCount = 1
-                        predictionTargetCount = tokens.size - 1
-                        trainedTargets = tokens.size - 1
-                        weightedLoss = windowLoss * (tokens.size - 1)
+            try {
+                for (text in texts) {
+                    val tokens = tokenizer.encode(text, autoRegister = false)
+                    if (tokens.size < 2) {
+                        sampleResults += NeuralTrainingStepResult(
+                            loss = Float.NaN,
+                            inputTokenCount = tokens.size,
+                            predictionTargetCount = 0,
+                            contextWindowCount = 0,
+                            optimizerUpdateCount = 0,
+                            vocabularySize = tokenizer.vocabSize
+                        )
+                        continue
                     }
-                } else {
-                    val overlapTokens = min(24, maxSeqLen - 1)
-                    val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
-                    var start = 0
 
-                    while (start < tokens.size - 1) {
-                        val end = min(start + maxSeqLen, tokens.size)
-                        val windowSequence = tokens.subList(start, end)
-                        if (windowSequence.size >= 2) {
-                            val firstTargetIndex =
-                                if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
-                            val targetCount =
-                                (windowSequence.size - 1 - firstTargetIndex).coerceAtLeast(0)
-                            if (targetCount > 0) {
-                                val windowLoss = trainSingleWindow(
-                                    seq = windowSequence,
-                                    currentVocab = currentVocab,
-                                    firstTargetIndex = firstTargetIndex,
-                                    gradientAccumulator = accumulator
-                                )
-                                if (windowLoss.isFinite()) {
-                                    contextWindowCount++
-                                    weightedLoss += windowLoss * targetCount
-                                    trainedTargets += targetCount
-                                    predictionTargetCount += targetCount
+                    ensureVocabCapacity(tokenizer.vocabSize)
+                    val currentVocab = tokenizer.vocabSize
+                    var contextWindowCount = 0
+                    var predictionTargetCount = 0
+                    var weightedLoss = 0f
+                    var trainedTargets = 0
+
+                    if (tokens.size <= runtimeContextLength) {
+                        val windowLoss = trainSingleWindow(
+                            seq = tokens,
+                            currentVocab = currentVocab,
+                            gradientAccumulator = accumulator
+                        )
+                        if (windowLoss.isFinite()) {
+                            contextWindowCount = 1
+                            predictionTargetCount = tokens.size - 1
+                            trainedTargets = tokens.size - 1
+                            weightedLoss = windowLoss * (tokens.size - 1)
+                        }
+                    } else {
+                        val overlapTokens = min(24, runtimeContextLength - 1)
+                        val stride = (runtimeContextLength - overlapTokens).coerceAtLeast(1)
+                        var start = 0
+                        while (start < tokens.size - 1) {
+                            val end = min(start + runtimeContextLength, tokens.size)
+                            val windowSequence = tokens.subList(start, end)
+                            if (windowSequence.size >= 2) {
+                                val firstTargetIndex =
+                                    if (start == 0 || overlapTokens == 0) 0 else overlapTokens - 1
+                                val targetCount =
+                                    (windowSequence.size - 1 - firstTargetIndex).coerceAtLeast(0)
+                                if (targetCount > 0) {
+                                    val windowLoss = trainSingleWindow(
+                                        seq = windowSequence,
+                                        currentVocab = currentVocab,
+                                        firstTargetIndex = firstTargetIndex,
+                                        gradientAccumulator = accumulator
+                                    )
+                                    if (windowLoss.isFinite()) {
+                                        contextWindowCount++
+                                        weightedLoss += windowLoss * targetCount
+                                        trainedTargets += targetCount
+                                        predictionTargetCount += targetCount
+                                    }
                                 }
                             }
+                            if (end >= tokens.size) break
+                            start += stride
                         }
-                        if (end >= tokens.size) break
-                        start += stride
                     }
+
+                    sampleResults += NeuralTrainingStepResult(
+                        loss = if (trainedTargets > 0) {
+                            weightedLoss / trainedTargets
+                        } else {
+                            Float.NaN
+                        },
+                        inputTokenCount = tokens.size,
+                        predictionTargetCount = predictionTargetCount,
+                        contextWindowCount = contextWindowCount,
+                        optimizerUpdateCount = 0,
+                        vocabularySize = currentVocab
+                    )
                 }
 
-                sampleResults += NeuralTrainingStepResult(
-                    loss = if (trainedTargets > 0) {
-                        weightedLoss / trainedTargets
-                    } else {
-                        Float.NaN
-                    },
-                    inputTokenCount = tokens.size,
-                    predictionTargetCount = predictionTargetCount,
-                    contextWindowCount = contextWindowCount,
-                    optimizerUpdateCount = 0,
-                    vocabularySize = currentVocab
+                val expectedOptimizerUpdates = if (accumulator.targetCount > 0) 1 else 0
+                val firstTrainableSample = sampleResults.indexOfFirst { sample ->
+                    sample.loss.isFinite() && sample.predictionTargetCount > 0
+                }
+                val reportedSamples = ArrayList<NeuralTrainingStepResult>(sampleResults.size)
+                sampleResults.forEachIndexed { index, sample ->
+                    reportedSamples.add(
+                        sample.copy(
+                            optimizerUpdateCount = if (index == firstTrainableSample) {
+                                expectedOptimizerUpdates
+                            } else {
+                                0
+                            }
+                        )
+                    )
+                }
+
+                // Allocate the full result before AdamW can commit. No result-list
+                // allocation is permitted after model parameters or moments are updated.
+                val completedBatch = NeuralTrainingBatchResult(
+                    samples = reportedSamples,
+                    optimizerUpdateCount = expectedOptimizerUpdates,
+                    totalPredictionTargetCount = accumulator.targetCount
                 )
-            }
 
-            if (accumulator.targetCount > 0) {
-                applyAccumulatedGradients(accumulator)
-            }
+                if (accumulator.targetCount > 0) {
+                    applyAccumulatedGradients(accumulator)
+                }
 
-            val optimizerUpdates = (adamStep - initialAdamStep).coerceAtLeast(0)
-            if (adamStep / CHECKPOINT_INTERVAL > initialAdamStep / CHECKPOINT_INTERVAL) {
-                shouldSaveCheckpoint = true
-            }
+                val actualOptimizerUpdates = (adamStep - initialAdamStep).coerceAtLeast(0)
+                check(actualOptimizerUpdates == expectedOptimizerUpdates) {
+                    "The optimizer committed $actualOptimizerUpdates updates; expected $expectedOptimizerUpdates."
+                }
+                if (adamStep / CHECKPOINT_INTERVAL > initialAdamStep / CHECKPOINT_INTERVAL) {
+                    shouldSaveCheckpoint = true
+                }
 
-            val firstTrainableSample = sampleResults.indexOfFirst {
-                it.loss.isFinite() && it.predictionTargetCount > 0
+                completedBatch
+            } finally {
+                // An exception before the optimizer commit must release the accumulated
+                // resident buffer. After a committed update, the manager's PREPARED
+                // journal/checkpoint recovery still decides whether to keep or roll back.
+                val remainingResident = accumulator.resident
+                if (remainingResident != null) {
+                    VulkanTrainingBackend.discardResidentGradientAccumulator(remainingResident)
+                    accumulator.resident = null
+                }
             }
-            val reportedSamples = sampleResults.mapIndexed { index, sample ->
-                sample.copy(
-                    optimizerUpdateCount = if (index == firstTrainableSample) {
-                        optimizerUpdates
-                    } else {
-                        0
-                    }
-                )
-            }
-
-            NeuralTrainingBatchResult(
-                samples = reportedSamples,
-                optimizerUpdateCount = optimizerUpdates,
-                totalPredictionTargetCount = accumulator.targetCount
-            )
         }
 
-        if (shouldSaveCheckpoint) {
+        if (autoCheckpoint && shouldSaveCheckpoint) {
             runCatching { saveCheckpoint() }
                 .onFailure { Log.e(TAG, "Auto-checkpoint save failed", it) }
         }
@@ -1521,7 +1607,11 @@ class ArgusNeuralEngine private constructor(
      * legacy 16-byte floor but cannot safely reserve an additional accumulation tensor.
      * It retains the original per-window Adam update behavior and is restricted to batch 1.
      */
-    private fun trainSingleSampleSequential(text: String): NeuralTrainingBatchResult {
+    private fun trainSingleSampleSequential(
+        text: String,
+        runtimeContextLength: Int,
+        autoCheckpoint: Boolean
+    ): NeuralTrainingBatchResult {
         var shouldSaveCheckpoint = false
         val result = synchronized(modelLock) {
             val initialAdamStep = adamStep
@@ -1550,7 +1640,7 @@ class ArgusNeuralEngine private constructor(
             var weightedLoss = 0f
             var trainedTargets = 0
 
-            if (tokens.size <= maxSeqLen) {
+            if (tokens.size <= runtimeContextLength) {
                 val loss = trainSingleWindow(tokens, currentVocab)
                 if (loss.isFinite()) {
                     contextWindowCount = 1
@@ -1559,11 +1649,11 @@ class ArgusNeuralEngine private constructor(
                     weightedLoss = loss * (tokens.size - 1)
                 }
             } else {
-                val overlapTokens = min(24, maxSeqLen - 1)
-                val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
+                val overlapTokens = min(24, runtimeContextLength - 1)
+                val stride = (runtimeContextLength - overlapTokens).coerceAtLeast(1)
                 var start = 0
                 while (start < tokens.size - 1) {
-                    val end = min(start + maxSeqLen, tokens.size)
+                    val end = min(start + runtimeContextLength, tokens.size)
                     val windowSequence = tokens.subList(start, end)
                     if (windowSequence.size >= 2) {
                         val firstTargetIndex =
@@ -1608,7 +1698,7 @@ class ArgusNeuralEngine private constructor(
             )
         }
 
-        if (shouldSaveCheckpoint) {
+        if (autoCheckpoint && shouldSaveCheckpoint) {
             runCatching { saveCheckpoint() }
                 .onFailure { Log.e(TAG, "Auto-checkpoint save failed", it) }
         }
@@ -1669,9 +1759,28 @@ class ArgusNeuralEngine private constructor(
         val seqLen = seq.size
         if (seqLen < 2) return Float.NaN
 
-        if (updateParameters && gradientAccumulator == null) adamStep++
-        val lr = if (updateParameters && gradientAccumulator == null) {
-            baseLearningRate / (1f + 0.0002f * adamStep)
+        val hostDirectParameters = ArrayList<Float16ParameterArray>(1 + layerCount * 4)
+        hostDirectParameters.add(wEmbed)
+        for (block in blocks) {
+            // The batched backward path forms effective Q/K/V input projections on
+            // the host. Keep only these directly-read matrices plus LoRA synchronized;
+            // the remaining dense matrices stay GPU-resident and are not read back.
+            hostDirectParameters.add(block.wQ)
+            hostDirectParameters.add(block.wK)
+            hostDirectParameters.add(block.wV)
+            if (block.loraQa.size > 0) hostDirectParameters.add(block.loraQa)
+            if (block.loraQb.size > 0) hostDirectParameters.add(block.loraQb)
+            if (block.loraVa.size > 0) hostDirectParameters.add(block.loraVa)
+            if (block.loraVb.size > 0) hostDirectParameters.add(block.loraVb)
+        }
+        check(VulkanTrainingBackend.synchronizeModelParameterTensors(hostDirectParameters)) {
+            "GPU-resident embedding or LoRA weights could not be recovered before host-side training operations."
+        }
+
+        val advancesOptimizerStep = updateParameters && gradientAccumulator == null
+        val nextAdamStep = if (advancesOptimizerStep) Math.addExact(adamStep, 1) else adamStep
+        val lr = if (advancesOptimizerStep) {
+            baseLearningRate / (1f + 0.0002f * nextAdamStep)
         } else {
             0f
         }
@@ -1724,53 +1833,95 @@ class ArgusNeuralEngine private constructor(
                 addLoraProjection(layerInput[t], b.loraVa, b.loraVb, dModel, dModel, loraRank, lf.mV[t], lf.v[t])
             }
 
-            for (h in 0 until nHeads) {
-                val hOffset = h * headDim
-                for (i in 0 until seqLen) {
-                    var maxScore = -Float.MAX_VALUE
-                    for (j in 0..i) {
-                        var dot = 0f
-                        for (d in 0 until headDim) dot += lf.q[i][hOffset + d] * lf.k[j][hOffset + d]
-                        val sc = dot * scale
-                        lf.attnWeights[h][i][j] = sc
-                        if (sc > maxScore) maxScore = sc
+
+            val residentAttentionCompleted = VulkanTrainingBackend.tryApplyResidentAttention(
+                queryRows = lf.q,
+                keyRows = lf.k,
+                valueRows = lf.v,
+                residualRows = layerInput,
+                outputWeights = b.wO,
+                attentionWeights = lf.attnWeights,
+                attentionOutputRows = lf.attnOut,
+                projectedOutputRows = lf.h1PreLN,
+                normalizedOutputRows = lf.h1,
+                modelWidth = dModel,
+                headCount = nHeads
+            )
+            if (!residentAttentionCompleted) {
+                for (h in 0 until nHeads) {
+                    val hOffset = h * headDim
+                    for (i in 0 until seqLen) {
+                        var maxScore = -Float.MAX_VALUE
+                        for (j in 0..i) {
+                            var dot = 0f
+                            for (d in 0 until headDim) dot += lf.q[i][hOffset + d] * lf.k[j][hOffset + d]
+                            val sc = dot * scale
+                            lf.attnWeights[h][i][j] = sc
+                            if (sc > maxScore) maxScore = sc
+                        }
+                        var sumExp = 0f
+                        for (j in 0..i) {
+                            val e = exp(lf.attnWeights[h][i][j] - maxScore)
+                            lf.attnWeights[h][i][j] = e; sumExp += e
+                        }
+                        val invSum = 1.0f / max(sumExp, 1e-9f)
+                        for (j in 0..i) lf.attnWeights[h][i][j] *= invSum
+                        for (d in 0 until headDim) {
+                            var weightedV = 0f
+                            for (j in 0..i) weightedV += lf.attnWeights[h][i][j] * lf.v[j][hOffset + d]
+                            lf.attnOut[i][hOffset + d] = weightedV
+                        }
                     }
-                    var sumExp = 0f
-                    for (j in 0..i) {
-                        val e = exp(lf.attnWeights[h][i][j] - maxScore)
-                        lf.attnWeights[h][i][j] = e; sumExp += e
-                    }
-                    val invSum = 1.0f / max(sumExp, 1e-9f)
-                    for (j in 0..i) lf.attnWeights[h][i][j] *= invSum
-                    for (d in 0 until headDim) {
-                        var weightedV = 0f
-                        for (j in 0..i) weightedV += lf.attnWeights[h][i][j] * lf.v[j][hOffset + d]
-                        lf.attnOut[i][hOffset + d] = weightedV
-                    }
+                }
+    
+    
+                computeLinearBatch(lf.attnOut, b.wO, dModel, dModel, lf.h1PreLN)
+                for (t in 0 until seqLen) {
+                    for (d in 0 until dModel) lf.h1PreLN[t][d] += layerInput[t][d]
+                }
+            }
+            if (!residentAttentionCompleted) {
+                for (t in 0 until seqLen) {
+                    System.arraycopy(lf.h1PreLN[t], 0, lf.h1[t], 0, dModel)
+                    layerNormInPlace(lf.h1[t], dModel)
                 }
             }
 
-            computeLinearBatch(lf.attnOut, b.wO, dModel, dModel, lf.h1PreLN)
-            for (t in 0 until seqLen) {
-                for (d in 0 until dModel) lf.h1PreLN[t][d] += layerInput[t][d]
-                System.arraycopy(lf.h1PreLN[t], 0, lf.h1[t], 0, dModel)
-                layerNormInPlace(lf.h1[t], dModel)
-            }
-
-            computeLinearBatch(lf.h1, b.wGate, dModel, dFf, lf.gate)
-            computeLinearBatch(lf.h1, b.wUp, dModel, dFf, lf.up)
-            for (t in 0 until seqLen) {
-                for (d in 0 until dFf) {
-                    val sig = 1.0f / (1.0f + exp(-lf.gate[t][d]))
-                    lf.act[t][d] = (lf.gate[t][d] * sig) * lf.up[t][d]
+            val residentFeedForwardCompleted =
+                VulkanTrainingBackend.tryApplyResidentFeedForward(
+                    inputRows = lf.h1,
+                    gateWeights = b.wGate,
+                    upWeights = b.wUp,
+                    downWeights = b.wDown,
+                    gateRows = lf.gate,
+                    upRows = lf.up,
+                    activationRows = lf.act,
+                    projectedOutputRows = lf.h2PreLN,
+                    normalizedOutputRows = lf.h2
+                )
+            if (!residentFeedForwardCompleted) {
+                computeLinearBatch(lf.h1, b.wGate, dModel, dFf, lf.gate)
+                computeLinearBatch(lf.h1, b.wUp, dModel, dFf, lf.up)
+                val residentSwiGluCompleted = VulkanTrainingBackend.tryApplyResidentSwiGlu(
+                    gateRows = lf.gate,
+                    upRows = lf.up,
+                    outputRows = lf.act
+                )
+                if (!residentSwiGluCompleted) {
+                    for (t in 0 until seqLen) {
+                        for (d in 0 until dFf) {
+                            val sigmoid = 1.0f / (1.0f + exp(-lf.gate[t][d]))
+                            lf.act[t][d] = (lf.gate[t][d] * sigmoid) * lf.up[t][d]
+                        }
+                    }
                 }
-            }
 
-            computeLinearBatch(lf.act, b.wDown, dFf, dModel, lf.h2PreLN)
-            for (t in 0 until seqLen) {
-                for (d in 0 until dModel) lf.h2PreLN[t][d] += lf.h1[t][d]
-                System.arraycopy(lf.h2PreLN[t], 0, lf.h2[t], 0, dModel)
-                layerNormInPlace(lf.h2[t], dModel)
+                computeLinearBatch(lf.act, b.wDown, dFf, dModel, lf.h2PreLN)
+                for (t in 0 until seqLen) {
+                    for (d in 0 until dModel) lf.h2PreLN[t][d] += lf.h1[t][d]
+                    System.arraycopy(lf.h2PreLN[t], 0, lf.h2[t], 0, dModel)
+                    layerNormInPlace(lf.h2[t], dModel)
+                }
             }
         }
 
@@ -1820,35 +1971,65 @@ class ArgusNeuralEngine private constructor(
 
         val dLogits = Array(seqLen) { FloatArray(currentVocab) }
 
-        // (1) Cross-Entropy & Gradient Accumulation for Output Head
-        for (t in firstTargetIndex until seqLen - 1) {
-            val target = seq[t + 1]
-            if (target !in 0 until currentVocab) continue
-
-            val logitRow = logits[t]
-            var maxLogit = -Float.MAX_VALUE
-            for (vocabIndex in 0 until currentVocab) {
-                if (logitRow[vocabIndex] > maxLogit) maxLogit = logitRow[vocabIndex]
+        // (1) Fused causal cross-entropy and output-head gradient.
+        val targetRows = FloatArray(seqLen) { row ->
+            if (row + 1 < seqLen) seq[row + 1].toFloat() else 0.0f
+        }
+        val stagedLogitGradient = FloatArray(Math.multiplyExact(seqLen, currentVocab))
+        val rowLossStatistics = FloatArray(Math.multiplyExact(seqLen, 2))
+        val crossEntropyOnGpu = VulkanTrainingBackend.isResidentBackwardAvailable &&
+            VulkanTrainingBackend.tryRunResidentBackward(
+                operation = VulkanTrainingBackend.BACKWARD_CROSS_ENTROPY,
+                rows = seqLen,
+                columns = currentVocab,
+                sequenceLength = firstTargetIndex,
+                inputs = arrayOf(flattenRows(logits), targetRows, null),
+                outputs = arrayOf(stagedLogitGradient, rowLossStatistics)
+            )
+        if (crossEntropyOnGpu) {
+            for (time in 0 until seqLen) {
+                System.arraycopy(
+                    stagedLogitGradient,
+                    time * currentVocab,
+                    dLogits[time],
+                    0,
+                    currentVocab
+                )
+                val statisticOffset = time * 2
+                totalLoss += rowLossStatistics[statisticOffset]
+                validSteps += rowLossStatistics[statisticOffset + 1].toInt()
             }
+        } else {
+            // Numerically equivalent fallback for unsupported or failed Vulkan dispatch.
+            for (t in firstTargetIndex until seqLen - 1) {
+                val target = seq[t + 1]
+                if (target !in 0 until currentVocab) continue
 
-            var sumExp = 0f
-            for (vocabIndex in 0 until currentVocab) {
-                sumExp += exp(logitRow[vocabIndex] - maxLogit)
-            }
+                val logitRow = logits[t]
+                var maxLogit = -Float.MAX_VALUE
+                for (vocabIndex in 0 until currentVocab) {
+                    if (logitRow[vocabIndex] > maxLogit) maxLogit = logitRow[vocabIndex]
+                }
 
-            val logProbability =
-                (logitRow[target] - maxLogit) - ln(max(sumExp, 1e-9f))
-            val loss = -logProbability
-            if (loss.isFinite()) {
-                totalLoss += loss
-                validSteps++
-            }
+                var sumExp = 0f
+                for (vocabIndex in 0 until currentVocab) {
+                    sumExp += exp(logitRow[vocabIndex] - maxLogit)
+                }
 
-            val inverseSumExp = 1f / max(sumExp, 1e-9f)
-            for (vocabIndex in 0 until currentVocab) {
-                val probability = exp(logitRow[vocabIndex] - maxLogit) * inverseSumExp
-                val gradient = if (vocabIndex == target) probability - 1f else probability
-                dLogits[t][vocabIndex] = gradient
+                val logProbability =
+                    (logitRow[target] - maxLogit) - ln(max(sumExp, 1e-9f))
+                val loss = -logProbability
+                if (loss.isFinite()) {
+                    totalLoss += loss
+                    validSteps++
+                }
+
+                val inverseSumExp = 1f / max(sumExp, 1e-9f)
+                for (vocabIndex in 0 until currentVocab) {
+                    val probability = exp(logitRow[vocabIndex] - maxLogit) * inverseSumExp
+                    val gradient = if (vocabIndex == target) probability - 1f else probability
+                    dLogits[t][vocabIndex] = gradient
+                }
             }
         }
 
@@ -1900,9 +2081,12 @@ class ArgusNeuralEngine private constructor(
             val dK = Array(seqLen) { FloatArray(dModel) }
             val dV = Array(seqLen) { FloatArray(dModel) }
 
-            for (t in 0 until seqLen - 1) {
-                layerNormBackward(incomingGrad[t], lf.h2PreLN[t], dL_dh2PreLN[t], dModel)
-            }
+            layerNormBackwardBatch(
+                incomingGradients = incomingGrad,
+                preLayerNormRows = lf.h2PreLN,
+                outputGradients = dL_dh2PreLN,
+                rowCount = seqLen - 1
+            )
 
             val dActRows = Array(seqLen) { FloatArray(dFf) }
             computeLinearBatch(
@@ -1916,15 +2100,39 @@ class ArgusNeuralEngine private constructor(
 
             val dUpRows = Array(seqLen) { FloatArray(dFf) }
             val dGateRows = Array(seqLen) { FloatArray(dFf) }
-            for (t in 0 until seqLen - 1) {
-                for (dimension in 0 until dFf) {
-                    val sigmoid = 1.0f / (1.0f + exp(-lf.gate[t][dimension]))
-                    val swish = lf.gate[t][dimension] * sigmoid
-                    val dActValue = dActRows[t][dimension]
-                    dUpRows[t][dimension] = dActValue * swish
-                    val dSwish = dActValue * lf.up[t][dimension]
-                    dGateRows[t][dimension] =
-                        dSwish * (sigmoid * (1f + lf.gate[t][dimension] * (1f - sigmoid)))
+            val backwardRows = seqLen - 1
+            val swigluElementCount = Math.multiplyExact(backwardRows, dFf)
+            val stagedGateGradient = FloatArray(swigluElementCount)
+            val stagedUpGradient = FloatArray(swigluElementCount)
+            val swigluBackwardOnGpu = VulkanTrainingBackend.isResidentBackwardAvailable &&
+                VulkanTrainingBackend.tryRunResidentBackward(
+                    operation = VulkanTrainingBackend.BACKWARD_SWIGLU,
+                    rows = backwardRows,
+                    columns = dFf,
+                    sequenceLength = 0,
+                    inputs = arrayOf(
+                        flattenRows(Array(backwardRows) { row -> lf.gate[row] }),
+                        flattenRows(Array(backwardRows) { row -> lf.up[row] }),
+                        flattenRows(Array(backwardRows) { row -> dActRows[row] })
+                    ),
+                    outputs = arrayOf(stagedGateGradient, stagedUpGradient)
+                )
+            if (swigluBackwardOnGpu) {
+                for (row in 0 until backwardRows) {
+                    System.arraycopy(stagedGateGradient, row * dFf, dGateRows[row], 0, dFf)
+                    System.arraycopy(stagedUpGradient, row * dFf, dUpRows[row], 0, dFf)
+                }
+            } else {
+                for (t in 0 until backwardRows) {
+                    for (dimension in 0 until dFf) {
+                        val sigmoid = 1.0f / (1.0f + exp(-lf.gate[t][dimension]))
+                        val swish = lf.gate[t][dimension] * sigmoid
+                        val dActValue = dActRows[t][dimension]
+                        dUpRows[t][dimension] = dActValue * swish
+                        val dSwish = dActValue * lf.up[t][dimension]
+                        dGateRows[t][dimension] =
+                            dSwish * (sigmoid * (1f + lf.gate[t][dimension] * (1f - sigmoid)))
+                    }
                 }
             }
 
@@ -1993,8 +2201,13 @@ class ArgusNeuralEngine private constructor(
                         dHiddenFromUp[t][dimension] +
                         dL_dh2PreLN[t][dimension]
                 }
-                layerNormBackward(dL_dh1PostLN[t], lf.h1PreLN[t], dL_dh1PreLN[t], dModel)
             }
+            layerNormBackwardBatch(
+                incomingGradients = dL_dh1PostLN,
+                preLayerNormRows = lf.h1PreLN,
+                outputGradients = dL_dh1PreLN,
+                rowCount = seqLen - 1
+            )
 
             val attentionBackwardRows = seqLen - 1
             val attentionOutputRows = Array(attentionBackwardRows) { row -> lf.attnOut[row] }
@@ -2089,19 +2302,73 @@ class ArgusNeuralEngine private constructor(
             )
 
             val dScoreByHead = Array(nHeads) { Array(seqLen) { FloatArray(seqLen) } }
+            val softmaxBackwardRows = Math.multiplyExact(nHeads, attentionBackwardRows)
+            val flattenedProbabilities = FloatArray(
+                Math.multiplyExact(softmaxBackwardRows, seqLen)
+            )
+            val flattenedProbabilityGradients = FloatArray(flattenedProbabilities.size)
             for (head in 0 until nHeads) {
-                for (queryIndex in 0 until seqLen) {
-                    var weightedGradient = 0f
-                    for (keyIndex in 0..queryIndex) {
-                        weightedGradient +=
-                            lf.attnWeights[head][queryIndex][keyIndex] *
-                            dWeightsByHead[head][queryIndex][keyIndex]
+                for (query in 0 until attentionBackwardRows) {
+                    val flatRow = head * attentionBackwardRows + query
+                    System.arraycopy(
+                        lf.attnWeights[head][query],
+                        0,
+                        flattenedProbabilities,
+                        flatRow * seqLen,
+                        seqLen
+                    )
+                    System.arraycopy(
+                        dWeightsByHead[head][query],
+                        0,
+                        flattenedProbabilityGradients,
+                        flatRow * seqLen,
+                        seqLen
+                    )
+                }
+            }
+            val flattenedScoreGradients = FloatArray(flattenedProbabilities.size)
+            val softmaxBackwardOnGpu = VulkanTrainingBackend.isResidentBackwardAvailable &&
+                VulkanTrainingBackend.tryRunResidentBackward(
+                    operation = VulkanTrainingBackend.BACKWARD_CAUSAL_SOFTMAX,
+                    rows = softmaxBackwardRows,
+                    columns = seqLen,
+                    sequenceLength = seqLen,
+                    inputs = arrayOf(
+                        flattenedProbabilities,
+                        flattenedProbabilityGradients,
+                        null
+                    ),
+                    outputs = arrayOf(flattenedScoreGradients),
+                    scale = scale
+                )
+            if (softmaxBackwardOnGpu) {
+                for (head in 0 until nHeads) {
+                    for (query in 0 until attentionBackwardRows) {
+                        val flatRow = (head * attentionBackwardRows + query) * seqLen
+                        System.arraycopy(
+                            flattenedScoreGradients,
+                            flatRow,
+                            dScoreByHead[head][query],
+                            0,
+                            seqLen
+                        )
                     }
-                    for (keyIndex in 0..queryIndex) {
-                        dScoreByHead[head][queryIndex][keyIndex] =
-                            lf.attnWeights[head][queryIndex][keyIndex] *
-                            (dWeightsByHead[head][queryIndex][keyIndex] - weightedGradient) *
-                            scale
+                }
+            } else {
+                for (head in 0 until nHeads) {
+                    for (queryIndex in 0 until seqLen) {
+                        var weightedGradient = 0f
+                        for (keyIndex in 0..queryIndex) {
+                            weightedGradient +=
+                                lf.attnWeights[head][queryIndex][keyIndex] *
+                                dWeightsByHead[head][queryIndex][keyIndex]
+                        }
+                        for (keyIndex in 0..queryIndex) {
+                            dScoreByHead[head][queryIndex][keyIndex] =
+                                lf.attnWeights[head][queryIndex][keyIndex] *
+                                (dWeightsByHead[head][queryIndex][keyIndex] - weightedGradient) *
+                                scale
+                        }
                     }
                 }
             }
@@ -2158,57 +2425,94 @@ class ArgusNeuralEngine private constructor(
             System.arraycopy(flattenRows(qkvGradientOutputs[1]), 0, lg.gradWK, 0, lg.gradWK.size)
             System.arraycopy(flattenRows(qkvGradientOutputs[2]), 0, lg.gradWV, 0, lg.gradWV.size)
 
-            for (time in 0 until attentionBackwardRows) {
-                for (rankIndex in 0 until loraRank) {
-                    val queryMidValue = lf.mQ[time][rankIndex]
-                    val valueMidValue = lf.mV[time][rankIndex]
-                    val queryGradientOffset = rankIndex * dModel
-                    for (dimension in 0 until dModel) {
-                        lg.gradLoraQb[queryGradientOffset + dimension] +=
-                            queryMidValue * dQ[time][dimension]
-                        lg.gradLoraVb[queryGradientOffset + dimension] +=
-                            valueMidValue * dV[time][dimension]
-                    }
-                }
-                for (rankIndex in 0 until loraRank) {
-                    var queryBackProjection = 0f
-                    var valueBackProjection = 0f
-                    val queryWeightOffset = rankIndex * dModel
-                    for (dimension in 0 until dModel) {
-                        queryBackProjection +=
-                            dQ[time][dimension] * b.loraQb[queryWeightOffset + dimension]
-                        valueBackProjection +=
-                            dV[time][dimension] * b.loraVb[queryWeightOffset + dimension]
-                    }
-                    for (dimension in 0 until dModel) {
-                        lg.gradLoraQa[dimension * loraRank + rankIndex] +=
-                            layerInput[time][dimension] * queryBackProjection
-                        lg.gradLoraVa[dimension * loraRank + rankIndex] +=
-                            layerInput[time][dimension] * valueBackProjection
-                    }
-                }
-            }
+            // LoRA B gradients: M^T × dProjection.
+            val queryMidRows = Array(attentionBackwardRows) { row -> lf.mQ[row] }
+            val valueMidRows = Array(attentionBackwardRows) { row -> lf.mV[row] }
+            val queryMidGradientB = Array(loraRank) { FloatArray(dModel) }
+            val valueMidGradientB = Array(loraRank) { FloatArray(dModel) }
+            computeLinearBatch(
+                inputs = transposeRows(queryMidRows),
+                weights = flattenRows(queryGradientRows),
+                inputColumns = attentionBackwardRows,
+                outputColumns = dModel,
+                outputs = queryMidGradientB
+            )
+            computeLinearBatch(
+                inputs = transposeRows(valueMidRows),
+                weights = flattenRows(valueGradientRows),
+                inputColumns = attentionBackwardRows,
+                outputColumns = dModel,
+                outputs = valueMidGradientB
+            )
+            System.arraycopy(flattenRows(queryMidGradientB), 0, lg.gradLoraQb, 0, lg.gradLoraQb.size)
+            System.arraycopy(flattenRows(valueMidGradientB), 0, lg.gradLoraVb, 0, lg.gradLoraVb.size)
 
-            val wQEff = FloatArray(dModel * dModel)
-            val wVEff = FloatArray(dModel * dModel)
-            for (i in 0 until dModel) {
-                for (j in 0 until dModel) {
-                    var qSum = b.wQ[i * dModel + j]
-                    var vSum = b.wV[i * dModel + j]
-                    for (r in 0 until loraRank) {
-                        qSum += b.loraQa[i * loraRank + r] * b.loraQb[r * dModel + j]
-                        vSum += b.loraVa[i * loraRank + r] * b.loraVb[r * dModel + j]
-                    }
-                    wQEff[i * dModel + j] = qSum
-                    wVEff[i * dModel + j] = vSum
-                }
-            }
+            // LoRA A gradients and the low-rank contribution to dLayerInput.
+            val queryRankGradients = Array(attentionBackwardRows) { FloatArray(loraRank) }
+            val valueRankGradients = Array(attentionBackwardRows) { FloatArray(loraRank) }
+            computeLinearBatch(
+                inputs = queryGradientRows,
+                weights = b.loraQb,
+                inputColumns = dModel,
+                outputColumns = loraRank,
+                outputs = queryRankGradients,
+                transposeWeights = true
+            )
+            computeLinearBatch(
+                inputs = valueGradientRows,
+                weights = b.loraVb,
+                inputColumns = dModel,
+                outputColumns = loraRank,
+                outputs = valueRankGradients,
+                transposeWeights = true
+            )
 
+            val layerInputTranspose = transposeRows(inputRowsForGradient)
+            val queryGradientA = Array(dModel) { FloatArray(loraRank) }
+            val valueGradientA = Array(dModel) { FloatArray(loraRank) }
+            computeLinearBatch(
+                inputs = layerInputTranspose,
+                weights = flattenRows(queryRankGradients),
+                inputColumns = attentionBackwardRows,
+                outputColumns = loraRank,
+                outputs = queryGradientA
+            )
+            computeLinearBatch(
+                inputs = layerInputTranspose,
+                weights = flattenRows(valueRankGradients),
+                inputColumns = attentionBackwardRows,
+                outputColumns = loraRank,
+                outputs = valueGradientA
+            )
+            System.arraycopy(flattenRows(queryGradientA), 0, lg.gradLoraQa, 0, lg.gradLoraQa.size)
+            System.arraycopy(flattenRows(valueGradientA), 0, lg.gradLoraVa, 0, lg.gradLoraVa.size)
+
+            val queryLoRaInputGradient = Array(attentionBackwardRows) { FloatArray(dModel) }
+            val valueLoRaInputGradient = Array(attentionBackwardRows) { FloatArray(dModel) }
+            computeLinearBatch(
+                inputs = queryRankGradients,
+                weights = b.loraQa,
+                inputColumns = loraRank,
+                outputColumns = dModel,
+                outputs = queryLoRaInputGradient,
+                transposeWeights = true
+            )
+            computeLinearBatch(
+                inputs = valueRankGradients,
+                weights = b.loraVa,
+                inputColumns = loraRank,
+                outputColumns = dModel,
+                outputs = valueLoRaInputGradient,
+                transposeWeights = true
+            )
+
+            // Base Q/K/V and LoRA input gradients are dispatched as separate Vulkan
+            // products. This avoids materializing effective Q/V matrices on the host.
             val inputGradientByProjection =
                 Array(3) { Array(attentionBackwardRows) { FloatArray(dModel) } }
             computeBatchedLinear(
                 inputs = arrayOf(queryGradientRows, keyGradientRows, valueGradientRows),
-                weights = arrayOf(wQEff, b.wK.toFloatArray(), wVEff),
+                weights = arrayOf(b.wQ, b.wK, b.wV),
                 outputs = inputGradientByProjection,
                 inputColumns = dModel,
                 outputColumns = dModel,
@@ -2225,19 +2529,44 @@ class ArgusNeuralEngine private constructor(
                         dL_dh1PreLN[time][dimension] +
                         queryInputGradient[dimension] +
                         keyInputGradient[dimension] +
-                        valueInputGradient[dimension]
+                        valueInputGradient[dimension] +
+                        queryLoRaInputGradient[time][dimension] +
+                        valueLoRaInputGradient[time][dimension]
                 }
             }
 
             if (layer > 0) {
                 incomingGrad = dLayerInput
             } else {
-                for (time in 0 until attentionBackwardRows) {
-                    val token = seq[time]
-                    if (token !in 0 until vocabCap) continue
-                    val embeddingOffset = token * dModel
-                    for (dimension in 0 until dModel) {
-                        gradWEmbed[embeddingOffset + dimension] += dLayerInput[time][dimension] * embedScale
+                val embeddingBackwardTokens = FloatArray(attentionBackwardRows) { row ->
+                    seq[row].toFloat()
+                }
+                val embeddingInputGradients = flattenRows(
+                    Array(attentionBackwardRows) { row -> dLayerInput[row] }
+                )
+                val embeddingGradientOnGpu = VulkanTrainingBackend.isResidentBackwardAvailable &&
+                    VulkanTrainingBackend.tryRunResidentBackward(
+                        operation = VulkanTrainingBackend.BACKWARD_EMBEDDING_GRADIENT,
+                        rows = vocabCap,
+                        columns = dModel,
+                        sequenceLength = attentionBackwardRows,
+                        inputs = arrayOf(
+                            embeddingBackwardTokens,
+                            embeddingInputGradients,
+                            null
+                        ),
+                        outputs = arrayOf(gradWEmbed),
+                        scale = embedScale
+                    )
+                if (!embeddingGradientOnGpu) {
+                    for (time in 0 until attentionBackwardRows) {
+                        val token = seq[time]
+                        if (token !in 0 until vocabCap) continue
+                        val embeddingOffset = token * dModel
+                        for (dimension in 0 until dModel) {
+                            gradWEmbed[embeddingOffset + dimension] +=
+                                dLayerInput[time][dimension] * embedScale
+                        }
                     }
                 }
             }
@@ -2343,11 +2672,44 @@ class ArgusNeuralEngine private constructor(
                     "Gradient accumulator tensor count does not match the active architecture."
                 }
                 for (tensorIndex in sampleGradients.indices) {
-                    val source = sampleGradients[tensorIndex]
-                    val destination = gradientAccumulator.gradients[tensorIndex]
-                    require(source.size <= destination.size) {
+                    require(sampleGradients[tensorIndex].size <= gradientAccumulator.gradients[tensorIndex].size) {
                         "Sample gradient exceeds the resident model tensor."
                     }
+                }
+
+                val residentAccumulator = gradientAccumulator.resident
+                if (residentAccumulator != null &&
+                    VulkanTrainingBackend.accumulateResidentGradients(
+                        residentAccumulator,
+                        sampleGradients.toTypedArray(),
+                        validSteps
+                    )) {
+                    gradientAccumulator.targetCount = Math.addExact(
+                        gradientAccumulator.targetCount,
+                        validSteps
+                    )
+                    return totalLoss / validSteps
+                }
+
+                if (residentAccumulator != null) {
+                    // Failed dispatches do not swap active/spare; recover the committed
+                    // prefix before appending this sample with the CPU fallback.
+                    if (!VulkanTrainingBackend.downloadResidentGradientAccumulator(
+                            residentAccumulator,
+                            gradientAccumulator.gradients
+                        )) {
+                        VulkanTrainingBackend.discardResidentGradientAccumulator(residentAccumulator)
+                        gradientAccumulator.resident = null
+                        throw IllegalStateException(
+                            "Vulkan gradient accumulation failed and its committed sums could not be recovered."
+                        )
+                    }
+                    gradientAccumulator.resident = null
+                }
+
+                for (tensorIndex in sampleGradients.indices) {
+                    val source = sampleGradients[tensorIndex]
+                    val destination = gradientAccumulator.gradients[tensorIndex]
                     for (elementIndex in source.indices) {
                         destination[elementIndex] += source[elementIndex] * validSteps
                     }
@@ -2360,29 +2722,8 @@ class ArgusNeuralEngine private constructor(
             return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
 
-        var sumSquares = 0f
-        sumSquares += computeSumSquares(gradWHead)
-        sumSquares += computeSumSquares(gradWEmbed)
-        for (lg in layerGrads) {
-            sumSquares += computeSumSquares(lg.gradWDown)
-            sumSquares += computeSumSquares(lg.gradWUp)
-            sumSquares += computeSumSquares(lg.gradWGate)
-            sumSquares += computeSumSquares(lg.gradWO)
-            sumSquares += computeSumSquares(lg.gradWQ)
-            sumSquares += computeSumSquares(lg.gradWK)
-            sumSquares += computeSumSquares(lg.gradWV)
-            sumSquares += computeSumSquares(lg.gradLoraQa)
-            sumSquares += computeSumSquares(lg.gradLoraQb)
-            sumSquares += computeSumSquares(lg.gradLoraVa)
-            sumSquares += computeSumSquares(lg.gradLoraVb)
-        }
-
-        val totalNorm = sqrt(sumSquares)
-        if (!totalNorm.isFinite()) { adamStep--; return Float.NaN }
-        val clipFactor = if (totalNorm > maxGradNorm) maxGradNorm / (totalNorm + 1e-6f) else 1.0f
-
-        val beta1Pow = Math.pow(beta1.toDouble(), adamStep.toDouble()).toFloat()
-        val beta2Pow = Math.pow(beta2.toDouble(), adamStep.toDouble()).toFloat()
+        val beta1Pow = Math.pow(beta1.toDouble(), nextAdamStep.toDouble()).toFloat()
+        val beta2Pow = Math.pow(beta2.toDouble(), nextAdamStep.toDouble()).toFloat()
         val biasCorr1 = 1f - beta1Pow
         val biasCorr2 = 1f - beta2Pow
 
@@ -2413,9 +2754,30 @@ class ArgusNeuralEngine private constructor(
             parameterList.add(b.loraVb); gradientList.add(lg.gradLoraVb); firstMomentList.add(b.mLoraVb); secondMomentList.add(b.vLoraVb); weightDecayList.add(0f)
         }
 
+        val gradientGroups = gradientList.toTypedArray()
+        val clippedOnGpu =
+            tryNormalizeAndClipGradientsOnVulkan(gradientGroups, maxGradNorm)
+        val clipFactor = if (clippedOnGpu) {
+            1.0f
+        } else {
+            var sumSquares = 0f
+            for (gradient in gradientGroups) {
+                sumSquares += computeSumSquares(gradient)
+            }
+            val totalNorm = sqrt(sumSquares)
+            if (!totalNorm.isFinite()) {
+                return Float.NaN
+            }
+            if (totalNorm > maxGradNorm) {
+                maxGradNorm / (totalNorm + 1e-6f)
+            } else {
+                1.0f
+            }
+        }
+
         applyAdamWUpdate(
             parameters = parameterList.toTypedArray(),
-            gradients = gradientList.toTypedArray(),
+            gradients = gradientGroups,
             firstMoments = firstMomentList.toTypedArray(),
             secondMoments = secondMomentList.toTypedArray(),
             weightDecayByGroup = weightDecayList.toFloatArray(),
@@ -2424,9 +2786,30 @@ class ArgusNeuralEngine private constructor(
             biasCorrection2 = biasCorr2,
             gradientClipFactor = clipFactor
         )
+        if (advancesOptimizerStep) adamStep = nextAdamStep
 
         return if (validSteps > 0) totalLoss / validSteps else Float.NaN
     }
+
+    private fun currentNamedParameterTensors(): List<VulkanModelParameterTensor> =
+        buildList(2 + layerCount * 11) {
+            add(VulkanModelParameterTensor("token.embedding.weight", wEmbed))
+            add(VulkanModelParameterTensor("lm_head.weight", wHead))
+            for ((layerIndex, block) in blocks.withIndex()) {
+                val prefix = "layers.$layerIndex"
+                add(VulkanModelParameterTensor("$prefix.attention.query.weight", block.wQ))
+                add(VulkanModelParameterTensor("$prefix.attention.key.weight", block.wK))
+                add(VulkanModelParameterTensor("$prefix.attention.value.weight", block.wV))
+                add(VulkanModelParameterTensor("$prefix.attention.output.weight", block.wO))
+                add(VulkanModelParameterTensor("$prefix.feed_forward.gate.weight", block.wGate))
+                add(VulkanModelParameterTensor("$prefix.feed_forward.up.weight", block.wUp))
+                add(VulkanModelParameterTensor("$prefix.feed_forward.down.weight", block.wDown))
+                add(VulkanModelParameterTensor("$prefix.adapter.q.a", block.loraQa))
+                add(VulkanModelParameterTensor("$prefix.adapter.q.b", block.loraQb))
+                add(VulkanModelParameterTensor("$prefix.adapter.v.a", block.loraVa))
+                add(VulkanModelParameterTensor("$prefix.adapter.v.b", block.loraVb))
+            }
+        }
 
     private fun currentParameterArrays(): Array<Float16ParameterArray> {
         val arrays = ArrayList<Float16ParameterArray>(2 + layerCount * 11)
@@ -2488,12 +2871,58 @@ class ArgusNeuralEngine private constructor(
         return arrays.toTypedArray()
     }
 
+    private fun tryNormalizeAndClipGradientsOnVulkan(
+        gradients: Array<FloatArray>,
+        maximumGradientNorm: Float
+    ): Boolean {
+        if (!VulkanTrainingBackend.isResidentGradientAccumulatorAvailable) return false
+        val accumulator = VulkanTrainingBackend.createResidentGradientAccumulator(gradients)
+            ?: return false
+        try {
+            if (!VulkanTrainingBackend.accumulateResidentGradients(
+                    accumulator,
+                    gradients,
+                    targetWeight = 1
+                )) {
+                return false
+            }
+            if (VulkanTrainingBackend.finalizeResidentGradientAccumulator(
+                    accumulator,
+                    gradients,
+                    targetCount = 1,
+                    maximumGradientNorm = maximumGradientNorm
+                )) {
+                return true
+            }
+            if (!VulkanTrainingBackend.downloadResidentGradientAccumulator(
+                    accumulator,
+                    gradients
+                )) {
+                throw IllegalStateException(
+                    "Vulkan gradient clipping failed and its original gradients could not be recovered."
+                )
+            }
+            return false
+        } finally {
+            if (!accumulator.released) {
+                VulkanTrainingBackend.discardResidentGradientAccumulator(accumulator)
+            }
+        }
+    }
+
     private fun createBatchGradientAccumulator(): BatchGradientAccumulator {
         val parameters = currentParameterArrays()
+        val gradients = Array(parameters.size) { index ->
+            FloatArray(parameters[index].size)
+        }
+        val resident = if (VulkanTrainingBackend.isResidentGradientAccumulatorAvailable) {
+            VulkanTrainingBackend.createResidentGradientAccumulator(gradients)
+        } else {
+            null
+        }
         return BatchGradientAccumulator(
-            gradients = Array(parameters.size) { index ->
-                FloatArray(parameters[index].size)
-            }
+            gradients = gradients,
+            resident = resident
         )
     }
 
@@ -2513,53 +2942,99 @@ class ArgusNeuralEngine private constructor(
                 parameters.size == secondMoments.size
         ) { "Optimizer tensor groups do not match the active architecture." }
 
-        var sumSquares = 0f
         for (index in gradients.indices) {
             require(
                 gradients[index].size <= parameters[index].size &&
                     parameters[index].size == firstMoments[index].size &&
                     parameters[index].size == secondMoments[index].size
             ) { "Optimizer tensor shape mismatch at index $index." }
-            normalizeGradient(gradients[index], accumulator.targetCount.toFloat())
-            sumSquares += computeSumSquares(gradients[index])
         }
 
-        val totalNorm = sqrt(sumSquares)
-        if (!totalNorm.isFinite()) {
-            throw IllegalStateException("Accumulated gradient norm is not finite.")
+        var clippedOnGpu = false
+        val residentAccumulator = accumulator.resident
+        var residentGradient: VulkanTensorAllocation? = null
+        if (residentAccumulator != null) {
+            clippedOnGpu = VulkanTrainingBackend.finalizeResidentGradientAccumulator(
+                accumulator = residentAccumulator,
+                destinationTensors = gradients,
+                targetCount = accumulator.targetCount,
+                maximumGradientNorm = maxGradNorm,
+                retainResidentBuffer = true
+            )
+            if (clippedOnGpu) {
+                // The finalizer swaps the normalized/clipped result into the active
+                // allocation; keep it alive so AdamW can consume it without re-upload.
+                residentGradient = residentAccumulator.active
+            } else if (!VulkanTrainingBackend.downloadResidentGradientAccumulator(
+                    residentAccumulator,
+                    gradients
+                )) {
+                VulkanTrainingBackend.discardResidentGradientAccumulator(residentAccumulator)
+                accumulator.resident = null
+                throw IllegalStateException(
+                    "Vulkan gradient norm/clipping failed and its committed sums could not be recovered."
+                )
+            }
+            accumulator.resident = null
         }
-        val clipFactor =
-            if (totalNorm > maxGradNorm) maxGradNorm / (totalNorm + 1e-6f) else 1.0f
 
-        adamStep++
-        val learningRate = baseLearningRate / (1f + 0.0002f * adamStep)
-        val biasCorrection1 = 1f -
-            Math.pow(beta1.toDouble(), adamStep.toDouble()).toFloat()
-        val biasCorrection2 = 1f -
-            Math.pow(beta2.toDouble(), adamStep.toDouble()).toFloat()
-        val weightDecayByGroup = FloatArray(parameters.size).also { values ->
-            for (layer in 0 until layerCount) {
-                val offset = 2 + layer * 11
-                for (index in 0 until 7) values[offset + index] = weightDecay
+        try {
+            var sumSquares = 0f
+            if (!clippedOnGpu) {
+                for (gradient in gradients) {
+                    normalizeGradient(gradient, accumulator.targetCount.toFloat())
+                    sumSquares += computeSumSquares(gradient)
+                }
+            }
+
+            val totalNorm = if (clippedOnGpu) 0.0f else sqrt(sumSquares)
+            if (!clippedOnGpu && !totalNorm.isFinite()) {
+                throw IllegalStateException("Accumulated gradient norm is not finite.")
+            }
+            val clipFactor = if (clippedOnGpu) {
+                1.0f
+            } else if (totalNorm > maxGradNorm) {
+                maxGradNorm / (totalNorm + 1e-6f)
+            } else {
+                1.0f
+            }
+
+            val nextAdamStep = Math.addExact(adamStep, 1)
+            val learningRate = baseLearningRate / (1f + 0.0002f * nextAdamStep)
+            val biasCorrection1 = 1f -
+                Math.pow(beta1.toDouble(), nextAdamStep.toDouble()).toFloat()
+            val biasCorrection2 = 1f -
+                Math.pow(beta2.toDouble(), nextAdamStep.toDouble()).toFloat()
+            val weightDecayByGroup = FloatArray(parameters.size).also { values ->
+                for (layer in 0 until layerCount) {
+                    val offset = 2 + layer * 11
+                    for (index in 0 until 7) values[offset + index] = weightDecay
+                }
+            }
+
+            applyAdamWUpdate(
+                parameters = parameters,
+                gradients = gradients,
+                firstMoments = firstMoments,
+                secondMoments = secondMoments,
+                weightDecayByGroup = weightDecayByGroup,
+                learningRate = learningRate,
+                biasCorrection1 = biasCorrection1,
+                biasCorrection2 = biasCorrection2,
+                gradientClipFactor = clipFactor,
+                residentGradient = residentGradient
+            )
+            adamStep = nextAdamStep
+        } finally {
+            residentAccumulator?.let { value ->
+                VulkanTrainingBackend.discardResidentGradientAccumulator(value)
             }
         }
-
-        applyAdamWUpdate(
-            parameters = parameters,
-            gradients = gradients,
-            firstMoments = firstMoments,
-            secondMoments = secondMoments,
-            weightDecayByGroup = weightDecayByGroup,
-            learningRate = learningRate,
-            biasCorrection1 = biasCorrection1,
-            biasCorrection2 = biasCorrection2,
-            gradientClipFactor = clipFactor
-        )
     }
 
     /**
-     * Executes one logical AdamW update. Vulkan stages FP16 weights through the
-     * existing FP32 optimizer kernel; Kotlin remains the authoritative fallback.
+     * Executes one logical AdamW update. The preferred Vulkan path updates resident
+     * FP16 weights and FP32 moments in place; staged Vulkan and Kotlin remain fallbacks.
      */
     private fun applyAdamWUpdate(
         parameters: Array<Float16ParameterArray>,
@@ -2570,7 +3045,34 @@ class ArgusNeuralEngine private constructor(
         learningRate: Float,
         biasCorrection1: Float,
         biasCorrection2: Float,
-        gradientClipFactor: Float
+        gradientClipFactor: Float,
+        residentGradient: VulkanTensorAllocation? = null
+    ) {
+        applyAdamWUpdateTransaction(
+            parameters = parameters,
+            gradients = gradients,
+            firstMoments = firstMoments,
+            secondMoments = secondMoments,
+            weightDecayByGroup = weightDecayByGroup,
+            learningRate = learningRate,
+            biasCorrection1 = biasCorrection1,
+            biasCorrection2 = biasCorrection2,
+            gradientClipFactor = gradientClipFactor,
+            residentGradient = residentGradient
+        )
+    }
+
+    private fun applyAdamWUpdateTransaction(
+        parameters: Array<Float16ParameterArray>,
+        gradients: Array<FloatArray>,
+        firstMoments: Array<FloatArray>,
+        secondMoments: Array<FloatArray>,
+        weightDecayByGroup: FloatArray,
+        learningRate: Float,
+        biasCorrection1: Float,
+        biasCorrection2: Float,
+        gradientClipFactor: Float,
+        residentGradient: VulkanTensorAllocation? = null
     ) {
         require(parameters.isNotEmpty()) {
             "AdamW requires at least one parameter group."
@@ -2584,7 +3086,9 @@ class ArgusNeuralEngine private constructor(
             "AdamW tensor and weight-decay group counts must match."
         }
 
-        if (VulkanTrainingBackend.tryApplyFp16AdamWUpdate(
+        val optimizerOperationCount = gradients.sumOf { gradient -> gradient.size.toLong() }
+        val gpuDispatchStartNanos = System.nanoTime()
+        val gpuOrStagedUpdateCompleted = VulkanTrainingBackend.tryApplyFp16AdamWUpdate(
                 parameters = parameters,
                 gradients = gradients,
                 firstMoments = firstMoments,
@@ -2596,19 +3100,89 @@ class ArgusNeuralEngine private constructor(
                 biasCorrection1 = biasCorrection1,
                 biasCorrection2 = biasCorrection2,
                 epsilon = epsilon,
-                gradientClipFactor = gradientClipFactor
-            )) {
+                gradientClipFactor = gradientClipFactor,
+                residentGradient = residentGradient
+            )
+        if (gpuOrStagedUpdateCompleted) {
+            runCatching {
+                synchronizeVulkanModelTensorResidency("Vulkan AdamW parameter update")
+            }.onFailure { error ->
+                Log.w(
+                    TAG,
+                    "AdamW committed successfully, but model-residency telemetry/reconciliation needs retry.",
+                    error
+                )
+            }
+            VulkanTrainingBackend.recordGpuAdamWTiming(
+                optimizerOperationCount,
+                System.nanoTime() - gpuDispatchStartNanos
+            )
             return
         }
 
-        for (index in parameters.indices) {
+        // Compare complete CPU commit cost against the complete GPU transaction.
+        // The timer starts after a rejected Vulkan attempt so CPU calibration does not
+        // inherit failed-GPU dispatch overhead.
+        val cpuOperationCount = optimizerOperationCount
+        val cpuDispatchStartNanos = System.nanoTime()
+
+        // Validate every CPU update before mutating any authoritative model or
+        // optimizer tensor. This keeps the fallback transactional without allocating
+        // a second full copy of the model, first moments, or second moments.
+        for (groupIndex in parameters.indices) {
+            val parameter = parameters[groupIndex]
+            val gradient = gradients[groupIndex]
+            val firstMoment = firstMoments[groupIndex]
+            val secondMoment = secondMoments[groupIndex]
             require(
-                gradients[index].size <= parameters[index].size &&
-                    parameters[index].size == firstMoments[index].size &&
-                    parameters[index].size == secondMoments[index].size
+                gradient.size <= parameter.size &&
+                    parameter.size == firstMoment.size &&
+                    parameter.size == secondMoment.size
             ) {
-                "AdamW tensor shape mismatch at parameter group $index."
+                "AdamW tensor shape mismatch at parameter group $groupIndex."
             }
+            val weightDecayValue = weightDecayByGroup[groupIndex]
+            require(weightDecayValue.isFinite() && weightDecayValue >= 0f) {
+                "AdamW weight decay must be finite and non-negative."
+            }
+            for (elementIndex in gradient.indices) {
+                val clippedGradient = gradient[elementIndex] * gradientClipFactor
+                val oldParameter = parameter[elementIndex]
+                val oldFirstMoment = firstMoment[elementIndex]
+                val oldSecondMoment = secondMoment[elementIndex]
+                require(
+                    clippedGradient.isFinite() &&
+                        oldParameter.isFinite() &&
+                        oldFirstMoment.isFinite() &&
+                        oldSecondMoment.isFinite() &&
+                        oldSecondMoment >= 0f
+                ) {
+                    "AdamW CPU fallback input contains a non-finite or invalid value at group $groupIndex, index $elementIndex."
+                }
+
+                val nextFirstMoment =
+                    beta1 * oldFirstMoment + (1f - beta1) * clippedGradient
+                val nextSecondMoment =
+                    beta2 * oldSecondMoment +
+                        (1f - beta2) * clippedGradient * clippedGradient
+                require(
+                    nextFirstMoment.isFinite() &&
+                        nextSecondMoment.isFinite() &&
+                        nextSecondMoment >= 0f
+                ) {
+                    "AdamW CPU fallback produced invalid moments at group $groupIndex, index $elementIndex."
+                }
+                val correctedFirstMoment = nextFirstMoment / biasCorrection1
+                val correctedSecondMoment = nextSecondMoment / biasCorrection2
+                val update =
+                    correctedFirstMoment / (sqrt(correctedSecondMoment) + epsilon) +
+                        weightDecayValue * oldParameter
+                Float16Codec.fromFiniteFloat(oldParameter - learningRate * update)
+            }
+        }
+
+        // Commit only after every parameter group has passed numerical validation.
+        for (index in parameters.indices) {
             applyClip(gradients[index], gradientClipFactor)
             adamUpdate(
                 param = parameters[index],
@@ -2621,6 +3195,19 @@ class ArgusNeuralEngine private constructor(
                 wd = weightDecayByGroup[index]
             )
         }
+        runCatching {
+            synchronizeVulkanModelTensorResidency("Kotlin AdamW fallback parameter update")
+        }.onFailure { error ->
+            Log.w(
+                TAG,
+                "CPU AdamW committed successfully, but Vulkan model-residency reconciliation needs retry.",
+                error
+            )
+        }
+        VulkanTrainingBackend.recordCpuAdamWTiming(
+            cpuOperationCount,
+            System.nanoTime() - cpuDispatchStartNanos
+        )
     }
 
     private fun normalizeGradient(grad: FloatArray, div: Float) {
@@ -2772,6 +3359,9 @@ class ArgusNeuralEngine private constructor(
             transposeWeights = transposeWeights
         )
         if (fp16Dispatched) return
+        check(VulkanTrainingBackend.synchronizeModelParameterTensor(weights)) {
+            "GPU-resident linear weights could not be recovered before CPU fallback."
+        }
 
         computeLinearBatch(
             inputs = inputs,
@@ -2801,6 +3391,13 @@ class ArgusNeuralEngine private constructor(
         )
         if (dispatchedToVulkan) return
 
+        val operationCount = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(inputs.size.toLong(), inputColumns.toLong()),
+                outputColumns.toLong()
+            )
+        }.getOrNull()
+        val cpuStartNanos = System.nanoTime()
         if (transposeWeights) {
             for (row in inputs.indices) {
                 computeLinearTransposed(
@@ -2822,6 +3419,12 @@ class ArgusNeuralEngine private constructor(
                 )
             }
         }
+        if (operationCount != null) {
+            VulkanTrainingBackend.recordCpuLinearTiming(
+                operationCount,
+                System.nanoTime() - cpuStartNanos
+            )
+        }
     }
 
     private fun computeBatchedLinear(
@@ -2832,15 +3435,31 @@ class ArgusNeuralEngine private constructor(
         outputColumns: Int,
         transposeWeights: Boolean = false
     ) {
+        val sharedInput = inputs.firstOrNull()
+        val residentDispatched = sharedInput != null &&
+            inputs.all { batchInput -> batchInput === sharedInput } &&
+            VulkanTrainingBackend.tryApplyResidentProjectionSet(
+                inputRows = sharedInput,
+                weightTensors = weights,
+                outputRows = outputs,
+                inputColumns = inputColumns,
+                outputColumns = outputColumns,
+                transposeWeights = transposeWeights
+            )
+        if (residentDispatched) return
+
         val fp16Dispatched = VulkanTrainingBackend.tryApplyFp16BatchedLinear(
             inputBatches = inputs,
-            weightBatches = Array(weights.size) { index -> weights[index].toShortArray() },
+            weightBatches = weights,
             outputBatches = outputs,
             inputColumns = inputColumns,
             outputColumns = outputColumns,
             transposeWeights = transposeWeights
         )
         if (fp16Dispatched) return
+        check(VulkanTrainingBackend.synchronizeModelParameterTensors(weights.toList())) {
+            "GPU-resident batched weights could not be recovered before CPU fallback."
+        }
 
         val fp32Weights = Array(weights.size) { index -> weights[index].toFloatArray() }
         computeBatchedLinear(
@@ -2876,6 +3495,16 @@ class ArgusNeuralEngine private constructor(
         )
         if (dispatchedToVulkan) return
 
+        val operationCount = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(
+                    Math.multiplyExact(inputs.size.toLong(), inputs[0].size.toLong()),
+                    inputColumns.toLong()
+                ),
+                outputColumns.toLong()
+            )
+        }.getOrNull()
+        val cpuStartNanos = System.nanoTime()
         for (batch in inputs.indices) {
             val weight = weights[batch]
             require(inputs[batch].size == outputs[batch].size) {
@@ -2900,6 +3529,12 @@ class ArgusNeuralEngine private constructor(
                     )
                 }
             }
+        }
+        if (operationCount != null) {
+            VulkanTrainingBackend.recordCpuLinearTiming(
+                operationCount,
+                System.nanoTime() - cpuStartNanos
+            )
         }
     }
 
@@ -2990,6 +3625,67 @@ class ArgusNeuralEngine private constructor(
         for (i in 0 until dim) vec[i] = (vec[i] - mean) * invStd
     }
 
+    private fun layerNormBackwardBatch(
+        incomingGradients: Array<FloatArray>,
+        preLayerNormRows: Array<FloatArray>,
+        outputGradients: Array<FloatArray>,
+        rowCount: Int
+    ) {
+        require(rowCount in 1..incomingGradients.size &&
+            rowCount <= preLayerNormRows.size &&
+            rowCount <= outputGradients.size) {
+            "LayerNorm backward batch dimensions are invalid."
+        }
+        require(
+            (0 until rowCount).all { row ->
+                incomingGradients[row].size == dModel &&
+                    preLayerNormRows[row].size == dModel &&
+                    outputGradients[row].size == dModel
+            }
+        ) {
+            "LayerNorm backward tensors must match the active model width."
+        }
+
+        val flattenedIncoming = flattenRows(
+            Array(rowCount) { row -> incomingGradients[row] }
+        )
+        val flattenedInputs = flattenRows(
+            Array(rowCount) { row -> preLayerNormRows[row] }
+        )
+        val flattenedOutput = FloatArray(Math.multiplyExact(rowCount, dModel))
+        val appliedOnGpu = VulkanTrainingBackend.isResidentBackwardAvailable &&
+            VulkanTrainingBackend.tryRunResidentBackward(
+                operation = VulkanTrainingBackend.BACKWARD_LAYER_NORM,
+                rows = rowCount,
+                columns = dModel,
+                sequenceLength = 0,
+                inputs = arrayOf(flattenedIncoming, flattenedInputs, null),
+                outputs = arrayOf(flattenedOutput),
+                epsilon = 1.0e-5f
+            )
+
+        if (appliedOnGpu) {
+            for (row in 0 until rowCount) {
+                System.arraycopy(
+                    flattenedOutput,
+                    row * dModel,
+                    outputGradients[row],
+                    0,
+                    dModel
+                )
+            }
+        } else {
+            for (row in 0 until rowCount) {
+                layerNormBackward(
+                    incomingGradients[row],
+                    preLayerNormRows[row],
+                    outputGradients[row],
+                    dModel
+                )
+            }
+        }
+    }
+
     private fun layerNormBackward(dY: FloatArray, xPreLN: FloatArray, dX: FloatArray, dim: Int) {
         var mean = 0f
         for (i in 0 until dim) mean += xPreLN[i]
@@ -3061,12 +3757,98 @@ class ArgusNeuralEngine private constructor(
     fun saveCheckpoint(): Boolean {
         return try {
             synchronized(modelLock) {
+                check(VulkanTrainingBackend.synchronizeTrainingStateMirrors()) {
+                    "GPU model or optimizer state could not be recovered before checkpoint serialization."
+                }
                 writeArg4Checkpoint()
             }
             val file = File(context.filesDir, "argus_model_weights.bin")
-            file.isFile && file.length() >= ARG4_HEADER_SIZE.toLong()
+            checkpointStateVerified = false
+            val verified = verifyArg4CheckpointFile(file)
+            checkpointStateVerified = verified
+            if (!verified) {
+                Log.e(TAG, "ARG4 checkpoint read-back verification failed.")
+            }
+            verified
         } catch (t: Throwable) {
             Log.e(TAG, "Checkpoint save failed", t)
+            false
+        }
+    }
+
+    /**
+     * Independently re-reads the committed ARG4 file and verifies its declared length
+     * and payload CRC32 before a Genesis identity or checkpoint-ready state is published.
+     * The payload is streamed through a bounded buffer; no complete checkpoint copy is
+     * materialized in the app heap.
+     */
+    private fun verifyArg4CheckpointFile(file: File): Boolean {
+        return try {
+            require(file.isFile && file.length() >= ARG4_HEADER_SIZE.toLong()) {
+                "ARG4 checkpoint is missing or shorter than its fixed header."
+            }
+
+            val headerBytes = FileInputStream(file).use { input ->
+                input.readFully(ARG4_HEADER_SIZE)
+            }
+            val header = ByteBuffer.wrap(headerBytes).order(ByteOrder.LITTLE_ENDIAN)
+            require(
+                header.get() == MAGIC_0 && header.get() == MAGIC_1 &&
+                    header.get() == MAGIC_2 && header.get() == MAGIC_4
+            ) {
+                "ARG4 checkpoint read-back magic is invalid."
+            }
+            require(header.int == ARG4_CHECKPOINT_VERSION) {
+                "ARG4 checkpoint read-back version is unsupported."
+            }
+            require(header.int == ARG4_HEADER_SIZE) {
+                "ARG4 checkpoint read-back header size is invalid."
+            }
+
+            header.position(ARG4_HEADER_SIZE - 16)
+            val payloadByteCount = header.long
+            val expectedChecksum = header.int.toLong() and 0xFFFF_FFFFL
+            val flags = header.int
+            require(payloadByteCount > 0L) {
+                "ARG4 checkpoint read-back payload length is invalid."
+            }
+            require(flags == 0) {
+                "ARG4 checkpoint read-back contains unsupported flags."
+            }
+
+            val expectedFileLength = Math.addExact(
+                ARG4_HEADER_SIZE.toLong(),
+                payloadByteCount
+            )
+            require(file.length() == expectedFileLength) {
+                "ARG4 checkpoint read-back length does not match the committed payload."
+            }
+
+            val actualChecksum = CRC32()
+            BufferedInputStream(FileInputStream(file)).use { input ->
+                skipFully(input, ARG4_HEADER_SIZE.toLong())
+                val buffer = ByteArray(TENSOR_WRITE_BUFFER_BYTES)
+                var remaining = payloadByteCount
+                while (remaining > 0L) {
+                    val requested = min(remaining, buffer.size.toLong()).toInt()
+                    val count = input.read(buffer, 0, requested)
+                    require(count > 0) {
+                        "ARG4 checkpoint read-back payload ended unexpectedly."
+                    }
+                    actualChecksum.update(buffer, 0, count)
+                    remaining -= count.toLong()
+                }
+                require(input.read() == -1) {
+                    "ARG4 checkpoint read-back contains trailing bytes."
+                }
+            }
+
+            require(actualChecksum.value == expectedChecksum) {
+                "ARG4 checkpoint read-back checksum does not match."
+            }
+            true
+        } catch (error: Exception) {
+            Log.e(TAG, "ARG4 checkpoint read-back verification failed.", error)
             false
         }
     }
@@ -3813,9 +4595,11 @@ class ArgusNeuralEngine private constructor(
     }
 
     fun loadCheckpointIfExists(): Boolean {
+        checkpointStateVerified = false
         val file = File(context.filesDir, "argus_model_weights.bin")
         if (!file.isFile || file.length() < 4L) return false
-        return try {
+
+        val restored = try {
             val magic = FileInputStream(file).use { it.readFully(4) }
             when {
                 magic[0] == MAGIC_0 && magic[1] == MAGIC_1 &&
@@ -3835,6 +4619,9 @@ class ArgusNeuralEngine private constructor(
             Log.e(TAG, "Checkpoint header read failed", e)
             false
         }
+
+        checkpointStateVerified = restored
+        return restored
     }
 
     private fun InputStream.readFully(size: Int): ByteArray {

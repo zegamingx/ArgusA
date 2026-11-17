@@ -1,15 +1,19 @@
 package com.argus.agi
 
+import android.app.Activity
 import android.app.ActivityManager
 import android.app.Application
 import android.app.ApplicationExitInfo
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.content.ComponentCallbacks2
 import android.os.Build
+import android.os.Bundle
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.argus.agi.model.ArgusNeuralEngine
+import com.argus.agi.model.EngineConfig
 import com.argus.agi.model.GenesisModelManager
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.WorldModel
@@ -29,12 +33,18 @@ import java.util.Locale
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 
 sealed interface ArgusCoreInitializationState {
     data object Initializing : ArgusCoreInitializationState
     data object Ready : ArgusCoreInitializationState
     data class Failed(val message: String) : ArgusCoreInitializationState
 }
+
+data class ArgusCoreInitializationProgress(
+    val status: String = "Assessing device",
+    val driverInfo: String = "System Vulkan capability profile pending"
+)
 
 class ArgusApp : Application() {
 
@@ -55,20 +65,31 @@ class ArgusApp : Application() {
 
         // === Lazy singletons (SYNCHRONIZED = default, dibuat eksplisit untuk dokumentasi) ===
 
-        private val _neuralEngine = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
-            // Stable device capacity selects a fresh model tier. Existing checkpoints
-            // keep their original tensor dimensions to avoid silently discarding weights.
-            val hardwareInfo = hardwareProfile.getHardwareInfo()
-            val resolvedConfig = ArgusNeuralEngine.resolveConfig(
+        private val _hardwareInfo = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            hardwareProfile.getHardwareInfo()
+        }
+        val hardwareInfo: com.argus.agi.sensor.SystemHardwareInfo
+            get() = _hardwareInfo.value
+
+        // Resolve model capacity before allocating tensors. Existing compatible checkpoints
+        // retain their architecture; fresh models use this device's current memory budget.
+        private val _neuralEngineConfig = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            val profile = hardwareInfo
+            ArgusNeuralEngine.resolveConfig(
                 context = instance,
-                totalRamGb = hardwareInfo.totalRamGb,
-                maxHeapMb = hardwareInfo.maxHeapMb,
-                availableRamGb = hardwareInfo.availRamGb,
-                cpuCores = hardwareInfo.cpuCores
+                totalRamGb = profile.totalRamGb,
+                maxHeapMb = profile.maxHeapMb,
+                availableRamGb = profile.availRamGb,
+                cpuCores = profile.cpuCores,
+                vulkanSupported = profile.vulkanSupported
             )
+        }
+        val neuralEngineConfig: EngineConfig
+            get() = _neuralEngineConfig.value
 
+        private val _neuralEngine = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            val resolvedConfig = neuralEngineConfig
             Log.i(TAG, "Resolved neural engine architecture: ${resolvedConfig.architectureLabel}")
-
             ArgusNeuralEngine.createBlocking(instance, resolvedConfig)
         }
         val neuralEngine: ArgusNeuralEngine get() = _neuralEngine.value
@@ -120,6 +141,11 @@ class ArgusApp : Application() {
     val coreInitializationState: StateFlow<ArgusCoreInitializationState> =
         _coreInitializationState.asStateFlow()
 
+    private val _coreInitializationProgress =
+        MutableStateFlow(ArgusCoreInitializationProgress())
+    val coreInitializationProgress: StateFlow<ArgusCoreInitializationProgress> =
+        _coreInitializationProgress.asStateFlow()
+
     private val _runtimeDiagnostics = MutableStateFlow<String?>(null)
     val runtimeDiagnostics: StateFlow<String?> = _runtimeDiagnostics.asStateFlow()
 
@@ -134,13 +160,44 @@ class ArgusApp : Application() {
     @Volatile
     private var coreInitializationJob: Job? = null
 
+    @Volatile
+    private var residencyTrimJob: Job? = null
+
     override fun onCreate() {
         super.onCreate()
         _instance = this
         capturePreviousProcessExit()
         installUncaughtExceptionHandler()
         createNotificationChannel()
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+            override fun onActivityStarted(activity: Activity) = Unit
+            override fun onActivityPaused(activity: Activity) = Unit
+            override fun onActivityStopped(activity: Activity) = Unit
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+            override fun onActivityDestroyed(activity: Activity) = Unit
+
+            override fun onActivityResumed(activity: Activity) {
+                val engine = if (_neuralEngine.isInitialized()) _neuralEngine.value else return
+                val pendingTrim = residencyTrimJob
+                applicationScope.launch(Dispatchers.IO) {
+                    pendingTrim?.join()
+                    engine.resumeVulkanTensorResidencyAfterForeground()
+                }
+            }
+        })
         initializeCoreRuntime()
+    }
+
+    private fun publishCoreProgress(
+        status: String,
+        driverInfo: String? = null
+    ) {
+        val current = _coreInitializationProgress.value
+        _coreInitializationProgress.value = ArgusCoreInitializationProgress(
+            status = status,
+            driverInfo = driverInfo ?: current.driverInfo
+        )
     }
 
     fun recordRuntimeDiagnostic(message: String) {
@@ -220,28 +277,104 @@ class ArgusApp : Application() {
      * Initializes blocking singletons on the application IO scope.
      * The activity must not create its ViewModel until this state becomes Ready.
      */
-    private fun initializeCoreRuntime() {
+    private fun initializeCoreRuntime(resetVulkanRuntime: Boolean = false) {
         synchronized(this) {
             if (coreInitializationJob?.isActive == true) return
 
             _coreInitializationState.value = ArgusCoreInitializationState.Initializing
+            _coreInitializationProgress.value = ArgusCoreInitializationProgress()
             coreInitializationJob = applicationScope.launch {
                 try {
-                    initializationStage = "Reading hardware profile"
-                    hardwareProfile
+                    if (resetVulkanRuntime && _neuralEngine.isInitialized()) {
+                        initializationStage = "Resetting Vulkan runtime for retry"
+                        _neuralEngine.value.resetOptionalVulkanRuntimeForRetry()
+                    }
+
+                    initializationStage = "Reading system device profile"
+                    publishCoreProgress("Reading device specifications")
+                    val profile = hardwareInfo
+                    val advertisedVulkan = if (profile.vulkanSupported) {
+                        "Vulkan API ${profile.vulkanVersionName} advertised"
+                    } else {
+                        "Vulkan is not advertised by the system"
+                    }
+                    publishCoreProgress("System device profile captured",
+                        "${profile.socManufacturer} ${profile.socModel} · $advertisedVulkan"
+                    )
+
                     initializationStage = "Registering device safety monitor"
-                    deviceGuard
+                    publishCoreProgress("Assessing device safety")
+                    deviceGuard.refreshState()
+                    val safety = deviceGuard.safetyState.value
+
                     initializationStage = "Opening local database"
+                    publishCoreProgress("Opening local database")
                     repository
-                    initializationStage = "Allocating neural engine and model tensors"
-                    neuralEngine
+
+                    initializationStage = "Assessing device compute and memory capacity"
+                    publishCoreProgress("Assessing device compute and memory budget")
+                    val modelConfig = neuralEngineConfig
+                    Log.i(
+                        TAG,
+                        "Device assessment resolved ${modelConfig.architectureLabel}; " +
+                            "available RAM ${profile.availRamGb} GB; " +
+                            "training safety: ${safety.statusMessage}"
+                    )
+                    publishCoreProgress("Device assessment complete",
+                        "${modelConfig.modelTier.displayName} · ${modelConfig.layerCount} layers · " +
+                            "batch ${modelConfig.trainingBatchSize}"
+                    )
+
+                    initializationStage = "Constructing model and restoring checkpoint"
+                    publishCoreProgress("Constructing or restoring model tensors")
+                    val engine = neuralEngine
+
                     initializationStage = "Restoring world model"
+                    publishCoreProgress("Restoring local world memory")
                     worldModel
+
                     initializationStage = "Preparing Genesis manager"
+                    publishCoreProgress("Preparing model lifecycle")
                     genesisModelManager
+
+                    // The model constructor has initialized its tensors and loaded any
+                    // compatible checkpoint. Vulkan now runs on this IO worker, while
+                    // the activity keeps rendering the startup progress screen.
+                    initializationStage = "Initializing Vulkan after model readiness"
+                    publishCoreProgress("Initializing Vulkan",
+                        "Detecting Vulkan compute driver..."
+                    )
+                    val progressObserver = launch {
+                        engine.vulkanInitializationProgress.collect { progress ->
+                            if (progress.isInitializing || progress.isVerified || progress.isCpuFallback) {
+                                publishCoreProgress(
+                                    status = progress.status,
+                                    driverInfo = progress.driverInfo
+                                )
+                            }
+                        }
+                    }
+                    val vulkanReady = try {
+                        engine.initializeOptionalVulkanRuntime()
+                    } finally {
+                        progressObserver.cancel()
+                    }
+                    val vulkanProgress = engine.vulkanInitializationProgress.value
+                    publishCoreProgress(
+                        status = if (vulkanReady) {
+                            "Vulkan runtime verified"
+                        } else {
+                            "Vulkan unavailable — CPU fallback"
+                        },
+                        driverInfo = vulkanProgress.driverInfo
+                    )
+
                     initializationStage = "Starting training manager"
+                    publishCoreProgress("Preparing background training runtime")
                     trainingManager
+
                     initializationStage = "Ready"
+                    publishCoreProgress("ARGUS READY", vulkanProgress.driverInfo)
                     _coreInitializationState.value = ArgusCoreInitializationState.Ready
                     Log.i(TAG, "Core runtime initialization completed.")
                 } catch (cancelled: CancellationException) {
@@ -269,8 +402,25 @@ class ArgusApp : Application() {
     }
 
     fun retryCoreInitialization() {
-        initializeCoreRuntime()
+        initializeCoreRuntime(resetVulkanRuntime = true)
     }
+
+    override fun onTrimMemory(level: Int) {
+    super.onTrimMemory(level)
+    if (level < ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) return
+    val engine = if (_neuralEngine.isInitialized()) _neuralEngine.value else return
+    val previousTrim = residencyTrimJob
+    residencyTrimJob = applicationScope.launch(Dispatchers.IO) {
+        previousTrim?.join()
+        val released = engine.releaseVulkanTensorResidencyForMemoryPressure()
+        if (released) {
+            Log.i(
+                TAG,
+                "Persistent Vulkan model residency released after memory-trim callback (level=$level)."
+            )
+        }
+    }
+}
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return

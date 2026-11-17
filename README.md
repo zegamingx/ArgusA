@@ -18,7 +18,7 @@ Argus is a native Android application built with Kotlin and Jetpack Compose.
 | Android NDK | 30.0.16248370 | Native C/C++ toolchain |
 | C++ language standard | C++23 | Vulkan JNI native library |
 | JUnit | 6.1.3 | Host-side unit-test platform and Jupiter API |
-| CMake | 3.31.6 | Native build configuration; minimum project requirement is 3.28.0 |
+| CMake | 4.5.0 | Native build configuration; minimum project requirement is 3.28 |
 
 JDK 25 is the runtime for Gradle; it does not set the application's Java
 bytecode target. Argus compiles Java-compatible application bytecode for
@@ -63,7 +63,7 @@ A release build requires the Argus release signing key at `signing/argus-release
 
 ## GitHub releases
 
-Every push to `main` runs release lint, JUnit/Robolectric unit tests, a signed release build, certificate verification, and an Android 15 (API 35) emulator startup smoke test. The smoke test installs the signed release APK, waits for `ArgusApp` core initialization, and verifies that the process and foreground service remain active. After a successful smoke test, the workflow publishes `ARGUS-v<version>.apk` and the stable `ARGUS.apk` alias to the `Release` tag, then removes superseded versioned APK assets.
+Every push to `main` runs release lint, JUnit/Robolectric unit tests, a signed release build, and APK signature/native-ABI verification. It does not run an Android emulator smoke test. Publishing the signed APK to the `Release` tag is a separate, explicit `workflow_dispatch` operation with `publish_release=true`; ordinary pushes only validate and build.
 
 The private repository keeps the CI signing-key backup in the private GitHub Release named `argus-signing-key`. Repository access therefore also grants access to the app-signing identity. Keep this repository private and restrict collaborator access. Never redistribute the signing-key asset. The asset-pruning step only targets old `ARGUS-v*.apk` files in the `Release` tag and does not touch this signing-key backup.
 
@@ -78,28 +78,42 @@ are not uploaded automatically.
 
 ## Vulkan training backend
 
-The native training module is built with Android NDK r30, CMake 3.31.6
-(project minimum 3.28.0), and C++23 for arm64-v8a, armeabi-v7a, and x86_64.
-It uses the NDK-bundled glslc compiler to
-compile the AdamW (`adamw.comp`), batched-linear (`linear.comp`), and Vulkan 1.2 FP16-weight linear (`linear_fp16.comp`) compute shaders to SPIR-V during the native build.
+The native training module is built with Android NDK r30, CMake 4.5.0
+(project minimum 3.28), and C++23 for arm64-v8a, armeabi-v7a, and x86_64.
+It negotiates up to the highest Vulkan API version supported by the pinned
+headers, Android loader, and physical device (including 1.4 when available).
+GPU execution uses Vulkan Synchronization 2 (Vulkan 1.3 core or
+`VK_KHR_synchronization2`); devices without that feature remain on the Kotlin
+CPU fallback. The backend does not issue legacy Synchronization 1 queue-submit,
+pipeline-barrier, or timestamp commands. Buffer copies use the Synchronization 2
+`COPY` stage and storage-buffer-specific access masks; timestamp placement does
+not use deprecated top-of-pipe or bottom-of-pipe pseudo-stages.
+It uses the NDK-bundled glslc compiler to compile the AdamW (`adamw.comp`),
+batched-linear (`linear.comp`), resident attention (`attention_resident.comp`),
+resident SwiGLU (`swiglu_resident.comp`), and Vulkan 1.2 FP16-weight linear
+(`linear_fp16.comp`) compute shaders to SPIR-V during the native build.
 
 When a compatible Vulkan GPU and compute queue are available, sufficiently large
 matrix products in batched Q/K/V projections, attention output projection, SwiGLU,
 the output head, output-head backward, attention output-projection backward,
 SwiGLU backward, batched attention backward, and Q/K/V weight-gradient accumulation
 can run through Vulkan Compute (using `linear_fp16.comp` with FP16 weights and FP32
-accumulation when GPU 16-bit storage/arithmetic passes startup self-checks, or `linear.comp` otherwise). The three Q/K/V input-gradient products used by
+accumulation when GPU FP16 arithmetic passes post-model runtime self-checks, or `linear.comp` otherwise). The three Q/K/V input-gradient products used by
 embedding backpropagation are also batched through Vulkan. The fused AdamW update
 runs on Vulkan for workloads with at least 49,152 optimizer elements. Attention
-score generation, softmax, the softmax-Jacobian reduction, layer normalization,
-low-rank LoRA gradient accumulation, token-ID embedding scatter, and global
-gradient-norm reduction remain in Kotlin. This is an incremental GPU training
+causal score generation, stable softmax, weighted V reduction, W_O plus residual,
+and the post-attention LayerNorm, plus the element-wise SwiGLU activation, now run
+in the batched training forward graph on Vulkan after independent native self-checks.
+The post-SwiGLU LayerNorm and autoregressive generation LayerNorm remain in Kotlin,
+as do the softmax-Jacobian reduction, LayerNorm backward, low-rank LoRA gradient
+accumulation, token-ID embedding scatter, and global gradient-norm reduction. This is an incremental GPU training
 path, not a fully GPU-resident training graph.
 
-Vulkan is declared as an optional device feature. Devices without a compatible
-Vulkan driver, compute queue, shader pipeline, suitable storage memory, or
-sufficiently large optimizer workload use the existing Kotlin CPU optimizer.
-The CPU path preserves the same AdamW update and remains the required fallback.
+Vulkan is prepared asynchronously only after the local model has been constructed
+or restored; application cold-start does not create the Vulkan runtime. Devices
+without a compatible driver, compute queue, shader pipeline, suitable storage
+memory, or sufficiently large optimizer workload use the existing Kotlin CPU
+optimizer. Runtime verification failures also preserve the CPU fallback.
 NPU/APU detection is informational only; no vendor-specific NPU training
 runtime is currently integrated.
 
@@ -107,7 +121,7 @@ The CI pull-request workflow builds the native library and verifies that the
 APK contains the configured ABI libraries. Main, pull-request, and release
 workflows execute Gradle on JDK 25; the Android app's Java source and bytecode
 compatibility target remains Java 21. All workflows install the checksum-pinned
-CMake 3.31.6 distribution and NDK r30 for native builds.
+CMake 4.5.0 distribution and NDK r30 for native builds.
 
 ## Background training service
 
@@ -132,7 +146,11 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - PDF extraction supports selectable text. Scanned/image-only PDFs are rejected; OCR is not included.
 - DOCX reads the Word document XML body. EPUB follows its package spine order.
 - Archive entry counts, per-entry expansion, total expansion, source file size, and extracted text length are bounded.
-- Import budgets are reduced using the device's available RAM and app heap. The active training queue still holds generated chunk records in app memory; ingestion is buffered, not a fully disk-backed queue.
+- Import budgets are reduced using the device's live app-heap headroom and a bounded queue-capacity estimate.
+- `Reader` ingestion stages UTF-16BE code units in a temporary cache file using fixed-size buffers. The file is removed after success, rejection, or coroutine cancellation.
+- JSONL is validated and processed one complete object per line, with per-record size and total generated-record limits. JSONL records are persisted only after the entire source has passed validation, so a malformed tail cannot leave a partially imported document.
+- Single-object ChatML/ShareGPT, reasoning, and legacy plain-text inputs retain document-level parsing semantics. Their in-memory parser path is still bounded by the live-heap limit; this is not a constant-memory parser for every format.
+- The active training queue still holds generated chunk records in app memory; the queue itself is not fully disk-backed.
 
 ### Persistent corpus
 
@@ -142,7 +160,10 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - Active queue rows are marked `TRAINING`; startup recovery returns interrupted rows to `QUEUED`. This is at-least-once recovery, so a chunk may be optimized again if the model checkpoint was saved but its completion status was not persisted before process death.
 - Retained documents can be replayed into the training queue without reopening the original file or fetching the article again.
 - Corpus status records whether training is ready, active, complete, or partial after a failed chunk.
-- Room schema version 2 adds corpus tables and an optional training-item document reference through an additive version 1 to 2 migration. Existing chat, memory, and training-queue rows are preserved; destructive migration fallback is not enabled. Legacy queue rows remain valid but are not retroactively grouped into corpus documents because their original document boundaries and fingerprints were not stored.
+- Room schema version 3 adds corpus tables and an optional training-item document reference through additive migrations 1 to 2 and 2 to 3. Existing chat, memory, queue rows, corpus documents, chunks, and source identities are preserved; destructive migration fallback is not enabled.
+- Version 3 adds nullable source-level license identity/name/URL, attribution, rights-evidence URL, user declaration text/timestamp, and reviewed timestamp. Historical rights claims without sufficient source evidence are conservatively migrated to `UNVERIFIED`; user-declared provenance is retained only when a prior explicit approval marker exists.
+- Aggregate document rights are recalculated from every retained source. A document is not treated as license-reviewed merely because a different source row declared permission.
+- Legacy queue rows remain valid but are not retroactively grouped into corpus documents because their original document boundaries and fingerprints were not stored.
 
 ## Argus-native architecture contract
 
@@ -216,7 +237,7 @@ Current limitations:
 - Corpus replay rejects documents that already have queued or active training work, preventing accidental duplicate scheduling. A completed or cleared corpus can be replayed again using the same seed.
 - Replay is bounded to 500 documents per scheduling request. Its default chunk limit is estimated from the current app heap (using a conservative 4 KiB per queue item) and capped at 4,096; callers may configure a larger limit up to the 50,000-item hard ceiling. Requests exceeding the configured limit are rejected before queue insertion.
 - `replayCorpusDocument` remains available for one-document replay and defaults to sequential chunk order.
-- Vulkan executes eligible batched forward/backward matrix products (via `linear_fp16.comp` or `linear.comp`) and AdamW updates (`adamw.comp`) after native numerical self-checks. Attention score generation, softmax, layer normalization, QKV/LoRA gradient accumulation, and global gradient-norm reduction remain Kotlin operations. NPU/APU hardware detection is informational only; no vendor-specific NPU/APU training runtime is integrated.
+- Vulkan executes eligible batched forward/backward matrix products (via `linear_fp16.comp` or `linear.comp`) and AdamW updates (`adamw.comp`) after native numerical self-checks. The batched training forward graph uses Vulkan for causal attention, W_O plus residual, and post-attention LayerNorm after native verification. QKV/LoRA gradient accumulation, LayerNorm backward, and global gradient-norm reduction remain Kotlin operations. NPU/APU hardware detection is informational only; no vendor-specific NPU/APU training runtime is integrated.
 - This pipeline is not yet validated as scalable from-random-initialization pretraining or general intelligence training.
 
 ## Compatibility note

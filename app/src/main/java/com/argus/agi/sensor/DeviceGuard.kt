@@ -19,6 +19,7 @@ data class DeviceSafetyState(
     val isCharging: Boolean = true,
     val temperatureCelsius: Float = 30.0f,
     val thermalStatus: Int = 0,
+    val isPowerSaveMode: Boolean = false,
     val isPhysicalThermalHazard: Boolean = false,
     val isBatteryLow: Boolean = false,
     val isBatteryOptimizedIgnored: Boolean = false,
@@ -117,6 +118,7 @@ class DeviceGuard(private val context: Context) {
             val isForce = _forceTrainingOverride.value
             val safe = (!current.isPhysicalThermalHazard) && (isForce || !current.isBatteryLow)
             _safetyState.value = current.copy(
+                isPowerSaveMode = powerManager?.isPowerSaveMode ?: false,
                 isForceOverrideActive = isForce,
                 isSafeToTrain = safe
             )
@@ -138,6 +140,7 @@ class DeviceGuard(private val context: Context) {
         val thermalStatus = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             powerManager?.currentThermalStatus ?: 0
         } else 0
+        val isPowerSaveMode = powerManager?.isPowerSaveMode ?: false
 
         val isIgnored = isIgnoringBatteryOptimizations()
         val isForce = _forceTrainingOverride.value
@@ -181,6 +184,7 @@ class DeviceGuard(private val context: Context) {
             isCharging = isCharging,
             temperatureCelsius = tempCelsius,
             thermalStatus = thermalStatus,
+            isPowerSaveMode = isPowerSaveMode,
             isPhysicalThermalHazard = isPhysicalThermalHazard,
             isBatteryLow = isBatteryLow,
             isBatteryOptimizedIgnored = isIgnored,

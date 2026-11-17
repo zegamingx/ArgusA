@@ -1,0 +1,160 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) coherent buffer TensorArena {
+    uint values[];
+};
+
+layout(push_constant) uniform ResidentAdamWParameters {
+    uint operation;
+    uint elementCount;
+    uint pairCount;
+    uint parameterOffsetWords;
+    uint candidateParameterOffsetWords;
+    uint gradientOffsetWords;
+    uint gradientElementOffset;
+    uint firstMomentOffsetWords;
+    uint secondMomentOffsetWords;
+    uint candidateFirstMomentOffsetWords;
+    uint candidateSecondMomentOffsetWords;
+    uint statusOffsetWords;
+    float learningRate;
+    float beta1;
+    float beta2;
+    float biasCorrection1;
+    float biasCorrection2;
+    float epsilon;
+    float gradientClipFactor;
+    float weightDecay;
+} parameters;
+
+bool finiteValue(float value) {
+    return !isnan(value) && !isinf(value);
+}
+
+void calculateUpdate(
+    uint elementIndex,
+    float parameter,
+    out float updatedParameter,
+    out float updatedFirstMoment,
+    out float updatedSecondMoment,
+    out bool valid
+) {
+    const uint gradientIndex =
+        parameters.gradientElementOffset + elementIndex;
+    const float gradient =
+        uintBitsToFloat(values[parameters.gradientOffsetWords + gradientIndex]) *
+        parameters.gradientClipFactor;
+    const float firstMoment =
+        uintBitsToFloat(values[parameters.firstMomentOffsetWords + elementIndex]);
+    const float secondMoment =
+        uintBitsToFloat(values[parameters.secondMomentOffsetWords + elementIndex]);
+
+    updatedFirstMoment =
+        parameters.beta1 * firstMoment +
+        (1.0 - parameters.beta1) * gradient;
+    updatedSecondMoment =
+        parameters.beta2 * secondMoment +
+        (1.0 - parameters.beta2) * gradient * gradient;
+
+    const float correctedFirstMoment =
+        updatedFirstMoment / parameters.biasCorrection1;
+    const float correctedSecondMoment =
+        updatedSecondMoment / parameters.biasCorrection2;
+    const float update =
+        correctedFirstMoment /
+            (sqrt(correctedSecondMoment) + parameters.epsilon) +
+        parameters.weightDecay * parameter;
+    updatedParameter = parameter - parameters.learningRate * update;
+
+    valid =
+        finiteValue(parameter) &&
+        finiteValue(gradient) &&
+        finiteValue(firstMoment) &&
+        finiteValue(secondMoment) &&
+        secondMoment >= 0.0 &&
+        finiteValue(updatedFirstMoment) &&
+        finiteValue(updatedSecondMoment) &&
+        updatedSecondMoment >= 0.0 &&
+        finiteValue(correctedFirstMoment) &&
+        finiteValue(correctedSecondMoment) &&
+        correctedSecondMoment >= 0.0 &&
+        finiteValue(update) &&
+        finiteValue(updatedParameter) &&
+        abs(updatedParameter) <= 65504.0;
+}
+
+void main() {
+    if (parameters.operation == 1u &&
+        values[parameters.statusOffsetWords] != 0u) {
+        return;
+    }
+
+    const uint invocationStride =
+        gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    uint pairIndex = gl_GlobalInvocationID.x;
+
+    while (pairIndex < parameters.pairCount) {
+        const uint firstElement = pairIndex * 2u;
+        const uint packedParameters =
+            values[parameters.parameterOffsetWords + pairIndex];
+        const vec2 oldParameters = unpackHalf2x16(packedParameters);
+
+        float updatedParameter0 = oldParameters.x;
+        float updatedParameter1 = oldParameters.y;
+        float updatedFirstMoment0 = 0.0;
+        float updatedFirstMoment1 = 0.0;
+        float updatedSecondMoment0 = 0.0;
+        float updatedSecondMoment1 = 0.0;
+        bool valid = true;
+
+        if (firstElement < parameters.elementCount) {
+            calculateUpdate(
+                firstElement,
+                oldParameters.x,
+                updatedParameter0,
+                updatedFirstMoment0,
+                updatedSecondMoment0,
+                valid
+            );
+        }
+
+        if (firstElement + 1u < parameters.elementCount) {
+            bool secondValid = true;
+            calculateUpdate(
+                firstElement + 1u,
+                oldParameters.y,
+                updatedParameter1,
+                updatedFirstMoment1,
+                updatedSecondMoment1,
+                secondValid
+            );
+            valid = valid && secondValid;
+        }
+
+        if (!valid) {
+            atomicOr(values[parameters.statusOffsetWords], 1u);
+        } else if (parameters.operation == 1u) {
+            if (firstElement < parameters.elementCount) {
+                values[parameters.candidateFirstMomentOffsetWords + firstElement] =
+                    floatBitsToUint(updatedFirstMoment0);
+                values[parameters.candidateSecondMomentOffsetWords + firstElement] =
+                    floatBitsToUint(updatedSecondMoment0);
+            }
+            if (firstElement + 1u < parameters.elementCount) {
+                values[parameters.candidateFirstMomentOffsetWords + firstElement + 1u] =
+                    floatBitsToUint(updatedFirstMoment1);
+                values[parameters.candidateSecondMomentOffsetWords + firstElement + 1u] =
+                    floatBitsToUint(updatedSecondMoment1);
+            }
+            values[parameters.candidateParameterOffsetWords + pairIndex] =
+                packHalf2x16(vec2(updatedParameter0, updatedParameter1));
+        }
+
+        if (parameters.pairCount - pairIndex <= invocationStride) {
+            break;
+        }
+        pairIndex += invocationStride;
+    }
+}

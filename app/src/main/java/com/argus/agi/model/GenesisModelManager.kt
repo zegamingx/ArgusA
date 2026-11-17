@@ -146,7 +146,8 @@ class GenesisModelManager(
         }
     }
 
-    fun hasCompletedGenesis(): Boolean = prefs.contains(KEY_ORIGIN_ID)
+    fun hasCompletedGenesis(): Boolean =
+        neuralEngine.isCheckpointStateVerified && prefs.contains(KEY_ORIGIN_ID)
 
     fun hasSeenBootAnimation(): Boolean = prefs.getBoolean(KEY_BOOT_SEEN, false)
 
@@ -262,11 +263,8 @@ class GenesisModelManager(
             "Selecting tensor dimensions based on the device compute and memory budget...")
 
         val archTier = neuralEngine.config.architectureLabel
-        // Vulkan accelerates eligible dense operations and AdamW after its runtime self-checks.
-        // Remaining operations continue to use the Kotlin CPU implementation.
-        val computeTarget = resolveComputeTarget()
         logs += "Selected configuration: $archTier"
-        logs += "Execution policy: $computeTarget | Context length: ${neuralEngine.maxSeqLen} tokens"
+        logs += "Context length: ${neuralEngine.maxSeqLen} tokens"
         throttleStage()
 
         publish(GenesisLifecycleStage.PREPARING_TOKENIZER,
@@ -303,6 +301,15 @@ class GenesisModelManager(
         logs += "LoRA A uses Gaussian initialization; LoRA B starts at zero for stability."
         logs += "Integrity check: no model weights downloaded; the model identity is created locally."
         throttleStage()
+
+        // Vulkan was initialized by ArgusApp after model construction/restoration.
+        // Genesis records the verified backend without invoking the native runtime again.
+        val vulkanReady = neuralEngine.isVulkanRuntimeReady
+        val computeTarget = resolveComputeTarget()
+        logs += "Execution policy: $computeTarget | Context length: ${neuralEngine.maxSeqLen} tokens"
+        if (!vulkanReady) {
+            logs += "Vulkan runtime verification was unavailable; Kotlin CPU remains the active fallback."
+        }
 
         publish(GenesisLifecycleStage.COMMITTING_INITIAL_GENERATION,
             "Validating the forward pass and saving the initial ARG4 checkpoint...")
@@ -452,6 +459,29 @@ class GenesisModelManager(
     }
 
     private fun loadIdentity(): GenesisIdentity? {
+        if (!neuralEngine.isCheckpointStateVerified) {
+            if (prefs.contains(KEY_ORIGIN_ID)) {
+                val invalidated = prefs.edit()
+                    .remove(KEY_ORIGIN_ID)
+                    .remove(KEY_BIRTH_TS)
+                    .remove(KEY_RAM_GB)
+                    .remove(KEY_COMPUTE)
+                    .remove(KEY_PARAM_COUNT)
+                    .remove(KEY_ARCH_TIER)
+                    .commit()
+                if (!invalidated) {
+                    throw GenesisException(
+                        "The stale Genesis identity could not be invalidated because its checkpoint was not verified."
+                    )
+                }
+            }
+            Log.w(
+                TAG,
+                "Stored Genesis identity was invalidated because no compatible checkpoint was restored or verified."
+            )
+            return null
+        }
+
         val originId = prefs.getString(KEY_ORIGIN_ID, null) ?: return null
         val birthTs = prefs.getLong(KEY_BIRTH_TS, 0L).takeIf { it > 0L }
             ?: System.currentTimeMillis()

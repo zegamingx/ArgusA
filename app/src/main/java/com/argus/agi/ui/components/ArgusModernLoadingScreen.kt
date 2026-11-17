@@ -4,6 +4,7 @@ import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -24,6 +25,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -36,6 +38,8 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.argus.agi.ui.theme.ArgusCyanGlow
@@ -43,45 +47,57 @@ import com.argus.agi.ui.theme.ArgusCyanPrimary
 import com.argus.agi.ui.theme.ArgusDarkBg
 import com.argus.agi.ui.theme.ArgusSurface
 import com.argus.agi.ui.theme.ArgusTextMuted
-import com.argus.agi.ui.theme.ArgusTextSecondary
 import kotlin.math.cos
 import kotlin.math.sin
 
 @Composable
 fun ArgusModernLoadingScreen(
     title: String = "A . R . G . U . S",
-    subtitle: String = "RESTORING THE NEURAL CORE & CHAT HISTORY..."
+    subtitle: String = "INITIALIZING LOCAL NEURAL RUNTIME",
+    progressPercent: Int? = null,
+    supportingText: String? = null,
+    driverInfo: String = "STANDALONE ON-DEVICE ARCHITECTURE",
+    isError: Boolean = false,
+    onRetry: (() -> Unit)? = null
 ) {
-    val infiniteTransition = rememberInfiniteTransition(label = "loading_infinite")
+    val accentColor = if (isError) MaterialTheme.colorScheme.error else ArgusCyanPrimary
+    val glowColor = if (isError) accentColor.copy(alpha = 0.82f) else ArgusCyanGlow
+    val safeProgressPercent = progressPercent?.coerceIn(0, 100)
+    val determinateProgress = safeProgressPercent?.div(100f)
 
+    val animatedProgress by animateFloatAsState(
+        targetValue = determinateProgress ?: 0f,
+        animationSpec = tween(320, easing = FastOutSlowInEasing),
+        label = "loading_progress"
+    )
+
+    val infiniteTransition = rememberInfiniteTransition(label = "loading_infinite")
     val rotation by infiniteTransition.animateFloat(
         initialValue = 0f,
         targetValue = 360f,
         animationSpec = infiniteRepeatable(
-            animation = tween(4000, easing = LinearEasing),
+            animation = tween(4_000, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         ),
-        label = "rotation"
+        label = "reactor_rotation"
     )
-
     val pulse by infiniteTransition.animateFloat(
         initialValue = 0.85f,
         targetValue = 1.15f,
         animationSpec = infiniteRepeatable(
-            animation = tween(1400, easing = FastOutSlowInEasing),
+            animation = tween(1_400, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
         ),
-        label = "pulse"
+        label = "reactor_pulse"
     )
-
     val scanLine by infiniteTransition.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
-            animation = tween(2000, easing = LinearEasing),
+            animation = tween(2_000, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         ),
-        label = "scanLine"
+        label = "progress_scan"
     )
 
     Box(
@@ -90,23 +106,23 @@ fun ArgusModernLoadingScreen(
             .background(ArgusDarkBg),
         contentAlignment = Alignment.Center
     ) {
-        // Background Cybernetic Grid
         Canvas(modifier = Modifier.fillMaxSize()) {
             val step = 48.dp.toPx()
             var x = 0f
             while (x < size.width) {
                 drawLine(
-                    color = ArgusCyanPrimary.copy(alpha = 0.035f),
+                    color = accentColor.copy(alpha = 0.035f),
                     start = Offset(x, 0f),
                     end = Offset(x, size.height),
                     strokeWidth = 1f
                 )
                 x += step
             }
+
             var y = 0f
             while (y < size.height) {
                 drawLine(
-                    color = ArgusCyanPrimary.copy(alpha = 0.035f),
+                    color = accentColor.copy(alpha = 0.035f),
                     start = Offset(0f, y),
                     end = Offset(size.width, y),
                     strokeWidth = 1f
@@ -116,88 +132,93 @@ fun ArgusModernLoadingScreen(
         }
 
         Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.Center)
+                .padding(horizontal = 24.dp, vertical = 28.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-            modifier = Modifier.padding(24.dp)
+            verticalArrangement = Arrangement.Center
         ) {
-            // Cybernetic Reactor Graphic
             Box(
                 modifier = Modifier.size(160.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
-                    val cx = size.width / 2f
-                    val cy = size.height / 2f
-                    val baseR = size.width * 0.42f
+                    val centerX = size.width / 2f
+                    val centerY = size.height / 2f
+                    val baseRadius = size.width * 0.42f
 
-                    // Outer Orbit with ticks
-                    for (i in 0 until 12) {
-                        val angleDeg = rotation + (i * 30f)
-                        val angleRad = Math.toRadians(angleDeg.toDouble())
-                        val p1 = Offset(
-                            (cx + (baseR - 8.dp.toPx()) * cos(angleRad)).toFloat(),
-                            (cy + (baseR - 8.dp.toPx()) * sin(angleRad)).toFloat()
+                    for (index in 0 until 12) {
+                        val angleDegrees = rotation + index * 30f
+                        val angleRadians = Math.toRadians(angleDegrees.toDouble())
+                        val innerRadius = baseRadius - 8.dp.toPx()
+                        val start = Offset(
+                            (centerX + innerRadius * cos(angleRadians)).toFloat(),
+                            (centerY + innerRadius * sin(angleRadians)).toFloat()
                         )
-                        val p2 = Offset(
-                            (cx + baseR * cos(angleRad)).toFloat(),
-                            (cy + baseR * sin(angleRad)).toFloat()
+                        val end = Offset(
+                            (centerX + baseRadius * cos(angleRadians)).toFloat(),
+                            (centerY + baseRadius * sin(angleRadians)).toFloat()
                         )
                         drawLine(
-                            color = ArgusCyanPrimary.copy(alpha = 0.45f),
-                            start = p1,
-                            end = p2,
+                            color = accentColor.copy(alpha = 0.45f),
+                            start = start,
+                            end = end,
                             strokeWidth = 2.dp.toPx(),
                             cap = StrokeCap.Round
                         )
                     }
 
-                    // Dual Rotating Ring Arcs
                     drawArc(
                         brush = Brush.sweepGradient(
-                            listOf(Color.Transparent, ArgusCyanPrimary, ArgusCyanGlow, Color.Transparent)
+                            listOf(Color.Transparent, accentColor, glowColor, Color.Transparent)
                         ),
                         startAngle = rotation,
                         sweepAngle = 220f,
                         useCenter = false,
                         style = Stroke(width = 2.5.dp.toPx(), cap = StrokeCap.Round),
-                        size = androidx.compose.ui.geometry.Size(baseR * 2, baseR * 2),
-                        topLeft = Offset(cx - baseR, cy - baseR)
+                        size = androidx.compose.ui.geometry.Size(
+                            baseRadius * 2f,
+                            baseRadius * 2f
+                        ),
+                        topLeft = Offset(centerX - baseRadius, centerY - baseRadius)
                     )
 
+                    val innerRadius = baseRadius * 0.75f
                     drawArc(
                         brush = Brush.sweepGradient(
-                            listOf(Color.Transparent, ArgusCyanGlow, Color.Transparent)
+                            listOf(Color.Transparent, glowColor, Color.Transparent)
                         ),
                         startAngle = -rotation * 1.5f,
                         sweepAngle = 140f,
                         useCenter = false,
                         style = Stroke(width = 1.5.dp.toPx(), cap = StrokeCap.Round),
-                        size = androidx.compose.ui.geometry.Size(baseR * 1.5f, baseR * 1.5f),
-                        topLeft = Offset(cx - baseR * 0.75f, cy - baseR * 0.75f)
+                        size = androidx.compose.ui.geometry.Size(
+                            innerRadius * 2f,
+                            innerRadius * 2f
+                        ),
+                        topLeft = Offset(centerX - innerRadius, centerY - innerRadius)
                     )
 
-                    // Core Reactor Glow
-                    val coreR = 24.dp.toPx() * pulse
+                    val coreRadius = 24.dp.toPx() * pulse
                     drawCircle(
                         brush = Brush.radialGradient(
                             colors = listOf(
                                 Color.White,
-                                ArgusCyanGlow,
-                                ArgusCyanPrimary.copy(alpha = 0.4f),
+                                glowColor,
+                                accentColor.copy(alpha = 0.4f),
                                 Color.Transparent
                             ),
-                            center = Offset(cx, cy),
-                            radius = coreR * 1.8f
+                            center = Offset(centerX, centerY),
+                            radius = coreRadius * 1.8f
                         ),
-                        radius = coreR * 1.8f,
-                        center = Offset(cx, cy)
+                        radius = coreRadius * 1.8f,
+                        center = Offset(centerX, centerY)
                     )
-
-                    // Inner Dot
                     drawCircle(
                         color = Color.White,
                         radius = 4.dp.toPx(),
-                        center = Offset(cx, cy)
+                        center = Offset(centerX, centerY)
                     )
                 }
             }
@@ -207,10 +228,13 @@ fun ArgusModernLoadingScreen(
             Text(
                 text = title,
                 style = MaterialTheme.typography.headlineSmall,
-                color = ArgusCyanPrimary,
+                color = accentColor,
                 fontWeight = FontWeight.Bold,
                 fontFamily = FontFamily.Monospace,
-                letterSpacing = 6.sp
+                letterSpacing = 6.sp,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
 
             Spacer(modifier = Modifier.height(8.dp))
@@ -218,15 +242,30 @@ fun ArgusModernLoadingScreen(
             Text(
                 text = subtitle,
                 style = MaterialTheme.typography.labelSmall,
-                color = ArgusCyanGlow,
+                color = glowColor,
                 fontFamily = FontFamily.Monospace,
-                letterSpacing = 2.sp,
-                fontSize = 10.sp
+                letterSpacing = 1.5.sp,
+                fontSize = 10.sp,
+                textAlign = TextAlign.Center,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
             )
+
+            if (!supportingText.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    text = supportingText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = ArgusTextMuted,
+                    fontSize = 11.sp,
+                    textAlign = TextAlign.Center,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
 
             Spacer(modifier = Modifier.height(28.dp))
 
-            // Sleek Cyber Progress Indicator
             Box(
                 modifier = Modifier
                     .width(220.dp)
@@ -235,25 +274,49 @@ fun ArgusModernLoadingScreen(
                     .background(ArgusSurface)
             ) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
-                    val scanW = size.width * 0.35f
-                    val startX = (size.width + scanW) * scanLine - scanW
-                    drawLine(
-                        brush = Brush.horizontalGradient(
-                            listOf(
-                                Color.Transparent,
-                                ArgusCyanPrimary,
-                                Color.White,
-                                ArgusCyanPrimary,
-                                Color.Transparent
+                    val centerY = size.height / 2f
+                    if (determinateProgress != null) {
+                        drawLine(
+                            color = accentColor,
+                            start = Offset(0f, centerY),
+                            end = Offset(size.width * animatedProgress.coerceIn(0f, 1f), centerY),
+                            strokeWidth = size.height,
+                            cap = StrokeCap.Round
+                        )
+                    } else {
+                        val scanWidth = size.width * 0.35f
+                        val startX = (size.width + scanWidth) * scanLine - scanWidth
+                        val endX = startX + scanWidth
+                        drawLine(
+                            brush = Brush.horizontalGradient(
+                                colors = listOf(
+                                    Color.Transparent,
+                                    accentColor,
+                                    Color.White,
+                                    accentColor,
+                                    Color.Transparent
+                                ),
+                                startX = startX,
+                                endX = endX
                             ),
-                            startX = startX,
-                            endX = startX + scanW
-                        ),
-                        start = Offset(startX, size.height / 2f),
-                        end = Offset(startX + scanW, size.height / 2f),
-                        strokeWidth = size.height
-                    )
+                            start = Offset(startX, centerY),
+                            end = Offset(endX, centerY),
+                            strokeWidth = size.height,
+                            cap = StrokeCap.Round
+                        )
+                    }
                 }
+            }
+
+            if (safeProgressPercent != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = safeProgressPercent.toString() + "%",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = glowColor,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 9.sp
+                )
             }
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -266,16 +329,33 @@ fun ArgusModernLoadingScreen(
                     modifier = Modifier
                         .size(6.dp)
                         .clip(CircleShape)
-                        .background(ArgusCyanGlow)
+                        .background(glowColor)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = "STANDALONE ON-DEVICE ARCHITECTURE",
+                    text = driverInfo,
                     style = MaterialTheme.typography.labelSmall,
                     color = ArgusTextMuted,
                     fontFamily = FontFamily.Monospace,
-                    fontSize = 9.sp
+                    fontSize = 9.sp,
+                    textAlign = TextAlign.Center,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
+            }
+
+            if (isError && onRetry != null) {
+                Spacer(modifier = Modifier.height(14.dp))
+                TextButton(onClick = onRetry) {
+                    Text(
+                        text = "RETRY GENESIS",
+                        color = accentColor,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 10.sp,
+                        letterSpacing = 1.sp
+                    )
+                }
             }
         }
     }

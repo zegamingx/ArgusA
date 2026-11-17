@@ -26,7 +26,7 @@ import com.argus.agi.data.local.entity.WorldMemoryEntity
         CorpusSourceEntity::class,
         CorpusChunkEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class ArgusDatabase : RoomDatabase() {
@@ -41,6 +41,68 @@ abstract class ArgusDatabase : RoomDatabase() {
          * Version 2 adds retained corpus tables and a nullable document reference.
          * This migration is additive; it does not erase any existing user data.
          */
+        val MIGRATION_2_3: Migration = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `corpus_sources` ADD COLUMN `licenseIdentifier` TEXT")
+                db.execSQL("ALTER TABLE `corpus_sources` ADD COLUMN `licenseName` TEXT")
+                db.execSQL("ALTER TABLE `corpus_sources` ADD COLUMN `licenseUrl` TEXT")
+                db.execSQL("ALTER TABLE `corpus_sources` ADD COLUMN `attributionText` TEXT")
+                db.execSQL("ALTER TABLE `corpus_sources` ADD COLUMN `rightsEvidenceUrl` TEXT")
+                db.execSQL("ALTER TABLE `corpus_sources` ADD COLUMN `userDeclarationText` TEXT")
+                db.execSQL("ALTER TABLE `corpus_sources` ADD COLUMN `userDeclaredAtEpochMs` INTEGER")
+                db.execSQL("ALTER TABLE `corpus_sources` ADD COLUMN `reviewedAtEpochMs` INTEGER")
+
+                // Preserve older explicit user-consent records when the original import
+                // marker exists. Statuses without durable evidence are conservatively
+                // downgraded; their corpus text and training history remain untouched.
+                db.execSQL(
+                    """
+                    UPDATE `corpus_sources`
+                    SET `userDeclarationText` = 'Legacy explicit user approval recorded at import time.',
+                        `userDeclaredAtEpochMs` = `importedAtEpochMs`
+                    WHERE `rightsStatus` = 'USER_DECLARED'
+                      AND (
+                        `source` = 'user_approved_conversation'
+                        OR instr(`source`, '|rights_declared_by_user=true') > 0
+                      )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "UPDATE `corpus_sources` SET `rightsStatus` = 'UNVERIFIED' " +
+                        "WHERE `rightsStatus` = 'USER_DECLARED' AND `userDeclarationText` IS NULL"
+                )
+                db.execSQL(
+                    "UPDATE `corpus_sources` SET `rightsStatus` = 'UNVERIFIED' " +
+                        "WHERE `rightsStatus` = 'LICENSE_REVIEWED'"
+                )
+                // Recompute aggregate document rights from the source records that
+                // still carry durable evidence after conservative legacy downgrades.
+                db.execSQL(
+                    """
+                    UPDATE `corpus_documents`
+                    SET `rightsStatus` = CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM `corpus_sources`
+                            WHERE `corpus_sources`.`documentId` = `corpus_documents`.`id`
+                              AND `corpus_sources`.`rightsStatus` = 'LICENSE_REVIEWED'
+                        ) THEN 'LICENSE_REVIEWED'
+                        WHEN EXISTS (
+                            SELECT 1 FROM `corpus_sources`
+                            WHERE `corpus_sources`.`documentId` = `corpus_documents`.`id`
+                              AND `corpus_sources`.`rightsStatus` = 'USER_DECLARED'
+                        ) THEN 'USER_DECLARED'
+                        ELSE 'UNVERIFIED'
+                    END
+                    WHERE EXISTS (
+                        SELECT 1 FROM `corpus_sources`
+                        WHERE `corpus_sources`.`documentId` = `corpus_documents`.`id`
+                    )
+                       OR `rightsStatus` IN ('USER_DECLARED', 'LICENSE_REVIEWED')
+                    """.trimIndent()
+                )
+            }
+        }
+
         val MIGRATION_1_2: Migration = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL(
@@ -146,7 +208,7 @@ abstract class ArgusDatabase : RoomDatabase() {
                     ArgusDatabase::class.java,
                     "argus_ondevice.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .build()
                     .also { database -> INSTANCE = database }
             }

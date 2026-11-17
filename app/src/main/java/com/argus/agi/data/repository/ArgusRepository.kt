@@ -8,6 +8,7 @@ import com.argus.agi.data.local.entity.ChatMessageEntity
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceEntity
+import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.data.local.entity.TrainingItemEntity
 import com.argus.agi.data.local.entity.WorldMemoryEntity
 import com.argus.agi.model.TrainingData
@@ -95,6 +96,44 @@ class ArgusRepository(
         trainingQueueDao.getPendingQueueSnapshot().map { it.toDomain() }
     }
 
+    suspend fun getOptimizerCommittedTrainingItemsSnapshot(): List<TrainingData> =
+        withContext(Dispatchers.IO) {
+            trainingQueueDao.getOptimizerCommittedItemsSnapshot().map { it.toDomain() }
+        }
+
+    /**
+     * Persists the optimizer commit before queue finalization. Room commits the entire
+     * micro-batch atomically so an interrupted finalizer can never retrain a committed item.
+     */
+    suspend fun markTrainingItemsOptimizerCommitted(items: List<TrainingData>) =
+        withContext(Dispatchers.IO) {
+            require(items.isNotEmpty() && items.size <= 8) {
+                "An optimizer commit must contain between one and eight training items."
+            }
+            require(items.all { it.status == TrainingStatus.OPTIMIZER_COMMITTED }) {
+                "Every committed training item must carry OPTIMIZER_COMMITTED status."
+            }
+            db.withTransaction {
+                for (item in items) {
+                    val existing = trainingQueueDao.getItem(item.id)
+                        ?: throw IllegalStateException(
+                            "Committed training item '${item.id}' is missing from Room."
+                        )
+                    if (existing.status == "COMPLETED" || existing.status == "FAILED") {
+                        continue
+                    }
+                    val updated = trainingQueueDao.markOptimizerCommitted(
+                        id = item.id,
+                        loss = item.finalLoss,
+                        duration = item.stepDurationMs
+                    )
+                    check(updated == 1) {
+                        "Training item '${item.id}' could not be persisted as optimizer-committed."
+                    }
+                }
+            }
+        }
+
     suspend fun getActiveCorpusTrainingDocumentIds(): Set<String> =
         withContext(Dispatchers.IO) {
             trainingQueueDao.getActiveCorpusDocumentIds().toSet()
@@ -131,8 +170,17 @@ class ArgusRepository(
         }
     }
 
-    suspend fun markTrainingCompleted(id: String, loss: Float, durationMs: Long) = withContext(Dispatchers.IO) {
-        trainingQueueDao.updateStatus(id, "COMPLETED", loss, durationMs)
+    suspend fun markTrainingCompleted(
+        id: String,
+        loss: Float,
+        durationMs: Long
+    ): Boolean = withContext(Dispatchers.IO) {
+        val updated = trainingQueueDao.markOptimizerCommittedCompleted(
+            id = id,
+            loss = loss,
+            duration = durationMs
+        )
+        updated == 1
     }
 
     suspend fun markTrainingStarted(id: String): Boolean = withContext(Dispatchers.IO) {
@@ -170,7 +218,7 @@ class ArgusRepository(
                 val partialDocumentIds = itemsByDocument
                     .filterValues { documentItems ->
                         val canFinishDocument = documentItems.size == 1 &&
-                            documentItems.single().status == "TRAINING" &&
+                            documentItems.single().status in setOf("TRAINING", "OPTIMIZER_COMMITTED") &&
                             documentItems.single().chunkIndex >= documentItems.single().totalChunks
                         !canFinishDocument
                     }
@@ -199,11 +247,10 @@ class ArgusRepository(
 
     suspend fun storeCorpusDocument(
         document: CorpusDocumentEntity,
-        chunks: List<CorpusChunkEntity>
+        chunks: List<CorpusChunkEntity>,
+        sourceProvenance: CorpusSourceProvenance = CorpusSourceProvenance()
     ): Boolean = withContext(Dispatchers.IO) {
-        require(document.rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
-            "Unsupported corpus rights status: ${document.rightsStatus}"
-        }
+        sourceProvenance.validateFor(document.rightsStatus)
         val isWebContent = document.source.startsWith("web_article", ignoreCase = true) ||
             document.canonicalUrl != null
         require(!isWebContent || document.rightsStatus != "UNVERIFIED") {
@@ -255,7 +302,15 @@ class ArgusRepository(
                     canonicalUrl = document.canonicalUrl,
                     language = document.language,
                     rightsStatus = document.rightsStatus,
-                    importedAtEpochMs = document.createdAtEpochMs
+                    importedAtEpochMs = document.createdAtEpochMs,
+                    licenseIdentifier = sourceProvenance.licenseIdentifier,
+                    licenseName = sourceProvenance.licenseName,
+                    licenseUrl = sourceProvenance.licenseUrl,
+                    attributionText = sourceProvenance.attributionText,
+                    rightsEvidenceUrl = sourceProvenance.rightsEvidenceUrl,
+                    userDeclarationText = sourceProvenance.userDeclarationText,
+                    userDeclaredAtEpochMs = sourceProvenance.userDeclaredAtEpochMs,
+                    reviewedAtEpochMs = sourceProvenance.reviewedAtEpochMs
                 )
             )
             corpusDao.updateSourceMetadata(
@@ -264,8 +319,19 @@ class ArgusRepository(
                 canonicalUrl = document.canonicalUrl,
                 language = document.language,
                 rightsStatus = document.rightsStatus,
-                importedAtEpochMs = document.createdAtEpochMs
+                importedAtEpochMs = document.createdAtEpochMs,
+                licenseIdentifier = sourceProvenance.licenseIdentifier,
+                licenseName = sourceProvenance.licenseName,
+                licenseUrl = sourceProvenance.licenseUrl,
+                attributionText = sourceProvenance.attributionText,
+                rightsEvidenceUrl = sourceProvenance.rightsEvidenceUrl,
+                userDeclarationText = sourceProvenance.userDeclarationText,
+                userDeclaredAtEpochMs = sourceProvenance.userDeclaredAtEpochMs,
+                reviewedAtEpochMs = sourceProvenance.reviewedAtEpochMs
             )
+            check(corpusDao.refreshDocumentRightsStatus(storedDocumentId) == 1) {
+                "The corpus document's aggregate rights status could not be synchronized with its sources."
+            }
             insertedRowId != -1L
         }
     }

@@ -90,12 +90,6 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
     val modelConfig = viewModel.engineConfig
     val backendState = viewModel.activeComputeBackend
     val computeBackendStatus by viewModel.computeBackendStatus.collectAsState()
-    val isVulkanEnabledForCurrentSession by
-        viewModel.isVulkanEnabledForCurrentSession.collectAsState()
-    val isVulkanInitializationInProgress by
-        viewModel.isVulkanInitializationInProgress.collectAsState()
-    val canInitializeVulkanForCurrentSession by
-        viewModel.canInitializeVulkanForCurrentSession.collectAsState()
     val activeDocument = activeDoc
     val activeTrainingItem = currentItem
 
@@ -477,31 +471,8 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             color = ArgusTextSecondary,
                             fontSize = 10.sp
                         )
-                        Button(
-                            onClick = viewModel::toggleVulkanForCurrentSession,
-                            enabled = !isVulkanInitializationInProgress &&
-                                (isVulkanEnabledForCurrentSession || canInitializeVulkanForCurrentSession),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isVulkanEnabledForCurrentSession) ArgusWarning else ArgusCyanPrimary,
-                                contentColor = ArgusDarkBg,
-                                disabledContainerColor = ArgusDarkBg,
-                                disabledContentColor = ArgusTextMuted
-                            ),
-                            modifier = Modifier.testTag("vulkan_session_toggle_button")
-                        ) {
-                            Text(
-                                text = when {
-                                    isVulkanInitializationInProgress -> "Checking Vulkan…"
-                                    isVulkanEnabledForCurrentSession -> "Disable Vulkan for this session"
-                                    canInitializeVulkanForCurrentSession -> "Enable Vulkan (advanced)"
-                                    else -> "Vulkan unavailable — CPU fallback"
-                                },
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
                         Text(
-                            text = "Vulkan stays off by default. Enabling it is optional and applies only until the app restarts.",
+                            text = "Vulkan is prepared after model restoration. Unsupported or unverified runtimes use Kotlin CPU.",
                             style = MaterialTheme.typography.labelSmall,
                             color = ArgusTextMuted,
                             fontSize = 10.sp
@@ -922,7 +893,12 @@ fun QueuedItemCard(item: TrainingData) {
     Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Color.White.copy(alpha = 0.04f)).padding(10.dp)) {
         Column {
             Text(text = displayTrainingItemTitle(item.title), style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary)
-            Text(text = "Source: ${item.source} (${item.content.length} characters)", style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted)
+            val queueDescription = if (item.status == TrainingStatus.OPTIMIZER_COMMITTED) {
+                "Optimizer committed • finalization pending"
+            } else {
+                "Source: ${item.source} (${item.content.length} characters)"
+            }
+            Text(text = queueDescription, style = MaterialTheme.typography.labelSmall, color = ArgusTextMuted)
         }
     }
 }

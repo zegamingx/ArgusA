@@ -42,6 +42,7 @@ class ArgusCheckpointCompatibilityTest {
             assertTrue(learnedMergeCount > 0)
             val encodedTrainingText = original.tokenizer.encode(trainingText)
             assertTrue(original.saveCheckpoint())
+            assertTrue(original.isCheckpointStateVerified)
 
             val checkpointBytes = checkpoint.readBytes()
             assertEquals('A'.code.toByte(), checkpointBytes[0])
@@ -65,7 +66,9 @@ class ArgusCheckpointCompatibilityTest {
             )
 
             val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
+            assertTrue(restored.isCheckpointStateVerified)
             assertTrue(restored.loadCheckpointIfExists())
+            assertTrue(restored.isCheckpointStateVerified)
             assertEquals(original.tokenizer.exportVocab(), restored.tokenizer.exportVocab())
             assertEquals(original.tokenizer.exportMerges(), restored.tokenizer.exportMerges())
             assertEquals(encodedTrainingText, restored.tokenizer.encode(trainingText))
@@ -103,14 +106,16 @@ class ArgusCheckpointCompatibilityTest {
                 availableRamGb = 1.0f
             )
             val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
+            assertTrue(!restored.isCheckpointStateVerified)
             assertTrue(!restored.loadCheckpointIfExists())
+            assertTrue(!restored.isCheckpointStateVerified)
         } finally {
             restoreCheckpoint(checkpoint, previousCheckpoint)
         }
     }
 
     @Test
-    fun arg3HeaderDoesNotOverrideCurrentByteLevelDeviceConfiguration() {
+    fun arg3HeaderPreservesSavedArchitectureAndLegacyTokenizerForRecovery() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
@@ -140,18 +145,14 @@ class ArgusCheckpointCompatibilityTest {
                 availableRamGb = 8.0f
             )
 
-            val expected = EngineConfig.forDevice(
-                totalRamGb = 12,
-                maxHeapMb = 512L,
-                availableRamGb = 8.0f
-            )
-            assertEquals(expected.dModel, restoredConfig.dModel)
-            assertEquals(expected.nHeads, restoredConfig.nHeads)
-            assertEquals(expected.dFf, restoredConfig.dFf)
-            assertEquals(expected.maxSeqLen, restoredConfig.maxSeqLen)
-            assertEquals(expected.loraRank, restoredConfig.loraRank)
+            assertEquals(16, restoredConfig.dModel)
+            assertEquals(4, restoredConfig.nHeads)
+            assertEquals(32, restoredConfig.dFf)
+            assertEquals(16, restoredConfig.maxSeqLen)
+            assertEquals(2, restoredConfig.loraRank)
+            assertEquals(176, restoredConfig.initialVocabularyCapacity)
             assertEquals(
-                ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2,
+                ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
                 restoredConfig.tokenizerConfig.algorithm
             )
         } finally {

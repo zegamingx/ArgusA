@@ -10,6 +10,7 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -73,6 +74,70 @@ class TrainingManagerPersistenceTest {
             assertEquals(1, manager.completedQueue.value.size)
             assertEquals(TrainingStatus.FAILED, manager.completedQueue.value.single().status)
             assertEquals(0, manager.totalStepsExecuted.value)
+        }
+    }
+
+    @Test
+    fun optimizerCommittedRowsSurviveInterruptedTrainingRecovery() = runBlocking {
+        withTrainingManager { _, repository, manager ->
+            manager.pauseTraining()
+            val trainingItem = TrainingData(
+                source = "persistence-test",
+                title = "Committed optimizer transaction",
+                content = "The optimizer already committed this item.",
+                status = TrainingStatus.TRAINING
+            )
+            repository.saveTrainingItem(trainingItem)
+
+            repository.markTrainingItemsOptimizerCommitted(
+                listOf(
+                    trainingItem.copy(
+                        status = TrainingStatus.OPTIMIZER_COMMITTED,
+                        finalLoss = 0.375f,
+                        stepDurationMs = 120L
+                    )
+                )
+            )
+            repository.recoverInterruptedTrainingItems()
+
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
+            assertEquals(1, committed.size)
+            assertEquals(trainingItem.id, committed.single().id)
+            assertEquals(TrainingStatus.OPTIMIZER_COMMITTED, committed.single().status)
+            assertEquals(0.375f, requireNotNull(committed.single().finalLoss), 0f)
+            assertEquals(120L, committed.single().stepDurationMs)
+        }
+    }
+
+    @Test
+    fun committedItemCanOnlyBeCompletedOnce() = runBlocking {
+        withTrainingManager { _, repository, manager ->
+            manager.pauseTraining()
+            val item = TrainingData(
+                source = "persistence-test",
+                title = "Single completion claim",
+                content = "A committed row must only transition to completed once.",
+                status = TrainingStatus.TRAINING
+            )
+            repository.saveTrainingItem(item)
+            repository.markTrainingItemsOptimizerCommitted(
+                listOf(
+                    item.copy(
+                        status = TrainingStatus.OPTIMIZER_COMMITTED,
+                        finalLoss = 0.25f,
+                        stepDurationMs = 75L
+                    )
+                )
+            )
+
+            assertTrue(repository.markTrainingCompleted(item.id, 0.25f, 75L))
+            assertFalse(repository.markTrainingCompleted(item.id, 0.25f, 75L))
+
+            val persisted = requireNotNull(repository.getTrainingItem(item.id))
+            assertEquals(TrainingStatus.COMPLETED, persisted.status)
+            assertEquals(0.25f, requireNotNull(persisted.finalLoss), 0f)
+            assertEquals(75L, persisted.stepDurationMs)
         }
     }
 

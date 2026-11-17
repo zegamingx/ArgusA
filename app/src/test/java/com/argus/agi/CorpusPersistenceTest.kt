@@ -5,6 +5,7 @@ import androidx.test.core.app.ApplicationProvider
 import android.content.Context
 import com.argus.agi.data.local.ArgusDatabase
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
+import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.data.repository.ArgusRepository
 import com.argus.agi.model.ArgusNeuralEngine
 import com.argus.agi.model.CorpusReplayPolicy
@@ -377,6 +378,224 @@ class CorpusPersistenceTest {
     }
 
     @Test
+    fun streamedImportRejectsInputBeyondItsHardMemoryBoundBeforePersisting() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(context),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val oversizedText = "x".repeat(TrainingManager.MAX_STREAMED_DOCUMENT_CHARACTERS + 1)
+            val failure = runCatching {
+                manager.enqueueDocumentStream(
+                    source = "Oversized streamed import test",
+                    title = "Must be rejected before persistence",
+                    reader = StringReader(oversizedText),
+                    chunkSize = 48,
+                    overlap = 0
+                )
+            }.exceptionOrNull()
+
+            assertTrue(
+                "An oversized source must be rejected by the hard stream bound.",
+                failure is IllegalArgumentException
+            )
+            assertTrue(repository.getCorpusDocuments().isEmpty())
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            assertTrue(
+                "The temporary UTF-16 spool must be deleted after rejection.",
+                context.cacheDir.listFiles().orEmpty().none { file ->
+                    file.name.startsWith("argus-ingest-")
+                }
+            )
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
+    @Test
+    fun streamedFingerprintPreservesSurrogatePairsAcrossReaderBufferBoundaries() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(context),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val existingStagingFiles = context.cacheDir.listFiles().orEmpty()
+                .filter { file -> file.name.startsWith("argus-ingest-") }
+                .mapTo(HashSet()) { file -> file.name }
+            // The high surrogate is the final code unit of the first 4 KiB read.
+            val transcript = "a".repeat(4095) + "\uD83D\uDE00" +
+                " A stream must preserve the exact UTF-16 fingerprint. ".repeat(12)
+
+            val firstImport = manager.enqueueDocument(
+                source = "UTF-16 fingerprint parity",
+                title = "Original transcript",
+                fullText = transcript,
+                chunkSize = 48,
+                overlap = 0
+            )
+            assertTrue(firstImport > 0)
+
+            val streamedImport = manager.enqueueDocumentStream(
+                source = "UTF-16 fingerprint parity via Reader",
+                title = "Streamed duplicate",
+                reader = StringReader(transcript),
+                chunkSize = 48,
+                overlap = 0
+            )
+
+            assertEquals(transcript.length.toLong(), streamedImport.second)
+            assertEquals(
+                "A streamed duplicate must have the same UTF-16BE fingerprint as the String API.",
+                0,
+                streamedImport.first
+            )
+            assertEquals(1, repository.getCorpusDocumentCount())
+            val storedDocument = repository.getCorpusDocuments().single()
+            assertEquals(2, repository.getCorpusSources(storedDocument.id).size)
+            assertEquals(
+                "The successful stream must also remove its temporary spool.",
+                existingStagingFiles,
+                context.cacheDir.listFiles().orEmpty()
+                    .filter { file -> file.name.startsWith("argus-ingest-") }
+                    .mapTo(HashSet()) { file -> file.name }
+            )
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
+    @Test
+    fun streamedJsonlRejectsTooManyRecordsBeforePersistingAnyDocument() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(
+                context,
+                EngineConfig(maxSeqLen = 64)
+            ),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val records = (0..TrainingManager.MAX_STREAMED_DOCUMENT_CHUNKS).joinToString("\n") {
+                index -> """{"topic":"record-$index"}"""
+            }
+            val failure = runCatching {
+                manager.enqueueDocumentStream(
+                    source = "JSONL record-budget regression",
+                    title = "Must not partially persist",
+                    reader = StringReader(records),
+                    chunkSize = 380,
+                    overlap = 0
+                )
+            }.exceptionOrNull()
+
+            assertTrue(
+                "The stream must reject an oversized input before persistence.",
+                failure is IllegalArgumentException
+            )
+            assertTrue(
+                "No partially processed JSONL document may be stored.",
+                repository.getCorpusDocuments().isEmpty()
+            )
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            assertTrue(
+                "The spool must be deleted after record-limit rejection.",
+                context.cacheDir.listFiles().orEmpty().none { file ->
+                    file.name.startsWith("argus-ingest-")
+                }
+            )
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
+    @Test
+    fun streamedJsonlRejectsOversizedRecordBeforePersistingAnyDocument() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(
+                context,
+                EngineConfig(maxSeqLen = 64)
+            ),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val oversizedRecord = """{"instruction":"prompt","response":"${
+                "x".repeat(256 * 1024 + 1)
+            }"}"""
+            val failure = runCatching {
+                manager.enqueueDocumentStream(
+                    source = "JSONL field-size regression",
+                    title = "Oversized JSONL record",
+                    reader = StringReader(oversizedRecord),
+                    chunkSize = 380,
+                    overlap = 0
+                )
+            }.exceptionOrNull()
+
+            assertTrue(
+                "A JSONL value above the per-record limit must be rejected.",
+                failure is IllegalArgumentException
+            )
+            assertTrue(repository.getCorpusDocuments().isEmpty())
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            assertTrue(
+                "The temporary spool must be deleted after JSON value rejection.",
+                context.cacheDir.listFiles().orEmpty().none { file ->
+                    file.name.startsWith("argus-ingest-")
+                }
+            )
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
+    @Test
     fun streamedPlainTextConversationIsProcessedOnlyAfterTheCompleteTranscriptArrives() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val database = Room.inMemoryDatabaseBuilder(
@@ -616,14 +835,64 @@ class CorpusPersistenceTest {
                 title = "Article source",
                 fullText = text,
                 canonicalUrl = "https://example.org/article",
-                rightsStatus = "USER_DECLARED"
+                rightsStatus = "USER_DECLARED",
+                sourceProvenance = CorpusSourceProvenance(
+                    userDeclarationText = "I confirm that I have the right to use this article content for local on-device training.",
+                    userDeclaredAtEpochMs = System.currentTimeMillis()
+                )
             )
             assertEquals(0, declaredArticleImport)
 
             val articleSource = repository.getCorpusSources(document.id)
                 .single { it.canonicalUrl == "https://example.org/article" }
             assertEquals("USER_DECLARED", articleSource.rightsStatus)
+            assertTrue(articleSource.userDeclarationText?.isNotBlank() == true)
+            assertTrue((articleSource.userDeclaredAtEpochMs ?: 0L) > 0L)
             assertEquals(4, repository.getCorpusSources(document.id).size)
+            assertEquals(
+                "Document rights must be recomputed from all durable source declarations.",
+                "USER_DECLARED",
+                repository.getCorpusDocument(document.id)?.rightsStatus
+            )
+
+            val reviewedText = "A reviewed license must retain durable provenance. ".repeat(10)
+            val reviewedAt = System.currentTimeMillis()
+            val reviewedChunks = manager.enqueueDocument(
+                source = "offline_public_domain",
+                title = "Reviewed license fixture",
+                fullText = reviewedText,
+                language = "en",
+                rightsStatus = "LICENSE_REVIEWED",
+                sourceProvenance = CorpusSourceProvenance(
+                    licenseIdentifier = "CC-BY-4.0",
+                    licenseName = "Creative Commons Attribution 4.0 International",
+                    licenseUrl = "https://creativecommons.org/licenses/by/4.0/",
+                    attributionText = "Attribution text preserved for the original source.",
+                    rightsEvidenceUrl = "https://example.org/source/license-evidence",
+                    reviewedAtEpochMs = reviewedAt
+                )
+            )
+            assertTrue(reviewedChunks > 0)
+            val reviewedDocument = repository.getCorpusDocuments()
+                .single { it.title == "Reviewed license fixture" }
+            val reviewedSource = repository.getCorpusSources(reviewedDocument.id).single()
+            assertEquals("LICENSE_REVIEWED", reviewedSource.rightsStatus)
+            assertEquals("CC-BY-4.0", reviewedSource.licenseIdentifier)
+            assertEquals("Creative Commons Attribution 4.0 International", reviewedSource.licenseName)
+            assertEquals("https://creativecommons.org/licenses/by/4.0/", reviewedSource.licenseUrl)
+            assertEquals("Attribution text preserved for the original source.", reviewedSource.attributionText)
+            assertEquals("https://example.org/source/license-evidence", reviewedSource.rightsEvidenceUrl)
+            assertEquals(reviewedAt, reviewedSource.reviewedAtEpochMs)
+
+            val missingLicenseFailure = runCatching {
+                manager.enqueueDocument(
+                    source = "offline_public_domain",
+                    title = "Missing license evidence",
+                    fullText = "This content must not be accepted as reviewed without evidence. ".repeat(4),
+                    rightsStatus = "LICENSE_REVIEWED"
+                )
+            }.exceptionOrNull()
+            assertTrue("LICENSE_REVIEWED must require complete auditable license metadata.", missingLicenseFailure != null)
 
             val unverifiedReimport = runCatching {
                 manager.enqueueDocument(
