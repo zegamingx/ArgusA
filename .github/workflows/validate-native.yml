@@ -109,7 +109,10 @@ jobs:
             throw 'The Windows runner must use JDK 25.'
           }
 
-          $cmakeInfo = (& $cmake --version | Select-Object -First 1).Trim()
+          $cmakeVersionOutput = @(& $cmake --version)
+          $cmakeExitCode = $LASTEXITCODE
+          if ($cmakeExitCode -ne 0 -or $cmakeVersionOutput.Count -eq 0) { throw "CMake version check failed with exit code $cmakeExitCode" }
+          $cmakeInfo = ([string]$cmakeVersionOutput[0]).Trim()
           if ($cmakeInfo -ne 'cmake version 4.5.0') { throw "Expected CMake 4.5.0, received: $cmakeInfo" }
           $ninjaInfo = (& $ninja --version | Out-String).Trim()
           if ($ninjaInfo -ne '1.13.2') { throw "Expected Ninja 1.13.2, received: $ninjaInfo" }
