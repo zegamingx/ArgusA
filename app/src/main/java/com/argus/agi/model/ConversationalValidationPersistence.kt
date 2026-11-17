@@ -46,7 +46,7 @@ internal class ConversationalValidationPersistence(
             stored.status
         }
         val restoredMessage = if (interrupted) {
-            "A previous validation cycle was interrupted. The last accepted checkpoint will be restored before training resumes."
+            "A previous validation cycle was interrupted. The candidate checkpoint and durable training queue will be reconciled before evaluation resumes."
         } else {
             stored.message
         }
@@ -58,6 +58,19 @@ internal class ConversationalValidationPersistence(
             message = restoredMessage,
             updatedAtEpochMs = stored.updatedAtEpochMs
         )
+    }
+
+    /**
+     * True when the current model file may contain a candidate from an interrupted
+     * training/evaluation run. In that case startup must reconcile the batch journal
+     * first and must not replace the candidate with the older accepted checkpoint.
+     */
+    @Synchronized
+    fun hasInterruptedCandidateRun(): Boolean {
+        val stored = readSnapshot() ?: return false
+        return stored.baselineReport != null &&
+            (stored.status == ConversationValidationStatus.TRAINING ||
+                stored.status == ConversationValidationStatus.EVALUATING)
     }
 
     @Synchronized
