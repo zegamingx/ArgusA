@@ -1557,9 +1557,22 @@ class TrainingManager(
             check(snapshot.entries.none { it.itemId in committedIds }) {
                 "Room marks a batch committed, but the restored checkpoint is only its baseline."
             }
-            // The write-ahead journal reached COMMITTED, but the following checkpoint
-            // replacement did not. The only durable model state is the exact saved baseline.
+            // COMMITTED reached disk before its model checkpoint. A restart therefore
+            // restored the baseline; reload that complete state rather than trusting only
+            // adamStep, then let Room's TRAINING rows return to QUEUED.
+            check(neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()) {
+                "Vulkan training state could not be released before committed-journal rollback."
+            }
+            check(
+                neuralEngine.loadCheckpointIfExists() &&
+                    neuralEngine.optimizerStep == snapshot.baselineOptimizerStep
+            ) {
+                "The committed batch could not be rolled back to its exact saved baseline."
+            }
+            neuralEngine.resumeVulkanTensorResidencyAfterForeground()
             TrainingCommitJournal.delete(trainingCommitJournalFile)
+            activeBatchBaselineOptimizerStep = null
+            activeBatchRoomCommitted = false
             return
         }
 
