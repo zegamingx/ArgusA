@@ -613,20 +613,13 @@ class TrainingManager(
     }
 
     /**
-     * Ingests a Reader through a bounded disk spool rather than retaining the original
-     * transcript in a growing StringBuilder while it is still being read.
+     * Ingests a Reader through a bounded disk spool instead of growing a transcript buffer
+     * while the caller is still producing input. UTF-16 code units are staged verbatim so
+     * SHA-256/UTF-16BE remains identical to enqueueDocument, even across surrogate boundaries.
      *
-     * UTF-16 code units are written verbatim in big-endian order. This preserves the
-     * exact SHA-256/UTF-16BE identity used by enqueueDocument, including a surrogate
-     * pair split across separate Reader reads.
-     *
-     * The downstream modality processor currently requires a complete bounded String.
-     * Therefore this is a hard-bounded ingestion path, not an unbounded/constant-memory
-     * parser: the input is capped at MAX_STREAMED_DOCUMENT_CHARACTERS and the queued
-     * chunk count is capped before any Room or queue write occurs.
-     *
-     * Conversations, reasoning sequences, and JSONL records remain atomic according to
-     * TextModalityProcessor. The neural engine continues to own context-window splitting.
+     * JSONL is processed one complete object per line from the spool. ChatML, ShareGPT,
+     * reasoning and legacy plain-text documents retain document-level parser semantics.
+     * A live-heap bound and conservative queue-capacity bound are enforced before parsing.
      *
      * @return Pair(number of generated queue chunks, total UTF-16 characters read)
      */
@@ -661,9 +654,14 @@ class TrainingManager(
         if (closed) return Pair(0, 0L)
 
         val availableHeapBytes = captureTrainingMemorySnapshot().availableHeapBytes
+        val maximumRawChunks = MAX_STREAMED_DOCUMENT_CHUNKS / epochs
+        val effectiveChunkStride = (chunkSize - overlap).coerceAtLeast(1)
+        val queueBoundedCharacterLimit = (
+            maximumRawChunks.toLong() * effectiveChunkStride.toLong() / 4L
+        ).coerceIn(1L, MAX_STREAMED_DOCUMENT_CHARACTERS.toLong()).toInt()
         val streamCharacterLimit = DeviceAdaptiveRuntimePolicy.streamedDocumentCharacterLimit(
             availableHeapBytes = availableHeapBytes,
-            hardLimitCharacters = MAX_STREAMED_DOCUMENT_CHARACTERS
+            hardLimitCharacters = queueBoundedCharacterLimit
         )
         require(streamCharacterLimit > 0) {
             "There is not enough available app-heap headroom for a streamed document import."
@@ -877,6 +875,7 @@ class TrainingManager(
                     org.json.JSONObject(record)
                 }.isSuccess
                 if (!isJsonObject) return null
+                validateStreamedJsonValueSizes(record)
 
                 foundRecord = true
                 val nextChunks = TextModalityProcessor.process(
