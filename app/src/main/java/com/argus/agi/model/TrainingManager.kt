@@ -40,7 +40,14 @@ import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 
-enum class TrainingStatus { PERSISTING, QUEUED, TRAINING, COMPLETED, FAILED }
+enum class TrainingStatus {
+    PERSISTING,
+    QUEUED,
+    TRAINING,
+    OPTIMIZER_COMMITTED,
+    COMPLETED,
+    FAILED
+}
 
 data class TrainingData(
     val id: String = UUID.randomUUID().toString(),
@@ -111,6 +118,8 @@ class TrainingManager(
     private val activityManager =
         context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
     private val validationFilesDirectory = context.applicationContext.filesDir
+    private val trainingCommitJournalFile =
+        File(validationFilesDirectory, TrainingCommitJournal.FILE_NAME)
     private val conversationalValidationPersistence =
         ConversationalValidationPersistence(validationFilesDirectory)
 
@@ -192,7 +201,14 @@ class TrainingManager(
     val totalStepsExecuted: StateFlow<Int> = _totalStepsExecuted.asStateFlow()
 
     private val preparedTokenizerDocuments = HashSet<String>()
-    private var consecutiveOomRecoveries = 0
+    private val oomRecoveryItemIds = HashSet<String>()
+    private val oomRetryCounts = HashMap<String, Int>()
+
+    @Volatile
+    private var activeBatchBaselineOptimizerStep: Int? = null
+
+    @Volatile
+    private var activeBatchRoomCommitted = false
 
     private data class TrainingMemorySnapshot(
         val availableHeapBytes: Long,
@@ -293,29 +309,33 @@ class TrainingManager(
         scope.launch {
             repo?.let { repository ->
                 runSuspendCatching {
+                    reconcilePersistedTrainingCommit(repository)
                     repository.recoverInterruptedTrainingItems()
-                    repository.getPendingQueueSnapshot()
+                    val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                    val pending = repository.getPendingQueueSnapshot()
+                    (committed.sortedBy { it.timestamp } + pending.sortedBy { it.timestamp })
                 }
-                    .onSuccess { pending ->
-                        if (pending.isNotEmpty()) {
-                            synchronized(queueLock) {
-                                if (
-                                    restoreGeneration == queueGeneration &&
-                                    _nextQueue.value.isEmpty()
-                                ) {
-                                    val orderedPending = pending.sortedBy { it.timestamp }
-                                    _nextQueue.value = orderedPending
-                                    lastScheduledTimestamp = maxOf(
-                                        lastScheduledTimestamp,
-                                        orderedPending.maxOf { it.timestamp }
-                                    )
-                                    wakeupSignal.trySend(Unit)
+                    .onSuccess { restoredItems ->
+                        synchronized(queueLock) {
+                            if (
+                                restoreGeneration == queueGeneration &&
+                                _nextQueue.value.isEmpty()
+                            ) {
+                                _nextQueue.value = restoredItems
+                                restoredItems.maxOfOrNull { it.timestamp }?.let { latest ->
+                                    lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
                                 }
+                                wakeupSignal.trySend(Unit)
                             }
                         }
                     }
                     .onFailure { error ->
-                        Log.e(TAG, "Failed to recover and restore persisted training queue", error)
+                        _isTrainingPaused.value = true
+                        Log.e(
+                            TAG,
+                            "Training is paused because its durable optimizer-commit state could not be reconciled.",
+                            error
+                        )
                     }
             }
         }
@@ -331,8 +351,21 @@ class TrainingManager(
     }
 
     fun pauseTraining() { _isTrainingPaused.value = true; wakeupSignal.trySend(Unit) }
-    fun resumeTraining() { _isTrainingPaused.value = false; wakeupSignal.trySend(Unit) }
+    fun resumeTraining() {
+        synchronized(queueLock) {
+            oomRetryCounts.clear()
+        }
+        _isTrainingPaused.value = false
+        wakeupSignal.trySend(Unit)
+    }
+
     fun togglePauseTraining() {
+        val resumed = _isTrainingPaused.value
+        if (resumed) {
+            synchronized(queueLock) {
+                oomRetryCounts.clear()
+            }
+        }
         _isTrainingPaused.update { !it }
         wakeupSignal.trySend(Unit)
     }
@@ -354,7 +387,10 @@ class TrainingManager(
     fun clearQueue() {
         synchronized(queueLock) {
             queueGeneration += 1L
-            _nextQueue.value = emptyList()
+            val committedItems = _nextQueue.value.filter {
+                it.status == TrainingStatus.OPTIMIZER_COMMITTED
+            }
+            _nextQueue.value = committedItems
             persistenceOperations.trySend(
                 QueuePersistenceOperation.Clear(queueGeneration)
             )
