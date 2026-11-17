@@ -129,7 +129,7 @@ jobs:
         run: |
           & .\tools\cmake-compat\install-wrapper.ps1 -RealCMake "$env:CMAKE_HOME\bin\cmake.exe" -WrapperRoot "$env:RUNNER_TEMP\argus-cmake-compat"
 
-      - name: Run Tensor Arena C++23 host unit tests
+      - name: Run Tensor Arena host unit tests
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -165,7 +165,7 @@ jobs:
           @echo off
           call "$vcvars" >nul
           if errorlevel 1 exit /b %errorlevel%
-          cl.exe /nologo /std:c++23 /EHsc /W4 /WX /O2 "$source" /Fe:"$testExe"
+          cl.exe /nologo /std:c++17 /EHsc /W4 /WX /O2 "$source" /Fe:"$testExe"
           if errorlevel 1 exit /b %errorlevel%
           "$testExe"
           exit /b %errorlevel%
@@ -176,7 +176,7 @@ jobs:
           & $env:ComSpec /d /c $batchArgument
           $testExitCode = $LASTEXITCODE
           if ($testExitCode -ne 0) { throw "Tensor Arena C++23 host tests failed with exit code $testExitCode." }
-          Write-Host 'Tensor Arena C++23 host unit tests passed.'
+          Write-Host 'Tensor Arena host unit tests passed (C++17 minimum; Android NDK target remains C++23).'
 
       - name: Verify Gradle and Java toolchain
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
