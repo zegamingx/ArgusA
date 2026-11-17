@@ -1408,7 +1408,7 @@ class ArgusNeuralEngine private constructor(
         }
         if (!config.gradientAccumulationEnabled) {
             require(texts.size == 1) {
-                "This legacy checkpoint requires single-sample compatibility training."
+                "This low-memory training configuration requires a single sample per batch."
             }
             return trainSingleSampleSequential(
                 text = texts.single(),
@@ -1562,9 +1562,9 @@ class ArgusNeuralEngine private constructor(
     }
 
     /**
-     * Compatibility path for older checkpoints whose existing model state fits the
-     * legacy 16-byte floor but cannot safely reserve an additional accumulation tensor.
-     * It retains the original per-window Adam update behavior and is restricted to batch 1.
+     * Low-memory training path for device configurations that cannot safely reserve
+     * an additional gradient-accumulation tensor. It retains per-window Adam updates
+     * and is deliberately restricted to a single sample per batch.
      */
     private fun trainSingleSampleSequential(
         text: String,
