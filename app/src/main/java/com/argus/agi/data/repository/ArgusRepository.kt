@@ -8,6 +8,7 @@ import com.argus.agi.data.local.entity.ChatMessageEntity
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceEntity
+import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.data.local.entity.TrainingItemEntity
 import com.argus.agi.data.local.entity.WorldMemoryEntity
 import com.argus.agi.model.TrainingData
@@ -246,11 +247,10 @@ class ArgusRepository(
 
     suspend fun storeCorpusDocument(
         document: CorpusDocumentEntity,
-        chunks: List<CorpusChunkEntity>
+        chunks: List<CorpusChunkEntity>,
+        sourceProvenance: CorpusSourceProvenance = CorpusSourceProvenance()
     ): Boolean = withContext(Dispatchers.IO) {
-        require(document.rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
-            "Unsupported corpus rights status: ${document.rightsStatus}"
-        }
+        sourceProvenance.validateFor(document.rightsStatus)
         val isWebContent = document.source.startsWith("web_article", ignoreCase = true) ||
             document.canonicalUrl != null
         require(!isWebContent || document.rightsStatus != "UNVERIFIED") {
@@ -302,7 +302,15 @@ class ArgusRepository(
                     canonicalUrl = document.canonicalUrl,
                     language = document.language,
                     rightsStatus = document.rightsStatus,
-                    importedAtEpochMs = document.createdAtEpochMs
+                    importedAtEpochMs = document.createdAtEpochMs,
+                    licenseIdentifier = sourceProvenance.licenseIdentifier,
+                    licenseName = sourceProvenance.licenseName,
+                    licenseUrl = sourceProvenance.licenseUrl,
+                    attributionText = sourceProvenance.attributionText,
+                    rightsEvidenceUrl = sourceProvenance.rightsEvidenceUrl,
+                    userDeclarationText = sourceProvenance.userDeclarationText,
+                    userDeclaredAtEpochMs = sourceProvenance.userDeclaredAtEpochMs,
+                    reviewedAtEpochMs = sourceProvenance.reviewedAtEpochMs
                 )
             )
             corpusDao.updateSourceMetadata(
@@ -311,7 +319,15 @@ class ArgusRepository(
                 canonicalUrl = document.canonicalUrl,
                 language = document.language,
                 rightsStatus = document.rightsStatus,
-                importedAtEpochMs = document.createdAtEpochMs
+                importedAtEpochMs = document.createdAtEpochMs,
+                licenseIdentifier = sourceProvenance.licenseIdentifier,
+                licenseName = sourceProvenance.licenseName,
+                licenseUrl = sourceProvenance.licenseUrl,
+                attributionText = sourceProvenance.attributionText,
+                rightsEvidenceUrl = sourceProvenance.rightsEvidenceUrl,
+                userDeclarationText = sourceProvenance.userDeclarationText,
+                userDeclaredAtEpochMs = sourceProvenance.userDeclaredAtEpochMs,
+                reviewedAtEpochMs = sourceProvenance.reviewedAtEpochMs
             )
             insertedRowId != -1L
         }

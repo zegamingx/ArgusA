@@ -5,6 +5,7 @@ import android.content.Context
 import android.util.Log
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
+import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.sensor.DeviceGuard
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -433,7 +434,8 @@ class TrainingManager(
         epochs: Int = 1,
         language: String? = null,
         canonicalUrl: String? = null,
-        rightsStatus: String = "UNVERIFIED"
+        rightsStatus: String = "UNVERIFIED",
+        sourceProvenance: CorpusSourceProvenance = CorpusSourceProvenance()
     ): Int {
         require(chunkSize > 0) { "chunkSize harus > 0." }
         require(overlap >= 0) { "overlap tidak boleh negatif." }
@@ -446,6 +448,7 @@ class TrainingManager(
         require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
             "Unsupported corpus rights status: $rightsStatus"
         }
+        sourceProvenance.validateFor(rightsStatus)
         requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
 
         if (fullText.isBlank() || closed) return 0
@@ -491,7 +494,7 @@ class TrainingManager(
         val activeRepository = requireNotNull(repo) {
             "Local corpus storage is unavailable; document training was not queued."
         }
-        val stored = activeRepository.storeCorpusDocument(corpusDocument, corpusChunks)
+        val stored = activeRepository.storeCorpusDocument(corpusDocument, corpusChunks, sourceProvenance)
         if (!stored) {
             Log.i(TAG, "Duplicate corpus document skipped: $documentId")
             return 0
@@ -629,7 +632,8 @@ class TrainingManager(
         epochs: Int = 1,
         language: String? = null,
         canonicalUrl: String? = null,
-        rightsStatus: String = "UNVERIFIED"
+        rightsStatus: String = "UNVERIFIED",
+        sourceProvenance: CorpusSourceProvenance = CorpusSourceProvenance()
     ): Pair<Int, Long> {
         require(chunkSize > 0) { "chunkSize must be positive." }
         require(overlap >= 0) { "overlap cannot be negative." }
@@ -645,6 +649,7 @@ class TrainingManager(
         require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
             "Unsupported corpus rights status: $rightsStatus"
         }
+        sourceProvenance.validateFor(rightsStatus)
         requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
         if (closed) return Pair(0, 0L)
 
@@ -719,7 +724,7 @@ class TrainingManager(
         val activeRepository = requireNotNull(repo) {
             "Local corpus storage is unavailable; document training was not queued."
         }
-        val stored = activeRepository.storeCorpusDocument(corpusDocument, corpusChunks)
+        val stored = activeRepository.storeCorpusDocument(corpusDocument, corpusChunks, sourceProvenance)
         if (!stored) {
             Log.i(TAG, "Duplicate corpus document skipped: $documentId")
             return Pair(0, totalCharsRead)
@@ -824,11 +829,13 @@ class TrainingManager(
         fullText: String,
         language: String? = null,
         canonicalUrl: String? = null,
-        rightsStatus: String = "UNVERIFIED"
+        rightsStatus: String = "UNVERIFIED",
+        sourceProvenance: CorpusSourceProvenance = CorpusSourceProvenance()
     ): Boolean {
         require(rightsStatus in setOf("UNVERIFIED", "USER_DECLARED", "LICENSE_REVIEWED")) {
             "Unsupported corpus rights status: $rightsStatus"
         }
+        sourceProvenance.validateFor(rightsStatus)
         requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
         if (fullText.isBlank() || closed) return false
 
@@ -858,7 +865,7 @@ class TrainingManager(
         val activeRepository = requireNotNull(repo) {
             "Local corpus storage is unavailable; validation data was not imported."
         }
-        return activeRepository.storeCorpusDocument(document, emptyList())
+        return activeRepository.storeCorpusDocument(document, emptyList(), sourceProvenance)
     }
 
     /**

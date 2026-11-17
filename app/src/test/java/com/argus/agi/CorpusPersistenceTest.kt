@@ -5,6 +5,7 @@ import androidx.test.core.app.ApplicationProvider
 import android.content.Context
 import com.argus.agi.data.local.ArgusDatabase
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
+import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.data.repository.ArgusRepository
 import com.argus.agi.model.ArgusNeuralEngine
 import com.argus.agi.model.CorpusReplayPolicy
@@ -616,14 +617,59 @@ class CorpusPersistenceTest {
                 title = "Article source",
                 fullText = text,
                 canonicalUrl = "https://example.org/article",
-                rightsStatus = "USER_DECLARED"
+                rightsStatus = "USER_DECLARED",
+                sourceProvenance = CorpusSourceProvenance(
+                    userDeclarationText = "I confirm that I have the right to use this article content for local on-device training.",
+                    userDeclaredAtEpochMs = System.currentTimeMillis()
+                )
             )
             assertEquals(0, declaredArticleImport)
 
             val articleSource = repository.getCorpusSources(document.id)
                 .single { it.canonicalUrl == "https://example.org/article" }
             assertEquals("USER_DECLARED", articleSource.rightsStatus)
+            assertTrue(articleSource.userDeclarationText?.isNotBlank() == true)
+            assertTrue((articleSource.userDeclaredAtEpochMs ?: 0L) > 0L)
             assertEquals(4, repository.getCorpusSources(document.id).size)
+
+            val reviewedText = "A reviewed license must retain durable provenance. ".repeat(10)
+            val reviewedAt = System.currentTimeMillis()
+            val reviewedChunks = manager.enqueueDocument(
+                source = "offline_public_domain",
+                title = "Reviewed license fixture",
+                fullText = reviewedText,
+                language = "en",
+                rightsStatus = "LICENSE_REVIEWED",
+                sourceProvenance = CorpusSourceProvenance(
+                    licenseIdentifier = "CC-BY-4.0",
+                    licenseName = "Creative Commons Attribution 4.0 International",
+                    licenseUrl = "https://creativecommons.org/licenses/by/4.0/",
+                    attributionText = "Attribution text preserved for the original source.",
+                    rightsEvidenceUrl = "https://example.org/source/license-evidence",
+                    reviewedAtEpochMs = reviewedAt
+                )
+            )
+            assertTrue(reviewedChunks > 0)
+            val reviewedDocument = repository.getCorpusDocuments()
+                .single { it.title == "Reviewed license fixture" }
+            val reviewedSource = repository.getCorpusSources(reviewedDocument.id).single()
+            assertEquals("LICENSE_REVIEWED", reviewedSource.rightsStatus)
+            assertEquals("CC-BY-4.0", reviewedSource.licenseIdentifier)
+            assertEquals("Creative Commons Attribution 4.0 International", reviewedSource.licenseName)
+            assertEquals("https://creativecommons.org/licenses/by/4.0/", reviewedSource.licenseUrl)
+            assertEquals("Attribution text preserved for the original source.", reviewedSource.attributionText)
+            assertEquals("https://example.org/source/license-evidence", reviewedSource.rightsEvidenceUrl)
+            assertEquals(reviewedAt, reviewedSource.reviewedAtEpochMs)
+
+            val missingLicenseFailure = runCatching {
+                manager.enqueueDocument(
+                    source = "offline_public_domain",
+                    title = "Missing license evidence",
+                    fullText = "This content must not be accepted as reviewed without evidence. ".repeat(4),
+                    rightsStatus = "LICENSE_REVIEWED"
+                )
+            }.exceptionOrNull()
+            assertTrue("LICENSE_REVIEWED must require complete auditable license metadata.", missingLicenseFailure != null)
 
             val unverifiedReimport = runCatching {
                 manager.enqueueDocument(

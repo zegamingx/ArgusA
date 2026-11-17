@@ -3763,13 +3763,92 @@ class ArgusNeuralEngine private constructor(
                 writeArg4Checkpoint()
             }
             val file = File(context.filesDir, "argus_model_weights.bin")
-            val saved = file.isFile && file.length() >= ARG4_HEADER_SIZE.toLong()
-            if (saved) {
-                checkpointStateVerified = true
+            checkpointStateVerified = false
+            val verified = verifyArg4CheckpointFile(file)
+            checkpointStateVerified = verified
+            if (!verified) {
+                Log.e(TAG, "ARG4 checkpoint read-back verification failed.")
             }
-            saved
+            verified
         } catch (t: Throwable) {
             Log.e(TAG, "Checkpoint save failed", t)
+            false
+        }
+    }
+
+    /**
+     * Independently re-reads the committed ARG4 file and verifies its declared length
+     * and payload CRC32 before a Genesis identity or checkpoint-ready state is published.
+     * The payload is streamed through a bounded buffer; no complete checkpoint copy is
+     * materialized in the app heap.
+     */
+    private fun verifyArg4CheckpointFile(file: File): Boolean {
+        return try {
+            require(file.isFile && file.length() >= ARG4_HEADER_SIZE.toLong()) {
+                "ARG4 checkpoint is missing or shorter than its fixed header."
+            }
+
+            val headerBytes = FileInputStream(file).use { input ->
+                input.readFully(ARG4_HEADER_SIZE)
+            }
+            val header = ByteBuffer.wrap(headerBytes).order(ByteOrder.LITTLE_ENDIAN)
+            require(
+                header.get() == MAGIC_0 && header.get() == MAGIC_1 &&
+                    header.get() == MAGIC_2 && header.get() == MAGIC_4
+            ) {
+                "ARG4 checkpoint read-back magic is invalid."
+            }
+            require(header.int == ARG4_CHECKPOINT_VERSION) {
+                "ARG4 checkpoint read-back version is unsupported."
+            }
+            require(header.int == ARG4_HEADER_SIZE) {
+                "ARG4 checkpoint read-back header size is invalid."
+            }
+
+            header.position(ARG4_HEADER_SIZE - 16)
+            val payloadByteCount = header.long
+            val expectedChecksum = header.int.toLong() and 0xFFFF_FFFFL
+            val flags = header.int
+            require(payloadByteCount > 0L) {
+                "ARG4 checkpoint read-back payload length is invalid."
+            }
+            require(flags == 0) {
+                "ARG4 checkpoint read-back contains unsupported flags."
+            }
+
+            val expectedFileLength = Math.addExact(
+                ARG4_HEADER_SIZE.toLong(),
+                payloadByteCount
+            )
+            require(file.length() == expectedFileLength) {
+                "ARG4 checkpoint read-back length does not match the committed payload."
+            }
+
+            val actualChecksum = CRC32()
+            BufferedInputStream(FileInputStream(file)).use { input ->
+                skipFully(input, ARG4_HEADER_SIZE.toLong())
+                val buffer = ByteArray(TENSOR_WRITE_BUFFER_BYTES)
+                var remaining = payloadByteCount
+                while (remaining > 0L) {
+                    val requested = min(remaining, buffer.size.toLong()).toInt()
+                    val count = input.read(buffer, 0, requested)
+                    require(count > 0) {
+                        "ARG4 checkpoint read-back payload ended unexpectedly."
+                    }
+                    actualChecksum.update(buffer, 0, count)
+                    remaining -= count.toLong()
+                }
+                require(input.read() == -1) {
+                    "ARG4 checkpoint read-back contains trailing bytes."
+                }
+            }
+
+            require(actualChecksum.value == expectedChecksum) {
+                "ARG4 checkpoint read-back checksum does not match."
+            }
+            true
+        } catch (error: Exception) {
+            Log.e(TAG, "ARG4 checkpoint read-back verification failed.", error)
             false
         }
     }

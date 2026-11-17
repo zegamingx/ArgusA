@@ -28,7 +28,16 @@ interface CorpusDao {
             "WHEN :rightsStatus = 'LICENSE_REVIEWED' THEN :rightsStatus " +
             "WHEN rightsStatus = 'USER_DECLARED' AND :rightsStatus = 'UNVERIFIED' THEN rightsStatus " +
             "ELSE :rightsStatus END, " +
-            "importedAtEpochMs = :importedAtEpochMs WHERE id = :sourceId"
+            "importedAtEpochMs = :importedAtEpochMs, " +
+            "licenseIdentifier = COALESCE(:licenseIdentifier, licenseIdentifier), " +
+            "licenseName = COALESCE(:licenseName, licenseName), " +
+            "licenseUrl = COALESCE(:licenseUrl, licenseUrl), " +
+            "attributionText = COALESCE(:attributionText, attributionText), " +
+            "rightsEvidenceUrl = COALESCE(:rightsEvidenceUrl, rightsEvidenceUrl), " +
+            "userDeclarationText = COALESCE(:userDeclarationText, userDeclarationText), " +
+            "userDeclaredAtEpochMs = COALESCE(:userDeclaredAtEpochMs, userDeclaredAtEpochMs), " +
+            "reviewedAtEpochMs = COALESCE(:reviewedAtEpochMs, reviewedAtEpochMs) " +
+            "WHERE id = :sourceId"
     )
     suspend fun updateSourceMetadata(
         sourceId: String,
@@ -36,7 +45,15 @@ interface CorpusDao {
         canonicalUrl: String?,
         language: String?,
         rightsStatus: String,
-        importedAtEpochMs: Long
+        importedAtEpochMs: Long,
+        licenseIdentifier: String?,
+        licenseName: String?,
+        licenseUrl: String?,
+        attributionText: String?,
+        rightsEvidenceUrl: String?,
+        userDeclarationText: String?,
+        userDeclaredAtEpochMs: Long?,
+        reviewedAtEpochMs: Long?
     ): Int
 
     @Query("SELECT * FROM corpus_sources WHERE documentId = :documentId ORDER BY importedAtEpochMs ASC")

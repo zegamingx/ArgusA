@@ -9,6 +9,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.argus.agi.ArgusApp
 import com.argus.agi.model.BenchmarkResult
+import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.model.GenesisLifecycleStage
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingManager
@@ -405,7 +406,11 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     chunkSize = 380,
                     overlap = 0,
                     epochs = 1,
-                    rightsStatus = "USER_DECLARED"
+                    rightsStatus = "USER_DECLARED",
+                    sourceProvenance = CorpusSourceProvenance(
+                        userDeclarationText = "I explicitly approve this selected conversation exchange for local on-device training.",
+                        userDeclaredAtEpochMs = System.currentTimeMillis()
+                    )
                 )
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -1436,7 +1441,11 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     epochs = epochs,
                     language = article.language,
                     canonicalUrl = article.canonicalUrl,
-                    rightsStatus = "USER_DECLARED"
+                    rightsStatus = "USER_DECLARED",
+                    sourceProvenance = CorpusSourceProvenance(
+                        userDeclarationText = "I confirm that I have the right to use this article content for local on-device training.",
+                        userDeclaredAtEpochMs = System.currentTimeMillis()
+                    )
                 )
             }
 
