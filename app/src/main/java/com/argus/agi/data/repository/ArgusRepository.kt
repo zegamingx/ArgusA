@@ -169,8 +169,17 @@ class ArgusRepository(
         }
     }
 
-    suspend fun markTrainingCompleted(id: String, loss: Float, durationMs: Long) = withContext(Dispatchers.IO) {
-        trainingQueueDao.updateStatus(id, "COMPLETED", loss, durationMs)
+    suspend fun markTrainingCompleted(
+        id: String,
+        loss: Float,
+        durationMs: Long
+    ): Boolean = withContext(Dispatchers.IO) {
+        val updated = trainingQueueDao.markOptimizerCommittedCompleted(
+            id = id,
+            loss = loss,
+            duration = durationMs
+        )
+        updated == 1
     }
 
     suspend fun markTrainingStarted(id: String): Boolean = withContext(Dispatchers.IO) {
