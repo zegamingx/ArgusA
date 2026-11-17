@@ -2443,32 +2443,53 @@ class TrainingManager(
     }
 
     private suspend fun processBatch(
-        items: List<TrainingData>,
+        items: MutableList<TrainingData>,
         runtimeContextLength: Int
     ): Boolean {
         require(items.isNotEmpty()) { "A training micro-batch cannot be empty." }
+        val repository = requireNotNull(repo) {
+            "Durable training storage is required before optimizer updates can begin."
+        }
         items.mapNotNull(TrainingData::documentId)
             .forEach(validationRunDocumentIds::add)
 
         for (item in items) {
             item.documentId?.let { documentId ->
                 if (item.chunkIndex == 1) {
-                    repo?.let { activeRepository ->
-                        runSuspendCatching {
-                            activeRepository.markCorpusDocumentTraining(documentId)
-                        }.onFailure { error ->
-                            Log.w(TAG, "Failed to mark corpus document as training", error)
-                        }
+                    try {
+                        repository.markCorpusDocumentTraining(documentId)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: OutOfMemoryError) {
+                        throw error
+                    } catch (error: Throwable) {
+                        Log.w(TAG, "Failed to mark corpus document as training", error)
                     }
                 }
                 prepareTokenizerForDocument(item)
             }
         }
 
+        // Save the exact model/tokenizer/optimizer baseline before preparing the
+        // transaction journal. Managed training disables engine auto-checkpointing,
+        // so this file remains the rollback point until the journal and Room agree.
+        check(neuralEngine.saveCheckpoint()) {
+            "The pre-batch model checkpoint could not be secured."
+        }
+        val baselineOptimizerStep = neuralEngine.optimizerStep
+        activeBatchBaselineOptimizerStep = baselineOptimizerStep
+        activeBatchRoomCommitted = false
+        TrainingCommitJournal.writePrepared(
+            file = trainingCommitJournalFile,
+            baselineOptimizerStep = baselineOptimizerStep,
+            itemIds = items.map(TrainingData::id)
+        )
+
         val startNs = System.nanoTime()
         val batchResult = neuralEngine.trainBatchDetailed(
             texts = items.map(TrainingData::content),
-            runtimeContextLength = runtimeContextLength
+            runtimeContextLength = runtimeContextLength,
+            autoCheckpoint = false
         )
         val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
         require(batchResult.samples.size == items.size) {
@@ -2476,23 +2497,55 @@ class TrainingManager(
         }
         val perItemDurationMs = (elapsedMs / items.size).coerceAtLeast(1L)
 
+        val commitEntries = items.zip(batchResult.samples).map { (item, result) ->
+            TrainingCommitJournalEntry(
+                itemId = item.id,
+                result = result,
+                stepDurationMs = perItemDurationMs
+            )
+        }
+        TrainingCommitJournal.writeCommitted(
+            file = trainingCommitJournalFile,
+            baselineOptimizerStep = baselineOptimizerStep,
+            committedOptimizerStep = neuralEngine.optimizerStep,
+            entries = commitEntries
+        )
+
+        // The write-ahead COMMITTED marker is durable before the model checkpoint.
+        // Room is updated only after that checkpoint is atomically secured.
+        check(neuralEngine.saveCheckpoint()) {
+            "The committed optimizer state could not be checkpointed."
+        }
+
+        val committedItems = items.zip(commitEntries).map { (item, entry) ->
+            val result = requireNotNull(entry.result)
+            item.copy(
+                status = TrainingStatus.OPTIMIZER_COMMITTED,
+                finalLoss = result.loss,
+                stepDurationMs = entry.stepDurationMs
+            )
+        }
+        repository.markTrainingItemsOptimizerCommitted(committedItems)
+        committedItems.forEachIndexed { index, item -> items[index] = item }
+        activeBatchRoomCommitted = true
+
         var allItemsSucceeded = true
-        for ((item, stepResult) in items.zip(batchResult.samples)) {
-            try {
-                if (!processItem(item, stepResult, perItemDurationMs)) {
-                    allItemsSucceeded = false
-                    item.documentId?.let(validationRunFailedDocumentIds::add)
-                }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: OutOfMemoryError) {
-                throw error
-            } catch (error: Throwable) {
+        for ((item, entry) in items.zip(commitEntries)) {
+            val result = requireNotNull(entry.result)
+            if (!processItem(item, result, entry.stepDurationMs)) {
                 allItemsSucceeded = false
                 item.documentId?.let(validationRunFailedDocumentIds::add)
-                Log.e(TAG, "Failed to finalize training item '${item.title}'.", error)
-                markTrainingItemFailed(item, error.message)
             }
+            synchronized(queueLock) {
+                oomRecoveryItemIds.remove(item.id)
+                oomRetryCounts.remove(item.id)
+            }
+        }
+
+        deleteTrainingCommitJournalWhenResolved()
+        if (!trainingCommitJournalFile.exists()) {
+            activeBatchBaselineOptimizerStep = null
+            activeBatchRoomCommitted = false
         }
         return allItemsSucceeded
     }
