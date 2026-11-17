@@ -1,6 +1,9 @@
 name: Argus Android Build
 
 on:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
@@ -116,6 +119,7 @@ jobs:
           echo "Building Argus ${version_name} (${build}) from $(git rev-parse HEAD)."
 
       - name: Restore persistent Argus signing identity
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -138,12 +142,20 @@ jobs:
           chmod +x gradlew
           ./gradlew --version
 
-      - name: Run release lint, unit tests and APK build
+      - name: Run PR validation or verified release build
         run: |
+          set -euo pipefail
           chmod +x gradlew
-          env -u ANDROID_SDK_ROOT ./gradlew --no-daemon --no-configuration-cache --stacktrace clean :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            echo "Running unsigned debug validation for the pull request."
+            env -u ANDROID_SDK_ROOT ./gradlew --no-daemon --no-configuration-cache --stacktrace clean :app:lintDebug :app:testDebugUnitTest :app:assembleDebug
+          else
+            echo "Running the signed release build for main."
+            env -u ANDROID_SDK_ROOT ./gradlew --no-daemon --no-configuration-cache --stacktrace clean :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
+          fi
 
       - name: Verify APK signature and prepare checksums
+        if: github.event_name == 'push'
         shell: bash
         run: |
           set -euo pipefail
@@ -204,6 +216,7 @@ jobs:
           echo "APK signature verified against the persistent Argus upload certificate."
 
       - name: Remove signing key from workspace
+        if: github.event_name == 'push'
         shell: bash
         run: |
           set -euo pipefail
@@ -216,6 +229,7 @@ jobs:
 
       # Every successful main build publishes the newly verified APK to the rolling Release channel.
       - name: Automatically publish latest signed APK to GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash

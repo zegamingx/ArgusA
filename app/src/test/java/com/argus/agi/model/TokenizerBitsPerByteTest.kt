@@ -35,6 +35,39 @@ class TokenizerBitsPerByteTest {
     }
 
     @Test
+    fun corpusByteDenominatorExcludesDocumentsWithoutScoredTargets() {
+        var accumulatedBytes = 0L
+        accumulatedBytes = TokenizerEvaluationMetrics.addScoredDocumentBytes(
+            accumulatedBytes,
+            LossEvaluation(
+                meanLoss = 1.5f,
+                targetCount = 4,
+                evaluatedDocumentCount = 1,
+                scoredUtf8ByteCount = 9L
+            )
+        )
+        accumulatedBytes = TokenizerEvaluationMetrics.addScoredDocumentBytes(
+            accumulatedBytes,
+            LossEvaluation(
+                meanLoss = Float.NaN,
+                targetCount = 0,
+                evaluatedDocumentCount = 0,
+                scoredUtf8ByteCount = 200L
+            )
+        )
+        accumulatedBytes = TokenizerEvaluationMetrics.addScoredDocumentBytes(
+            accumulatedBytes,
+            LossEvaluation(
+                meanLoss = Float.POSITIVE_INFINITY,
+                targetCount = 2,
+                evaluatedDocumentCount = 0,
+                scoredUtf8ByteCount = 100L
+            )
+        )
+        assertEquals(9L, accumulatedBytes)
+    }
+
+    @Test
     fun byteDenominatorUsesTheSameReplacementPolicyAsEncoding() {
         val tokenizer = Tokenizer()
         assertEquals(1L, tokenizer.utf8ByteCount("A"))

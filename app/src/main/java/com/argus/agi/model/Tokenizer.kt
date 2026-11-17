@@ -9,6 +9,7 @@ import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicReferenceArray
 import java.util.PriorityQueue
 
@@ -141,6 +142,8 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         private const val MAX_ENCODE_CACHE_ENTRIES = 128
         private const val MAX_CACHEABLE_TEXT_LENGTH = 2_048
         private const val MAX_CACHEABLE_TOKEN_IDS = 4_096
+        private const val MAX_TRAINING_PRETOKEN_CACHE_ENTRIES = 128
+        private const val MAX_TRAINING_PRETOKEN_CACHE_SEGMENT_LENGTH = 4_096
 
         const val MAX_TOKEN_LEN = TokenizerConfig.DEFAULT_MAX_TOKEN_LENGTH
         const val MAX_VOCAB_SIZE = TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE
@@ -580,6 +583,33 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
         val candidate = copyMutableState(current)
         val wordFrequencies = LinkedHashMap<String, Long>()
+        val preTokenCache = LinkedHashMap<String, List<String>>(16, 0.75f, true)
+
+        fun cachedPreTokens(segment: String): List<String> {
+            if (segment.length > MAX_TRAINING_PRETOKEN_CACHE_SEGMENT_LENGTH) {
+                return buildList {
+                    forEachByteLevelPreToken(segment) { preToken -> add(preToken) }
+                }
+            }
+
+            val cached = preTokenCache[segment]
+            if (cached != null) return cached
+
+            val computed = buildList {
+                forEachByteLevelPreToken(segment) { preToken -> add(preToken) }
+            }
+            if (computed.isNotEmpty()) {
+                if (preTokenCache.size >= MAX_TRAINING_PRETOKEN_CACHE_ENTRIES) {
+                    val oldest = preTokenCache.entries.iterator()
+                    if (oldest.hasNext()) {
+                        oldest.next()
+                        oldest.remove()
+                    }
+                }
+                preTokenCache[segment] = computed
+            }
+            return computed
+        }
 
         fun addWordFrequency(word: String) {
             if (word.isEmpty()) return
@@ -593,7 +623,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
         for (document in corpus) {
             forEachNormalTextSegment(document) { segment ->
-                forEachByteLevelPreToken(segment) { preToken ->
+                for (preToken in cachedPreTokens(segment)) {
                     addWordFrequency(preToken)
                 }
             }

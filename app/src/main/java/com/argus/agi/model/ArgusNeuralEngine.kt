@@ -246,7 +246,8 @@ data class EngineConfig(
 data class LossEvaluation(
     val meanLoss: Float,
     val targetCount: Int,
-    val evaluatedDocumentCount: Int
+    val evaluatedDocumentCount: Int,
+    val scoredUtf8ByteCount: Long = 0L
 )
 
 /**
@@ -254,6 +255,19 @@ data class LossEvaluation(
  * This makes held-out scores comparable across tokenizers with different token counts.
  */
 internal object TokenizerEvaluationMetrics {
+    fun addScoredDocumentBytes(
+        accumulatedBytes: Long,
+        evaluation: LossEvaluation
+    ): Long {
+        if (evaluation.targetCount <= 0 || !evaluation.meanLoss.isFinite()) {
+            return accumulatedBytes
+        }
+        require(evaluation.scoredUtf8ByteCount >= 0L) {
+            "Scored UTF-8 byte counts cannot be negative."
+        }
+        return Math.addExact(accumulatedBytes, evaluation.scoredUtf8ByteCount)
+    }
+
     fun bitsPerByte(totalNegativeLogLikelihood: Double, utf8ByteCount: Long): Float {
         if (
             !totalNegativeLogLikelihood.isFinite() ||
@@ -1206,7 +1220,8 @@ class ArgusNeuralEngine private constructor(
             return@synchronized LossEvaluation(
                 meanLoss = loss,
                 targetCount = if (loss.isFinite()) tokens.size - 1 else 0,
-                evaluatedDocumentCount = if (loss.isFinite()) 1 else 0
+                evaluatedDocumentCount = if (loss.isFinite()) 1 else 0,
+                scoredUtf8ByteCount = if (loss.isFinite()) tokenizer.utf8ByteCount(text) else 0L
             )
         }
 
@@ -1247,7 +1262,8 @@ class ArgusNeuralEngine private constructor(
         LossEvaluation(
             meanLoss = meanLoss,
             targetCount = evaluatedTargets,
-            evaluatedDocumentCount = if (evaluatedTargets > 0) 1 else 0
+            evaluatedDocumentCount = if (evaluatedTargets > 0) 1 else 0,
+            scoredUtf8ByteCount = if (evaluatedTargets > 0) tokenizer.utf8ByteCount(text) else 0L
         )
     }
 
@@ -1259,12 +1275,17 @@ class ArgusNeuralEngine private constructor(
         var weightedLoss = 0.0
         var targetCount = 0
         var evaluatedDocumentCount = 0
+        var scoredUtf8ByteCount = 0L
         texts.forEach { text ->
             val result = evaluateLossWithTargetCount(text)
             if (result.targetCount > 0 && result.meanLoss.isFinite()) {
                 weightedLoss += result.meanLoss.toDouble() * result.targetCount
                 targetCount += result.targetCount
                 evaluatedDocumentCount += result.evaluatedDocumentCount
+                scoredUtf8ByteCount = TokenizerEvaluationMetrics.addScoredDocumentBytes(
+                    scoredUtf8ByteCount,
+                    result
+                )
             }
         }
         val meanLoss = if (targetCount > 0) {
@@ -1272,7 +1293,7 @@ class ArgusNeuralEngine private constructor(
         } else {
             Float.NaN
         }
-        LossEvaluation(meanLoss, targetCount, evaluatedDocumentCount)
+        LossEvaluation(meanLoss, targetCount, evaluatedDocumentCount, scoredUtf8ByteCount)
     }
 
     /**
@@ -1307,15 +1328,11 @@ class ArgusNeuralEngine private constructor(
         if (evaluation.targetCount <= 0 || !evaluation.meanLoss.isFinite()) {
             return Float.NaN
         }
-        var utf8ByteCount = 0L
-        for (text in texts) {
-            utf8ByteCount = Math.addExact(utf8ByteCount, tokenizer.utf8ByteCount(text))
-        }
         val totalNegativeLogLikelihood =
             evaluation.meanLoss.toDouble() * evaluation.targetCount.toDouble()
         return TokenizerEvaluationMetrics.bitsPerByte(
             totalNegativeLogLikelihood = totalNegativeLogLikelihood,
-            utf8ByteCount = utf8ByteCount
+            utf8ByteCount = evaluation.scoredUtf8ByteCount
         )
     }
 

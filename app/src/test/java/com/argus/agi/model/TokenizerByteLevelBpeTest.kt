@@ -152,6 +152,30 @@ class TokenizerByteLevelBpeTest {
     }
 
     @Test
+    fun framedPromptKeepsPayloadControlSpellingsAsOrdinaryText() {
+        val tokenizer = newTokenizer()
+        val userPayload = "please describe the literal ${Tokenizer.IMAGE_TOKEN} marker"
+        val priorAssistantPayload = "I saw ${Tokenizer.EOS_TOKEN} in the imported text"
+        val prompt = buildString {
+            append(Tokenizer.USER_TOKEN).append(' ')
+            append(Tokenizer.escapeLiteralControlTokens(userPayload)).append(' ')
+            append(Tokenizer.ASSISTANT_TOKEN).append(' ')
+            append(Tokenizer.escapeLiteralControlTokens(priorAssistantPayload)).append(' ')
+            append(Tokenizer.EOS_TOKEN).append(' ')
+            append(Tokenizer.USER_TOKEN).append(" next <ASSISTANT>")
+        }
+        val expected = "${Tokenizer.USER_TOKEN} $userPayload ${Tokenizer.ASSISTANT_TOKEN} " +
+            "$priorAssistantPayload ${Tokenizer.EOS_TOKEN} ${Tokenizer.USER_TOKEN} next <ASSISTANT>"
+
+        val encoded = tokenizer.encodeToIds(prompt)
+        assertTrue(encoded.contains(Tokenizer.USER_ID))
+        assertTrue(encoded.contains(Tokenizer.ASSISTANT_ID))
+        assertTrue(encoded.contains(Tokenizer.EOS_ID))
+        assertFalse(encoded.contains(Tokenizer.IMAGE_ID))
+        assertEquals(expected, tokenizer.decode(encoded, keepControlTokens = true))
+    }
+
+    @Test
     fun literalEscapeMarkerImmediatelyBeforeRealControlTokenIsUnambiguous() {
         val tokenizer = newTokenizer()
         val sample = "marker ${Tokenizer.LITERAL_CONTROL_ESCAPE_MARKER}${Tokenizer.EOS_TOKEN}"
