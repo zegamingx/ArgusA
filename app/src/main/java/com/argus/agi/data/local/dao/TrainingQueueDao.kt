@@ -16,14 +16,19 @@ interface TrainingQueueDao {
     suspend fun getPendingQueueSnapshot(): List<TrainingItemEntity>
 
     @Query(
+        "SELECT * FROM training_items WHERE status = 'OPTIMIZER_COMMITTED' ORDER BY timestamp ASC"
+    )
+    suspend fun getOptimizerCommittedItemsSnapshot(): List<TrainingItemEntity>
+
+    @Query(
         "SELECT DISTINCT documentId FROM training_items " +
-            "WHERE documentId IS NOT NULL AND status IN ('QUEUED', 'TRAINING')"
+            "WHERE documentId IS NOT NULL AND status IN ('QUEUED', 'TRAINING', 'OPTIMIZER_COMMITTED')"
     )
     suspend fun getActiveCorpusDocumentIds(): List<String>
 
     @Query(
         "SELECT * FROM training_items " +
-            "WHERE documentId IS NOT NULL AND status IN ('QUEUED', 'TRAINING')"
+            "WHERE documentId IS NOT NULL AND status IN ('QUEUED', 'TRAINING', 'OPTIMIZER_COMMITTED')"
     )
     suspend fun getActiveCorpusTrainingItems(): List<TrainingItemEntity>
 
@@ -41,6 +46,13 @@ interface TrainingQueueDao {
 
     @Query("UPDATE training_items SET status = :status, finalLoss = :loss, stepDurationMs = :duration WHERE id = :id")
     suspend fun updateStatus(id: String, status: String, loss: Float?, duration: Long)
+
+    @Query(
+        "UPDATE training_items SET status = 'OPTIMIZER_COMMITTED', " +
+            "finalLoss = :loss, stepDurationMs = :duration " +
+            "WHERE id = :id AND status IN ('TRAINING', 'QUEUED', 'OPTIMIZER_COMMITTED')"
+    )
+    suspend fun markOptimizerCommitted(id: String, loss: Float?, duration: Long): Int
 
     @Query("SELECT * FROM training_items WHERE id = :id LIMIT 1")
     suspend fun getItem(id: String): TrainingItemEntity?
