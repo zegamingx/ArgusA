@@ -95,6 +95,44 @@ class ArgusRepository(
         trainingQueueDao.getPendingQueueSnapshot().map { it.toDomain() }
     }
 
+    suspend fun getOptimizerCommittedTrainingItemsSnapshot(): List<TrainingData> =
+        withContext(Dispatchers.IO) {
+            trainingQueueDao.getOptimizerCommittedItemsSnapshot().map { it.toDomain() }
+        }
+
+    /**
+     * Persists the optimizer commit before queue finalization. Room commits the entire
+     * micro-batch atomically so an interrupted finalizer can never retrain a committed item.
+     */
+    suspend fun markTrainingItemsOptimizerCommitted(items: List<TrainingData>) =
+        withContext(Dispatchers.IO) {
+            require(items.isNotEmpty() && items.size <= 8) {
+                "An optimizer commit must contain between one and eight training items."
+            }
+            require(items.all { it.status == TrainingStatus.OPTIMIZER_COMMITTED }) {
+                "Every committed training item must carry OPTIMIZER_COMMITTED status."
+            }
+            db.withTransaction {
+                for (item in items) {
+                    val existing = trainingQueueDao.getItem(item.id)
+                        ?: throw IllegalStateException(
+                            "Committed training item '${item.id}' is missing from Room."
+                        )
+                    if (existing.status == "COMPLETED" || existing.status == "FAILED") {
+                        continue
+                    }
+                    val updated = trainingQueueDao.markOptimizerCommitted(
+                        id = item.id,
+                        loss = item.finalLoss,
+                        duration = item.stepDurationMs
+                    )
+                    check(updated == 1) {
+                        "Training item '${item.id}' could not be persisted as optimizer-committed."
+                    }
+                }
+            }
+        }
+
     suspend fun getActiveCorpusTrainingDocumentIds(): Set<String> =
         withContext(Dispatchers.IO) {
             trainingQueueDao.getActiveCorpusDocumentIds().toSet()
@@ -170,7 +208,7 @@ class ArgusRepository(
                 val partialDocumentIds = itemsByDocument
                     .filterValues { documentItems ->
                         val canFinishDocument = documentItems.size == 1 &&
-                            documentItems.single().status == "TRAINING" &&
+                            documentItems.single().status in setOf("TRAINING", "OPTIMIZER_COMMITTED") &&
                             documentItems.single().chunkIndex >= documentItems.single().totalChunks
                         !canFinishDocument
                     }
