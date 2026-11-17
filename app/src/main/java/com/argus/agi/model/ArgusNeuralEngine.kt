@@ -3110,10 +3110,15 @@ class ArgusNeuralEngine private constructor(
             return
         }
 
+        // Compare complete CPU commit cost against the complete GPU transaction.
+        // The timer starts after a rejected Vulkan attempt so CPU calibration does not
+        // inherit failed-GPU dispatch overhead.
+        val cpuOperationCount = optimizerOperationCount
+        val cpuDispatchStartNanos = System.nanoTime()
+
         // Validate every CPU update before mutating any authoritative model or
         // optimizer tensor. This keeps the fallback transactional without allocating
         // a second full copy of the model, first moments, or second moments.
-        val cpuOperationCount = optimizerOperationCount
         for (groupIndex in parameters.indices) {
             val parameter = parameters[groupIndex]
             val gradient = gradients[groupIndex]
@@ -3191,7 +3196,7 @@ class ArgusNeuralEngine private constructor(
         }
         VulkanTrainingBackend.recordCpuAdamWTiming(
             cpuOperationCount,
-            System.nanoTime() - gpuDispatchStartNanos
+            System.nanoTime() - cpuDispatchStartNanos
         )
     }
 
