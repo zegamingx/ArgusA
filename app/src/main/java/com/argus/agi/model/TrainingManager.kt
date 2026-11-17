@@ -329,6 +329,7 @@ class TrainingManager(
                 return@launch
             }
             try {
+                awaitQueuePersistenceIdle()
                 // Recover a prepared/committed journal before moving any interrupted
                 // TRAINING row back to QUEUED. A committed optimizer step must first
                 // receive its checkpoint; a partial pre-commit step must roll back.
@@ -1896,10 +1897,10 @@ class TrainingManager(
             try {
                 // Finish in-memory queue writes before examining persisted state.
                 awaitQueuePersistenceIdle()
-                val repository = repo
-                val persistedCommitted = repository
-                    ?.getOptimizerCommittedTrainingItemsSnapshot()
-                    .orEmpty()
+                val repository = requireNotNull(repo) {
+                    "Training cannot start without durable local queue storage."
+                }
+                val persistedCommitted = repository.getOptimizerCommittedTrainingItemsSnapshot()
                 val resumeInterruptedCandidate =
                     conversationalValidationPersistence.hasInterruptedCandidateRun() ||
                         trainingCommitJournalFile.isFile ||
@@ -1917,11 +1918,11 @@ class TrainingManager(
                     }
                 }
 
-                repository?.let { activeRepository ->
-                    reconcilePersistedTrainingCommit(activeRepository)
-                    activeRepository.recoverInterruptedTrainingItems()
-                    val committed = activeRepository.getOptimizerCommittedTrainingItemsSnapshot()
-                    val pending = activeRepository.getPendingQueueSnapshot()
+                run {
+                    reconcilePersistedTrainingCommit(repository)
+                    repository.recoverInterruptedTrainingItems()
+                    val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                    val pending = repository.getPendingQueueSnapshot()
                     val databaseIds = (committed + pending).mapTo(HashSet()) { it.id }
                     val inMemoryItems = synchronized(queueLock) {
                         _nextQueue.value.filterNot { item -> item.id in databaseIds }
