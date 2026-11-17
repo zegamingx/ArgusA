@@ -20,7 +20,7 @@ on:
       publish_release:
         description: "Publish the signed APK to the GitHub Release tag."
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
