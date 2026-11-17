@@ -482,6 +482,22 @@ internal object VulkanTrainingBackend {
     private const val MIN_GPU_UPDATE_ELEMENTS = 49_152L
     private const val MIN_LINEAR_OPERATION_COUNT = 262_144L
 
+    internal fun recordCpuLinearTiming(operationCount: Long, elapsedNanoseconds: Long) {
+        AdaptiveComputeDispatchPolicy.recordCpu(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount,
+            elapsedNanoseconds
+        )
+    }
+
+    internal fun recordCpuAdamWTiming(operationCount: Long, elapsedNanoseconds: Long) {
+        AdaptiveComputeDispatchPolicy.recordCpu(
+            AdaptiveComputeOperation.ADAMW,
+            operationCount,
+            elapsedNanoseconds
+        )
+    }
+
     internal const val BACKWARD_CROSS_ENTROPY = 0
     internal const val BACKWARD_SWIGLU = 1
     internal const val BACKWARD_LAYER_NORM = 2
@@ -1176,7 +1192,9 @@ internal object VulkanTrainingBackend {
             // With no native device alive, the successfully recovered host arrays are
             // authoritative and no native allocation handles remain to be preserved.
             invalidateTensorResidency(releaseAllocations = false)
-            return false
+            // No native Vulkan runtime means there are no device allocations left to
+            // release. The host model and optimizer state remain authoritative.
+            return true
         }
 
         if (!synchronizeTrainingStateMirrors()) {
@@ -1308,7 +1326,21 @@ internal object VulkanTrainingBackend {
             Math.multiplyExact(inputColumns, outputColumns)
         }.getOrNull() ?: return false
         if (weightTensors.any { it.size != expectedWeightElements }) return false
-        if (!ensureModelTensorResidencyReady()) return false
+        val operationCount = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(inputRows.size.toLong(), inputColumns.toLong()),
+                Math.multiplyExact(outputColumns.toLong(), weightTensors.size.toLong())
+            )
+        }.getOrNull() ?: return false
+        if (!AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount,
+                MIN_LINEAR_OPERATION_COUNT
+            ) ||
+            !ensureModelTensorResidencyReady()) {
+            return false
+        }
+        val gpuStartNanos = System.nanoTime()
 
         val residentWeights = ArrayList<VulkanTensorAllocation>(weightTensors.size)
         for (parameters in weightTensors) {
@@ -1382,6 +1414,11 @@ internal object VulkanTrainingBackend {
                 )
             }
         }
+        AdaptiveComputeDispatchPolicy.recordGpu(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount,
+            System.nanoTime() - gpuStartNanos
+        )
         return true
     }
 
@@ -4705,11 +4742,16 @@ internal object VulkanTrainingBackend {
             Math.multiplyExact(inputElements, outputColumns.toLong())
         }.getOrNull() ?: return false
         if (!isFp16ComputeAvailable ||
-            operationCount < MIN_LINEAR_OPERATION_COUNT ||
+            !AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount,
+                MIN_LINEAR_OPERATION_COUNT
+            ) ||
             !ensureModelTensorResidencyReady()) {
             return false
         }
 
+        val gpuStartNanos = System.nanoTime()
         val flattenedInput: FloatArray
         val flattenedOutput: FloatArray
         try {
@@ -4767,6 +4809,11 @@ internal object VulkanTrainingBackend {
                 outputColumns
             )
         }
+        AdaptiveComputeDispatchPolicy.recordGpu(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount,
+            System.nanoTime() - gpuStartNanos
+        )
         refreshGpuPerformanceMetrics()
         _currentBackend = "Vulkan Compute (FP16 persistent model weights)"
         return true
@@ -4849,11 +4896,16 @@ internal object VulkanTrainingBackend {
             )
         }.getOrNull() ?: return false
         if (!isFp16ComputeAvailable ||
-            operationCount < MIN_LINEAR_OPERATION_COUNT ||
+            !AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount,
+                MIN_LINEAR_OPERATION_COUNT
+            ) ||
             !ensureModelTensorResidencyReady()) {
             return false
         }
 
+        val gpuStartNanos = System.nanoTime()
         val flattenedInput: FloatArray
         val flattenedOutput: FloatArray
         try {
@@ -4932,6 +4984,11 @@ internal object VulkanTrainingBackend {
             }
         }
 
+        AdaptiveComputeDispatchPolicy.recordGpu(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount,
+            System.nanoTime() - gpuStartNanos
+        )
         refreshGpuPerformanceMetrics()
         _currentBackend = "Vulkan Compute (FP16 persistent batched model weights)"
         return true
@@ -5019,10 +5076,15 @@ internal object VulkanTrainingBackend {
             outputColumns.toLong()
         if (!isRuntimeAvailable ||
             disabledAfterRuntimeFailure ||
-            operationCount < MIN_LINEAR_OPERATION_COUNT) {
+            !AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount,
+                MIN_LINEAR_OPERATION_COUNT
+            )) {
             return false
         }
 
+        val gpuStartNanos = System.nanoTime()
         val flattenedInput: FloatArray
         val flattenedWeights: FloatArray
         val flattenedOutput: FloatArray
@@ -5101,6 +5163,11 @@ internal object VulkanTrainingBackend {
                 )
             }
         }
+        AdaptiveComputeDispatchPolicy.recordGpu(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount,
+            System.nanoTime() - gpuStartNanos
+        )
         refreshGpuPerformanceMetrics()
         _currentBackend = "Vulkan Compute (Batched Linear)"
         return true
@@ -5190,12 +5257,17 @@ internal object VulkanTrainingBackend {
             }.getOrNull() ?: return false
         }
 
-        if (totalActiveElements < MIN_GPU_UPDATE_ELEMENTS ||
+        if (!AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.ADAMW,
+                totalActiveElements,
+                MIN_GPU_UPDATE_ELEMENTS
+            ) ||
             totalActiveElements > Int.MAX_VALUE.toLong() ||
             totalGradientBytes <= 0L ||
             totalGradientBytes > Int.MAX_VALUE.toLong()) {
             return false
         }
+        val gpuStartNanos = System.nanoTime()
 
         // Active FP32 moments and their candidate replacements must both fit in
         // the optimizer-state reservation during the atomic swap window.
@@ -5497,6 +5569,11 @@ internal object VulkanTrainingBackend {
             optimizerStateMirrorReliable = false
 
             _currentBackend = "Vulkan Compute (Resident FP16 AdamW)"
+            AdaptiveComputeDispatchPolicy.recordGpu(
+                AdaptiveComputeOperation.ADAMW,
+                totalActiveElements,
+                System.nanoTime() - gpuStartNanos
+            )
             runCatching { refreshGpuPerformanceMetrics() }
             return true
         } catch (error: OutOfMemoryError) {
@@ -5726,7 +5803,11 @@ internal object VulkanTrainingBackend {
         }
 
         if (!isRuntimeAvailable || disabledAfterRuntimeFailure ||
-            totalElements < MIN_GPU_UPDATE_ELEMENTS) {
+            !AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.ADAMW,
+                totalElements,
+                MIN_GPU_UPDATE_ELEMENTS
+            )) {
             _currentBackend = "Kotlin CPU"
             return false
         }
@@ -5860,11 +5941,16 @@ internal object VulkanTrainingBackend {
 
         if (!isRuntimeAvailable ||
             disabledAfterRuntimeFailure ||
-            totalElements < MIN_GPU_UPDATE_ELEMENTS) {
+            !AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.ADAMW,
+                totalElements,
+                MIN_GPU_UPDATE_ELEMENTS
+            )) {
             _currentBackend = "Kotlin CPU"
             return false
         }
 
+        val gpuStartNanos = System.nanoTime()
         val updated = try {
             nativeApplyAdamWUpdate(
                 parameterGroups = parameters,
@@ -5889,6 +5975,11 @@ internal object VulkanTrainingBackend {
         }
 
         if (updated) {
+            AdaptiveComputeDispatchPolicy.recordGpu(
+                AdaptiveComputeOperation.ADAMW,
+                totalElements,
+                System.nanoTime() - gpuStartNanos
+            )
             refreshGpuPerformanceMetrics()
             _currentBackend = "Vulkan Compute (AdamW)"
             return true

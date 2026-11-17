@@ -1,5 +1,6 @@
 package com.argus.agi.model
 
+import android.app.ActivityManager
 import android.content.Context
 import android.util.Log
 import com.argus.agi.data.local.entity.CorpusChunkEntity
@@ -107,6 +108,8 @@ class TrainingManager(
     private val repositoryInitialization =
         runCatching { repository ?: com.argus.agi.data.repository.ArgusRepository(context) }
     private val repo = repositoryInitialization.getOrNull()
+    private val activityManager =
+        context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
     private val validationFilesDirectory = context.applicationContext.filesDir
     private val conversationalValidationPersistence =
         ConversationalValidationPersistence(validationFilesDirectory)
@@ -189,6 +192,42 @@ class TrainingManager(
     val totalStepsExecuted: StateFlow<Int> = _totalStepsExecuted.asStateFlow()
 
     private val preparedTokenizerDocuments = HashSet<String>()
+    private var consecutiveOomRecoveries = 0
+
+    private data class TrainingMemorySnapshot(
+        val availableHeapBytes: Long,
+        val maximumHeapBytes: Long,
+        val availableSystemMemoryBytes: Long,
+        val isSystemLowMemory: Boolean
+    )
+
+    private fun captureTrainingMemorySnapshot(): TrainingMemorySnapshot {
+        val runtime = Runtime.getRuntime()
+        val maximumHeapBytes = runtime.maxMemory().coerceAtLeast(0L)
+        val availableHeapBytes = (
+            runtime.freeMemory() +
+                (maximumHeapBytes - runtime.totalMemory()).coerceAtLeast(0L)
+            ).coerceAtLeast(0L)
+        val manager = activityManager
+        if (manager == null) {
+            return TrainingMemorySnapshot(
+                availableHeapBytes = availableHeapBytes,
+                maximumHeapBytes = maximumHeapBytes,
+                availableSystemMemoryBytes = Long.MAX_VALUE,
+                isSystemLowMemory = false
+            )
+        }
+
+        val memoryInfo = ActivityManager.MemoryInfo()
+        manager.getMemoryInfo(memoryInfo)
+        return TrainingMemorySnapshot(
+            availableHeapBytes = availableHeapBytes,
+            maximumHeapBytes = maximumHeapBytes,
+            availableSystemMemoryBytes =
+                (memoryInfo.availMem - memoryInfo.threshold).coerceAtLeast(0L),
+            isSystemLowMemory = memoryInfo.lowMemory
+        )
+    }
 
     private val _trainingMetrics = MutableStateFlow(
         TrainingSessionMetrics(
@@ -1465,6 +1504,7 @@ class TrainingManager(
                 if (closed) break
 
                 resetForceOverrideIfSet()
+                deviceGuard.refreshState()
 
                 val firstQueuedItem = _nextQueue.value.firstOrNull()
                 if (!validationRunActive && firstQueuedItem?.status == TrainingStatus.QUEUED) {
@@ -1487,15 +1527,42 @@ class TrainingManager(
                     }
                 }
 
+                val safetySnapshot = deviceGuard.safetyState.value
+                val memorySnapshot = captureTrainingMemorySnapshot()
                 val thermalBatchLimit = DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
                     configuredBatchSize = neuralEngine.config.trainingBatchSize,
-                    thermalStatus = deviceGuard.safetyState.value.thermalStatus
+                    thermalStatus = safetySnapshot.thermalStatus,
+                    availableHeapBytes = memorySnapshot.availableHeapBytes,
+                    maximumHeapBytes = memorySnapshot.maximumHeapBytes,
+                    availableSystemMemoryBytes = memorySnapshot.availableSystemMemoryBytes,
+                    systemLowMemory = memorySnapshot.isSystemLowMemory,
+                    isPowerSaveMode = safetySnapshot.isPowerSaveMode,
+                    isCharging = safetySnapshot.isCharging,
+                    batteryPct = safetySnapshot.batteryPct,
+                    memoryRecovery = consecutiveOomRecoveries > 0
                 )
                 if (thermalBatchLimit == 0) {
                     // Severe thermal states are normally blocked by DeviceGuard above.
                     // Re-enter the safety wait instead of spinning or starting another batch.
                     continue
                 }
+
+                val runtimeContextLength = DeviceAdaptiveRuntimePolicy.trainingContextLimit(
+                    configuredContextLength = neuralEngine.config.maxSeqLen,
+                    availableHeapBytes = memorySnapshot.availableHeapBytes,
+                    maximumHeapBytes = memorySnapshot.maximumHeapBytes,
+                    dModel = neuralEngine.config.dModel,
+                    feedForwardSize = neuralEngine.config.dFf,
+                    vocabularySize = neuralEngine.tokenizer.vocabSize,
+                    layerCount = neuralEngine.config.layerCount,
+                    headCount = neuralEngine.config.nHeads,
+                    thermalStatus = safetySnapshot.thermalStatus,
+                    availableSystemMemoryBytes = memorySnapshot.availableSystemMemoryBytes,
+                    systemLowMemory = memorySnapshot.isSystemLowMemory,
+                    isPowerSaveMode = safetySnapshot.isPowerSaveMode,
+                    isCharging = safetySnapshot.isCharging,
+                    memoryRecovery = consecutiveOomRecoveries > 0
+                )
 
                 val firstItem = popNext()
                 if (firstItem == null) {
@@ -1526,11 +1593,51 @@ class TrainingManager(
                 updateActiveDocumentEntering(activeItems.first())
 
                 try {
-                    if (!processBatch(activeItems)) {
+                    if (!processBatch(activeItems, runtimeContextLength)) {
                         validationRunHadFailures = true
+                    } else {
+                        consecutiveOomRecoveries = 0
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
+                } catch (outOfMemory: OutOfMemoryError) {
+                    Log.e(
+                        TAG,
+                        "Training micro-batch hit memory pressure; preserving queued samples and reducing the next workload.",
+                        outOfMemory
+                    )
+                    val residencyReleased = runCatching {
+                        neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()
+                    }.getOrDefault(false)
+                    val checkpointSaved = runCatching {
+                        neuralEngine.saveCheckpoint()
+                    }.getOrDefault(false)
+                    val requeued = appendPersistingQueueItems(
+                        activeItems.map { item -> item.copy(status = TrainingStatus.QUEUED) }
+                    )
+                    _currentTrainingItem.value = null
+                    _activeDocument.value = null
+
+                    if (requeued.isEmpty()) {
+                        _isTrainingPaused.value = true
+                        Log.e(TAG, "OOM recovery could not return the active samples to the durable queue.")
+                    } else {
+                        consecutiveOomRecoveries++
+                        if (!residencyReleased || !checkpointSaved || consecutiveOomRecoveries > 1) {
+                            _isTrainingPaused.value = true
+                            Log.e(
+                                TAG,
+                                "Training paused after OOM recovery: residencyReleased=$residencyReleased, " +
+                                    "checkpointSaved=$checkpointSaved, retries=$consecutiveOomRecoveries."
+                            )
+                        } else {
+                            Log.w(
+                                TAG,
+                                "OOM recovery saved the model and requeued ${requeued.size} samples; " +
+                                    "retrying once with batch 1 and a reduced context."
+                            )
+                        }
+                    }
                 } catch (error: Throwable) {
                     validationRunHadFailures = true
                     activeItems.mapNotNull(TrainingData::documentId)
@@ -1547,12 +1654,14 @@ class TrainingManager(
                     resetForceOverrideIfSet()
                 }
 
-                val temperature = deviceGuard.safetyState.value.temperatureCelsius
-                val throttleMs = when {
-                    temperature >= 45f -> 600L
-                    temperature >= 40f -> 300L
-                    else -> 100L
-                }
+                val currentSafety = deviceGuard.safetyState.value
+                val throttleMs = DeviceAdaptiveRuntimePolicy.trainingBatchDelayMillis(
+                    thermalStatus = currentSafety.thermalStatus,
+                    temperatureCelsius = currentSafety.temperatureCelsius,
+                    batteryPct = currentSafety.batteryPct,
+                    isCharging = currentSafety.isCharging,
+                    isPowerSaveMode = currentSafety.isPowerSaveMode
+                )
                 delay(throttleMs)
             }
         }
@@ -1813,7 +1922,10 @@ class TrainingManager(
         }
     }
 
-    private suspend fun processBatch(items: List<TrainingData>): Boolean {
+    private suspend fun processBatch(
+        items: List<TrainingData>,
+        runtimeContextLength: Int
+    ): Boolean {
         require(items.isNotEmpty()) { "A training micro-batch cannot be empty." }
         items.mapNotNull(TrainingData::documentId)
             .forEach(validationRunDocumentIds::add)
@@ -1834,7 +1946,10 @@ class TrainingManager(
         }
 
         val startNs = System.nanoTime()
-        val batchResult = neuralEngine.trainBatchDetailed(items.map(TrainingData::content))
+        val batchResult = neuralEngine.trainBatchDetailed(
+            texts = items.map(TrainingData::content),
+            runtimeContextLength = runtimeContextLength
+        )
         val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
         require(batchResult.samples.size == items.size) {
             "Neural engine returned ${batchResult.samples.size} results for ${items.size} samples."
@@ -1850,6 +1965,8 @@ class TrainingManager(
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
+            } catch (error: OutOfMemoryError) {
+                throw error
             } catch (error: Throwable) {
                 allItemsSucceeded = false
                 item.documentId?.let(validationRunFailedDocumentIds::add)

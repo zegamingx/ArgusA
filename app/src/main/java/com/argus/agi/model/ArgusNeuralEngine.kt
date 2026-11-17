@@ -137,13 +137,15 @@ data class EngineConfig(
             totalRamGb: Int,
             maxHeapMb: Long,
             availableRamGb: Float = totalRamGb.toFloat(),
-            cpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+            cpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
+            vulkanSupported: Boolean = true
         ): EngineConfig {
             val profile = ArgusDeviceModelPolicy.select(
                 totalRamGb = totalRamGb,
                 maxHeapMb = maxHeapMb,
                 availableRamGb = availableRamGb,
-                cpuCores = cpuCores
+                cpuCores = cpuCores,
+                vulkanSupported = vulkanSupported
             )
             val tier = profile.tier
             val shape = selectExecutableShape(
@@ -536,7 +538,8 @@ class ArgusNeuralEngine private constructor(
             totalRamGb: Int,
             maxHeapMb: Long,
             availableRamGb: Float = totalRamGb.toFloat(),
-            cpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+            cpuCores: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
+            vulkanSupported: Boolean = true
         ): EngineConfig {
             val checkpoint = File(context.filesDir, "argus_model_weights.bin")
             val savedConfig = runCatching {
@@ -560,7 +563,8 @@ class ArgusNeuralEngine private constructor(
                     totalRamGb = totalRamGb,
                     maxHeapMb = maxHeapMb,
                     availableRamGb = availableRamGb,
-                    cpuCores = cpuCores
+                    cpuCores = cpuCores,
+                    vulkanSupported = vulkanSupported
                 )
             }.getOrNull()
 
@@ -1421,7 +1425,13 @@ class ArgusNeuralEngine private constructor(
      * Activations are released between samples; only the accumulated parameter gradients
      * remain resident. The accepted batch size is strictly bounded to 1..8.
      */
-    fun trainBatchDetailed(texts: List<String>): NeuralTrainingBatchResult {
+    fun trainBatchDetailed(
+        texts: List<String>,
+        runtimeContextLength: Int = maxSeqLen
+    ): NeuralTrainingBatchResult {
+        require(runtimeContextLength in 2..maxSeqLen) {
+            "Runtime context length must be between 2 and the configured model context."
+        }
         require(texts.size in 1..8) {
             "Training batch size must be between 1 and 8."
         }
@@ -1429,7 +1439,7 @@ class ArgusNeuralEngine private constructor(
             require(texts.size == 1) {
                 "This legacy checkpoint requires single-sample compatibility training."
             }
-            return trainSingleSampleSequential(texts.single())
+            return trainSingleSampleSequential(texts.single(), runtimeContextLength)
         }
 
         var shouldSaveCheckpoint = false
@@ -1461,7 +1471,7 @@ class ArgusNeuralEngine private constructor(
                     var weightedLoss = 0f
                     var trainedTargets = 0
 
-                    if (tokens.size <= maxSeqLen) {
+                    if (tokens.size <= runtimeContextLength) {
                         val windowLoss = trainSingleWindow(
                             seq = tokens,
                             currentVocab = currentVocab,
@@ -1474,12 +1484,12 @@ class ArgusNeuralEngine private constructor(
                             weightedLoss = windowLoss * (tokens.size - 1)
                         }
                     } else {
-                        val overlapTokens = min(24, maxSeqLen - 1)
-                        val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
+                        val overlapTokens = min(24, runtimeContextLength - 1)
+                        val stride = (runtimeContextLength - overlapTokens).coerceAtLeast(1)
                         var start = 0
 
                         while (start < tokens.size - 1) {
-                            val end = min(start + maxSeqLen, tokens.size)
+                            val end = min(start + runtimeContextLength, tokens.size)
                             val windowSequence = tokens.subList(start, end)
                             if (windowSequence.size >= 2) {
                                 val firstTargetIndex =
@@ -1568,7 +1578,10 @@ class ArgusNeuralEngine private constructor(
      * legacy 16-byte floor but cannot safely reserve an additional accumulation tensor.
      * It retains the original per-window Adam update behavior and is restricted to batch 1.
      */
-    private fun trainSingleSampleSequential(text: String): NeuralTrainingBatchResult {
+    private fun trainSingleSampleSequential(
+        text: String,
+        runtimeContextLength: Int
+    ): NeuralTrainingBatchResult {
         var shouldSaveCheckpoint = false
         val result = synchronized(modelLock) {
             val initialAdamStep = adamStep
@@ -1597,7 +1610,7 @@ class ArgusNeuralEngine private constructor(
             var weightedLoss = 0f
             var trainedTargets = 0
 
-            if (tokens.size <= maxSeqLen) {
+            if (tokens.size <= runtimeContextLength) {
                 val loss = trainSingleWindow(tokens, currentVocab)
                 if (loss.isFinite()) {
                     contextWindowCount = 1
@@ -1606,11 +1619,11 @@ class ArgusNeuralEngine private constructor(
                     weightedLoss = loss * (tokens.size - 1)
                 }
             } else {
-                val overlapTokens = min(24, maxSeqLen - 1)
-                val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
+                val overlapTokens = min(24, runtimeContextLength - 1)
+                val stride = (runtimeContextLength - overlapTokens).coerceAtLeast(1)
                 var start = 0
                 while (start < tokens.size - 1) {
-                    val end = min(start + maxSeqLen, tokens.size)
+                    val end = min(start + runtimeContextLength, tokens.size)
                     val windowSequence = tokens.subList(start, end)
                     if (windowSequence.size >= 2) {
                         val firstTargetIndex =
@@ -3074,6 +3087,8 @@ class ArgusNeuralEngine private constructor(
         // Validate every CPU update before mutating any authoritative model or
         // optimizer tensor. This keeps the fallback transactional without allocating
         // a second full copy of the model, first moments, or second moments.
+        val cpuOperationCount = gradients.sumOf { gradient -> gradient.size.toLong() }
+        val cpuStartNanos = System.nanoTime()
         for (groupIndex in parameters.indices) {
             val parameter = parameters[groupIndex]
             val gradient = gradients[groupIndex]
@@ -3149,6 +3164,10 @@ class ArgusNeuralEngine private constructor(
                 error
             )
         }
+        VulkanTrainingBackend.recordCpuAdamWTiming(
+            cpuOperationCount,
+            System.nanoTime() - cpuStartNanos
+        )
     }
 
     private fun normalizeGradient(grad: FloatArray, div: Float) {
@@ -3332,6 +3351,13 @@ class ArgusNeuralEngine private constructor(
         )
         if (dispatchedToVulkan) return
 
+        val operationCount = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(inputs.size.toLong(), inputColumns.toLong()),
+                outputColumns.toLong()
+            )
+        }.getOrNull()
+        val cpuStartNanos = System.nanoTime()
         if (transposeWeights) {
             for (row in inputs.indices) {
                 computeLinearTransposed(
@@ -3352,6 +3378,12 @@ class ArgusNeuralEngine private constructor(
                     outputs[row]
                 )
             }
+        }
+        if (operationCount != null) {
+            VulkanTrainingBackend.recordCpuLinearTiming(
+                operationCount,
+                System.nanoTime() - cpuStartNanos
+            )
         }
     }
 
@@ -3423,6 +3455,16 @@ class ArgusNeuralEngine private constructor(
         )
         if (dispatchedToVulkan) return
 
+        val operationCount = runCatching {
+            Math.multiplyExact(
+                Math.multiplyExact(
+                    Math.multiplyExact(inputs.size.toLong(), inputs[0].size.toLong()),
+                    inputColumns.toLong()
+                ),
+                outputColumns.toLong()
+            )
+        }.getOrNull()
+        val cpuStartNanos = System.nanoTime()
         for (batch in inputs.indices) {
             val weight = weights[batch]
             require(inputs[batch].size == outputs[batch].size) {
@@ -3447,6 +3489,12 @@ class ArgusNeuralEngine private constructor(
                     )
                 }
             }
+        }
+        if (operationCount != null) {
+            VulkanTrainingBackend.recordCpuLinearTiming(
+                operationCount,
+                System.nanoTime() - cpuStartNanos
+            )
         }
     }
 

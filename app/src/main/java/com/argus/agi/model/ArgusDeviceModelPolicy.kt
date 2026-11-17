@@ -62,7 +62,8 @@ object ArgusDeviceModelPolicy {
         totalRamGb: Int,
         maxHeapMb: Long,
         availableRamGb: Float,
-        cpuCores: Int
+        cpuCores: Int,
+        vulkanSupported: Boolean = true
     ): ArgusDeviceModelProfile {
         require(totalRamGb > 0) { "Total RAM must be positive." }
         require(maxHeapMb > 0L) { "App heap must be positive." }
@@ -92,7 +93,7 @@ object ArgusDeviceModelPolicy {
             "This device does not currently have enough safe memory to train Argus's minimum executable model."
         }
 
-        val tier = when {
+        val detectedTier = when {
             totalRamGb >= 12 && maxHeapMb >= 512L &&
                 safeAvailableRamGb >= 2.5f && cpuCores >= 8 ->
                 ArgusDeviceModelTier.FLAGSHIP
@@ -107,6 +108,9 @@ object ArgusDeviceModelPolicy {
 
             else -> ArgusDeviceModelTier.COMPACT
         }
+        // Vulkan is the primary training accelerator. Devices that do not advertise
+        // Vulkan start with the compact architecture while retaining CPU fallback.
+        val tier = if (vulkanSupported) detectedTier else ArgusDeviceModelTier.COMPACT
 
         val targetParameterCount = minOf(
             tier.maximumFamilyParameters,

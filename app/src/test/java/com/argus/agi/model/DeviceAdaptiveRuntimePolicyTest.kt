@@ -2,6 +2,8 @@ package com.argus.agi.model
 
 import android.os.PowerManager
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DeviceAdaptiveRuntimePolicyTest {
@@ -58,6 +60,120 @@ class DeviceAdaptiveRuntimePolicyTest {
     }
 
     @Test
+    fun adaptiveBatchAndContextRespectMemoryThermalAndPowerConstraints() {
+        val batchSize = DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
+            configuredBatchSize = 8,
+            thermalStatus = PowerManager.THERMAL_STATUS_LIGHT,
+            availableHeapBytes = 256L * 1024L * 1024L,
+            maximumHeapBytes = 1_024L * 1024L * 1024L,
+            availableSystemMemoryBytes = 2L * 1024L * 1024L * 1024L
+        )
+        assertEquals(4, batchSize)
+
+        val memoryLimitedBatch = DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
+            configuredBatchSize = 8,
+            thermalStatus = PowerManager.THERMAL_STATUS_LIGHT,
+            availableHeapBytes = 128L * 1024L * 1024L,
+            maximumHeapBytes = 1_024L * 1024L * 1024L,
+            availableSystemMemoryBytes = 128L * 1024L * 1024L,
+            systemLowMemory = true
+        )
+        assertEquals(1, memoryLimitedBatch)
+
+        val context = DeviceAdaptiveRuntimePolicy.trainingContextLimit(
+            configuredContextLength = 128,
+            availableHeapBytes = 128L * 1024L * 1024L,
+            maximumHeapBytes = 1_024L * 1024L * 1024L,
+            dModel = 128,
+            feedForwardSize = 512,
+            vocabularySize = 2_048,
+            layerCount = 2,
+            headCount = 4,
+            thermalStatus = PowerManager.THERMAL_STATUS_MODERATE,
+            availableSystemMemoryBytes = 2L * 1024L * 1024L * 1024L
+        )
+        assertTrue(context in 32..96)
+    }
+
+    @Test
+    fun trainingWorkspaceEstimateGrowsWithContextAndArchitecture() {
+        val short = DeviceAdaptiveRuntimePolicy.estimateTrainingWindowWorkspaceBytes(
+            contextLength = 32,
+            dModel = 128,
+            feedForwardSize = 512,
+            vocabularySize = 2_048,
+            layerCount = 1,
+            headCount = 4
+        )
+        val long = DeviceAdaptiveRuntimePolicy.estimateTrainingWindowWorkspaceBytes(
+            contextLength = 64,
+            dModel = 128,
+            feedForwardSize = 512,
+            vocabularySize = 2_048,
+            layerCount = 1,
+            headCount = 4
+        )
+        val deeper = DeviceAdaptiveRuntimePolicy.estimateTrainingWindowWorkspaceBytes(
+            contextLength = 32,
+            dModel = 128,
+            feedForwardSize = 512,
+            vocabularySize = 2_048,
+            layerCount = 2,
+            headCount = 4
+        )
+
+        assertTrue(long > short)
+        assertTrue(deeper > short)
+    }
+
+    @Test
+    fun adaptiveBatchAndContextReduceLoadForPowerSavingAndRecovery() {
+        assertEquals(
+            4,
+            DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
+                configuredBatchSize = 8,
+                thermalStatus = PowerManager.THERMAL_STATUS_LIGHT,
+                isPowerSaveMode = true,
+                isCharging = false,
+                batteryPct = 18
+            )
+        )
+        assertEquals(
+            1,
+            DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
+                configuredBatchSize = 8,
+                thermalStatus = PowerManager.THERMAL_STATUS_LIGHT,
+                memoryRecovery = true
+            )
+        )
+        assertEquals(
+            64,
+            DeviceAdaptiveRuntimePolicy.trainingContextLimit(
+                configuredContextLength = 128,
+                availableHeapBytes = 800L * 1024L * 1024L,
+                maximumHeapBytes = 1_024L * 1024L * 1024L,
+                dModel = 128,
+                feedForwardSize = 512,
+                vocabularySize = 2_048,
+                layerCount = 1,
+                headCount = 4,
+                thermalStatus = PowerManager.THERMAL_STATUS_LIGHT,
+                memoryRecovery = true
+            )
+        )
+        assertEquals(
+            500L,
+            DeviceAdaptiveRuntimePolicy.trainingBatchDelayMillis(
+                thermalStatus = PowerManager.THERMAL_STATUS_LIGHT,
+                temperatureCelsius = 35.0f,
+                batteryPct = 20,
+                isCharging = false,
+                isPowerSaveMode = true
+            )
+        )
+    }
+
+    @Test
     fun thermalStatusReducesTrainingBatchAndSevereStatusPausesIt() {
         assertEquals(
             8,
@@ -80,5 +196,164 @@ class DeviceAdaptiveRuntimePolicyTest {
                 thermalStatus = PowerManager.THERMAL_STATUS_SEVERE
             )
         )
+    }
+}
+
+
+class AdaptiveComputeDispatchPolicyTest {
+
+    @Test
+    fun cpuCalibrationProbeStaysSelectedAcrossRepeatedGpuFallbackLayers() {
+        AdaptiveComputeDispatchPolicy.resetForTests()
+        repeat(16) {
+            AdaptiveComputeDispatchPolicy.recordGpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount = 300_000L,
+                elapsedNanoseconds = 2_000_000L
+            )
+        }
+
+        assertFalse(
+            AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount = 300_000L,
+                bootstrapMinimumOperationCount = 262_144L
+            )
+        )
+        // A second GPU adapter path must not override the pending CPU probe.
+        assertFalse(
+            AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount = 300_000L,
+                bootstrapMinimumOperationCount = 262_144L
+            )
+        )
+
+        AdaptiveComputeDispatchPolicy.recordCpu(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount = 300_000L,
+            elapsedNanoseconds = 3_000_000L
+        )
+        assertTrue(
+            AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount = 300_000L,
+                bootstrapMinimumOperationCount = 262_144L
+            )
+        )
+    }
+
+    @Test
+    fun dispatchProfilesAreSeparatedByOperationSizeBucket() {
+        AdaptiveComputeDispatchPolicy.resetForTests()
+        AdaptiveComputeDispatchPolicy.recordGpu(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount = 300_000L,
+            elapsedNanoseconds = 2_000_000L
+        )
+
+        assertEquals(
+            1,
+            AdaptiveComputeDispatchPolicy.snapshot(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount = 300_000L
+            ).gpuSamples
+        )
+        assertEquals(
+            0,
+            AdaptiveComputeDispatchPolicy.snapshot(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount = 3_000_000L
+            ).gpuSamples
+        )
+    }
+
+    @Test
+    fun keepsConservativeBootstrapThresholdUntilBothBackendsAreMeasured() {
+        AdaptiveComputeDispatchPolicy.resetForTests()
+
+        assertFalse(
+            AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount = 100_000L,
+                bootstrapMinimumOperationCount = 262_144L
+            )
+        )
+        assertTrue(
+            AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount = 300_000L,
+                bootstrapMinimumOperationCount = 262_144L
+            )
+        )
+    }
+
+    @Test
+    fun selectsGpuOnlyAfterMeasuredEndToEndSpeedup() {
+        AdaptiveComputeDispatchPolicy.resetForTests()
+        repeat(4) {
+            AdaptiveComputeDispatchPolicy.recordCpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount = 300_000L,
+                elapsedNanoseconds = 3_000_000L
+            )
+            AdaptiveComputeDispatchPolicy.recordGpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount = 300_000L,
+                elapsedNanoseconds = 2_000_000L
+            )
+        }
+
+        assertTrue(
+            AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.LINEAR,
+                operationCount = 300_000L,
+                bootstrapMinimumOperationCount = 262_144L
+            )
+        )
+    }
+
+    @Test
+    fun selectsCpuWhenGpuEndToEndCostIsNotCompetitive() {
+        AdaptiveComputeDispatchPolicy.resetForTests()
+        repeat(4) {
+            AdaptiveComputeDispatchPolicy.recordCpu(
+                AdaptiveComputeOperation.ADAMW,
+                operationCount = 60_000L,
+                elapsedNanoseconds = 1_000_000L
+            )
+            AdaptiveComputeDispatchPolicy.recordGpu(
+                AdaptiveComputeOperation.ADAMW,
+                operationCount = 60_000L,
+                elapsedNanoseconds = 2_000_000L
+            )
+        }
+
+        assertFalse(
+            AdaptiveComputeDispatchPolicy.shouldUseGpu(
+                AdaptiveComputeOperation.ADAMW,
+                operationCount = 60_000L,
+                bootstrapMinimumOperationCount = 49_152L
+            )
+        )
+    }
+
+    @Test
+    fun ignoresInvalidTimingSamples() {
+        AdaptiveComputeDispatchPolicy.resetForTests()
+        AdaptiveComputeDispatchPolicy.recordCpu(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount = 100L,
+            elapsedNanoseconds = 0L
+        )
+        AdaptiveComputeDispatchPolicy.recordGpu(
+            AdaptiveComputeOperation.LINEAR,
+            operationCount = -1L,
+            elapsedNanoseconds = 1_000L
+        )
+
+        val snapshot = AdaptiveComputeDispatchPolicy.snapshot(AdaptiveComputeOperation.LINEAR, operationCount = 100L)
+        assertEquals(0, snapshot.cpuSamples)
+        assertEquals(0, snapshot.gpuSamples)
     }
 }

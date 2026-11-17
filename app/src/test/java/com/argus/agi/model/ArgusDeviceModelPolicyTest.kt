@@ -7,6 +7,22 @@ import org.junit.Test
 class ArgusDeviceModelPolicyTest {
 
     @Test
+    fun devicesWithoutAdvertisedVulkanStartWithCompactTier() {
+        val profile = ArgusDeviceModelPolicy.select(
+            totalRamGb = 12,
+            maxHeapMb = 512L,
+            availableRamGb = 3.0f,
+            cpuCores = 8,
+            vulkanSupported = false
+        )
+
+        assertEquals(ArgusDeviceModelTier.COMPACT, profile.tier)
+        assertEquals(1, profile.trainingBatchSize)
+        assertEquals(1_024, profile.tier.vocabularyCapacity)
+        assertTrue(profile.targetParameterCount <= profile.tier.maximumFamilyParameters)
+    }
+
+    @Test
     fun selectsFourModelFamiliesAndBoundedBatchSizesFromDeviceCapacity() {
         val compact = ArgusDeviceModelPolicy.select(4, 256L, 0.6f, 4)
         val balanced = ArgusDeviceModelPolicy.select(6, 256L, 0.8f, 6)

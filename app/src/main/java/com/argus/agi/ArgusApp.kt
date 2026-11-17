@@ -80,7 +80,8 @@ class ArgusApp : Application() {
                 totalRamGb = profile.totalRamGb,
                 maxHeapMb = profile.maxHeapMb,
                 availableRamGb = profile.availRamGb,
-                cpuCores = profile.cpuCores
+                cpuCores = profile.cpuCores,
+                vulkanSupported = profile.vulkanSupported
             )
         }
         val neuralEngineConfig: EngineConfig
