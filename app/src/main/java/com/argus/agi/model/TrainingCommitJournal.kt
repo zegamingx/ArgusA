@@ -290,11 +290,15 @@ internal object TrainingCommitJournal {
                     StandardCopyOption.REPLACE_EXISTING
                 )
             } catch (unsupported: AtomicMoveNotSupportedException) {
-                if (!temporary.renameTo(file)) {
-                    throw IOException(
-                        "Atomic journal replacement is unavailable and the fallback rename failed.",
-                        unsupported
+                try {
+                    Files.move(
+                        temporary.toPath(),
+                        file.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING
                     )
+                } catch (fallbackError: IOException) {
+                    fallbackError.addSuppressed(unsupported)
+                    throw fallbackError
                 }
             }
         } finally {
