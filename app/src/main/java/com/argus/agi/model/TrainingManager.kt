@@ -350,24 +350,42 @@ class TrainingManager(
         startTrainingWorker()
     }
 
-    fun pauseTraining() { _isTrainingPaused.value = true; wakeupSignal.trySend(Unit) }
-    fun resumeTraining() {
-        synchronized(queueLock) {
-            oomRetryCounts.clear()
-        }
-        _isTrainingPaused.value = false
+    fun pauseTraining() {
+        _isTrainingPaused.value = true
         wakeupSignal.trySend(Unit)
     }
 
-    fun togglePauseTraining() {
-        val resumed = _isTrainingPaused.value
-        if (resumed) {
+    private fun resumeAfterCommittedQueueRefresh(forceTrainingOnce: Boolean = false) {
+        scope.launch {
+            val committedItems = try {
+                repo?.getOptimizerCommittedTrainingItemsSnapshot().orEmpty()
+            } catch (error: Throwable) {
+                Log.e(TAG, "Cannot resume training until committed queue state is readable.", error)
+                _isTrainingPaused.value = true
+                return@launch
+            }
+            prependCommittedQueueItems(committedItems)
             synchronized(queueLock) {
                 oomRetryCounts.clear()
             }
+            if (forceTrainingOnce) {
+                deviceGuard.setForceTrainingOverride(true)
+            }
+            _isTrainingPaused.value = false
+            wakeupSignal.trySend(Unit)
         }
-        _isTrainingPaused.update { !it }
-        wakeupSignal.trySend(Unit)
+    }
+
+    fun resumeTraining() {
+        resumeAfterCommittedQueueRefresh()
+    }
+
+    fun togglePauseTraining() {
+        if (_isTrainingPaused.value) {
+            resumeTraining()
+        } else {
+            pauseTraining()
+        }
     }
 
     /**
@@ -375,9 +393,7 @@ class TrainingManager(
      * pada langkah berikutnya. Override akan otomatis di-reset setelah satu trainStep.
      */
     fun triggerImmediateTrainingStep() {
-        _isTrainingPaused.value = false
-        deviceGuard.setForceTrainingOverride(true)
-        wakeupSignal.trySend(Unit)
+        resumeAfterCommittedQueueRefresh(forceTrainingOnce = true)
     }
 
     /**
