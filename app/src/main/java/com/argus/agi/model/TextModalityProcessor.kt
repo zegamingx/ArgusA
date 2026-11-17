@@ -126,7 +126,7 @@ object TextModalityProcessor {
 
     /**
      * Explicit, lossy typography normalization for callers that deliberately opt in.
-     * Training ingestion and BYTE_LEVEL_BPE_V2 preserve source text instead.
+     * Training ingestion and BYTE_LEVEL_BPE_V1 preserve source text instead.
      * - Curly quotes (“ ” ‘ ’ « »)  → ASCII (" ')
      * - Em/en dash (— –)            → hyphen (-)
      * - Ellipsis (…)                → tiga titik (...)

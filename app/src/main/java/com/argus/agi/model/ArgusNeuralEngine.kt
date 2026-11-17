@@ -579,7 +579,7 @@ class ArgusNeuralEngine private constructor(
 
             // Token IDs are part of the checkpoint contract. Preserve the saved
             // tokenizer algorithm and architecture for the active ARG5 model.
-            // Fresh installations still receive the current BYTE_LEVEL_BPE_V2 default.
+            // Fresh installations use the canonical BYTE_LEVEL_BPE_V1 tokenizer.
             val compatibleSavedConfig = savedConfig
             val resolvedConfig = compatibleSavedConfig ?: requireNotNull(deviceConfig) {
                 "This device cannot currently allocate the minimum executable Argus model safely."
