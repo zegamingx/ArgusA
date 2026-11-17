@@ -166,6 +166,20 @@ internal object DeviceAdaptiveRuntimePolicy {
             availableHeapBytes.coerceAtLeast(0L) / 3L,
             maximumHeapBytes.coerceAtLeast(0L) / 4L
         )
+        val minimumContextWorkspaceBytes = estimateTrainingWindowWorkspaceBytes(
+            contextLength = minimumContext,
+            dModel = dModel,
+            feedForwardSize = feedForwardSize,
+            vocabularySize = vocabularySize,
+            layerCount = layerCount,
+            headCount = headCount
+        )
+        if (minimumContextWorkspaceBytes > runtimeWorkspaceBudget) {
+            // Zero is an explicit "do not dispatch a training batch" result. Reducing
+            // below the model's minimum context would silently change training semantics.
+            return 0
+        }
+
         var selectedContext = targetContext
         while (selectedContext > minimumContext &&
             estimateTrainingWindowWorkspaceBytes(

@@ -96,6 +96,47 @@ class DeviceAdaptiveRuntimePolicyTest {
     }
 
     @Test
+    fun returnsNoTrainingContextWhenEvenMinimumWindowExceedsLiveWorkspaceBudget() {
+        val contextLimit = DeviceAdaptiveRuntimePolicy.trainingContextLimit(
+            configuredContextLength = 128,
+            availableHeapBytes = 512L * 1024L,
+            maximumHeapBytes = 512L * 1024L * 1024L,
+            dModel = 128,
+            feedForwardSize = 512,
+            vocabularySize = 2_048,
+            layerCount = 2,
+            headCount = 4,
+            thermalStatus = PowerManager.THERMAL_STATUS_LIGHT,
+            availableSystemMemoryBytes = 2L * 1024L * 1024L * 1024L
+        )
+
+        assertEquals(
+            "The worker must defer training rather than force a context that does not fit.",
+            0,
+            contextLimit
+        )
+    }
+
+    @Test
+    fun keepsTheMinimumLegalContextWhenItsWorkspaceFitsTheCurrentBudget() {
+        val contextLimit = DeviceAdaptiveRuntimePolicy.trainingContextLimit(
+            configuredContextLength = 128,
+            availableHeapBytes = 64L * 1024L * 1024L,
+            maximumHeapBytes = 512L * 1024L * 1024L,
+            dModel = 128,
+            feedForwardSize = 512,
+            vocabularySize = 2_048,
+            layerCount = 2,
+            headCount = 4,
+            thermalStatus = PowerManager.THERMAL_STATUS_LIGHT,
+            availableSystemMemoryBytes = 2L * 1024L * 1024L * 1024L,
+            memoryRecovery = true
+        )
+
+        assertEquals(64, contextLimit)
+    }
+
+    @Test
     fun trainingWorkspaceEstimateGrowsWithContextAndArchitecture() {
         val short = DeviceAdaptiveRuntimePolicy.estimateTrainingWindowWorkspaceBytes(
             contextLength = 32,

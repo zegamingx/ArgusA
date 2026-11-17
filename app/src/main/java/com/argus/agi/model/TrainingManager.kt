@@ -2230,6 +2230,18 @@ class TrainingManager(
                             isCharging = safetySnapshot.isCharging,
                             memoryRecovery = memoryRecovery
                         )
+                        if (runtimeContextLength == 0) {
+                            // Even the minimum legal context exceeds current live
+                            // workspace headroom. Return the claim to durable QUEUED
+                            // state without touching model/checkpoint/optimizer state.
+                            prependPersistingQueueItems(listOf(firstItem))
+                            Log.i(
+                                TAG,
+                                "Training deferred: minimum context does not fit current memory headroom."
+                            )
+                            delay(IDLE_POLL_MS)
+                            continue
+                        }
 
                         val batchItems = ArrayList<TrainingData>(thermalBatchLimit)
                         batchItems += firstItem
