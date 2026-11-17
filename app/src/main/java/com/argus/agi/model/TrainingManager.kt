@@ -875,6 +875,10 @@ class TrainingManager(
                     org.json.JSONObject(record)
                 }.isSuccess
                 if (!isJsonObject) return null
+                require(processed.size < MAX_STREAMED_DOCUMENT_CHUNKS) {
+                    "JSONL document exceeds the safe limit of " +
+                        "$MAX_STREAMED_DOCUMENT_CHUNKS processed records."
+                }
                 validateStreamedJsonValueSizes(record)
 
                 foundRecord = true

@@ -489,6 +489,61 @@ class CorpusPersistenceTest {
     }
 
     @Test
+    fun streamedJsonlRejectsTooManyRecordsBeforePersistingAnyDocument() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(
+                context,
+                EngineConfig(maxSeqLen = 64)
+            ),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val records = (0..TrainingManager.MAX_STREAMED_DOCUMENT_CHUNKS).joinToString("\n") {
+                index -> """{"topic":"record-$index"}"""
+            }
+            val failure = runCatching {
+                manager.enqueueDocumentStream(
+                    source = "JSONL record-budget regression",
+                    title = "Must not partially persist",
+                    reader = StringReader(records),
+                    chunkSize = 380,
+                    overlap = 0
+                )
+            }.exceptionOrNull()
+
+            assertTrue(
+                "The stream must reject more than the bounded record count.",
+                failure is IllegalArgumentException
+            )
+            assertTrue(
+                "No partially processed JSONL document may be stored.",
+                repository.getCorpusDocuments().isEmpty()
+            )
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            assertTrue(
+                "The spool must be deleted after record-limit rejection.",
+                context.cacheDir.listFiles().orEmpty().none { file ->
+                    file.name.startsWith("argus-ingest-")
+                }
+            )
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
+    @Test
     fun streamedPlainTextConversationIsProcessedOnlyAfterTheCompleteTranscriptArrives() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val database = Room.inMemoryDatabaseBuilder(
