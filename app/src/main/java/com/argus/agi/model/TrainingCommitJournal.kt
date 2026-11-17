@@ -119,7 +119,7 @@ internal object TrainingCommitJournal {
 
         DataInputStream(BufferedInputStream(FileInputStream(file))).use { input ->
             val payloadSize = input.readInt()
-            require(payloadSize in 1..MAX_JOURNAL_BYTES - Long.SIZE_BYTES) {
+            require(payloadSize in 1..MAX_JOURNAL_BYTES - Int.SIZE_BYTES - Long.SIZE_BYTES) {
                 "Training commit journal payload size is invalid."
             }
             val payload = ByteArray(payloadSize)
@@ -264,7 +264,7 @@ internal object TrainingCommitJournal {
         }
 
         val payload = payloadBuffer.toByteArray()
-        require(payload.size <= MAX_JOURNAL_BYTES - Long.SIZE_BYTES) {
+        require(payload.size <= MAX_JOURNAL_BYTES - Int.SIZE_BYTES - Long.SIZE_BYTES) {
             "Training commit journal exceeds its maximum size."
         }
         val checksum = CRC32().apply { update(payload) }
