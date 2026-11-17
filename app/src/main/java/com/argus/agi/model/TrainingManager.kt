@@ -1540,13 +1540,16 @@ class TrainingManager(
 
         val committedOptimizerStep = requireNotNull(snapshot.committedOptimizerStep)
         if (currentOptimizerStep < committedOptimizerStep) {
+            check(currentOptimizerStep == snapshot.baselineOptimizerStep) {
+                "The committed training journal does not match either its baseline or committed checkpoint."
+            }
             val committedIds = repository.getOptimizerCommittedTrainingItemsSnapshot()
                 .mapTo(HashSet()) { it.id }
             check(snapshot.entries.none { it.itemId in committedIds }) {
-                "Room marks a batch committed, but the restored checkpoint is older than its optimizer commit."
+                "Room marks a batch committed, but the restored checkpoint is only its baseline."
             }
             // The write-ahead journal reached COMMITTED, but the following checkpoint
-            // replacement did not. The only durable model state is the saved baseline.
+            // replacement did not. The only durable model state is the exact saved baseline.
             TrainingCommitJournal.delete(trainingCommitJournalFile)
             return
         }
