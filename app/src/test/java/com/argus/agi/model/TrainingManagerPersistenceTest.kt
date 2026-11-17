@@ -76,6 +76,39 @@ class TrainingManagerPersistenceTest {
         }
     }
 
+    @Test
+    fun optimizerCommittedRowsSurviveInterruptedTrainingRecovery() = runBlocking {
+        withTrainingManager { _, repository, manager ->
+            manager.pauseTraining()
+            val trainingItem = TrainingData(
+                source = "persistence-test",
+                title = "Committed optimizer transaction",
+                content = "The optimizer already committed this item.",
+                status = TrainingStatus.TRAINING
+            )
+            repository.saveTrainingItem(trainingItem)
+
+            repository.markTrainingItemsOptimizerCommitted(
+                listOf(
+                    trainingItem.copy(
+                        status = TrainingStatus.OPTIMIZER_COMMITTED,
+                        finalLoss = 0.375f,
+                        stepDurationMs = 120L
+                    )
+                )
+            )
+            repository.recoverInterruptedTrainingItems()
+
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
+            assertEquals(1, committed.size)
+            assertEquals(trainingItem.id, committed.single().id)
+            assertEquals(TrainingStatus.OPTIMIZER_COMMITTED, committed.single().status)
+            assertEquals(0.375f, requireNotNull(committed.single().finalLoss), 0f)
+            assertEquals(120L, committed.single().stepDurationMs)
+        }
+    }
+
     private suspend fun awaitPersistence(manager: TrainingManager) {
         withTimeout(5_000L) {
             manager.awaitQueuePersistenceIdle()
