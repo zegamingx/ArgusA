@@ -3076,6 +3076,8 @@ class ArgusNeuralEngine private constructor(
             "AdamW tensor and weight-decay group counts must match."
         }
 
+        val optimizerOperationCount = gradients.sumOf { gradient -> gradient.size.toLong() }
+        val gpuDispatchStartNanos = System.nanoTime()
         val gpuOrStagedUpdateCompleted = VulkanTrainingBackend.tryApplyFp16AdamWUpdate(
                 parameters = parameters,
                 gradients = gradients,
@@ -3101,6 +3103,10 @@ class ArgusNeuralEngine private constructor(
                     error
                 )
             }
+            VulkanTrainingBackend.recordGpuAdamWTiming(
+                optimizerOperationCount,
+                System.nanoTime() - gpuDispatchStartNanos
+            )
             return
         }
 
