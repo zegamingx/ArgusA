@@ -24,14 +24,20 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.Closeable
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.Reader
 import java.io.StringReader
 import java.security.MessageDigest
@@ -119,6 +125,7 @@ class TrainingManager(
     private val activityManager =
         context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
     private val validationFilesDirectory = context.applicationContext.filesDir
+    private val ingestionStagingDirectory = context.applicationContext.cacheDir
     private val trainingCommitJournalFile =
         File(validationFilesDirectory, TrainingCommitJournal.FILE_NAME)
     private val conversationalValidationPersistence =
@@ -155,6 +162,9 @@ class TrainingManager(
         private const val MAX_TOKENIZER_SAMPLE_CHUNKS = 256
         private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
         private const val MAX_STREAMED_JSON_VALUE_CHARACTERS = 256 * 1024
+        // Import remains bounded even when the supplied Reader is unbounded.
+        const val MAX_STREAMED_DOCUMENT_CHARACTERS = 2 * 1024 * 1024
+        const val MAX_STREAMED_DOCUMENT_CHUNKS = 8_192
         private const val IDLE_POLL_MS = 500L
         private val REASONING_BLOCK_PATTERN = Regex(
             "<THINK>(.*?)</THINK>",
@@ -623,6 +633,24 @@ class TrainingManager(
      *
      * @return Pair(number of generated chunks, total UTF-16 characters read)
      */
+    /**
+     * Ingests a Reader through a bounded disk spool rather than retaining the original
+     * transcript in a growing StringBuilder while it is still being read.
+     *
+     * UTF-16 code units are written verbatim in big-endian order. This preserves the
+     * exact SHA-256/UTF-16BE identity used by enqueueDocument, including a surrogate
+     * pair split across separate Reader reads.
+     *
+     * The downstream modality processor currently requires a complete bounded String.
+     * Therefore this is a hard-bounded ingestion path, not an unbounded/constant-memory
+     * parser: the input is capped at MAX_STREAMED_DOCUMENT_CHARACTERS and the queued
+     * chunk count is capped before any Room or queue write occurs.
+     *
+     * Conversations, reasoning sequences, and JSONL records remain atomic according to
+     * TextModalityProcessor. The neural engine continues to own context-window splitting.
+     *
+     * @return Pair(number of generated queue chunks, total UTF-16 characters read)
+     */
     suspend fun enqueueDocumentStream(
         source: String,
         title: String,
@@ -653,121 +681,201 @@ class TrainingManager(
         requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
         if (closed) return Pair(0, 0L)
 
-        val sourceText = StringBuilder()
-        val buffer = CharArray(4096)
+        check(
+            ingestionStagingDirectory.isDirectory ||
+                ingestionStagingDirectory.mkdirs()
+        ) {
+            "Temporary ingestion storage is unavailable."
+        }
+
+        val stagingFile = File(
+            ingestionStagingDirectory,
+            "argus-ingest-${UUID.randomUUID()}.utf16be"
+        )
+        val inputBuffer = CharArray(4096)
+        val encodedBuffer = ByteArray(inputBuffer.size * 2)
         val fingerprintDigest = MessageDigest.getInstance("SHA-256")
         var totalCharsRead = 0L
 
-        while (true) {
-            val readCount = reader.read(buffer)
-            if (readCount < 0) break
-            if (readCount == 0) continue
-            if (closed) {
-                sourceText.setLength(0)
+        try {
+            BufferedOutputStream(FileOutputStream(stagingFile)).use { output ->
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    val readCount = reader.read(inputBuffer)
+                    if (readCount < 0) break
+                    if (readCount == 0) continue
+                    if (closed) return Pair(0, totalCharsRead)
+
+                    val nextTotal = Math.addExact(totalCharsRead, readCount.toLong())
+                    require(nextTotal <= MAX_STREAMED_DOCUMENT_CHARACTERS.toLong()) {
+                        "Streamed document exceeds the safe limit of " +
+                            "$MAX_STREAMED_DOCUMENT_CHARACTERS UTF-16 characters. " +
+                            "Split the source into smaller documents at a record or paragraph boundary."
+                    }
+
+                    updateUtf16BeDigest(fingerprintDigest, inputBuffer, readCount)
+                    for (index in 0 until readCount) {
+                        val value = inputBuffer[index].code
+                        encodedBuffer[index * 2] = (value ushr 8).toByte()
+                        encodedBuffer[index * 2 + 1] = value.toByte()
+                    }
+                    output.write(encodedBuffer, 0, readCount * 2)
+                    totalCharsRead = nextTotal
+                }
+            }
+
+            if (closed) return Pair(0, totalCharsRead)
+            if (totalCharsRead == 0L) return Pair(0, 0L)
+
+            val completeTranscript = readUtf16BeStagingFile(
+                file = stagingFile,
+                expectedCharacterCount = totalCharsRead.toInt()
+            )
+            if (completeTranscript.isBlank()) return Pair(0, totalCharsRead)
+
+            validateStreamedJsonValueSizes(completeTranscript)
+
+            val processedChunks = TextModalityProcessor.process(
+                rawText = completeTranscript,
+                documentTitle = title,
+                chunkSize = chunkSize,
+                overlap = overlap,
+                tokenizer = neuralEngine.tokenizer
+            )
+            val rawChunks = processedChunks.map(ProcessedChunk::content)
+            val chunksPerEpoch = rawChunks.size
+            if (chunksPerEpoch == 0) return Pair(0, totalCharsRead)
+
+            val totalScheduledChunks = Math.multiplyExact(chunksPerEpoch, epochs)
+            require(totalScheduledChunks <= MAX_STREAMED_DOCUMENT_CHUNKS) {
+                "Streamed document would create $totalScheduledChunks queue chunks, " +
+                    "exceeding the safe limit of $MAX_STREAMED_DOCUMENT_CHUNKS. " +
+                    "Use a larger chunk size or split the source."
+            }
+
+            val documentId = fingerprintDigest.digest().toHexString()
+            val corpusDocument = CorpusDocumentEntity(
+                id = documentId,
+                contentFingerprint = documentId,
+                fingerprintAlgorithm = "SHA-256/UTF-16BE",
+                source = source,
+                title = title,
+                language = language,
+                canonicalUrl = canonicalUrl,
+                characterCount = totalCharsRead.toInt(),
+                chunkCount = chunksPerEpoch,
+                plannedEpochs = epochs,
+                rightsStatus = rightsStatus,
+                status = "READY",
+                createdAtEpochMs = System.currentTimeMillis(),
+                lastTrainedAtEpochMs = null,
+                completedPassCount = 0
+            )
+            val corpusChunks = rawChunks.mapIndexed { index, chunkText ->
+                CorpusChunkEntity(
+                    id = "$documentId:${index + 1}",
+                    documentId = documentId,
+                    chunkIndex = index + 1,
+                    content = chunkText,
+                    characterCount = chunkText.length
+                )
+            }
+
+            val activeRepository = requireNotNull(repo) {
+                "Local corpus storage is unavailable; document training was not queued."
+            }
+            val stored = activeRepository.storeCorpusDocument(
+                corpusDocument,
+                corpusChunks,
+                sourceProvenance
+            )
+            if (!stored) {
+                Log.i(TAG, "Duplicate corpus document skipped: $documentId")
                 return Pair(0, totalCharsRead)
             }
 
-            updateUtf16BeDigest(fingerprintDigest, buffer, readCount)
-            sourceText.append(buffer, 0, readCount)
-            totalCharsRead += readCount.toLong()
+            val newItems = ArrayList<TrainingData>(totalScheduledChunks)
+            for (epochIndex in 0 until epochs) {
+                rawChunks.forEachIndexed { chunkIndex, chunkText ->
+                    val chunkTitle = if (epochs == 1) {
+                        "$title [Block ${chunkIndex + 1}/$chunksPerEpoch]"
+                    } else {
+                        "$title [Block ${chunkIndex + 1}/$chunksPerEpoch] " +
+                            "[Epoch ${epochIndex + 1}/$epochs]"
+                    }
+
+                    newItems += TrainingData(
+                        source = source,
+                        title = chunkTitle,
+                        content = chunkText,
+                        chunkIndex = epochIndex * chunksPerEpoch + chunkIndex + 1,
+                        totalChunks = totalScheduledChunks,
+                        documentTitle = title,
+                        status = TrainingStatus.QUEUED,
+                        documentId = documentId
+                    )
+                }
+            }
+
+            synchronized(queueLock) {
+                if (closed) return Pair(0, totalCharsRead)
+                val orderedItems = appendPersistingQueueItems(newItems)
+
+                if (_activeDocument.value == null && orderedItems.isNotEmpty()) {
+                    _activeDocument.value = ActiveDocumentTraining(
+                        docTitle = title,
+                        totalCharacters = totalCharsRead.toInt(),
+                        totalChunks = orderedItems.size,
+                        completedChunks = 0,
+                        currentChunkIndex = 1
+                    )
+                }
+                return Pair(orderedItems.size, totalCharsRead)
+            }
+        } finally {
+            if (stagingFile.exists() && !stagingFile.delete()) {
+                Log.w(TAG, "Could not remove temporary streamed-ingestion file: ${stagingFile.name}")
+            }
         }
+    }
 
-        if (closed) {
-            sourceText.setLength(0)
-            return Pair(0, totalCharsRead)
-        }
+    /**
+     * Rehydrates a bounded UTF-16BE spool in fixed-size blocks. Reading code units rather
+     * than using a charset decoder preserves even isolated surrogate code units exactly.
+     */
+    private fun readUtf16BeStagingFile(
+        file: File,
+        expectedCharacterCount: Int
+    ): String {
+        require(expectedCharacterCount in 1..MAX_STREAMED_DOCUMENT_CHARACTERS)
+        val result = StringBuilder(expectedCharacterCount)
+        val byteBuffer = ByteArray(8 * 1024)
+        val charBuffer = CharArray(byteBuffer.size / 2)
+        var charactersRead = 0
 
-        val completeTranscript = sourceText.toString()
-        if (completeTranscript.isBlank()) return Pair(0, totalCharsRead)
-
-        validateStreamedJsonValueSizes(completeTranscript)
-
-        val processedChunks = TextModalityProcessor.process(
-            rawText = completeTranscript,
-            documentTitle = title,
-            chunkSize = chunkSize,
-            overlap = overlap,
-            tokenizer = neuralEngine.tokenizer
-        )
-        val rawChunks = processedChunks.map(ProcessedChunk::content)
-        val chunksPerEpoch = rawChunks.size
-        if (chunksPerEpoch == 0) return Pair(0, totalCharsRead)
-
-        val documentId = fingerprintDigest.digest().toHexString()
-        val corpusDocument = CorpusDocumentEntity(
-            id = documentId,
-            contentFingerprint = documentId,
-            fingerprintAlgorithm = "SHA-256/UTF-16BE",
-            source = source,
-            title = title,
-            language = language,
-            canonicalUrl = canonicalUrl,
-            characterCount = totalCharsRead.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-            chunkCount = chunksPerEpoch,
-            plannedEpochs = epochs,
-            rightsStatus = rightsStatus,
-            status = "READY",
-            createdAtEpochMs = System.currentTimeMillis(),
-            lastTrainedAtEpochMs = null,
-            completedPassCount = 0
-        )
-        val corpusChunks = rawChunks.mapIndexed { index, chunkText ->
-            CorpusChunkEntity(
-                id = "$documentId:${index + 1}",
-                documentId = documentId,
-                chunkIndex = index + 1,
-                content = chunkText,
-                characterCount = chunkText.length
-            )
-        }
-
-        val activeRepository = requireNotNull(repo) {
-            "Local corpus storage is unavailable; document training was not queued."
-        }
-        val stored = activeRepository.storeCorpusDocument(corpusDocument, corpusChunks, sourceProvenance)
-        if (!stored) {
-            Log.i(TAG, "Duplicate corpus document skipped: $documentId")
-            return Pair(0, totalCharsRead)
-        }
-
-        val totalScheduledChunks = Math.multiplyExact(chunksPerEpoch, epochs)
-        val newItems = ArrayList<TrainingData>(totalScheduledChunks)
-        for (epochIndex in 0 until epochs) {
-            rawChunks.forEachIndexed { chunkIndex, chunkText ->
-                val chunkTitle = if (epochs == 1) {
-                    "$title [Block ${chunkIndex + 1}/$chunksPerEpoch]"
-                } else {
-                    "$title [Block ${chunkIndex + 1}/$chunksPerEpoch] [Epoch ${epochIndex + 1}/$epochs]"
+        BufferedInputStream(FileInputStream(file)).use { input ->
+            while (true) {
+                val byteCount = input.read(byteBuffer)
+                if (byteCount < 0) break
+                check(byteCount % 2 == 0) {
+                    "Temporary streamed-ingestion data ended in the middle of a UTF-16 code unit."
                 }
 
-                newItems += TrainingData(
-                    source = source,
-                    title = chunkTitle,
-                    content = chunkText,
-                    chunkIndex = epochIndex * chunksPerEpoch + chunkIndex + 1,
-                    totalChunks = totalScheduledChunks,
-                    documentTitle = title,
-                    status = TrainingStatus.QUEUED,
-                    documentId = documentId
-                )
+                val charCount = byteCount / 2
+                for (index in 0 until charCount) {
+                    val high = byteBuffer[index * 2].toInt() and 0xFF
+                    val low = byteBuffer[index * 2 + 1].toInt() and 0xFF
+                    charBuffer[index] = ((high shl 8) or low).toChar()
+                }
+                result.append(charBuffer, 0, charCount)
+                charactersRead = Math.addExact(charactersRead, charCount)
             }
         }
 
-        synchronized(queueLock) {
-            if (closed) return Pair(0, totalCharsRead)
-            val orderedItems = appendPersistingQueueItems(newItems)
-
-            if (_activeDocument.value == null && orderedItems.isNotEmpty()) {
-                _activeDocument.value = ActiveDocumentTraining(
-                    docTitle = title,
-                    totalCharacters = totalCharsRead.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                    totalChunks = orderedItems.size,
-                    completedChunks = 0,
-                    currentChunkIndex = 1
-                )
-            }
-            return Pair(orderedItems.size, totalCharsRead)
+        check(charactersRead == expectedCharacterCount) {
+            "Temporary streamed-ingestion character count does not match the source stream."
         }
+        return result.toString()
     }
 
     private fun validateStreamedJsonValueSizes(text: String) {

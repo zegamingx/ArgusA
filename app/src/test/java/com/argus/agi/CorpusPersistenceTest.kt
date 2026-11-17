@@ -378,6 +378,107 @@ class CorpusPersistenceTest {
     }
 
     @Test
+    fun streamedImportRejectsInputBeyondItsHardMemoryBoundBeforePersisting() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(context),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val oversizedText = "x".repeat(TrainingManager.MAX_STREAMED_DOCUMENT_CHARACTERS + 1)
+            val failure = runCatching {
+                manager.enqueueDocumentStream(
+                    source = "Oversized streamed import test",
+                    title = "Must be rejected before persistence",
+                    reader = StringReader(oversizedText),
+                    chunkSize = 48,
+                    overlap = 0
+                )
+            }.exceptionOrNull()
+
+            assertTrue(
+                "An oversized source must be rejected by the hard stream bound.",
+                failure is IllegalArgumentException
+            )
+            assertTrue(repository.getCorpusDocuments().isEmpty())
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            assertTrue(
+                "The temporary UTF-16 spool must be deleted after rejection.",
+                context.cacheDir.listFiles().orEmpty().none { file ->
+                    file.name.startsWith("argus-ingest-")
+                }
+            )
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
+    @Test
+    fun streamedFingerprintPreservesSurrogatePairsAcrossReaderBufferBoundaries() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(context),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            // The high surrogate is the final code unit of the first 4 KiB read.
+            val transcript = "a".repeat(4095) + "\uD83D\uDE00" +
+                " A stream must preserve the exact UTF-16 fingerprint. ".repeat(12)
+
+            val firstImport = manager.enqueueDocument(
+                source = "UTF-16 fingerprint parity",
+                title = "Original transcript",
+                fullText = transcript,
+                chunkSize = 48,
+                overlap = 0
+            )
+            assertTrue(firstImport > 0)
+
+            val streamedImport = manager.enqueueDocumentStream(
+                source = "UTF-16 fingerprint parity",
+                title = "Streamed duplicate",
+                reader = StringReader(transcript),
+                chunkSize = 48,
+                overlap = 0
+            )
+
+            assertEquals(transcript.length.toLong(), streamedImport.second)
+            assertEquals(
+                "A streamed duplicate must have the same UTF-16BE fingerprint as the String API.",
+                0,
+                streamedImport.first
+            )
+            assertEquals(1, repository.getCorpusDocumentCount())
+            val storedDocument = repository.getCorpusDocuments().single()
+            assertEquals(2, repository.getCorpusSources(storedDocument.id).size)
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
+    @Test
     fun streamedPlainTextConversationIsProcessedOnlyAfterTheCompleteTranscriptArrives() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val database = Room.inMemoryDatabaseBuilder(
