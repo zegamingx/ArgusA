@@ -11,7 +11,12 @@ if ([string]::IsNullOrWhiteSpace($env:ANDROID_SDK_ROOT)) { throw 'ANDROID_SDK_RO
 if ([string]::IsNullOrWhiteSpace($env:GITHUB_WORKSPACE)) { throw 'GITHUB_WORKSPACE is missing.' }
 
 $RealCMake = (Resolve-Path -LiteralPath $RealCMake).Path
-$version = (& $RealCMake --version | Select-Object -First 1).Trim()
+$versionOutput = @(& $RealCMake --version)
+$versionExitCode = $LASTEXITCODE
+if ($versionExitCode -ne 0 -or $versionOutput.Count -eq 0) {
+    throw "Unable to read the real CMake version. Exit code: $versionExitCode"
+}
+$version = ([string]$versionOutput[0]).Trim()
 if ($version -ne 'cmake version 4.5.0') { throw "Expected CMake 4.5.0, received: $version" }
 
 $ninjaPath = 'C:\Tools\Ninja\ninja.exe'
@@ -156,6 +161,11 @@ finally {
     if (Test-Path -LiteralPath $probeRoot) { Remove-Item -LiteralPath $probeRoot -Recurse -Force }
 }
 
-$launcherVersion = (& $launcherPath --version | Select-Object -First 1).Trim()
+$launcherVersionOutput = @(& $launcherPath --version)
+$launcherExitCode = $LASTEXITCODE
+if ($launcherExitCode -ne 0 -or $launcherVersionOutput.Count -eq 0) {
+    throw "CMake compatibility launcher version check failed. Exit code: $launcherExitCode"
+}
+$launcherVersion = ([string]$launcherVersionOutput[0]).Trim()
 if ($launcherVersion -ne 'cmake version 4.5.0') { throw "Launcher version mismatch: $launcherVersion" }
 Write-Host "CMake 4.5.0 launcher installed. Ninja $ninjaVersion."
