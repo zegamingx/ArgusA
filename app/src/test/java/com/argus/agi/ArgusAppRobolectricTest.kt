@@ -120,7 +120,7 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun legacyCheckpointDoesNotOverrideCurrentDeviceTier() {
+    fun arg3CheckpointPreservesSavedArchitectureAndTokenizerContract() {
         val checkpoint = java.io.File(context.filesDir, "argus_model_weights.bin")
         val previousBytes = checkpoint.takeIf { it.isFile }?.readBytes()
 
@@ -146,17 +146,14 @@ class ArgusAppRobolectricTest {
                 maxHeapMb = 192L
             )
 
-            val expected = EngineConfig.forDevice(
-                totalRamGb = 4,
-                maxHeapMb = 192L
-            )
-            assertEquals(expected.dModel, resolved.dModel)
-            assertEquals(expected.nHeads, resolved.nHeads)
-            assertEquals(expected.dFf, resolved.dFf)
-            assertEquals(expected.maxSeqLen, resolved.maxSeqLen)
-            assertEquals(expected.loraRank, resolved.loraRank)
+            assertEquals(96, resolved.dModel)
+            assertEquals(4, resolved.nHeads)
+            assertEquals(384, resolved.dFf)
+            assertEquals(128, resolved.maxSeqLen)
+            assertEquals(4, resolved.loraRank)
+            assertEquals(160, resolved.initialVocabularyCapacity)
             assertEquals(
-                ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2,
+                ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
                 resolved.tokenizerConfig.algorithm
             )
         } finally {

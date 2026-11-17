@@ -208,7 +208,7 @@ class TokenizerLearningTest {
     }
 
     @Test
-    fun legacyGreedyCheckpointIsNotRestoredUnderByteLevelBpeV2() {
+    fun greedyTokenizerCheckpointPreservesVocabularyIdsAndEncoding() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
@@ -227,30 +227,38 @@ class TokenizerLearningTest {
                     maxTokenLength = 16
                 )
             )
-            val legacyEngine = ArgusNeuralEngine.createBlocking(context, config)
+            val originalEngine = ArgusNeuralEngine.createBlocking(context, config)
             val corpus = List(48) {
                 "Greedy legacy tokenizer learns repeated local language patterns from corpus documents."
             }
-            val update = legacyEngine.trainTokenizerFromCorpus(corpus)
+            val update = originalEngine.trainTokenizerFromCorpus(corpus)
 
             assertTrue(update.tokensAdded > 0)
             assertEquals(0, update.mergeCount)
             assertTrue(checkpoint.isFile)
 
-            val freshConfig = ArgusNeuralEngine.resolveConfig(
+            val restoredConfig = ArgusNeuralEngine.resolveConfig(
                 context = context,
                 totalRamGb = 2,
                 maxHeapMb = 128L,
                 availableRamGb = 1.0f
             )
             assertEquals(
-                ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2,
-                freshConfig.tokenizerConfig.algorithm
+                ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
+                restoredConfig.tokenizerConfig.algorithm
             )
 
-            val freshEngine = ArgusNeuralEngine.createBlocking(context, freshConfig)
-            assertTrue(!freshEngine.loadCheckpointIfExists())
-            assertEquals(265, freshEngine.tokenizer.vocabSize)
+            val restoredEngine = ArgusNeuralEngine.createBlocking(context, restoredConfig)
+            assertTrue(restoredEngine.isCheckpointStateVerified)
+            assertEquals(
+                originalEngine.tokenizer.exportVocab(),
+                restoredEngine.tokenizer.exportVocab()
+            )
+            val sample = corpus.first()
+            assertEquals(
+                originalEngine.tokenizer.encode(sample, autoRegister = false),
+                restoredEngine.tokenizer.encode(sample, autoRegister = false)
+            )
         } finally {
             if (previousCheckpoint == null) {
                 checkpoint.delete()

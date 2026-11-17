@@ -460,9 +460,24 @@ class GenesisModelManager(
 
     private fun loadIdentity(): GenesisIdentity? {
         if (!neuralEngine.isCheckpointStateVerified) {
+            if (prefs.contains(KEY_ORIGIN_ID)) {
+                val invalidated = prefs.edit()
+                    .remove(KEY_ORIGIN_ID)
+                    .remove(KEY_BIRTH_TS)
+                    .remove(KEY_RAM_GB)
+                    .remove(KEY_COMPUTE)
+                    .remove(KEY_PARAM_COUNT)
+                    .remove(KEY_ARCH_TIER)
+                    .commit()
+                if (!invalidated) {
+                    throw GenesisException(
+                        "The stale Genesis identity could not be invalidated because its checkpoint was not verified."
+                    )
+                }
+            }
             Log.w(
                 TAG,
-                "Stored Genesis identity ignored because no compatible checkpoint was restored or verified."
+                "Stored Genesis identity was invalidated because no compatible checkpoint was restored or verified."
             )
             return null
         }

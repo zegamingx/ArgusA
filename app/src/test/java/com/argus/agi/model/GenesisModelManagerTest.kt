@@ -64,7 +64,15 @@ class GenesisModelManagerTest {
 
             assertFalse(manager.hasCompletedGenesis())
             assertNull(manager.getIdentity())
+            assertFalse("Stale origin IDs must be removed, not merely hidden.", preferences.contains(KEY_ORIGIN_ID))
             assertEquals(GenesisLifecycleStage.IDLE, manager.lifecycleState.value.stage)
+
+            // A later successful save of freshly initialized weights must not revive
+            // the identity belonging to the checkpoint that failed restoration.
+            assertTrue(engine.saveCheckpoint())
+            assertTrue(engine.isCheckpointStateVerified)
+            assertFalse(manager.hasCompletedGenesis())
+            assertNull(manager.getIdentity())
         } finally {
             restorePreferences(preferences, previousPreferences)
             if (previousCheckpoint == null) {

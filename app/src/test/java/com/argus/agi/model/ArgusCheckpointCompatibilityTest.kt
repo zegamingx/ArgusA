@@ -148,8 +148,8 @@ class ArgusCheckpointCompatibilityTest {
             assertEquals(16, restoredConfig.dModel)
             assertEquals(4, restoredConfig.nHeads)
             assertEquals(32, restoredConfig.dFf)
-            assertEquals(32, restoredConfig.maxSeqLen)
-            assertEquals(16, restoredConfig.loraRank)
+            assertEquals(16, restoredConfig.maxSeqLen)
+            assertEquals(2, restoredConfig.loraRank)
             assertEquals(176, restoredConfig.initialVocabularyCapacity)
             assertEquals(
                 ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,

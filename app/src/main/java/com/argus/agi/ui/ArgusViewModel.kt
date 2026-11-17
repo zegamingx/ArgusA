@@ -228,63 +228,48 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
 
-        // Muat riwayat percakapan dari Room database on-device
+        // Restore durable chat history independently from model/checkpoint recovery.
         viewModelScope.launch(Dispatchers.IO) {
-            val savedMessages = runCatching { repository.getChatMessagesSnapshot() }.getOrDefault(emptyList())
-            if (savedMessages.isNotEmpty()) {
-                withContext(Dispatchers.Main) {
-                    _messages.value = savedMessages.takeLast(MAX_MESSAGES)
-                }
-            } else {
-                val existing = genesisModelManager.getIdentity()
-                if (existing == null) {
-                    try {
-                        val identity = genesisModelManager.executeGenesisLifecycle(
-                            _hardwareInfo.value, trainingManager
-                        )
-                        val initialMsg = ChatMessage(
-                            isUser = false,
-                            text = "A.R.G.U.S local model initialized on this device (${identity.originId}). " +
-                                    "Model parameters are initialized locally and can continue to evolve through on-device training.",
-                            thinkReasoning = "Genesis Origin: ${identity.originId} | " +
-                                    "Created: ${identity.formattedBirthDate} | " +
-                                    "Architecture: ${identity.architectureTier}. " +
-                                    "Total parameters: ${identity.parameterCount} (FP16 weights / FP32 state)."
-                        )
-                        withContext(Dispatchers.Main) {
-                            appendMessage(initialMsg)
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Genesis lifecycle failed", e)
-                    }
-                } else {
-                    val initialMsg = ChatMessage(
-                        isUser = false,
-                        text = "A.R.G.U.S local model initialized on this device (${existing.originId}). " +
-                                "Model parameters are initialized locally and can continue to evolve through on-device training.",
-                        thinkReasoning = "Genesis Origin: ${existing.originId} | " +
-                                "Created: ${existing.formattedBirthDate} | " +
-                                "Architecture: ${existing.architectureTier}. " +
-                                "Total parameters: ${existing.parameterCount} (FP16 weights / FP32 state)."
-                    )
-                    withContext(Dispatchers.Main) {
-                        appendMessage(initialMsg)
-                    }
-                }
+            val historyResult = runCatching {
+                repository.getChatMessagesSnapshot()
             }
+            val savedMessages = historyResult.getOrDefault(emptyList())
+            historyResult.exceptionOrNull()?.let { error ->
+                Log.e(TAG, "Failed to restore local chat history", error)
+            }
+
             withContext(Dispatchers.Main) {
+                _messages.value = savedMessages.takeLast(MAX_MESSAGES)
                 _isMessagesLoaded.value = true
             }
-        }
 
-        // Existing installations can have a Genesis identity and chat history while
-        // their original seed work was never persisted in the retained corpus.
-        if (genesisModelManager.hasCompletedGenesis()) {
+            // Genesis must validate the checkpoint even when chat history already exists.
+            // Existing history is retained; a new welcome entry is only created for a
+            // genuinely empty, successfully-read conversation store.
             viewModelScope.launch(Dispatchers.IO) {
-                runCatching {
-                    genesisModelManager.ensureGeneralLearningCorpus(trainingManager)
-                }.onFailure { error ->
-                    Log.w(TAG, "Genesis seed corpus recovery failed", error)
+                val identity = try {
+                    genesisModelManager.executeGenesisLifecycle(
+                        _hardwareInfo.value,
+                        trainingManager
+                    )
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    Log.e(TAG, "Genesis lifecycle failed", error)
+                    null
+                }
+
+                if (historyResult.isSuccess && savedMessages.isEmpty() && identity != null) {
+                    val initialMessage = ChatMessage(
+                        isUser = false,
+                        text = "A.R.G.U.S local model initialized on this device (${identity.originId}). " +
+                            "Model parameters are initialized locally and can continue to evolve through on-device training.",
+                        thinkReasoning = "Genesis Origin: ${identity.originId} | " +
+                            "Created: ${identity.formattedBirthDate} | " +
+                            "Architecture: ${identity.architectureTier}. " +
+                            "Total parameters: ${identity.parameterCount} (FP16 weights / FP32 state)."
+                    )
+                    appendMessage(initialMessage)
                 }
             }
         }
