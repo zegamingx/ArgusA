@@ -2319,11 +2319,21 @@ class TrainingManager(
      * Internal visibility allows persistence-contract tests to exercise the same path
      * used by the worker without starting the optimizer loop.
      */
-    internal suspend fun popNext(): TrainingData? {
+    internal suspend fun popNext(
+        expectedStatus: TrainingStatus? = null
+    ): TrainingData? {
         val startCompletion = CompletableDeferred<Result<Unit>>()
         val reservation = synchronized(queueLock) {
             val list = _nextQueue.value
             val first = list.firstOrNull() ?: return@synchronized null
+            if (expectedStatus != null && first.status != expectedStatus) {
+                return@synchronized null
+            }
+
+            if (first.status == TrainingStatus.OPTIMIZER_COMMITTED) {
+                _nextQueue.value = list.drop(1)
+                return@synchronized first to null
+            }
             if (first.status != TrainingStatus.QUEUED) return@synchronized null
 
             val sendResult = persistenceOperations.trySend(
@@ -2338,21 +2348,22 @@ class TrainingManager(
             }
 
             _nextQueue.value = list.drop(1)
-            first to queueGeneration
+            first to startCompletion
         } ?: return null
 
-        val (item, reservationGeneration) = reservation
+        val item = reservation.first
+        val completion = reservation.second ?: return item
+        val reservationGeneration = synchronized(queueLock) { queueGeneration }
 
-        // Start is ordered in the same persistence channel as Clear. Training must not
-        // begin until Room confirms that the queue row is now TRAINING.
-        val persistenceResult = startCompletion.await()
+        // A committed item is already durable and must go directly to finalization.
+        // A queued item is not allowed to train until Room confirms TRAINING.
+        val persistenceResult = completion.await()
         if (persistenceResult.isFailure) {
             synchronized(queueLock) {
                 // A clear that happened while the Room update was pending must win.
                 // Never resurrect a queue item from an older generation.
                 if (
                     !closed &&
-                    queueGeneration == reservationGeneration &&
                     _nextQueue.value.none { queued -> queued.id == item.id }
                 ) {
                     _nextQueue.value = listOf(item) + _nextQueue.value
