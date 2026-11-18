@@ -353,6 +353,30 @@ class ArgusNeuralEngine private constructor(
     val optimizerStep: Int
         get() = synchronized(modelLock) { adamStep }
 
+    /**
+     * Captures the exact active architecture, tokenizer, optimizer progress and
+     * checkpoint verification state without exposing mutable engine arrays.
+     */
+    internal fun snapshotModelState(): ModelState = synchronized(modelLock) {
+        val tokenizerConfig = tokenizer.config
+        ModelState(
+            identity = ModelStateIdentity(
+                architecture = architectureConfig,
+                tokenizer = TokenizerModelState(
+                    schemaVersion = tokenizerConfig.schemaVersion,
+                    algorithm = tokenizerConfig.algorithm,
+                    maximumVocabularySize = tokenizerConfig.maxVocabularySize,
+                    maxTokenLength = tokenizerConfig.maxTokenLength,
+                    vocabularySize = tokenizer.vocabSize,
+                    snapshotFingerprint = tokenizer.snapshotFingerprint()
+                )
+            ),
+            optimizerStep = adamStep,
+            checkpointFormat = ModelCheckpointFormat.ARG5,
+            checkpointVerified = checkpointStateVerified
+        )
+    }
+
     val optimizerBackend: String
         get() = VulkanTrainingBackend.currentBackend
     val isVulkanRuntimeReady: Boolean
@@ -3996,20 +4020,22 @@ class ArgusNeuralEngine private constructor(
 
         val target = File(context.filesDir, "argus_model_weights.bin")
         val temporary = File(context.filesDir, "argus_model_weights.bin.tmp")
+        val activeModelState = snapshotModelState()
+        val architecture = activeModelState.identity.architecture
+        val tokenizerState = activeModelState.identity.tokenizer
         val vocabEntries = tokenizer.exportVocab()
-        val isLearnedBpe = config.tokenizerConfig.algorithm.usesBpeMerges
+        val isLearnedBpe = tokenizerState.algorithm.usesBpeMerges
         val merges = if (isLearnedBpe) tokenizer.exportMerges() else emptyList()
         val tensors = checkpointTensors()
-        val architecture = architectureConfig
         val architectureIdBytes = architecture.architectureId.toByteArray(Charsets.UTF_8)
-        val tokenizerFingerprint = tokenizerFingerprintBytes(tokenizer.snapshotFingerprint())
+        val tokenizerFingerprint = tokenizerFingerprintBytes(tokenizerState.snapshotFingerprint)
         require(architecture.layerCount in 1..32) {
             "ARG5 writer supports 1..32 Transformer blocks."
         }
         require(architectureIdBytes.size in 1..512) {
             "Architecture ID length is invalid."
         }
-        require(vocabEntries.size <= config.tokenizerConfig.maxVocabularySize) {
+        require(vocabEntries.size == tokenizerState.vocabularySize) {
             "Tokenizer vocabulary exceeds its configured checkpoint capacity."
         }
 
@@ -4017,7 +4043,7 @@ class ArgusNeuralEngine private constructor(
         payloadLength = Math.addExact(payloadLength, tokenizerFingerprint.size.toLong())
         for ((token, _) in vocabEntries) {
             val tokenBytes = token.toByteArray(Charsets.UTF_8)
-            require(tokenBytes.isNotEmpty() && tokenBytes.size <= config.tokenizerConfig.maxTokenLength * 4) {
+            require(tokenBytes.isNotEmpty() && tokenBytes.size <= tokenizerState.maxTokenLength * 4) {
                 "Checkpoint token byte length is invalid."
             }
             payloadLength = Math.addExact(payloadLength, 8L + tokenBytes.size.toLong())
@@ -4053,11 +4079,11 @@ class ArgusNeuralEngine private constructor(
         header.putInt(architecture.adapterRank)
         header.putInt(vocabEntries.size) // Persist the actual tokenizer entry count.
         header.putInt(vocabCap)
-        header.putInt(adamStep)
-        header.putInt(config.tokenizerConfig.schemaVersion)
-        header.putInt(config.tokenizerConfig.algorithm.checkpointId)
-        header.putInt(config.tokenizerConfig.maxVocabularySize)
-        header.putInt(config.tokenizerConfig.maxTokenLength)
+        header.putInt(activeModelState.optimizerStep)
+        header.putInt(tokenizerState.schemaVersion)
+        header.putInt(tokenizerState.algorithm.checkpointId)
+        header.putInt(tokenizerState.maximumVocabularySize)
+        header.putInt(tokenizerState.maxTokenLength)
         header.putInt(vocabEntries.size)
         header.putInt(tensors.size)
         header.putLong(payloadLength)
