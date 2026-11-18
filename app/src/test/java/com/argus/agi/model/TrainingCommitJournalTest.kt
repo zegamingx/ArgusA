@@ -149,6 +149,27 @@ class TrainingCommitJournalTest {
     }
 
     @Test
+    fun versionTwoRejectsMalformedModelIdentityFingerprints() {
+        val directory = Files.createTempDirectory("argus-training-journal-v2-invalid").toFile()
+        val file = File(directory, TrainingCommitJournal.FILE_NAME)
+        try {
+            val failure = runCatching {
+                TrainingCommitJournal.writePrepared(
+                    file = file,
+                    baselineOptimizerStep = 3,
+                    itemIds = listOf("item-a"),
+                    modelIdentityFingerprint = "not-a-sha256-fingerprint"
+                )
+            }.exceptionOrNull()
+
+            assertNotNull(failure)
+            assertFalse(file.exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun journalAcceptsOnlyExactBaselineOrCommittedOptimizerSteps() {
         val snapshot = TrainingCommitJournalSnapshot(
             baselineOptimizerStep = 41,

@@ -2821,6 +2821,12 @@ class TrainingManager(
             entries = commitEntries,
             modelIdentityFingerprint = baselineModelIdentityFingerprint
         )
+        val committedJournal = requireNotNull(
+            TrainingCommitJournal.read(trainingCommitJournalFile)
+        ) {
+            "The committed training journal could not be read back."
+        }
+        requireJournalModelIdentity(committedJournal, "live batch commit before checkpoint write")
 
         // The write-ahead COMMITTED marker is durable before the model checkpoint.
         // Room is updated only after that checkpoint is atomically secured.
