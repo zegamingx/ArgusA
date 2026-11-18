@@ -1,5 +1,6 @@
 name: Argus Android Build
 
+# Every matching main push builds, signs, and publishes the verified APK automatically.
 on:
   push:
     branches:
