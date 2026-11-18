@@ -178,19 +178,20 @@ jobs:
             Remove-Item -LiteralPath $localProperties -Force
           }
           if (Test-Path -LiteralPath $localProperties) {
-            throw 'Runner-local local.properties must not be present during Android Lint.'
+            throw "Could not remove runner-local Android SDK metadata: $localProperties"
           }
           if ([string]::IsNullOrWhiteSpace($env:ANDROID_HOME) -or
               [string]::IsNullOrWhiteSpace($env:ANDROID_SDK_ROOT)) {
             throw 'Android SDK environment variables must be available to Gradle.'
           }
-          Write-Host 'Gradle will resolve Android SDK from the verified machine environment.'
+          Write-Host "Verified local.properties is absent: $localProperties"
+          Write-Host "Gradle SDK source: ANDROID_SDK_ROOT=$env:ANDROID_SDK_ROOT"
 
       - name: Run native build, lint and unit tests
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
           $ErrorActionPreference = 'Continue'
-          & .\gradlew.bat --no-daemon --no-configuration-cache --max-workers=2 --warning-mode=all --stacktrace clean :app:lintRelease :app:testReleaseUnitTest :app:assembleDebug
+          & .\gradlew.bat --no-daemon --no-configuration-cache --no-build-cache --max-workers=2 --warning-mode=all --stacktrace clean :app:lintRelease :app:testReleaseUnitTest :app:assembleDebug
           $gradleExitCode = $LASTEXITCODE
           if ($gradleExitCode -ne 0) { exit $gradleExitCode }
 
