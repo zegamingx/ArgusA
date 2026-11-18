@@ -180,6 +180,7 @@ class ArgusCheckpointCompatibilityTest {
 
             val restored = ArgusNeuralEngine.createBlocking(context, config)
             assertTrue(restored.isCheckpointStateVerified)
+            assertFalse(restored.isCheckpointRestoreBlocked)
             assertEquals(ModelCheckpointFormat.ARG5, restored.snapshotModelState().checkpointFormat)
             assertNull(restored.snapshotModelState().checkpointOptimizerConfigurationFingerprint)
             assertEquals(original.tokenizer.exportVocab(), restored.tokenizer.exportVocab())
@@ -216,8 +217,12 @@ class ArgusCheckpointCompatibilityTest {
             checkpoint.writeBytes(corrupted)
 
             val restored = ArgusNeuralEngine.createBlocking(context, config)
+            val rejectedBytes = checkpoint.readBytes()
             assertFalse(restored.loadCheckpointIfExists())
             assertFalse(restored.isCheckpointStateVerified)
+            assertTrue(restored.isCheckpointRestoreBlocked)
+            assertFalse(restored.saveCheckpoint())
+            assertArrayEquals(rejectedBytes, checkpoint.readBytes())
         } finally {
             restoreCheckpoint(checkpoint, previousCheckpoint)
         }
@@ -238,8 +243,12 @@ class ArgusCheckpointCompatibilityTest {
                     context.applicationContext,
                     smallEngineConfig(TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32))
                 )
+                val rejectedBytes = checkpoint.readBytes()
                 assertFalse("$magic is obsolete under the pre-release clean-break policy.", engine.loadCheckpointIfExists())
                 assertFalse(engine.isCheckpointStateVerified)
+                assertTrue(engine.isCheckpointRestoreBlocked)
+                assertFalse(engine.saveCheckpoint())
+                assertArrayEquals(rejectedBytes, checkpoint.readBytes())
                 assertTrue("Unsupported checkpoint is not deleted automatically.", checkpoint.isFile)
             }
         } finally {

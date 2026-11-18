@@ -344,6 +344,9 @@ class ArgusNeuralEngine private constructor(
     private var checkpointStateVerified = false
 
     @Volatile
+    private var checkpointRestoreBlocked = false
+
+    @Volatile
     private var activeCheckpointFormat = ModelCheckpointFormat.ARG6
 
     @Volatile
@@ -355,6 +358,10 @@ class ArgusNeuralEngine private constructor(
      */
     val isCheckpointStateVerified: Boolean
         get() = checkpointStateVerified
+
+    /** True while an existing checkpoint has failed restoration and must not be overwritten. */
+    val isCheckpointRestoreBlocked: Boolean
+        get() = checkpointRestoreBlocked
 
     val optimizerStep: Int
         get() = synchronized(modelLock) { adamStep }
@@ -3846,6 +3853,9 @@ class ArgusNeuralEngine private constructor(
     fun saveCheckpoint(): Boolean {
         return try {
             synchronized(modelLock) {
+                check(!checkpointRestoreBlocked) {
+                    "An existing checkpoint could not be restored; refusing to overwrite it without explicit recovery."
+                }
                 check(VulkanTrainingBackend.synchronizeTrainingStateMirrors()) {
                     "GPU model or optimizer state could not be recovered before checkpoint serialization."
                 }
@@ -4666,7 +4676,12 @@ class ArgusNeuralEngine private constructor(
     fun loadCheckpointIfExists(): Boolean {
         checkpointStateVerified = false
         val file = File(context.filesDir, "argus_model_weights.bin")
-        if (!file.isFile || file.length() < 4L) return false
+        if (!file.isFile) {
+            checkpointRestoreBlocked = false
+            return false
+        }
+        checkpointRestoreBlocked = true
+        if (file.length() < 4L) return false
 
         val restored = try {
             val magic = FileInputStream(file).use { it.readFully(4) }
@@ -4695,7 +4710,10 @@ class ArgusNeuralEngine private constructor(
             false
         }
 
-        checkpointStateVerified = restored
+        synchronized(modelLock) {
+            checkpointStateVerified = restored
+            if (restored) checkpointRestoreBlocked = false
+        }
         return restored
     }
 
