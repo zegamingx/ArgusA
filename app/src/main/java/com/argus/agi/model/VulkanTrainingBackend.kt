@@ -2,6 +2,8 @@ package com.argus.agi.model
 
 import com.argus.agi.device.DeviceProfile
 import com.argus.agi.runtime.AdaptiveComputeOperation
+import com.argus.agi.runtime.DeviceAdaptiveRuntimePolicy
+import com.argus.agi.runtime.RuntimeConfigurationPlanner
 import com.argus.agi.runtime.AdaptiveComputePerformanceMonitor
 
 import android.util.Log
@@ -856,16 +858,10 @@ internal object VulkanTrainingBackend {
             runtime.freeMemory() +
                 (maximumAppHeapBytes - runtime.totalMemory()).coerceAtLeast(0L)
             ).coerceAtLeast(0L)
-        val deviceLocalHeadroomBytes =
-            deviceProfile?.memory?.deviceLocalMemoryBudgetHeadroomBytes?.minOrNull()
-        val maximumStorageBufferRangeBytes =
-            deviceProfile?.limits?.maxStorageBufferRangeBytes ?: 0L
-
-        return DeviceAdaptiveRuntimePolicy.calculateTensorArenaBudget(
+        return RuntimeConfigurationPlanner.calculateTensorArenaBudget(
+            deviceProfile = deviceProfile,
             maximumAppHeapBytes = maximumAppHeapBytes,
-            availableAppHeapBytes = availableAppHeapBytes,
-            deviceLocalHeadroomBytes = deviceLocalHeadroomBytes,
-            maximumStorageBufferRangeBytes = maximumStorageBufferRangeBytes
+            availableAppHeapBytes = availableAppHeapBytes
         ).totalBytes
     }
 

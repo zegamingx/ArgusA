@@ -6,6 +6,12 @@ import android.util.Log
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceProvenance
+import com.argus.agi.runtime.DeviceAdaptiveRuntimePolicy
+import com.argus.agi.runtime.RuntimeConfiguration
+import com.argus.agi.runtime.RuntimeConfigurationPlanner
+import com.argus.agi.runtime.RuntimeDeferReason
+import com.argus.agi.runtime.RuntimeModelConstraints
+import com.argus.agi.runtime.RuntimeResourceSnapshot
 import com.argus.agi.sensor.DeviceGuard
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -2203,6 +2209,7 @@ class TrainingManager(
             }
 
             while (isActive && !closed) {
+                var loopRuntimeConfiguration: RuntimeConfiguration? = null
                 if (_isTrainingPaused.value) {
                     _isTrainingPaused.first { !it || closed }
                     if (closed) break
@@ -2288,40 +2295,39 @@ class TrainingManager(
                         }
                         val safetySnapshot = deviceGuard.safetyState.value
                         val memorySnapshot = captureTrainingMemorySnapshot()
-                        val thermalBatchLimit = DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
-                            configuredBatchSize = neuralEngine.config.trainingBatchSize,
-                            thermalStatus = safetySnapshot.thermalStatus,
-                            availableHeapBytes = memorySnapshot.availableHeapBytes,
-                            maximumHeapBytes = memorySnapshot.maximumHeapBytes,
-                            availableSystemMemoryBytes = memorySnapshot.availableSystemMemoryBytes,
-                            systemLowMemory = memorySnapshot.isSystemLowMemory,
-                            isPowerSaveMode = safetySnapshot.isPowerSaveMode,
-                            isCharging = safetySnapshot.isCharging,
-                            batteryPct = safetySnapshot.batteryPct,
-                            memoryRecovery = memoryRecovery
+                        val runtimeConfiguration = RuntimeConfigurationPlanner.create(
+                            deviceProfile = VulkanTrainingBackend.deviceProfile.value,
+                            resources = RuntimeResourceSnapshot(
+                                availableAppHeapBytes = memorySnapshot.availableHeapBytes,
+                                maximumAppHeapBytes = memorySnapshot.maximumHeapBytes,
+                                availableSystemMemoryBytes = memorySnapshot.availableSystemMemoryBytes,
+                                systemLowMemory = memorySnapshot.isSystemLowMemory,
+                                thermalStatus = safetySnapshot.thermalStatus,
+                                temperatureCelsius = safetySnapshot.temperatureCelsius,
+                                isPowerSaveMode = safetySnapshot.isPowerSaveMode,
+                                isCharging = safetySnapshot.isCharging,
+                                batteryPct = safetySnapshot.batteryPct,
+                                memoryRecovery = memoryRecovery
+                            ),
+                            model = RuntimeModelConstraints(
+                                configuredBatchSize = neuralEngine.config.trainingBatchSize,
+                                configuredContextLength = neuralEngine.config.maxSeqLen,
+                                dModel = neuralEngine.config.dModel,
+                                feedForwardSize = neuralEngine.config.dFf,
+                                vocabularySize = neuralEngine.tokenizer.vocabSize,
+                                layerCount = neuralEngine.config.layerCount,
+                                headCount = neuralEngine.config.nHeads
+                            ),
+                            vulkanRuntimeReady = VulkanTrainingBackend.isRuntimeAvailable,
+                            fp16KernelVerified = VulkanTrainingBackend.isFp16ComputeAvailable
                         )
-                        if (thermalBatchLimit == 0) {
+                        loopRuntimeConfiguration = runtimeConfiguration
+
+                        if (runtimeConfiguration.deferReason == RuntimeDeferReason.THERMAL_LIMIT) {
                             prependPersistingQueueItems(listOf(firstItem))
                             continue
                         }
-
-                        val runtimeContextLength = DeviceAdaptiveRuntimePolicy.trainingContextLimit(
-                            configuredContextLength = neuralEngine.config.maxSeqLen,
-                            availableHeapBytes = memorySnapshot.availableHeapBytes,
-                            maximumHeapBytes = memorySnapshot.maximumHeapBytes,
-                            dModel = neuralEngine.config.dModel,
-                            feedForwardSize = neuralEngine.config.dFf,
-                            vocabularySize = neuralEngine.tokenizer.vocabSize,
-                            layerCount = neuralEngine.config.layerCount,
-                            headCount = neuralEngine.config.nHeads,
-                            thermalStatus = safetySnapshot.thermalStatus,
-                            availableSystemMemoryBytes = memorySnapshot.availableSystemMemoryBytes,
-                            systemLowMemory = memorySnapshot.isSystemLowMemory,
-                            isPowerSaveMode = safetySnapshot.isPowerSaveMode,
-                            isCharging = safetySnapshot.isCharging,
-                            memoryRecovery = memoryRecovery
-                        )
-                        if (runtimeContextLength == 0) {
+                        if (!runtimeConfiguration.canTrain) {
                             // Even the minimum legal context exceeds current live
                             // workspace headroom. Return the claim to durable QUEUED
                             // state without touching model/checkpoint/optimizer state.
@@ -2336,9 +2342,11 @@ class TrainingManager(
                             continue
                         }
 
-                        val batchItems = ArrayList<TrainingData>(thermalBatchLimit)
+                        val batchItems = ArrayList<TrainingData>(
+                            runtimeConfiguration.effectiveTrainingBatchSize
+                        )
                         batchItems += firstItem
-                        while (batchItems.size < thermalBatchLimit) {
+                        while (batchItems.size < runtimeConfiguration.effectiveTrainingBatchSize) {
                             val nextItem = popNext(expectedStatus = TrainingStatus.QUEUED) ?: break
                             batchItems += nextItem
                         }
@@ -2349,7 +2357,7 @@ class TrainingManager(
                         updateActiveDocumentEntering(activeItems.first())
 
                         try {
-                            if (!processBatch(activeItems, runtimeContextLength)) {
+                            if (!processBatch(activeItems, runtimeConfiguration.effectiveContextLength)) {
                                 validationRunHadFailures = true
                             } else {
                                 synchronized(queueLock) {
@@ -2426,13 +2434,14 @@ class TrainingManager(
                 }
 
                 val currentSafety = deviceGuard.safetyState.value
-                val throttleMs = DeviceAdaptiveRuntimePolicy.trainingBatchDelayMillis(
-                    thermalStatus = currentSafety.thermalStatus,
-                    temperatureCelsius = currentSafety.temperatureCelsius,
-                    batteryPct = currentSafety.batteryPct,
-                    isCharging = currentSafety.isCharging,
-                    isPowerSaveMode = currentSafety.isPowerSaveMode
-                )
+                val throttleMs = loopRuntimeConfiguration?.trainingBatchDelayMillis
+                    ?: DeviceAdaptiveRuntimePolicy.trainingBatchDelayMillis(
+                        thermalStatus = currentSafety.thermalStatus,
+                        temperatureCelsius = currentSafety.temperatureCelsius,
+                        batteryPct = currentSafety.batteryPct,
+                        isCharging = currentSafety.isCharging,
+                        isPowerSaveMode = currentSafety.isPowerSaveMode
+                    )
                 delay(throttleMs)
             }
         }

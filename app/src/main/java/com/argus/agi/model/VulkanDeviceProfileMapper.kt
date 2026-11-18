@@ -8,6 +8,7 @@ import com.argus.agi.device.DeviceMemoryHeap
 import com.argus.agi.device.DeviceMemoryProfile
 import com.argus.agi.device.DeviceProfile
 import com.argus.agi.device.VulkanApiVersion
+import com.argus.agi.runtime.DeviceAdaptiveRuntimePolicy
 
 /**
  * Adapts the existing native Vulkan capability report to the stable device contract.

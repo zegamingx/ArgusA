@@ -1,6 +1,7 @@
 package com.argus.agi.model
 
 import android.os.PowerManager
+import com.argus.agi.runtime.DeviceAdaptiveRuntimePolicy
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

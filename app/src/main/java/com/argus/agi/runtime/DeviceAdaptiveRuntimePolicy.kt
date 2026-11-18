@@ -1,4 +1,4 @@
-package com.argus.agi.model
+package com.argus.agi.runtime
 
 import android.os.PowerManager
 import kotlin.math.ceil
