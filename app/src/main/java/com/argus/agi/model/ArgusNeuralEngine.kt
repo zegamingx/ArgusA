@@ -572,7 +572,7 @@ class ArgusNeuralEngine private constructor(
         private const val ARG5_HEADER_SIZE = 96
         private val ARG5_CHECKPOINT_VERSION = ModelCheckpointFormat.ARG5.version
         private val ARG6_CHECKPOINT_VERSION = ModelCheckpointFormat.ARG6.version
-        private const val ARG5_CHECKSUM_OFFSET = 88
+        private const val CHECKPOINT_CHECKSUM_OFFSET = 88
         private const val ARG6_OPTIMIZER_FINGERPRINT_FLAG = 1
         private const val TOKENIZER_FINGERPRINT_BYTES = 32
         private const val FLOAT32_TENSOR_TYPE = 1
@@ -3841,7 +3841,7 @@ class ArgusNeuralEngine private constructor(
     }
 
     // =====================================================================
-    // Checkpoint (ARG5 streaming writer and reader)
+    // Checkpoint (ARG6 streaming writer; ARG5/ARG6 readers)
     // =====================================================================
     fun saveCheckpoint(): Boolean {
         return try {
@@ -4198,7 +4198,7 @@ class ArgusNeuralEngine private constructor(
             }
 
             RandomAccessFile(temporary, "rw").use { randomAccessFile ->
-                randomAccessFile.seek(ARG5_CHECKSUM_OFFSET.toLong())
+                randomAccessFile.seek(CHECKPOINT_CHECKSUM_OFFSET.toLong())
                 val checksumBytes = ByteBuffer.allocate(4)
                     .order(ByteOrder.LITTLE_ENDIAN)
                     .putInt(checksum.value.toInt())

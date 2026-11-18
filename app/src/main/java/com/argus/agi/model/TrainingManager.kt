@@ -1724,7 +1724,7 @@ class TrainingManager(
     // Worker
     // =====================================================================
 
-    private fun requireJournalModelIdentity(
+    private fun requireJournalCompatibility(
         snapshot: TrainingCommitJournalSnapshot,
         recoveryPhase: String
     ) {
@@ -1760,6 +1760,16 @@ class TrainingManager(
                 "Training journal optimizer configuration mismatch during $recoveryPhase. " +
                     "The checkpoint was preserved and queue recovery was stopped."
             }
+            check(activeModelState.checkpointVerified) {
+                "Training journal recovery requires a read-back-verified model checkpoint."
+            }
+            check(
+                activeModelState.checkpointOptimizerConfigurationFingerprint ==
+                    snapshot.optimizerConfigFingerprint
+            ) {
+                "Training journal optimizer configuration does not match the fingerprint persisted by the checkpoint during $recoveryPhase. " +
+                    "The checkpoint was preserved and queue recovery was stopped."
+            }
         }
     }
 
@@ -1783,7 +1793,7 @@ class TrainingManager(
             ) {
                 "The prepared training batch could not be rolled back to its exact optimizer baseline."
             }
-            requireJournalModelIdentity(snapshot, "PREPARED-batch rollback")
+            requireJournalCompatibility(snapshot, "PREPARED-batch rollback")
             neuralEngine.resumeVulkanTensorResidencyAfterForeground()
             TrainingCommitJournal.delete(trainingCommitJournalFile)
             activeBatchBaselineOptimizerStep = null
@@ -1818,7 +1828,7 @@ class TrainingManager(
             ) {
                 "The committed batch could not be rolled back to its exact saved baseline."
             }
-            requireJournalModelIdentity(snapshot, "COMMITTED-batch baseline rollback")
+            requireJournalCompatibility(snapshot, "COMMITTED-batch baseline rollback")
             neuralEngine.resumeVulkanTensorResidencyAfterForeground()
             TrainingCommitJournal.delete(trainingCommitJournalFile)
             activeBatchBaselineOptimizerStep = null
@@ -1826,7 +1836,7 @@ class TrainingManager(
             return
         }
 
-        requireJournalModelIdentity(snapshot, "COMMITTED-batch recovery")
+        requireJournalCompatibility(snapshot, "COMMITTED-batch recovery")
 
         // Room must never publish COMMITTED until the exact model and optimizer
         // state represented by this journal is durably saved. A checkpoint that is
@@ -1936,7 +1946,7 @@ class TrainingManager(
         if (!TrainingCommitJournal.isExactCommittedCheckpoint(snapshot, neuralEngine.optimizerStep)) {
             return false
         }
-        requireJournalModelIdentity(snapshot, "live committed-batch recovery")
+        requireJournalCompatibility(snapshot, "live committed-batch recovery")
         check(neuralEngine.saveCheckpoint()) {
             "The optimizer committed the batch, but its checkpoint could not be secured."
         }
@@ -2053,7 +2063,7 @@ class TrainingManager(
                 val restored = neuralEngine.loadCheckpointIfExists() &&
                     neuralEngine.optimizerStep == baselineStep
                 if (restored && journal != null) {
-                    requireJournalModelIdentity(journal, "OOM batch rollback")
+                    requireJournalCompatibility(journal, "OOM batch rollback")
                 }
                 restored
             }.getOrDefault(false)
@@ -2139,7 +2149,7 @@ class TrainingManager(
         val journalEntry = runCatching {
             val snapshot = TrainingCommitJournal.read(trainingCommitJournalFile)
             if (snapshot?.isCommitted == true) {
-                requireJournalModelIdentity(snapshot, "committed-item finalization")
+                requireJournalCompatibility(snapshot, "committed-item finalization")
             }
             snapshot
                 ?.takeIf(TrainingCommitJournalSnapshot::isCommitted)
@@ -2451,7 +2461,7 @@ class TrainingManager(
                                         val restored = neuralEngine.loadCheckpointIfExists() &&
                                             neuralEngine.optimizerStep == baseline
                                         if (restored) {
-                                            requireJournalModelIdentity(journal, "failed-batch rollback")
+                                            requireJournalCompatibility(journal, "failed-batch rollback")
                                         }
                                         restored
                                     }.getOrDefault(false)
@@ -2847,7 +2857,7 @@ class TrainingManager(
         ) {
             "The committed training journal could not be read back."
         }
-        requireJournalModelIdentity(committedJournal, "live batch commit before checkpoint write")
+        requireJournalCompatibility(committedJournal, "live batch commit before checkpoint write")
 
         // The write-ahead COMMITTED marker is durable before the model checkpoint.
         // Room is updated only after that checkpoint is atomically secured.

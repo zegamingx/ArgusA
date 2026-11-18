@@ -112,5 +112,23 @@ internal data class ModelState(
         require(optimizerStep >= 0) {
             "Optimizer step cannot be negative."
         }
+        val persistedFingerprint = checkpointOptimizerConfigurationFingerprint
+        require(persistedFingerprint == null || (
+            persistedFingerprint.length == 64 && persistedFingerprint.all { character ->
+                character in '0'..'9' || character in 'a'..'f'
+            }
+        )) {
+            "Persisted optimizer configuration identity must be a lowercase SHA-256 fingerprint."
+        }
+        if (checkpointFormat == ModelCheckpointFormat.ARG5) {
+            require(persistedFingerprint == null) {
+                "ARG5 checkpoints cannot claim a persisted optimizer configuration fingerprint."
+            }
+        }
+        if (checkpointVerified && checkpointFormat == ModelCheckpointFormat.ARG6) {
+            require(persistedFingerprint != null) {
+                "A verified ARG6 checkpoint must expose its persisted optimizer configuration fingerprint."
+            }
+        }
     }
 }
