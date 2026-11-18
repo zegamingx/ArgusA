@@ -566,7 +566,7 @@ class ArgusNeuralEngine private constructor(
         private const val MAGIC_2 = 0x47.toByte()  // 'G'
         private const val MAGIC_5 = 0x35.toByte()  // '5'
         private const val ARG5_HEADER_SIZE = 96
-        private const val ARG5_CHECKPOINT_VERSION = 5
+        private val ARG5_CHECKPOINT_VERSION = ModelCheckpointFormat.ARG5.version
         private const val ARG5_CHECKSUM_OFFSET = 88
         private const val TOKENIZER_FINGERPRINT_BYTES = 32
         private const val FLOAT32_TENSOR_TYPE = 1

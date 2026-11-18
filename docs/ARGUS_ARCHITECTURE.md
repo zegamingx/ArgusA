@@ -240,3 +240,19 @@ A checkpoint load must reject incompatible architecture/tokenizer state without 
 ## 8. Completion criteria
 
 The architecture foundation is complete only when the production code—not merely this document—enforces the contracts above; no existing feature has been lost during migration; model/optimizer state survives backend release/reinitialization; checkpoint compatibility and transaction recovery are tested; GPU dispatch does not deliberately use CPU for calibration; and the relevant build, unit, native, and device-level validation evidence is recorded.
+
+
+## 9. Implementation progress after the baseline audit
+
+The audited source tree and package inventory in section 2 describe the baseline revision recorded at the top of this document. They are historical audit evidence, not a claim that the current `master` tree is unchanged.
+
+The following architecture increments have since been committed to `master`:
+
+- **Device profile:** immutable `com.argus.agi.device.DeviceProfile` now represents physical-device identity, Vulkan limits, feature support versus enablement, and memory-heap budgets. The existing JNI report remains the parsing boundary through `VulkanDeviceCapabilities.toDeviceProfile()`.
+- **Runtime configuration:** `DeviceAdaptiveRuntimePolicy` now belongs to `com.argus.agi.runtime`. `RuntimeConfigurationPlanner` combines a device profile with live heap, system-memory, thermal, battery, and active-model constraints. It calculates execution batch/context limits without changing persisted architecture dimensions.
+- **Compute backend contract:** `com.argus.agi.backend.ComputeBackend` is implemented by the Vulkan backend for readiness, FP16 self-test readiness, device profile, state synchronization, and device-resource recovery. The Kotlin CPU path remains the engine's existing fallback; it has not been replaced with an empty backend stub.
+- **Model state:** `ModelState` captures architecture identity, tokenizer configuration and snapshot fingerprint, optimizer step, checkpoint format, and local checkpoint-verification state. The ARG5 writer consumes this snapshot while preserving the existing ARG5 header and payload layout. `ModelCheckpointFormat.ARG5` is the source of the ARG5 version metadata.
+
+These are implementation increments, not completion evidence. The current changes have not yet passed a complete Android build, lint, JVM unit-test suite, native validation, or device-level validation. No merge to `main` is authorized by this status note.
+
+Remaining architecture work includes routing model operations through the backend contract where appropriate, auditing end-to-end checkpoint and training-session recovery (including schedule, RNG/sampler, dataset cursor, and pending queue state), and completing the existing M1–M10 validation sequence. The cross-GPU evidence audit remains deferred until implementation and milestone validation are complete.
