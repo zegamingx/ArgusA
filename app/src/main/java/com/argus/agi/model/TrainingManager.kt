@@ -77,7 +77,8 @@ data class TrainingData(
     val status: TrainingStatus = TrainingStatus.QUEUED,
     val finalLoss: Float? = null,
     val stepDurationMs: Long = 0L,
-    val documentId: String? = null
+    val documentId: String? = null,
+    val replaySessionId: String? = null
 )
 
 data class ActiveDocumentTraining(
