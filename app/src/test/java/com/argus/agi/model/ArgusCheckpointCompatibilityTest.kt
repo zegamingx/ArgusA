@@ -205,7 +205,7 @@ class ArgusCheckpointCompatibilityTest {
     }
 
     @Test
-    fun heldOutEvaluationScoresEveryOriginalUtf8ByteFromBosContext() {
+    fun heldOutEvaluationExcludesContextTokenFromBitsPerByteDenominator() {
         val engine = ArgusNeuralEngine.createBlocking(
             context,
             smallEngineConfig(TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32))
@@ -215,8 +215,8 @@ class ArgusCheckpointCompatibilityTest {
         val evaluation = engine.evaluateLossWithTargetCount(text)
 
         assertTrue(evaluation.meanLoss.isFinite())
-        assertEquals(3, evaluation.targetCount)
-        assertEquals(3L, evaluation.scoredUtf8ByteCount)
+        assertEquals(2, evaluation.targetCount)
+        assertEquals(2L, evaluation.scoredUtf8ByteCount)
     }
     private fun smallEngineConfig(tokenizerConfig: TokenizerConfig): EngineConfig =
         EngineConfig(

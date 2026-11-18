@@ -1205,16 +1205,10 @@ class ArgusNeuralEngine private constructor(
      * No parameters, optimizer state, tokenizer vocabulary, or checkpoint files are changed.
      */
     fun evaluateLossWithTargetCount(text: String): LossEvaluation = synchronized(modelLock) {
-        val encodedTokens = tokenizer.encodeToIds(text, autoRegister = false)
-        if (encodedTokens.isEmpty() || tokenizer.vocabSize > vocabCap) {
+        val tokens = tokenizer.encodeToIds(text, autoRegister = false)
+        if (tokens.size < 2 || tokenizer.vocabSize > vocabCap) {
             return@synchronized LossEvaluation(Float.NaN, 0, 0)
         }
-
-        // Score every text token. BOS supplies the preceding context for the first one,
-        // so the UTF-8 byte denominator matches the evaluated target sequence exactly.
-        val tokens = IntArray(Math.addExact(encodedTokens.size, 1))
-        tokens[0] = Tokenizer.BOS_ID
-        encodedTokens.copyInto(tokens, destinationOffset = 1)
 
         val currentVocab = tokenizer.vocabSize
         if (tokens.size <= maxSeqLen) {
@@ -1227,7 +1221,11 @@ class ArgusNeuralEngine private constructor(
                 meanLoss = loss,
                 targetCount = if (loss.isFinite()) tokens.size - 1 else 0,
                 evaluatedDocumentCount = if (loss.isFinite()) 1 else 0,
-                scoredUtf8ByteCount = if (loss.isFinite()) tokenizer.utf8ByteCount(text) else 0L
+                scoredUtf8ByteCount = if (loss.isFinite()) {
+                    tokenizer.utf8ByteCountForTokenIds(tokens, startIndex = 1)
+                } else {
+                    0L
+                }
             )
         }
 
@@ -1235,6 +1233,7 @@ class ArgusNeuralEngine private constructor(
         val stride = (maxSeqLen - overlapTokens).coerceAtLeast(1)
         var weightedLoss = 0f
         var evaluatedTargets = 0
+        var scoredUtf8ByteCount = 0L
         var start = 0
 
         while (start < tokens.size - 1) {
@@ -1253,6 +1252,13 @@ class ArgusNeuralEngine private constructor(
                     if (windowLoss.isFinite()) {
                         weightedLoss += windowLoss * targetCount
                         evaluatedTargets += targetCount
+                        scoredUtf8ByteCount = Math.addExact(
+                            scoredUtf8ByteCount,
+                            tokenizer.utf8ByteCountForTokenIds(
+                                windowTokens,
+                                startIndex = firstTargetIndex + 1
+                            )
+                        )
                     }
                 }
             }
@@ -1269,7 +1275,7 @@ class ArgusNeuralEngine private constructor(
             meanLoss = meanLoss,
             targetCount = evaluatedTargets,
             evaluatedDocumentCount = if (evaluatedTargets > 0) 1 else 0,
-            scoredUtf8ByteCount = if (evaluatedTargets > 0) tokenizer.utf8ByteCount(text) else 0L
+            scoredUtf8ByteCount = scoredUtf8ByteCount
         )
     }
 

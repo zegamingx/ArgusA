@@ -22,6 +22,16 @@ class TokenizerBitsPerByteTest {
     }
 
     @Test
+    fun encodedTokenByteCountExcludesContextAndPreservesUtf8ByteWidths() {
+        val tokenizer = Tokenizer()
+        val tokenIds = tokenizer.encodeToIds("Aé😀", autoRegister = false)
+
+        assertEquals(7L, tokenizer.utf8ByteCountForTokenIds(tokenIds))
+        assertEquals(6L, tokenizer.utf8ByteCountForTokenIds(tokenIds, startIndex = 1))
+        assertEquals(0L, tokenizer.utf8ByteCountForTokenIds(tokenIds, startIndex = tokenIds.size))
+    }
+
+    @Test
     fun invalidMetricInputsReturnNaN() {
         assertTrue(
             TokenizerEvaluationMetrics.bitsPerByte(Double.NaN, 10L).isNaN()

@@ -392,6 +392,32 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
     internal fun utf8ByteCount(text: String): Long =
         encodeUtf8WithReplacement(text).size.toLong()
 
+    /**
+     * Counts the original UTF-8 bytes represented by an encoded token suffix.
+     *
+     * BYTE_LEVEL_BPE_V1 stores each byte as one UTF-16 code unit in byte symbols.
+     * Learned merges concatenate those symbols, while reserved token spellings are
+     * ASCII. Their string lengths therefore equal the represented UTF-8 byte count.
+     * [startIndex] excludes context-only tokens from held-out bits-per-byte metrics.
+     */
+    internal fun utf8ByteCountForTokenIds(
+        tokenIds: IntArray,
+        startIndex: Int = 0
+    ): Long {
+        require(startIndex in 0..tokenIds.size) {
+            "startIndex must be within the encoded token array."
+        }
+        val snapshot = state
+        var byteCount = 0L
+        for (index in startIndex until tokenIds.size) {
+            val tokenId = tokenIds[index]
+            val token = snapshot.idToToken[tokenId]
+                ?: throw IllegalArgumentException("Tokenizer ID $tokenId is not registered.")
+            byteCount = Math.addExact(byteCount, token.length.toLong())
+        }
+        return byteCount
+    }
+
     @Synchronized
     fun registerToken(token: String, id: Int? = null): Int {
         val current = state
