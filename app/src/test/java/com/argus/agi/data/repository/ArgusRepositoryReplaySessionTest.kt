@@ -227,7 +227,7 @@ class ArgusRepositoryReplaySessionTest {
         createdAtEpochMs = 200L
     )
 
-    private fun trainingItem(id: String, documentId: String, sessionId: String) =
+    private fun trainingItem(id: String, documentId: String?, sessionId: String?) =
         TrainingData(
             id = id,
             source = "local-import",
