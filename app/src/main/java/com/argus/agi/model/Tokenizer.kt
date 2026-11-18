@@ -436,7 +436,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         require(resolvedId == candidate.nextId) {
             "BYTE_LEVEL_BPE_V1 vocabulary IDs are append-only; expected ID ${candidate.nextId}, received $resolvedId."
         }
-        require(resolvedId < config.maxVocabularySize) {
+        check(resolvedId < config.maxVocabularySize) {
             "Tokenizer vocabulary capacity ${config.maxVocabularySize} is exhausted."
         }
         require(candidate.idToToken[resolvedId] == null) {

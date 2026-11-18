@@ -1205,10 +1205,16 @@ class ArgusNeuralEngine private constructor(
      * No parameters, optimizer state, tokenizer vocabulary, or checkpoint files are changed.
      */
     fun evaluateLossWithTargetCount(text: String): LossEvaluation = synchronized(modelLock) {
-        val tokens = tokenizer.encodeToIds(text, autoRegister = false)
-        if (tokens.size < 2 || tokenizer.vocabSize > vocabCap) {
+        val encodedTokens = tokenizer.encodeToIds(text, autoRegister = false)
+        if (encodedTokens.isEmpty() || tokenizer.vocabSize > vocabCap) {
             return@synchronized LossEvaluation(Float.NaN, 0, 0)
         }
+
+        // Score every text token. BOS supplies the preceding context for the first one,
+        // so the UTF-8 byte denominator matches the evaluated target sequence exactly.
+        val tokens = IntArray(Math.addExact(encodedTokens.size, 1))
+        tokens[0] = Tokenizer.BOS_ID
+        encodedTokens.copyInto(tokens, destinationOffset = 1)
 
         val currentVocab = tokenizer.vocabSize
         if (tokens.size <= maxSeqLen) {

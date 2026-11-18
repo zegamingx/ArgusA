@@ -199,10 +199,25 @@ class ArgusCheckpointCompatibilityTest {
             )
         )
         assertEquals(TokenizerConfig.MINIMUM_VOCAB_SIZE, tokenizer.vocabSize)
-        val failure = runCatching { tokenizer.registerToken("overflow") }.exceptionOrNull()
+        val failure = runCatching { tokenizer.registerToken("overflow-token-abc") }.exceptionOrNull()
         assertTrue(failure is IllegalStateException)
+        assertEquals(TokenizerConfig.MINIMUM_VOCAB_SIZE, tokenizer.vocabSize)
     }
 
+    @Test
+    fun heldOutEvaluationScoresEveryOriginalUtf8ByteFromBosContext() {
+        val engine = ArgusNeuralEngine.createBlocking(
+            context,
+            smallEngineConfig(TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32))
+        )
+        val text = "Aé"
+
+        val evaluation = engine.evaluateLossWithTargetCount(text)
+
+        assertTrue(evaluation.meanLoss.isFinite())
+        assertEquals(3, evaluation.targetCount)
+        assertEquals(3L, evaluation.scoredUtf8ByteCount)
+    }
     private fun smallEngineConfig(tokenizerConfig: TokenizerConfig): EngineConfig =
         EngineConfig(
             dModel = 16,
