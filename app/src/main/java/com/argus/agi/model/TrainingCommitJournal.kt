@@ -154,6 +154,26 @@ internal object TrainingCommitJournal {
         expected == activeOptimizerConfigFingerprint
     } ?: true
 
+    /**
+     * Determines whether a verified checkpoint can participate in this journal's recovery.
+     * ARG5 predates the embedded optimizer identity, so it remains readable as explicitly
+     * unverified; ARG6 must match the journal fingerprint exactly.
+     */
+    fun allowsCheckpointForRecovery(
+        snapshot: TrainingCommitJournalSnapshot,
+        checkpointFormat: ModelCheckpointFormat,
+        checkpointVerified: Boolean,
+        checkpointOptimizerConfigFingerprint: String?
+    ): Boolean {
+        val journalFingerprint = snapshot.optimizerConfigFingerprint ?: return true
+        if (!checkpointVerified) return false
+        return when (checkpointFormat) {
+            ModelCheckpointFormat.ARG5 -> checkpointOptimizerConfigFingerprint == null
+            ModelCheckpointFormat.ARG6 ->
+                checkpointOptimizerConfigFingerprint == journalFingerprint
+        }
+    }
+
     fun read(file: File): TrainingCommitJournalSnapshot? {
         if (!file.isFile) return null
         require(file.length() in 16L..MAX_JOURNAL_BYTES.toLong()) {

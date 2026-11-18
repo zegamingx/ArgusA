@@ -1760,15 +1760,23 @@ class TrainingManager(
                 "Training journal optimizer configuration mismatch during $recoveryPhase. " +
                     "The checkpoint was preserved and queue recovery was stopped."
             }
-            check(activeModelState.checkpointVerified) {
-                "Training journal recovery requires a read-back-verified model checkpoint."
-            }
             check(
-                activeModelState.checkpointOptimizerConfigurationFingerprint ==
-                    snapshot.optimizerConfigFingerprint
+                TrainingCommitJournal.allowsCheckpointForRecovery(
+                    snapshot = snapshot,
+                    checkpointFormat = activeModelState.checkpointFormat,
+                    checkpointVerified = activeModelState.checkpointVerified,
+                    checkpointOptimizerConfigFingerprint =
+                        activeModelState.checkpointOptimizerConfigurationFingerprint
+                )
             ) {
-                "Training journal optimizer configuration does not match the fingerprint persisted by the checkpoint during $recoveryPhase. " +
+                "Training journal optimizer configuration cannot be reconciled with the verified checkpoint during $recoveryPhase. " +
                     "The checkpoint was preserved and queue recovery was stopped."
+            }
+            if (activeModelState.checkpointFormat == ModelCheckpointFormat.ARG5) {
+                Log.w(
+                    TAG,
+                    "Journal v3 is being recovered from a verified ARG5 checkpoint without embedded optimizer identity; checkpoint optimizer compatibility remains unverified."
+                )
             }
         }
     }

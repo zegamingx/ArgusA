@@ -141,6 +141,58 @@ class TrainingCommitJournalTest {
     }
 
     @Test
+    fun versionThreeAcceptsVerifiedLegacyArg5CheckpointAsUnverifiedCompatibility() {
+        val directory = Files.createTempDirectory("argus-training-journal-v3-arg5").toFile()
+        val file = File(directory, TrainingCommitJournal.FILE_NAME)
+        val modelFingerprint = "1234567890abcdef".repeat(4)
+        val optimizerFingerprint = OptimizerConfig.DEFAULT.fingerprint
+        try {
+            TrainingCommitJournal.writePrepared(
+                file = file,
+                baselineOptimizerStep = 8,
+                itemIds = listOf("legacy-arg5"),
+                modelIdentityFingerprint = modelFingerprint,
+                optimizerConfigFingerprint = optimizerFingerprint
+            )
+            val snapshot = requireNotNull(TrainingCommitJournal.read(file))
+            assertTrue(
+                TrainingCommitJournal.allowsCheckpointForRecovery(
+                    snapshot = snapshot,
+                    checkpointFormat = ModelCheckpointFormat.ARG5,
+                    checkpointVerified = true,
+                    checkpointOptimizerConfigFingerprint = null
+                )
+            )
+            assertFalse(
+                TrainingCommitJournal.allowsCheckpointForRecovery(
+                    snapshot = snapshot,
+                    checkpointFormat = ModelCheckpointFormat.ARG5,
+                    checkpointVerified = false,
+                    checkpointOptimizerConfigFingerprint = null
+                )
+            )
+            assertFalse(
+                TrainingCommitJournal.allowsCheckpointForRecovery(
+                    snapshot = snapshot,
+                    checkpointFormat = ModelCheckpointFormat.ARG6,
+                    checkpointVerified = true,
+                    checkpointOptimizerConfigFingerprint = "f".repeat(64)
+                )
+            )
+            assertTrue(
+                TrainingCommitJournal.allowsCheckpointForRecovery(
+                    snapshot = snapshot,
+                    checkpointFormat = ModelCheckpointFormat.ARG6,
+                    checkpointVerified = true,
+                    checkpointOptimizerConfigFingerprint = optimizerFingerprint
+                )
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun versionThreeRejectsMalformedOptimizerConfigurationFingerprint() {
         val directory = Files.createTempDirectory("argus-training-journal-v3-invalid").toFile()
         val file = File(directory, TrainingCommitJournal.FILE_NAME)
