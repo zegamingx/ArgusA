@@ -58,6 +58,7 @@ import java.io.StringReader
 import java.io.IOException
 import java.security.MessageDigest
 import java.net.URLEncoder
+import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.UUID
@@ -635,6 +636,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
                 val mimeType = cr.getType(uri).orEmpty().lowercase(Locale.ROOT)
                 val extension = docDisplayName.substringAfterLast('.', "").lowercase(Locale.ROOT)
+                val isJsonLines = extension in setOf("jsonl", "ndjson") ||
+                    mimeType in setOf("application/x-ndjson", "application/jsonl")
                 val structuredFormat = when {
                     extension == "pdf" || mimeType in setOf("application/pdf", "application/x-pdf") -> "pdf"
                     extension == "docx" || mimeType.contains("wordprocessingml") -> "docx"
@@ -746,7 +749,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 // tanpa pernah memuat seluruh file ke dalam sebuah String raksasa di heap RAM.
                 val (chunkCount, charsRead) = cr.openInputStream(uri)?.use { stream ->
                     val boundedReader = BoundedReader(
-                        InputStreamReader(stream, Charsets.UTF_8),
+                        openImportReader(stream, strictUtf8 = isJsonLines),
                         maxImportTextCharacters()
                     )
                     val reader = BufferedReader(boundedReader, 16_384)
@@ -754,7 +757,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                         source = "text_file|name=${encodeProvenanceField(docDisplayName)}",
                         title = docDisplayName,
                         reader = reader,
-                        epochs = recommendedTrainingPasses(sizeBytes ?: 0L)
+                        epochs = recommendedTrainingPasses(sizeBytes ?: 0L),
+                        strictJsonLines = isJsonLines
                     )
                 } ?: Pair(0, 0L)
 
@@ -815,6 +819,23 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+    }
+
+    /**
+     * JSONL is a structured interchange format, so invalid UTF-8 must not be silently
+     * replaced with U+FFFD and then accepted as trainable text. Plain text retains the
+     * platform's replacement behavior for compatibility with ordinary document imports.
+     */
+    private fun openImportReader(
+        input: InputStream,
+        strictUtf8: Boolean
+    ): InputStreamReader {
+        if (!strictUtf8) return InputStreamReader(input, StandardCharsets.UTF_8)
+
+        val decoder = StandardCharsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+        return InputStreamReader(input, decoder)
     }
 
     private fun maxQueuedTextMemoryBudgetBytes(): Long {
@@ -1022,7 +1043,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 val maxTextCharacters = maxImportTextCharacters()
 
                 val plainTextExtensions = setOf(
-                    "txt", "md", "json", "jsonl", "csv", "tsv", "log",
+                    "txt", "md", "json", "jsonl", "ndjson", "csv", "tsv", "log",
                     "kt", "java", "py"
                 )
                 val structuredExtensions = setOf(
@@ -1107,9 +1128,13 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                             source
                                         )
                                         else -> {
+                                            val strictJsonLines = extension in setOf("jsonl", "ndjson")
                                             val reader = BufferedReader(
                                                 BoundedReader(
-                                                    InputStreamReader(boundedEntry, Charsets.UTF_8),
+                                                    openImportReader(
+                                                        boundedEntry,
+                                                        strictUtf8 = strictJsonLines
+                                                    ),
                                                     maxTextCharacters
                                                 ),
                                                 8_192
@@ -1119,7 +1144,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                                     source = source,
                                                     title = entryTitle,
                                                     reader = it,
-                                                    epochs = recommendedTrainingPasses(entry.size)
+                                                    epochs = recommendedTrainingPasses(entry.size),
+                                                    strictJsonLines = strictJsonLines
                                                 )
                                             }
                                         }
