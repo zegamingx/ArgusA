@@ -24,7 +24,8 @@ internal data class TrainingCommitJournalEntry(
 internal data class TrainingCommitJournalSnapshot(
     val baselineOptimizerStep: Int,
     val committedOptimizerStep: Int?,
-    val entries: List<TrainingCommitJournalEntry>
+    val entries: List<TrainingCommitJournalEntry>,
+    val modelIdentityFingerprint: String? = null
 ) {
     val isCommitted: Boolean
         get() = committedOptimizerStep != null
@@ -40,7 +41,11 @@ internal object TrainingCommitJournal {
     const val FILE_NAME = "argus_training_commit.journal"
 
     private const val MAGIC = 0x4154474A // ATGJ
-    private const val VERSION = 1
+    private const val LEGACY_VERSION = 1
+    private const val CURRENT_VERSION = 2
+    private const val MODEL_IDENTITY_FINGERPRINT_BYTES = 32
+    private const val MODEL_IDENTITY_FINGERPRINT_HEX_LENGTH =
+        MODEL_IDENTITY_FINGERPRINT_BYTES * 2
     private const val STATE_PREPARED = 0
     private const val STATE_COMMITTED = 1
     private const val MAX_JOURNAL_BYTES = 64 * 1024
@@ -60,7 +65,8 @@ internal object TrainingCommitJournal {
     fun writePrepared(
         file: File,
         baselineOptimizerStep: Int,
-        itemIds: List<String>
+        itemIds: List<String>,
+        modelIdentityFingerprint: String? = null
     ) {
         require(baselineOptimizerStep >= 0) {
             "Baseline optimizer step cannot be negative."
@@ -83,7 +89,8 @@ internal object TrainingCommitJournal {
             state = STATE_PREPARED,
             baselineOptimizerStep = baselineOptimizerStep,
             committedOptimizerStep = null,
-            entries = entries
+            entries = entries,
+            modelIdentityFingerprint = modelIdentityFingerprint
         )
     }
 
@@ -91,7 +98,8 @@ internal object TrainingCommitJournal {
         file: File,
         baselineOptimizerStep: Int,
         committedOptimizerStep: Int,
-        entries: List<TrainingCommitJournalEntry>
+        entries: List<TrainingCommitJournalEntry>,
+        modelIdentityFingerprint: String? = null
     ) {
         require(baselineOptimizerStep >= 0)
         require(committedOptimizerStep >= baselineOptimizerStep) {
@@ -117,9 +125,22 @@ internal object TrainingCommitJournal {
             state = STATE_COMMITTED,
             baselineOptimizerStep = baselineOptimizerStep,
             committedOptimizerStep = committedOptimizerStep,
-            entries = entries
+            entries = entries,
+            modelIdentityFingerprint = modelIdentityFingerprint
         )
     }
+
+    /**
+     * Version-1 journals have no model identity and retain their original
+     * optimizer-step-only recovery behavior. Version 2 journals require an exact
+     * architecture/tokenizer identity match before recovery can mutate Room state.
+     */
+    fun matchesModelIdentity(
+        snapshot: TrainingCommitJournalSnapshot,
+        activeModelIdentityFingerprint: String
+    ): Boolean = snapshot.modelIdentityFingerprint?.let { expected ->
+        expected == activeModelIdentityFingerprint
+    } ?: true
 
     fun read(file: File): TrainingCommitJournalSnapshot? {
         if (!file.isFile) return null
@@ -147,8 +168,9 @@ internal object TrainingCommitJournal {
                 require(body.readInt() == MAGIC) {
                     "Training commit journal magic is invalid."
                 }
-                require(body.readInt() == VERSION) {
-                    "Training commit journal version is unsupported."
+                val version = body.readInt()
+                require(version in LEGACY_VERSION..CURRENT_VERSION) {
+                    "Training commit journal version is unsupported: $version."
                 }
                 val state = body.readInt()
                 require(state == STATE_PREPARED || state == STATE_COMMITTED) {
@@ -158,6 +180,13 @@ internal object TrainingCommitJournal {
                 val committedOptimizerStep = body.readInt()
                 val count = body.readInt()
                 require(baselineOptimizerStep >= 0 && count in 1..MAX_ITEMS)
+                val modelIdentityFingerprint = if (version >= CURRENT_VERSION) {
+                    val fingerprintBytes = ByteArray(MODEL_IDENTITY_FINGERPRINT_BYTES)
+                    body.readFully(fingerprintBytes)
+                    fingerprintBytes.toHexFingerprint()
+                } else {
+                    null
+                }
                 require(
                     if (state == STATE_COMMITTED) committedOptimizerStep >= baselineOptimizerStep
                     else committedOptimizerStep == -1
@@ -223,7 +252,8 @@ internal object TrainingCommitJournal {
                     } else {
                         null
                     },
-                    entries = entries
+                    entries = entries,
+                    modelIdentityFingerprint = modelIdentityFingerprint
                 )
             }
         }
@@ -240,21 +270,48 @@ internal object TrainingCommitJournal {
         }
     }
 
+    private fun String.toSha256FingerprintBytes(): ByteArray {
+        require(length == MODEL_IDENTITY_FINGERPRINT_HEX_LENGTH) {
+            "Model identity fingerprint must contain exactly 32 SHA-256 bytes."
+        }
+        require(all { character ->
+            character in '0'..'9' || character in 'a'..'f'
+        }) {
+            "Model identity fingerprint must be lowercase hexadecimal."
+        }
+        return ByteArray(MODEL_IDENTITY_FINGERPRINT_BYTES) { index ->
+            substring(index * 2, index * 2 + 2).toInt(16).toByte()
+        }
+    }
+
+    private fun ByteArray.toHexFingerprint(): String {
+        require(size == MODEL_IDENTITY_FINGERPRINT_BYTES)
+        return joinToString(separator = "") { byte ->
+            "%02x".format(java.util.Locale.ROOT, byte.toInt() and 0xFF)
+        }
+    }
+
     private fun writeSnapshot(
         file: File,
         state: Int,
         baselineOptimizerStep: Int,
         committedOptimizerStep: Int?,
-        entries: List<TrainingCommitJournalEntry>
+        entries: List<TrainingCommitJournalEntry>,
+        modelIdentityFingerprint: String?
     ) {
+        val fingerprintBytes = modelIdentityFingerprint?.toSha256FingerprintBytes()
+        val version = if (fingerprintBytes == null) LEGACY_VERSION else CURRENT_VERSION
         val payloadBuffer = ByteArrayOutputStream()
         DataOutputStream(payloadBuffer).use { output ->
             output.writeInt(MAGIC)
-            output.writeInt(VERSION)
+            output.writeInt(version)
             output.writeInt(state)
             output.writeInt(baselineOptimizerStep)
             output.writeInt(committedOptimizerStep ?: -1)
             output.writeInt(entries.size)
+            if (fingerprintBytes != null) {
+                output.write(fingerprintBytes)
+            }
             for (entry in entries) {
                 val idBytes = entry.itemId.toByteArray(Charsets.UTF_8)
                 require(idBytes.isNotEmpty() && idBytes.size <= MAX_ITEM_ID_BYTES)

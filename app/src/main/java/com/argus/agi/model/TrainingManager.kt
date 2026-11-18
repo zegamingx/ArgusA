@@ -1724,6 +1724,27 @@ class TrainingManager(
     // Worker
     // =====================================================================
 
+    private fun requireJournalModelIdentity(
+        snapshot: TrainingCommitJournalSnapshot,
+        recoveryPhase: String
+    ) {
+        val journalFingerprint = snapshot.modelIdentityFingerprint
+        if (journalFingerprint == null) {
+            Log.w(
+                TAG,
+                "Training journal v1 has no model identity fingerprint; preserving its legacy optimizer-step recovery path."
+            )
+            return
+        }
+        val activeFingerprint = neuralEngine.snapshotModelState().identity.fingerprint
+        check(
+            TrainingCommitJournal.matchesModelIdentity(snapshot, activeFingerprint)
+        ) {
+            "Training journal model identity mismatch during $recoveryPhase. " +
+                "The checkpoint was preserved and queue recovery was stopped."
+        }
+    }
+
     private suspend fun reconcilePersistedTrainingCommit(
         repository: com.argus.agi.data.repository.ArgusRepository
     ) {
@@ -1744,6 +1765,7 @@ class TrainingManager(
             ) {
                 "The prepared training batch could not be rolled back to its exact optimizer baseline."
             }
+            requireJournalModelIdentity(snapshot, "PREPARED-batch rollback")
             neuralEngine.resumeVulkanTensorResidencyAfterForeground()
             TrainingCommitJournal.delete(trainingCommitJournalFile)
             activeBatchBaselineOptimizerStep = null
@@ -1778,12 +1800,15 @@ class TrainingManager(
             ) {
                 "The committed batch could not be rolled back to its exact saved baseline."
             }
+            requireJournalModelIdentity(snapshot, "COMMITTED-batch baseline rollback")
             neuralEngine.resumeVulkanTensorResidencyAfterForeground()
             TrainingCommitJournal.delete(trainingCommitJournalFile)
             activeBatchBaselineOptimizerStep = null
             activeBatchRoomCommitted = false
             return
         }
+
+        requireJournalModelIdentity(snapshot, "COMMITTED-batch recovery")
 
         // Room must never publish COMMITTED until the exact model and optimizer
         // state represented by this journal is durably saved. A checkpoint that is
@@ -1893,6 +1918,7 @@ class TrainingManager(
         if (!TrainingCommitJournal.isExactCommittedCheckpoint(snapshot, neuralEngine.optimizerStep)) {
             return false
         }
+        requireJournalModelIdentity(snapshot, "live committed-batch recovery")
         check(neuralEngine.saveCheckpoint()) {
             "The optimizer committed the batch, but its checkpoint could not be secured."
         }
@@ -2006,8 +2032,12 @@ class TrainingManager(
             true
         } else {
             runCatching {
-                neuralEngine.loadCheckpointIfExists() &&
+                val restored = neuralEngine.loadCheckpointIfExists() &&
                     neuralEngine.optimizerStep == baselineStep
+                if (restored && journal != null) {
+                    requireJournalModelIdentity(journal, "OOM batch rollback")
+                }
+                restored
             }.getOrDefault(false)
         }
         if (!rolledBack) {
@@ -2089,7 +2119,11 @@ class TrainingManager(
 
     private suspend fun processCommittedItem(item: TrainingData): Boolean {
         val journalEntry = runCatching {
-            TrainingCommitJournal.read(trainingCommitJournalFile)
+            val snapshot = TrainingCommitJournal.read(trainingCommitJournalFile)
+            if (snapshot?.isCommitted == true) {
+                requireJournalModelIdentity(snapshot, "committed-item finalization")
+            }
+            snapshot
                 ?.takeIf(TrainingCommitJournalSnapshot::isCommitted)
                 ?.entries
                 ?.firstOrNull { entry -> entry.itemId == item.id }
@@ -2396,8 +2430,12 @@ class TrainingManager(
                                     val baseline = activeBatchBaselineOptimizerStep
                                         ?: journal.baselineOptimizerStep
                                     val rolledBack = released && runCatching {
-                                        neuralEngine.loadCheckpointIfExists() &&
+                                        val restored = neuralEngine.loadCheckpointIfExists() &&
                                             neuralEngine.optimizerStep == baseline
+                                        if (restored) {
+                                            requireJournalModelIdentity(journal, "failed-batch rollback")
+                                        }
+                                        restored
                                     }.getOrDefault(false)
                                     if (!rolledBack) {
                                         _isTrainingPaused.value = true
@@ -2745,13 +2783,16 @@ class TrainingManager(
         check(neuralEngine.saveCheckpoint()) {
             "The pre-batch model checkpoint could not be secured."
         }
+        val baselineModelIdentityFingerprint =
+            neuralEngine.snapshotModelState().identity.fingerprint
         val baselineOptimizerStep = neuralEngine.optimizerStep
         activeBatchBaselineOptimizerStep = baselineOptimizerStep
         activeBatchRoomCommitted = false
         TrainingCommitJournal.writePrepared(
             file = trainingCommitJournalFile,
             baselineOptimizerStep = baselineOptimizerStep,
-            itemIds = items.map(TrainingData::id)
+            itemIds = items.map(TrainingData::id),
+            modelIdentityFingerprint = baselineModelIdentityFingerprint
         )
 
         val startNs = System.nanoTime()
@@ -2777,7 +2818,8 @@ class TrainingManager(
             file = trainingCommitJournalFile,
             baselineOptimizerStep = baselineOptimizerStep,
             committedOptimizerStep = neuralEngine.optimizerStep,
-            entries = commitEntries
+            entries = commitEntries,
+            modelIdentityFingerprint = baselineModelIdentityFingerprint
         )
 
         // The write-ahead COMMITTED marker is durable before the model checkpoint.

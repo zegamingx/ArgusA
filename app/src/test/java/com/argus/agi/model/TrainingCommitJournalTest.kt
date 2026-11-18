@@ -27,6 +27,11 @@ class TrainingCommitJournalTest {
             assertEquals(41, restored.baselineOptimizerStep)
             assertNull(restored.committedOptimizerStep)
             assertEquals(listOf("item-a", "item-b"), restored.entries.map { it.itemId })
+            assertNull(restored.modelIdentityFingerprint)
+            assertTrue(
+                "Version-1 journals preserve their legacy step-only recovery path.",
+                TrainingCommitJournal.matchesModelIdentity(restored, "f".repeat(64))
+            )
             assertTrue(restored.entries.all { it.result == null })
         } finally {
             directory.deleteRecursively()
@@ -73,6 +78,71 @@ class TrainingCommitJournalTest {
             assertEquals(result.optimizerUpdateCount, restoredResult.optimizerUpdateCount)
             assertEquals(result.vocabularySize, restoredResult.vocabularySize)
             assertEquals(85L, restoredEntry.stepDurationMs)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun versionTwoJournalPersistsAndVerifiesModelIdentityFingerprint() {
+        val directory = Files.createTempDirectory("argus-training-journal-v2").toFile()
+        val file = File(directory, TrainingCommitJournal.FILE_NAME)
+        val fingerprint = "0123456789abcdef".repeat(4)
+        try {
+            TrainingCommitJournal.writePrepared(
+                file = file,
+                baselineOptimizerStep = 12,
+                itemIds = listOf("item-a"),
+                modelIdentityFingerprint = fingerprint
+            )
+
+            val bytes = file.readBytes()
+            assertEquals(
+                2,
+                java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.BIG_ENDIAN).getInt(8)
+            )
+
+            val restored = requireNotNull(TrainingCommitJournal.read(file))
+            assertEquals(fingerprint, restored.modelIdentityFingerprint)
+            assertTrue(TrainingCommitJournal.matchesModelIdentity(restored, fingerprint))
+            assertFalse(TrainingCommitJournal.matchesModelIdentity(restored, "f".repeat(64)))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun versionTwoCommittedJournalKeepsModelIdentityAlongsideTrainingResults() {
+        val directory = Files.createTempDirectory("argus-training-journal-v2-committed").toFile()
+        val file = File(directory, TrainingCommitJournal.FILE_NAME)
+        val fingerprint = "abcdef0123456789".repeat(4)
+        try {
+            TrainingCommitJournal.writeCommitted(
+                file = file,
+                baselineOptimizerStep = 20,
+                committedOptimizerStep = 21,
+                entries = listOf(
+                    TrainingCommitJournalEntry(
+                        itemId = "committed-a",
+                        result = NeuralTrainingStepResult(
+                            loss = 0.75f,
+                            inputTokenCount = 16,
+                            predictionTargetCount = 15,
+                            contextWindowCount = 1,
+                            optimizerUpdateCount = 1,
+                            vocabularySize = 512
+                        ),
+                        stepDurationMs = 9L
+                    )
+                ),
+                modelIdentityFingerprint = fingerprint
+            )
+
+            val restored = requireNotNull(TrainingCommitJournal.read(file))
+            assertEquals(fingerprint, restored.modelIdentityFingerprint)
+            assertEquals(21, restored.committedOptimizerStep)
+            assertEquals("committed-a", restored.entries.single().itemId)
+            assertEquals(0.75f, requireNotNull(restored.entries.single().result).loss, 0f)
         } finally {
             directory.deleteRecursively()
         }
