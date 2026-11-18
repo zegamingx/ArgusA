@@ -633,7 +633,8 @@ class TrainingManager(
         language: String? = null,
         canonicalUrl: String? = null,
         rightsStatus: String = "UNVERIFIED",
-        sourceProvenance: CorpusSourceProvenance = CorpusSourceProvenance()
+        sourceProvenance: CorpusSourceProvenance = CorpusSourceProvenance(),
+        strictJsonLines: Boolean = false
     ): Pair<Int, Long> {
         require(chunkSize > 0) { "chunkSize must be positive." }
         require(overlap >= 0) { "overlap cannot be negative." }
@@ -724,7 +725,8 @@ class TrainingManager(
                 file = stagingFile,
                 documentTitle = title,
                 chunkSize = chunkSize,
-                overlap = overlap
+                overlap = overlap,
+                strictJsonLines = strictJsonLines
             )
             val processedChunks = streamedJsonlChunks ?: run {
                 // Single-object ChatML, legacy plain text and other formats retain
@@ -842,8 +844,9 @@ class TrainingManager(
     }
 
     /**
-     * Processes JSONL one complete record per line. A non-JSONL file returns null so the
-     * caller can use the document-level parser without committing partial results.
+     * Processes JSONL one complete object per line. In automatic mode a non-JSONL source
+     * returns null so the caller can use the document-level parser. Explicit JSONL imports
+     * fail closed: malformed, mixed-format, or empty streams are rejected before persistence.
      *
      * The returned list is bounded by MAX_STREAMED_DOCUMENT_CHUNKS. Each JSONObject is
      * parsed and released before the next source line is read; conversation objects stay
@@ -853,10 +856,12 @@ class TrainingManager(
         file: File,
         documentTitle: String,
         chunkSize: Int,
-        overlap: Int
+        overlap: Int,
+        strictJsonLines: Boolean
     ): List<ProcessedChunk>? {
         val processed = ArrayList<ProcessedChunk>()
         var foundRecord = false
+        var lineNumber = 0
 
         BufferedReader(
             InputStreamReader(
@@ -867,9 +872,17 @@ class TrainingManager(
             while (true) {
                 currentCoroutineContext().ensureActive()
                 val line = reader.readLine() ?: break
+                lineNumber++
                 val record = line.removePrefix("\uFEFF").trim()
                 if (record.isEmpty()) continue
-                if (!record.startsWith('{')) return null
+                if (!record.startsWith('{')) {
+                    if (strictJsonLines) {
+                        throw IllegalArgumentException(
+                            "Invalid JSONL record at line $lineNumber: expected a JSON object."
+                        )
+                    }
+                    return null
+                }
                 require(record.length <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
                     "A streamed JSONL record exceeds " +
                         "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
@@ -880,7 +893,14 @@ class TrainingManager(
                 val isJsonObject = runCatching {
                     org.json.JSONObject(record)
                 }.isSuccess
-                if (!isJsonObject) return null
+                if (!isJsonObject) {
+                    if (strictJsonLines) {
+                        throw IllegalArgumentException(
+                            "Malformed JSONL record at line $lineNumber: expected one complete JSON object."
+                        )
+                    }
+                    return null
+                }
                 require(processed.size < MAX_STREAMED_DOCUMENT_CHUNKS) {
                     "JSONL document exceeds the safe limit of " +
                         "$MAX_STREAMED_DOCUMENT_CHUNKS processed records."
@@ -894,6 +914,14 @@ class TrainingManager(
                     overlap = overlap,
                     tokenizer = neuralEngine.tokenizer
                 )
+                if (nextChunks.isEmpty()) {
+                    if (strictJsonLines) {
+                        throw IllegalArgumentException(
+                            "JSONL record at line $lineNumber did not produce a trainable sample."
+                        )
+                    }
+                    return null
+                }
                 val nextSize = Math.addExact(processed.size, nextChunks.size)
                 require(nextSize <= MAX_STREAMED_DOCUMENT_CHUNKS) {
                     "JSONL document exceeds the safe limit of " +
@@ -903,7 +931,13 @@ class TrainingManager(
             }
         }
 
-        return processed.takeIf { foundRecord }
+        val completedRecords = processed.takeIf { foundRecord }
+        if (strictJsonLines) {
+            require(completedRecords != null) {
+                "The JSONL file contains no non-empty JSON object records."
+            }
+        }
+        return completedRecords
     }
 
     /**
