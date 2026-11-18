@@ -143,6 +143,53 @@ class ArgusRepositoryReplaySessionTest {
         assertEquals("IMPORTED", database.corpusDao().getDocument(document.id)?.status)
     }
 
+    @Test
+    fun optimizerCommitBatchRollsBackAllRowsWhenOneStatusUpdateFails() = runBlocking {
+        val first = trainingItem(
+            id = "optimizer-first",
+            documentId = null,
+            sessionId = null
+        )
+        val second = trainingItem(
+            id = "optimizer-second",
+            documentId = null,
+            sessionId = null
+        )
+        repository.saveTrainingItems(listOf(first, second))
+        database.openHelper.writableDatabase.execSQL(
+            """
+            CREATE TRIGGER abort_second_optimizer_commit
+            BEFORE UPDATE OF status ON training_items
+            WHEN NEW.id = 'optimizer-second'
+                AND NEW.status = 'OPTIMIZER_COMMITTED'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced optimizer commit persistence failure');
+            END
+            """.trimIndent()
+        )
+        val committedItems = listOf(first, second).map { item ->
+            item.copy(
+                status = TrainingStatus.OPTIMIZER_COMMITTED,
+                finalLoss = 0.25f,
+                stepDurationMs = 10L
+            )
+        }
+
+        val failure = runCatching {
+            repository.markTrainingItemsOptimizerCommitted(committedItems)
+        }.exceptionOrNull()
+
+        assertTrue(failure != null)
+        assertEquals(
+            TrainingStatus.QUEUED,
+            requireNotNull(repository.getTrainingItem(first.id)).status
+        )
+        assertEquals(
+            TrainingStatus.QUEUED,
+            requireNotNull(repository.getTrainingItem(second.id)).status
+        )
+    }
+
     private fun corpusDocument(id: String, fingerprintCharacter: String) =
         CorpusDocumentEntity(
             id = id,
