@@ -9,6 +9,7 @@ import java.util.zip.CRC32
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -23,7 +24,7 @@ class ArgusCheckpointCompatibilityTest {
         get() = ApplicationProvider.getApplicationContext()
 
     @Test
-    fun arg5RoundTripRestoresArchitectureTokenizerAndFingerprintBoundState() {
+    fun arg6RoundTripRestoresArchitectureTokenizerAndOptimizerBoundState() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
@@ -50,13 +51,18 @@ class ArgusCheckpointCompatibilityTest {
             assertEquals(original.tokenizer.vocabSize, modelStateBeforeSave.identity.tokenizer.vocabularySize)
             assertEquals(tokenizerFingerprint, modelStateBeforeSave.identity.tokenizer.snapshotFingerprint)
             assertEquals(0, modelStateBeforeSave.optimizerStep)
-            assertEquals(ModelCheckpointFormat.ARG5, modelStateBeforeSave.checkpointFormat)
+            assertNull(modelStateBeforeSave.checkpointOptimizerConfigurationFingerprint)
+            assertEquals(ModelCheckpointFormat.ARG6, modelStateBeforeSave.checkpointFormat)
             assertFalse(modelStateBeforeSave.checkpointVerified)
             assertEquals(64, modelStateBeforeSave.identity.fingerprint.length)
 
             assertTrue(original.saveCheckpoint())
             val modelStateAfterSave = original.snapshotModelState()
             assertTrue(modelStateAfterSave.checkpointVerified)
+            assertEquals(
+                modelStateBeforeSave.optimizerConfiguration.fingerprint,
+                modelStateAfterSave.checkpointOptimizerConfigurationFingerprint
+            )
             assertEquals(modelStateBeforeSave.identity, modelStateAfterSave.identity)
             assertEquals(modelStateBeforeSave.identity.fingerprint, modelStateAfterSave.identity.fingerprint)
             assertTrue(original.isCheckpointStateVerified)
@@ -65,8 +71,8 @@ class ArgusCheckpointCompatibilityTest {
             assertEquals('A'.code.toByte(), checkpointBytes[0])
             assertEquals('R'.code.toByte(), checkpointBytes[1])
             assertEquals('G'.code.toByte(), checkpointBytes[2])
-            assertEquals('5'.code.toByte(), checkpointBytes[3])
-            assertEquals(5, ByteBuffer.wrap(checkpointBytes).order(ByteOrder.LITTLE_ENDIAN).getInt(4))
+            assertEquals('6'.code.toByte(), checkpointBytes[3])
+            assertEquals(6, ByteBuffer.wrap(checkpointBytes).order(ByteOrder.LITTLE_ENDIAN).getInt(4))
             assertEquals(96, ByteBuffer.wrap(checkpointBytes).order(ByteOrder.LITTLE_ENDIAN).getInt(8))
 
             val header = ByteBuffer.wrap(checkpointBytes).order(ByteOrder.LITTLE_ENDIAN)
@@ -77,6 +83,14 @@ class ArgusCheckpointCompatibilityTest {
                 fingerprintOffset + 32
             )
             assertArrayEquals(hexToBytes(tokenizerFingerprint), persistedFingerprint)
+            val persistedOptimizerFingerprint = checkpointBytes.copyOfRange(
+                fingerprintOffset + 32,
+                fingerprintOffset + 64
+            )
+            assertArrayEquals(
+                hexToBytes(modelStateBeforeSave.optimizerConfiguration.fingerprint),
+                persistedOptimizerFingerprint
+            )
 
             val restoredConfig = ArgusNeuralEngine.resolveConfig(
                 context = context,
@@ -99,6 +113,11 @@ class ArgusCheckpointCompatibilityTest {
             val restoredModelState = restored.snapshotModelState()
             assertEquals(modelStateAfterSave.identity, restoredModelState.identity)
             assertEquals(modelStateAfterSave.identity.fingerprint, restoredModelState.identity.fingerprint)
+            assertEquals(ModelCheckpointFormat.ARG6, restoredModelState.checkpointFormat)
+            assertEquals(
+                modelStateAfterSave.optimizerConfiguration.fingerprint,
+                restoredModelState.checkpointOptimizerConfigurationFingerprint
+            )
             assertEquals(modelStateAfterSave.optimizerStep, restoredModelState.optimizerStep)
             assertTrue(restoredModelState.checkpointVerified)
             assertArrayEquals(encodedBefore, restored.tokenizer.encodeToIds(trainingText))
@@ -110,7 +129,7 @@ class ArgusCheckpointCompatibilityTest {
     }
 
     @Test
-    fun arg5LoaderRejectsTokenizerFingerprintMismatchEvenWithRecomputedPayloadChecksum() {
+    fun arg6LoaderRejectsTokenizerFingerprintMismatchEvenWithRecomputedPayloadChecksum() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
@@ -146,6 +165,65 @@ class ArgusCheckpointCompatibilityTest {
     }
 
     @Test
+    fun arg5CheckpointRemainsReadableAndReportsMissingOptimizerIdentity() {
+        val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
+        val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
+
+        try {
+            checkpoint.delete()
+            val config = smallEngineConfig(
+                TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32)
+            )
+            val original = ArgusNeuralEngine.createBlocking(context, config)
+            assertTrue(original.saveCheckpoint())
+            convertArg6CheckpointToArg5(checkpoint)
+
+            val restored = ArgusNeuralEngine.createBlocking(context, config)
+            assertTrue(restored.isCheckpointStateVerified)
+            assertEquals(ModelCheckpointFormat.ARG5, restored.snapshotModelState().checkpointFormat)
+            assertNull(restored.snapshotModelState().checkpointOptimizerConfigurationFingerprint)
+            assertEquals(original.tokenizer.exportVocab(), restored.tokenizer.exportVocab())
+            assertEquals(original.tokenizer.snapshotFingerprint(), restored.tokenizer.snapshotFingerprint())
+        } finally {
+            restoreCheckpoint(checkpoint, previousCheckpoint)
+        }
+    }
+
+    @Test
+    fun arg6LoaderRejectsOptimizerConfigurationMismatchEvenWithRecomputedPayloadChecksum() {
+        val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
+        val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
+
+        try {
+            checkpoint.delete()
+            val config = smallEngineConfig(
+                TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32)
+            )
+            val original = ArgusNeuralEngine.createBlocking(context, config)
+            assertTrue(original.saveCheckpoint())
+
+            val corrupted = checkpoint.readBytes()
+            val header = ByteBuffer.wrap(corrupted).order(ByteOrder.LITTLE_ENDIAN)
+            val architectureIdLength = header.getInt(16)
+            val optimizerFingerprintOffset = 96 + architectureIdLength + 32
+            corrupted[optimizerFingerprintOffset] =
+                (corrupted[optimizerFingerprintOffset].toInt() xor 0x01).toByte()
+
+            val checksum = CRC32()
+            checksum.update(corrupted, 96, corrupted.size - 96)
+            ByteBuffer.wrap(corrupted).order(ByteOrder.LITTLE_ENDIAN)
+                .putInt(88, checksum.value.toInt())
+            checkpoint.writeBytes(corrupted)
+
+            val restored = ArgusNeuralEngine.createBlocking(context, config)
+            assertFalse(restored.loadCheckpointIfExists())
+            assertFalse(restored.isCheckpointStateVerified)
+        } finally {
+            restoreCheckpoint(checkpoint, previousCheckpoint)
+        }
+    }
+
+    @Test
     fun preReleaseArg3AndArg4CheckpointsAreRejectedWithoutMigration() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
@@ -170,7 +248,7 @@ class ArgusCheckpointCompatibilityTest {
     }
 
     @Test
-    fun multiLayerArg5RoundTripRestoresEveryTransformerBlock() {
+    fun multiLayerArg6RoundTripRestoresEveryTransformerBlock() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
@@ -251,6 +329,33 @@ class ArgusCheckpointCompatibilityTest {
             val start = index * 2
             hex.substring(start, start + 2).toInt(16).toByte()
         }
+
+    private fun convertArg6CheckpointToArg5(file: File) {
+        val arg6Bytes = file.readBytes()
+        val header = ByteBuffer.wrap(arg6Bytes).order(ByteOrder.LITTLE_ENDIAN)
+        require(arg6Bytes[3] == '6'.code.toByte())
+        val architectureIdLength = header.getInt(16)
+        val optimizerFingerprintOffset = 96 + architectureIdLength + 32
+        val arg5Bytes = ByteArray(arg6Bytes.size - 32)
+        arg6Bytes.copyInto(arg5Bytes, 0, 0, optimizerFingerprintOffset)
+        arg6Bytes.copyInto(
+            arg5Bytes,
+            optimizerFingerprintOffset,
+            optimizerFingerprintOffset + 32,
+            arg6Bytes.size
+        )
+
+        val legacyHeader = ByteBuffer.wrap(arg5Bytes).order(ByteOrder.LITTLE_ENDIAN)
+        arg5Bytes[3] = '5'.code.toByte()
+        legacyHeader.putInt(4, 5)
+        legacyHeader.putLong(80, header.getLong(80) - 32L)
+        legacyHeader.putInt(92, 0)
+        val checksum = CRC32().apply {
+            update(arg5Bytes, 96, arg5Bytes.size - 96)
+        }
+        legacyHeader.putInt(88, checksum.value.toInt())
+        file.writeBytes(arg5Bytes)
+    }
 
     private fun restoreCheckpoint(file: File, previous: ByteArray?) {
         if (previous == null) {

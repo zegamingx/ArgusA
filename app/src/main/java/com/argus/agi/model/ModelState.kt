@@ -90,7 +90,8 @@ internal enum class ModelCheckpointFormat(
     val magic: String,
     val version: Int
 ) {
-    ARG5("ARG5", 5)
+    ARG5("ARG5", 5),
+    ARG6("ARG6", 6)
 }
 
 /**
@@ -104,7 +105,8 @@ internal data class ModelState(
     val optimizerStep: Int,
     val checkpointFormat: ModelCheckpointFormat,
     val checkpointVerified: Boolean,
-    val optimizerConfiguration: OptimizerConfigIdentity = OptimizerConfig.DEFAULT.identity
+    val optimizerConfiguration: OptimizerConfigIdentity = OptimizerConfig.DEFAULT.identity,
+    val checkpointOptimizerConfigurationFingerprint: String? = null
 ) {
     init {
         require(optimizerStep >= 0) {
