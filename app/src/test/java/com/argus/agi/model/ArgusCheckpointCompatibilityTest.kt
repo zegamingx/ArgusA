@@ -116,7 +116,7 @@ class ArgusCheckpointCompatibilityTest {
                 .putInt(88, checksum.value.toInt())
             checkpoint.writeBytes(corrupted)
 
-            val restored = ArgusNeuralEngine(
+            val restored = ArgusNeuralEngine.createBlocking(
                 context.applicationContext,
                 smallEngineConfig(TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32))
             )
@@ -138,7 +138,7 @@ class ArgusCheckpointCompatibilityTest {
                 magic.toByteArray(Charsets.US_ASCII).copyInto(legacyHeader)
                 checkpoint.writeBytes(legacyHeader)
 
-                val engine = ArgusNeuralEngine(
+                val engine = ArgusNeuralEngine.createBlocking(
                     context.applicationContext,
                     smallEngineConfig(TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32))
                 )
