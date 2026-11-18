@@ -1,8 +1,13 @@
 package com.argus.agi.runtime
 
 import android.os.PowerManager
+import com.argus.agi.backend.ComputeBackend
+import com.argus.agi.backend.ComputeBackendKind
+import com.argus.agi.device.DeviceProfile
 import com.argus.agi.model.VulkanDeviceCapabilities
 import com.argus.agi.model.toDeviceProfile
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -15,11 +20,9 @@ class RuntimeConfigurationPlannerTest {
     fun keepsVulkanPrimaryAndRequiresSupportedEnabledAndVerifiedFp16() {
         val profile = deviceProfile(shaderFloat16Supported = true, shaderFloat16Enabled = true)
         val configuration = RuntimeConfigurationPlanner.create(
-            deviceProfile = profile,
+            backend = FakeComputeBackend(profile, isReady = true, isFp16ComputeReady = true),
             resources = healthyResources(),
-            model = modelConstraints(),
-            vulkanRuntimeReady = true,
-            fp16KernelVerified = true
+            model = modelConstraints()
         )
 
         assertEquals(RuntimeComputeBackend.VULKAN, configuration.computeBackend)
@@ -36,11 +39,9 @@ class RuntimeConfigurationPlannerTest {
     fun doesNotEnableFp16WhenPhysicalDeviceFeatureWasNotEnabled() {
         val profile = deviceProfile(shaderFloat16Supported = true, shaderFloat16Enabled = false)
         val configuration = RuntimeConfigurationPlanner.create(
-            deviceProfile = profile,
+            backend = FakeComputeBackend(profile, isReady = true, isFp16ComputeReady = true),
             resources = healthyResources(),
-            model = modelConstraints(),
-            vulkanRuntimeReady = true,
-            fp16KernelVerified = true
+            model = modelConstraints()
         )
 
         assertFalse(configuration.fp16ComputeUsable)
@@ -51,11 +52,9 @@ class RuntimeConfigurationPlannerTest {
     fun doesNotEnableFp16WhenKernelSelfTestHasNotPassed() {
         val profile = deviceProfile(shaderFloat16Supported = true, shaderFloat16Enabled = true)
         val configuration = RuntimeConfigurationPlanner.create(
-            deviceProfile = profile,
+            backend = FakeComputeBackend(profile, isReady = true, isFp16ComputeReady = false),
             resources = healthyResources(),
-            model = modelConstraints(),
-            vulkanRuntimeReady = true,
-            fp16KernelVerified = false
+            model = modelConstraints()
         )
 
         assertFalse(configuration.fp16ComputeUsable)
@@ -64,11 +63,9 @@ class RuntimeConfigurationPlannerTest {
     @Test
     fun reportsCpuOnlyAsTheExplicitFallbackWhenVulkanIsUnavailable() {
         val configuration = RuntimeConfigurationPlanner.create(
-            deviceProfile = null,
+            backend = FakeComputeBackend(null, isReady = false, isFp16ComputeReady = false),
             resources = healthyResources(),
-            model = modelConstraints(),
-            vulkanRuntimeReady = false,
-            fp16KernelVerified = false
+            model = modelConstraints()
         )
 
         assertEquals(RuntimeComputeBackend.CPU_FALLBACK, configuration.computeBackend)
@@ -79,11 +76,9 @@ class RuntimeConfigurationPlannerTest {
     @Test
     fun blocksTrainingWhenThermalLimitIsSevere() {
         val configuration = RuntimeConfigurationPlanner.create(
-            deviceProfile = deviceProfile(),
+            backend = FakeComputeBackend(deviceProfile(), isReady = true, isFp16ComputeReady = false),
             resources = healthyResources().copy(thermalStatus = PowerManager.THERMAL_STATUS_SEVERE),
-            model = modelConstraints(),
-            vulkanRuntimeReady = true,
-            fp16KernelVerified = false
+            model = modelConstraints()
         )
 
         assertEquals(0, configuration.effectiveTrainingBatchSize)
@@ -95,14 +90,12 @@ class RuntimeConfigurationPlannerTest {
     @Test
     fun defersTrainingWhenEvenTheMinimumContextDoesNotFitMemory() {
         val configuration = RuntimeConfigurationPlanner.create(
-            deviceProfile = deviceProfile(),
+            backend = FakeComputeBackend(deviceProfile(), isReady = true, isFp16ComputeReady = false),
             resources = healthyResources().copy(
                 availableAppHeapBytes = 1024L * MEBIBYTE,
                 availableSystemMemoryBytes = 128L * MEBIBYTE
             ),
-            model = modelConstraints(),
-            vulkanRuntimeReady = true,
-            fp16KernelVerified = false
+            model = modelConstraints()
         )
 
         assertEquals(RuntimeDeferReason.INSUFFICIENT_MEMORY, configuration.deferReason)
@@ -114,14 +107,12 @@ class RuntimeConfigurationPlannerTest {
     fun runtimeLimitsDoNotRewriteConfiguredModelDimensions() {
         val model = modelConstraints()
         val configuration = RuntimeConfigurationPlanner.create(
-            deviceProfile = deviceProfile(),
+            backend = FakeComputeBackend(deviceProfile(), isReady = true, isFp16ComputeReady = false),
             resources = healthyResources().copy(
                 availableAppHeapBytes = 200L * MEBIBYTE,
                 maximumAppHeapBytes = 512L * MEBIBYTE
             ),
-            model = model,
-            vulkanRuntimeReady = true,
-            fp16KernelVerified = false
+            model = model
         )
 
         assertEquals(128, configuration.configuredContextLength)
@@ -143,6 +134,24 @@ class RuntimeConfigurationPlannerTest {
         )
 
         assertEquals(8L * MEBIBYTE, budget.totalBytes)
+    }
+
+    private class FakeComputeBackend(
+        profile: DeviceProfile?,
+        override val isReady: Boolean,
+        override val isFp16ComputeReady: Boolean
+    ) : ComputeBackend {
+        override val kind: ComputeBackendKind = ComputeBackendKind.VULKAN
+        override val deviceProfile: StateFlow<DeviceProfile?> =
+            MutableStateFlow(profile)
+
+        override fun initializeAfterModelReady(): Boolean = isReady
+
+        override fun synchronizeAuthoritativeState(): Boolean = true
+
+        override fun releaseDeviceResourcesForMemoryPressure(): Boolean = true
+
+        override fun resumeDeviceResourcesAfterForeground() = Unit
     }
 
     private fun healthyResources(): RuntimeResourceSnapshot = RuntimeResourceSnapshot(

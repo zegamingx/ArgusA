@@ -1,5 +1,7 @@
 package com.argus.agi.model
 
+import com.argus.agi.backend.ComputeBackend
+import com.argus.agi.backend.ComputeBackendKind
 import com.argus.agi.device.DeviceProfile
 import com.argus.agi.runtime.AdaptiveComputeOperation
 import com.argus.agi.runtime.DeviceAdaptiveRuntimePolicy
@@ -481,9 +483,11 @@ data class VulkanDeviceCapabilities(
  * enabled device capabilities, kernel availability, and resource checks permit it.
  * Kotlin execution is reserved for unavailable, unsupported, or failed Vulkan paths.
  */
-internal object VulkanTrainingBackend {
+internal object VulkanTrainingBackend : ComputeBackend {
 
     private const val TAG = "VulkanTrainingBackend"
+
+    override val kind: ComputeBackendKind = ComputeBackendKind.VULKAN
     private const val MEMORY_BUDGET_REFRESH_INTERVAL_NANOS = 5_000_000_000L
 
     internal fun recordCpuLinearTiming(operationCount: Long, elapsedNanoseconds: Long) {
@@ -552,7 +556,7 @@ internal object VulkanTrainingBackend {
         _deviceCapabilities.asStateFlow()
 
     private val _deviceProfile = MutableStateFlow<DeviceProfile?>(null)
-    val deviceProfile: StateFlow<DeviceProfile?> = _deviceProfile.asStateFlow()
+    override val deviceProfile: StateFlow<DeviceProfile?> = _deviceProfile.asStateFlow()
 
     private val _gpuPerformanceMetrics = MutableStateFlow(VulkanGpuPerformanceMetrics())
     val gpuPerformanceMetrics: StateFlow<VulkanGpuPerformanceMetrics> =
@@ -713,8 +717,14 @@ internal object VulkanTrainingBackend {
     val isRuntimeAvailable: Boolean
         get() = nativeReady && !disabledAfterRuntimeFailure
 
+    override val isReady: Boolean
+        get() = isRuntimeAvailable
+
     val isFp16ComputeAvailable: Boolean
         get() = isRuntimeAvailable && fp16RuntimeReady && !fp16DisabledAfterRuntimeFailure
+
+    override val isFp16ComputeReady: Boolean
+        get() = isFp16ComputeAvailable
 
     internal val isResidentActivationLinearAvailable: Boolean
         get() = isRuntimeAvailable && residentActivationLinearReady
@@ -1039,6 +1049,15 @@ internal object VulkanTrainingBackend {
     @Synchronized
     internal fun synchronizeTrainingStateMirrors(): Boolean =
         synchronizeModelParameterMirrors() && synchronizeOptimizerStateMirrors()
+
+    override fun synchronizeAuthoritativeState(): Boolean =
+        synchronizeTrainingStateMirrors()
+
+    override fun releaseDeviceResourcesForMemoryPressure(): Boolean =
+        releaseModelTensorResidencyForMemoryPressure()
+
+    override fun resumeDeviceResourcesAfterForeground() =
+        resumeModelTensorResidencyAfterForeground()
 
     /** Drops optimizer replicas only after the exact GPU moments have been recovered. */
     @Synchronized
@@ -1864,7 +1883,7 @@ internal object VulkanTrainingBackend {
     }
 
     @Synchronized
-    fun initializeAfterModelReady(): Boolean {
+    override fun initializeAfterModelReady(): Boolean {
         if (isRuntimeAvailable) {
             publishInitializationProgress(
                 status = "Vulkan runtime verified",

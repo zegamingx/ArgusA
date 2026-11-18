@@ -1,5 +1,7 @@
 package com.argus.agi.runtime
 
+import com.argus.agi.backend.ComputeBackend
+import com.argus.agi.backend.ComputeBackendKind
 import com.argus.agi.device.DeviceProfile
 
 /**
@@ -89,12 +91,12 @@ internal data class RuntimeConfiguration(
 internal object RuntimeConfigurationPlanner {
 
     fun create(
-        deviceProfile: DeviceProfile?,
+        backend: ComputeBackend,
         resources: RuntimeResourceSnapshot,
-        model: RuntimeModelConstraints,
-        vulkanRuntimeReady: Boolean,
-        fp16KernelVerified: Boolean
+        model: RuntimeModelConstraints
     ): RuntimeConfiguration {
+        val deviceProfile = backend.deviceProfile.value
+        val vulkanRuntimeReady = backend.kind == ComputeBackendKind.VULKAN && backend.isReady
         val batchLimit = DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
             configuredBatchSize = model.configuredBatchSize,
             thermalStatus = resources.thermalStatus,
@@ -161,7 +163,7 @@ internal object RuntimeConfigurationPlanner {
             },
             dispatchLimits = dispatchLimits,
             fp16ComputeUsable = vulkanRuntimeReady &&
-                fp16KernelVerified &&
+                backend.isFp16ComputeReady &&
                 deviceProfile?.features?.shaderFloat16?.isUsable == true,
             configuredTrainingBatchSize = model.configuredBatchSize,
             effectiveTrainingBatchSize = batchLimit,

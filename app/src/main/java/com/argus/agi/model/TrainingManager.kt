@@ -2294,7 +2294,7 @@ class TrainingManager(
                         val safetySnapshot = deviceGuard.safetyState.value
                         val memorySnapshot = captureTrainingMemorySnapshot()
                         val runtimeConfiguration = RuntimeConfigurationPlanner.create(
-                            deviceProfile = VulkanTrainingBackend.deviceProfile.value,
+                            backend = VulkanTrainingBackend,
                             resources = RuntimeResourceSnapshot(
                                 availableAppHeapBytes = memorySnapshot.availableHeapBytes,
                                 maximumAppHeapBytes = memorySnapshot.maximumHeapBytes,
@@ -2315,9 +2315,7 @@ class TrainingManager(
                                 vocabularySize = neuralEngine.tokenizer.vocabSize,
                                 layerCount = neuralEngine.config.layerCount,
                                 headCount = neuralEngine.config.nHeads
-                            ),
-                            vulkanRuntimeReady = VulkanTrainingBackend.isRuntimeAvailable,
-                            fp16KernelVerified = VulkanTrainingBackend.isFp16ComputeAvailable
+                            )
                         )
 
                         if (runtimeConfiguration.deferReason == RuntimeDeferReason.THERMAL_LIMIT) {
