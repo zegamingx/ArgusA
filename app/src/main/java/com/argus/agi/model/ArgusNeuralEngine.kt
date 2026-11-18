@@ -3156,11 +3156,11 @@ class ArgusNeuralEngine private constructor(
                 secondMoments = secondMoments,
                 weightDecayByGroup = weightDecayByGroup,
                 learningRate = learningRate,
-                beta1 = beta1,
-                beta2 = beta2,
+                beta1 = optimizerConfig.beta1,
+                beta2 = optimizerConfig.beta2,
                 biasCorrection1 = biasCorrection1,
                 biasCorrection2 = biasCorrection2,
-                epsilon = epsilon,
+                epsilon = optimizerConfig.epsilon,
                 gradientClipFactor = gradientClipFactor,
                 residentGradient = residentGradient
             )
