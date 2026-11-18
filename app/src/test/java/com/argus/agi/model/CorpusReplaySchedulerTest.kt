@@ -52,6 +52,23 @@ class CorpusReplaySchedulerTest {
         )
     }
 
+    @Test
+    fun sourceSnapshotFingerprintChangesWhenRightsProvenanceChanges() {
+        val original = source(
+            documentId = "document-a",
+            createdAt = 100L,
+            chunks = listOf(chunk("a-1", "document-a", 1, "same content"))
+        )
+        val changed = original.copy(
+            document = original.document.copy(rightsStatus = "LICENSE_VERIFIED")
+        )
+
+        assertNotEquals(
+            CorpusReplayScheduler.sourceSnapshotFingerprint(listOf(original)),
+            CorpusReplayScheduler.sourceSnapshotFingerprint(listOf(changed))
+        )
+    }
+
     private fun source(
         documentId: String,
         createdAt: Long,

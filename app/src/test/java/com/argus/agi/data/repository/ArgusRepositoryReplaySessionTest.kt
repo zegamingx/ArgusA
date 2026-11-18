@@ -104,6 +104,45 @@ class ArgusRepositoryReplaySessionTest {
         assertEquals("IMPORTED", database.corpusDao().getDocument(existingDocument.id)?.status)
     }
 
+    @Test
+    fun failureDuringReadyTransitionRollsBackSessionAndQueueRows() = runBlocking {
+        val document = corpusDocument("document-trigger", "e")
+        database.corpusDao().insertDocument(document)
+        database.corpusDao().insertChunks(
+            listOf(
+                CorpusChunkEntity(
+                    id = "chunk-trigger-1",
+                    documentId = document.id,
+                    chunkIndex = 1,
+                    content = "transaction rollback sample",
+                    characterCount = 28
+                )
+            )
+        )
+        database.openHelper.writableDatabase.execSQL(
+            """
+            CREATE TRIGGER abort_replay_ready_update
+            BEFORE UPDATE OF status ON corpus_documents
+            WHEN NEW.status = 'READY'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced replay transaction failure');
+            END
+            """.trimIndent()
+        )
+        val session = replaySession("session-trigger", scheduledDocuments = 1, scheduledChunks = 1)
+        val item = trainingItem("item-trigger", document.id, session.id)
+
+        val failure = runCatching {
+            repository.saveCorpusReplaySession(session, listOf(item))
+        }.exceptionOrNull()
+
+        assertTrue(failure != null)
+        assertNull(database.trainingReplaySessionDao().getSession(session.id))
+        assertNull(database.trainingQueueDao().getItem(item.id))
+        assertTrue(database.trainingQueueDao().getPendingQueueSnapshot().isEmpty())
+        assertEquals("IMPORTED", database.corpusDao().getDocument(document.id)?.status)
+    }
+
     private fun corpusDocument(id: String, fingerprintCharacter: String) =
         CorpusDocumentEntity(
             id = id,

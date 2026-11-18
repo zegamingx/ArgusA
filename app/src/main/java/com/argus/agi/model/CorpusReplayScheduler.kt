@@ -168,6 +168,9 @@ internal object CorpusReplayScheduler {
             updateNullableString(document.language)
             updateNullableString(document.canonicalUrl)
             updateString(document.datasetSplit)
+            updateString(document.rightsStatus)
+            updateInt(document.plannedEpochs)
+            updateInt(document.characterCount)
             updateLong(document.createdAtEpochMs)
             updateInt(source.chunks.size)
             source.chunks.forEach { chunk ->
