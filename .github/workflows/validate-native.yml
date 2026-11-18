@@ -169,31 +169,102 @@ jobs:
           $gradleExitCode = $LASTEXITCODE
           if ($gradleExitCode -ne 0) { exit $gradleExitCode }
 
-      - name: Remove runner-local Android SDK metadata before lint
+      - name: Prepare lint-safe Android SDK metadata
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
           $ErrorActionPreference = 'Stop'
-          $localProperties = Join-Path $env:GITHUB_WORKSPACE 'local.properties'
-          if (Test-Path -LiteralPath $localProperties) {
-            Remove-Item -LiteralPath $localProperties -Force
-          }
-          if (Test-Path -LiteralPath $localProperties) {
-            throw "Could not remove runner-local Android SDK metadata: $localProperties"
-          }
           if ([string]::IsNullOrWhiteSpace($env:ANDROID_HOME) -or
               [string]::IsNullOrWhiteSpace($env:ANDROID_SDK_ROOT)) {
-            throw 'Android SDK environment variables must be available to Gradle.'
+            throw 'ANDROID_HOME and ANDROID_SDK_ROOT must be available to Gradle.'
           }
-          Write-Host "Verified local.properties is absent: $localProperties"
-          Write-Host "Gradle SDK source: ANDROID_SDK_ROOT=$env:ANDROID_SDK_ROOT"
+
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $sdkRoot = [IO.Path]::GetFullPath($env:ANDROID_SDK_ROOT)
+          $workspaceDrive = [IO.Path]::GetPathRoot($workspace)
+          $sdkDrive = [IO.Path]::GetPathRoot($sdkRoot)
+          if ($workspaceDrive -ine $sdkDrive) {
+            throw "The runner workspace and Android SDK must be on the same drive for a portable local.properties path. Workspace: $workspace; SDK: $sdkRoot"
+          }
+
+          $workspaceUri = [Uri]::new($workspace.TrimEnd([char]92) + [string][char]92)
+          $sdkUri = [Uri]::new($sdkRoot.TrimEnd([char]92) + [string][char]92)
+          $relativeSdk = [Uri]::UnescapeDataString($workspaceUri.MakeRelativeUri($sdkUri).ToString())
+          if ([string]::IsNullOrWhiteSpace($relativeSdk) -or
+              $relativeSdk.Contains(':') -or
+              $relativeSdk.Contains([string][char]92)) {
+            throw "The generated SDK path is not a safe relative Java-properties value: $relativeSdk"
+          }
+
+          $relativeSdkWindows = $relativeSdk.Replace('/', '\')
+          $resolvedSdk = [IO.Path]::GetFullPath((Join-Path $workspace $relativeSdkWindows))
+          if ($resolvedSdk.TrimEnd([char]92) -ine $sdkRoot.TrimEnd([char]92)) {
+            throw "Relative SDK path did not round-trip. Expected $sdkRoot, resolved $resolvedSdk"
+          }
+
+          $localProperties = Join-Path $workspace 'local.properties'
+          $propertyLine = "sdk.dir=$relativeSdk"
+          [IO.File]::WriteAllText(
+            $localProperties,
+            $propertyLine + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false)
+          )
+          $storedLine = (Get-Content -LiteralPath $localProperties -Raw).TrimEnd([char[]]@([char]10, [char]13))
+          if ($storedLine -cne $propertyLine) {
+            throw "local.properties verification failed. Expected '$propertyLine', received '$storedLine'."
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $resolvedSdk 'platforms\android-37.0\android.jar') -PathType Leaf)) {
+            throw "The relative Android SDK path does not contain platform android-37.0: $resolvedSdk"
+          }
+
+          Write-Host "Workspace: $workspace"
+          Write-Host "Android SDK: $sdkRoot"
+          Write-Host "Lint-safe sdk.dir: $relativeSdk"
+          Write-Host 'Android SDK metadata round-trip verification passed.'
 
       - name: Run native build, lint and unit tests
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
           $ErrorActionPreference = 'Continue'
-          & .\gradlew.bat --no-daemon --no-configuration-cache --no-build-cache --max-workers=2 --warning-mode=all --stacktrace clean :app:lintRelease :app:testReleaseUnitTest :app:assembleDebug
+          $gradleLog = Join-Path $env:RUNNER_TEMP 'argus-gradle-validation.log'
+          $gradleArguments = @(
+            '--no-daemon',
+            '--no-configuration-cache',
+            '--max-workers=2',
+            '--warning-mode=all',
+            '--stacktrace',
+            'clean',
+            ':app:lintRelease',
+            ':app:testReleaseUnitTest',
+            ':app:assembleDebug'
+          )
+          & .\gradlew.bat @gradleArguments 2>&1 | Tee-Object -FilePath $gradleLog
           $gradleExitCode = $LASTEXITCODE
-          if ($gradleExitCode -ne 0) { exit $gradleExitCode }
+          if ($gradleExitCode -ne 0) {
+            $diagnosticPattern = '(^e: |error:|FAILURE:|What went wrong|BUILD FAILED|Lint found|Exception|Execution failed for task|Could not )'
+            $diagnostics = @(
+              Get-Content -LiteralPath $gradleLog |
+                Select-String -Pattern $diagnosticPattern |
+                Select-Object -Last 100 |
+                ForEach-Object { $_.Line }
+            )
+            if ($diagnostics.Count -eq 0) {
+              $diagnostics = @(Get-Content -LiteralPath $gradleLog | Select-Object -Last 100)
+            }
+
+            $summary = @(
+              '## Gradle validation failed',
+              '',
+              "Exit code: $gradleExitCode",
+              '',
+              'Gradle failure diagnostics:'
+            ) + $diagnostics
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary -join [Environment]::NewLine)
+
+            Write-Host '::group::Gradle failure diagnostics'
+            foreach ($line in $diagnostics) { Write-Host $line }
+            Write-Host '::endgroup::'
+            exit $gradleExitCode
+          }
 
       - name: Verify packaged native ABI libraries
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
