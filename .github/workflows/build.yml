@@ -243,7 +243,7 @@ jobs:
 
           # Keep the rolling Release tag attached to the exact commit that produced these assets.
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/Release" \
-            --raw-field "sha=${GITHUB_SHA}" --raw-field "force=true" >/dev/null
+            --raw-field "sha=${GITHUB_SHA}" --field "force=true" >/dev/null
 
           stale_assets="$(gh release view "Release" --json assets --jq '.assets[].name' |
             grep -E '^ARGUS-v[0-9]+\.[0-9]+\.[0-9]+\.apk(\.sha256)?$' || true)"
