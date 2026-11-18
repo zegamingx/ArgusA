@@ -249,6 +249,11 @@ internal object TrainingCommitJournal {
                     if (state == STATE_COMMITTED) committedOptimizerStep >= baselineOptimizerStep
                     else committedOptimizerStep == -1
                 ) { "Training commit journal optimizer-step metadata is inconsistent." }
+                require(
+                    version < CHECKPOINT_DIGEST_VERSION || state == STATE_COMMITTED
+                ) {
+                    "Checkpoint-bound journal versions require COMMITTED state."
+                }
 
                 val entries = ArrayList<TrainingCommitJournalEntry>(count)
                 repeat(count) {

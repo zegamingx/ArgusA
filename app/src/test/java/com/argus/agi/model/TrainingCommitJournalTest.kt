@@ -318,6 +318,57 @@ class TrainingCommitJournalTest {
     }
 
     @Test
+    fun readerRejectsPreparedJournalForgedAsCheckpointBoundVersionFour() {
+        val directory = Files.createTempDirectory("argus-training-journal-v4-prepared").toFile()
+        val file = File(directory, TrainingCommitJournal.FILE_NAME)
+        try {
+            TrainingCommitJournal.writePrepared(
+                file = file,
+                baselineOptimizerStep = 4,
+                itemIds = listOf("prepared-item"),
+                modelIdentityFingerprint = "1".repeat(64),
+                optimizerConfigFingerprint = OptimizerConfig.DEFAULT.fingerprint
+            )
+
+            val original = file.readBytes()
+            val originalBuffer = java.nio.ByteBuffer.wrap(original)
+                .order(java.nio.ByteOrder.BIG_ENDIAN)
+            val originalPayloadSize = originalBuffer.getInt(0)
+            val originalPayload = original.copyOfRange(4, 4 + originalPayloadSize)
+            val identityHeaderSize = 24 + 32 + 32
+            val invalidPayload = ByteArray(originalPayload.size + 32)
+
+            originalPayload.copyInto(invalidPayload, 0, 0, identityHeaderSize)
+            ByteArray(32) { 0x5A.toByte() }.copyInto(invalidPayload, identityHeaderSize)
+            originalPayload.copyInto(
+                invalidPayload,
+                identityHeaderSize + 32,
+                identityHeaderSize,
+                originalPayload.size
+            )
+            java.nio.ByteBuffer.wrap(invalidPayload)
+                .order(java.nio.ByteOrder.BIG_ENDIAN)
+                .putInt(Int.SIZE_BYTES, 4)
+
+            val checksum = java.util.zip.CRC32().apply { update(invalidPayload) }
+            val forged = java.nio.ByteBuffer.allocate(
+                Int.SIZE_BYTES + invalidPayload.size + Long.SIZE_BYTES
+            ).order(java.nio.ByteOrder.BIG_ENDIAN)
+            forged.putInt(invalidPayload.size)
+            forged.put(invalidPayload)
+            forged.putLong(checksum.value)
+            file.writeBytes(forged.array())
+
+            val failure = runCatching {
+                TrainingCommitJournal.read(file)
+            }.exceptionOrNull()
+            assertNotNull(failure)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun versionFourRejectsMalformedCheckpointFileFingerprint() {
         val directory = Files.createTempDirectory("argus-training-journal-v4-invalid").toFile()
         val file = File(directory, TrainingCommitJournal.FILE_NAME)
