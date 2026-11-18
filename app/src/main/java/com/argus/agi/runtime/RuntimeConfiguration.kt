@@ -73,7 +73,6 @@ internal data class RuntimeConfiguration(
     val effectiveTrainingBatchSize: Int,
     val configuredContextLength: Int,
     val effectiveContextLength: Int,
-    val trainingBatchDelayMillis: Long,
     val tensorArenaBudget: DeviceAdaptiveRuntimePolicy.TensorArenaBudget,
     val deferReason: RuntimeDeferReason?
 ) {
@@ -168,13 +167,6 @@ internal object RuntimeConfigurationPlanner {
             effectiveTrainingBatchSize = batchLimit,
             configuredContextLength = model.configuredContextLength,
             effectiveContextLength = contextLimit,
-            trainingBatchDelayMillis = DeviceAdaptiveRuntimePolicy.trainingBatchDelayMillis(
-                thermalStatus = resources.thermalStatus,
-                temperatureCelsius = resources.temperatureCelsius,
-                batteryPct = resources.batteryPct,
-                isCharging = resources.isCharging,
-                isPowerSaveMode = resources.isPowerSaveMode
-            ),
             tensorArenaBudget = calculateTensorArenaBudget(
                 deviceProfile = deviceProfile,
                 maximumAppHeapBytes = resources.maximumAppHeapBytes,

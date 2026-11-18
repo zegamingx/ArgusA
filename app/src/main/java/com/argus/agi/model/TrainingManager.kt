@@ -7,7 +7,6 @@ import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.runtime.DeviceAdaptiveRuntimePolicy
-import com.argus.agi.runtime.RuntimeConfiguration
 import com.argus.agi.runtime.RuntimeConfigurationPlanner
 import com.argus.agi.runtime.RuntimeDeferReason
 import com.argus.agi.runtime.RuntimeModelConstraints
@@ -2209,7 +2208,6 @@ class TrainingManager(
             }
 
             while (isActive && !closed) {
-                var loopRuntimeConfiguration: RuntimeConfiguration? = null
                 if (_isTrainingPaused.value) {
                     _isTrainingPaused.first { !it || closed }
                     if (closed) break
@@ -2321,7 +2319,6 @@ class TrainingManager(
                             vulkanRuntimeReady = VulkanTrainingBackend.isRuntimeAvailable,
                             fp16KernelVerified = VulkanTrainingBackend.isFp16ComputeAvailable
                         )
-                        loopRuntimeConfiguration = runtimeConfiguration
 
                         if (runtimeConfiguration.deferReason == RuntimeDeferReason.THERMAL_LIMIT) {
                             prependPersistingQueueItems(listOf(firstItem))
@@ -2434,14 +2431,13 @@ class TrainingManager(
                 }
 
                 val currentSafety = deviceGuard.safetyState.value
-                val throttleMs = loopRuntimeConfiguration?.trainingBatchDelayMillis
-                    ?: DeviceAdaptiveRuntimePolicy.trainingBatchDelayMillis(
-                        thermalStatus = currentSafety.thermalStatus,
-                        temperatureCelsius = currentSafety.temperatureCelsius,
-                        batteryPct = currentSafety.batteryPct,
-                        isCharging = currentSafety.isCharging,
-                        isPowerSaveMode = currentSafety.isPowerSaveMode
-                    )
+                val throttleMs = DeviceAdaptiveRuntimePolicy.trainingBatchDelayMillis(
+                    thermalStatus = currentSafety.thermalStatus,
+                    temperatureCelsius = currentSafety.temperatureCelsius,
+                    batteryPct = currentSafety.batteryPct,
+                    isCharging = currentSafety.isCharging,
+                    isPowerSaveMode = currentSafety.isPowerSaveMode
+                )
                 delay(throttleMs)
             }
         }
