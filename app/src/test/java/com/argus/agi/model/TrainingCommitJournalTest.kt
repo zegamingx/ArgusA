@@ -162,6 +162,52 @@ class TrainingCommitJournalTest {
     }
 
     @Test
+    fun versionThreeCommittedJournalPersistsBothFingerprintsAndTrainingResults() {
+        val directory = Files.createTempDirectory("argus-training-journal-v3-committed").toFile()
+        val file = File(directory, TrainingCommitJournal.FILE_NAME)
+        val modelFingerprint = "1234567890abcdef".repeat(4)
+        val optimizerFingerprint = OptimizerConfig.DEFAULT.fingerprint
+        val result = NeuralTrainingStepResult(
+            loss = 0.375f,
+            inputTokenCount = 18,
+            predictionTargetCount = 17,
+            contextWindowCount = 1,
+            optimizerUpdateCount = 1,
+            vocabularySize = 512
+        )
+        try {
+            TrainingCommitJournal.writeCommitted(
+                file = file,
+                baselineOptimizerStep = 40,
+                committedOptimizerStep = 41,
+                entries = listOf(
+                    TrainingCommitJournalEntry(
+                        itemId = "committed-v3",
+                        result = result,
+                        stepDurationMs = 21L
+                    )
+                ),
+                modelIdentityFingerprint = modelFingerprint,
+                optimizerConfigFingerprint = optimizerFingerprint
+            )
+
+            val bytes = file.readBytes()
+            assertEquals(
+                3,
+                java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.BIG_ENDIAN).getInt(8)
+            )
+            val restored = requireNotNull(TrainingCommitJournal.read(file))
+            assertEquals(modelFingerprint, restored.modelIdentityFingerprint)
+            assertEquals(optimizerFingerprint, restored.optimizerConfigFingerprint)
+            assertEquals(41, restored.committedOptimizerStep)
+            assertEquals("committed-v3", restored.entries.single().itemId)
+            assertEquals(result.loss, requireNotNull(restored.entries.single().result).loss, 0f)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun versionTwoCommittedJournalKeepsModelIdentityAlongsideTrainingResults() {
         val directory = Files.createTempDirectory("argus-training-journal-v2-committed").toFile()
         val file = File(directory, TrainingCommitJournal.FILE_NAME)

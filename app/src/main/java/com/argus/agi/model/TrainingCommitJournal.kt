@@ -130,7 +130,8 @@ internal object TrainingCommitJournal {
             baselineOptimizerStep = baselineOptimizerStep,
             committedOptimizerStep = committedOptimizerStep,
             entries = entries,
-            modelIdentityFingerprint = modelIdentityFingerprint
+            modelIdentityFingerprint = modelIdentityFingerprint,
+            optimizerConfigFingerprint = optimizerConfigFingerprint
         )
     }
 
