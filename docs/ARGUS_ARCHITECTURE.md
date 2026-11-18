@@ -207,16 +207,18 @@ Before serialization, CPU fallback, backend restart, or recovery, all authoritat
 
 Checkpoints must be backend- and GPU-vendor-independent. The canonical format must be versioned and validate magic, header size, architecture identity, tokenizer identity, named tensor manifest, tensor types/shapes, declared payload length, checksum, and end-of-file. Writes must use a temporary file, durable flush, atomic replacement where supported, and independent read-back verification.
 
-The current ARG4 implementation already:
+The current ARG5 implementation already:
 - stores architecture and tokenizer metadata, named model tensors, Adam first/second moments, and optimizer step;
 - serializes tensor values through a canonical float32 representation, even where in-memory model parameters use FP16;
 - validates architecture dimensions/ID, tokenizer schema/algorithm/capacity, tensor manifest, payload length, and CRC32;
 - synchronizes Vulkan model/optimizer mirrors before checkpoint serialization;
 - verifies the saved file by reading its header and streaming the payload checksum.
 
+The active implementation uses the ARG5 magic/version and persists the current checkpoint payload as described above. The current clean-break loader explicitly rejects pre-release ARG3 and ARG4 files; this is covered by `preReleaseArg3AndArg4CheckpointsAreRejectedWithoutMigration`. Therefore this branch does **not** currently provide ARG4 restore compatibility. The earlier ARG4 wording in this document was stale and must not be interpreted as a compatibility guarantee. Any future legacy restore must be an explicit versioned reader with preservation tests, not an implicit change to the ARG5 writer.
+
 The training queue transaction is separate: `TrainingCommitJournal` and Room queue state coordinate prepared/committed optimizer updates and recovery. Do not conflate the model checkpoint with queue persistence.
 
-Before claiming full training-session continuity, separately verify whether optimizer hyperparameters, learning-rate schedule position, random-number-generator/sampler state, dataset cursor, and all pending queue metadata are persisted or deterministically reconstructed. Missing state must be reported as a gap, not assumed to be in ARG4.
+Before claiming full training-session continuity, separately verify whether optimizer hyperparameters, learning-rate schedule position, random-number-generator/sampler state, dataset cursor, and all pending queue metadata are persisted or deterministically reconstructed. Missing state must be reported as a gap, not assumed to be in ARG5.
 
 A checkpoint load must reject incompatible architecture/tokenizer state without modifying the currently active model. Any future migration requires a new format/schema version and explicit compatibility tests.
 
@@ -226,7 +228,7 @@ A checkpoint load must reject incompatible architecture/tokenizer state without 
 2. **Package ownership is not yet enforced.** Device/runtime/training/backend/memory/checkpoint classes remain concentrated in `model/`. Introduce the boundaries incrementally; do not duplicate the existing policies under new names.
 3. **The device capability report is broad, but kernel coverage is narrower.** Report feature support separately from actual compiled and selected kernels. In particular, capability reporting for subgroup, integer dot product, cooperative matrix, ARM tensor, or shader-core features must not be marketed as working Argus kernels until the corresponding shader/dispatch/test path exists.
 4. **Capacity recommendations are not the training model selector.** `ArgusDeviceModelPolicy` chooses the current locally executable training family. `DeviceModelCapacityPolicy` contains much larger RAM-based parameter recommendations and explicitly is not proof that the current Argus trainer can build or train those model sizes. Keep these concepts separate until the capacity estimator is reconciled with the actual backend memory/compute implementation.
-5. **Checkpoint continuity needs a complete state inventory.** ARG4 model/optimizer tensor persistence and the queue transaction journal are substantial foundations, but they do not by themselves prove that all training-session state (schedule, RNG/sampler, dataset cursor, and pending work) is durable.
+5. **Checkpoint continuity needs a complete state inventory.** ARG5 model/optimizer tensor persistence and the queue transaction journal are substantial foundations, but they do not by themselves prove that all training-session state (schedule, RNG/sampler, dataset cursor, and pending work) is durable.
 
 ## 7. Safe migration sequence
 
@@ -256,3 +258,40 @@ The following architecture increments have since been committed to `master`:
 These are implementation increments, not completion evidence. The current changes have not yet passed a complete Android build, lint, JVM unit-test suite, native validation, or device-level validation. No merge to `main` is authorized by this status note.
 
 Remaining architecture work includes routing model operations through the backend contract where appropriate, auditing end-to-end checkpoint and training-session recovery (including schedule, RNG/sampler, dataset cursor, and pending queue state), and completing the existing M1–M10 validation sequence. The cross-GPU evidence audit remains deferred until implementation and milestone validation are complete.
+
+## 10. Training-session persistence audit
+
+This audit describes the current `master` implementation, not a claim that every item below has passed CI or device validation.
+
+### 10.1 Durable state already present
+
+- **Model and optimizer tensors:** ARG5 stores named model tensors, Adam first/second moments, and optimizer step. Tensor payload values use the checkpoint's canonical float32 representation. The tokenizer manifest and snapshot fingerprint are stored with the architecture metadata.
+- **Checkpoint integrity:** the writer uses a temporary file, flushes and syncs it, atomically replaces the destination where supported, then independently verifies header, declared length, and CRC32. The loader validates architecture dimensions/ID, tokenizer schema/algorithm/configuration/fingerprint, tensor manifest and shapes, payload length, checksum, and end-of-file before accepting the restored state.
+- **Queue and dataset position:** each `TrainingItemEntity` stores item ID, source/title/content, document ID, chunk index, total chunk count, timestamp, status, final loss, and step duration. The durable queue order and remaining rows therefore represent the materialized replay cursor; there is no separate persisted integer cursor.
+- **Batch transaction:** `TrainingCommitJournal` v1 stores PREPARED/COMMITTED state, baseline and committed optimizer steps, item IDs, per-item loss/token/context/optimizer metrics, and a CRC32. It is atomically written. `TrainingManager` writes PREPARED before optimizer mutation, COMMITTED after mutation, secures the checkpoint, and only then marks the corresponding Room rows optimizer-committed/completed.
+- **Startup recovery:** the worker reconciles the journal against the restored optimizer step before converting interrupted Room `TRAINING` rows back to `QUEUED`. It restores the remaining committed and pending rows in persisted timestamp order. A committed row is finalized without applying the optimizer update again.
+- **Validation promotion:** `ConversationalValidationPersistence` separately stores baseline/latest reports, decision/status, and an accepted checkpoint filename plus SHA-256. This is validation-promotion state, not a replacement for the training batch journal.
+
+### 10.2 RNG, replay scheduling, and cursor semantics
+
+- The active training update path does not currently use a stochastic sample selector. The engine's Kotlin `Random` calls are used for initial/new tensor weight initialization and generation sampling; generation sampling is not training sampler state. Restored weights make the initialization RNG unnecessary after a valid checkpoint exists.
+- `CorpusReplayScheduler` uses `java.util.Random(seed)` to create the complete deterministic order for the requested source snapshot, epoch count, seed, and policy. The scheduler materializes every selected chunk into queue items before worker execution. Room then persists those rows and their timestamps; restart continues the already-materialized order without needing to restore the RNG stream.
+- The replay seed, selected policy, and a distinct replay-session ID are **not** persisted as separate metadata. Epoch/chunk labels and aggregate chunk indexes are encoded in queue item metadata/title, and the ordered queue preserves execution order. This is sufficient to continue an intact materialized queue, but it is not sufficient to independently audit or regenerate the exact original replay plan after its source corpus changes.
+
+### 10.3 Remaining gaps
+
+1. **Optimizer configuration identity — PARTIAL.** The learning-rate schedule position is derivable from the checkpointed optimizer step, and the current schedule formula is deterministic. However, base learning rate, decay coefficient, weight decay, beta values, epsilon, and gradient clipping limit are currently code constants; ARG5 does not persist a versioned optimizer-configuration fingerprint. A future release changing those constants could resume the same moments/step with different update semantics without an explicit compatibility signal.
+2. **Journal-to-model identity — PARTIAL.** Journal v1 binds item IDs to optimizer-step numbers and per-item results, but it does not store `ModelStateIdentity.fingerprint`. The ARG5 loader validates the checkpoint against the active engine, but journal reconciliation itself cannot prove that a same-step checkpoint is the exact architecture/tokenizer/model identity that prepared the batch.
+3. **Replay provenance — PARTIAL.** The full queue order and chunk cursor are durable once scheduling completes, but seed, policy, epoch request, and source-snapshot fingerprint are not stored as a first-class replay-session record.
+4. **Training-session telemetry — SESSION-LOCAL.** `TrainingSessionMetrics`, loss history, active-document UI state, and transient retry counters are in-memory runtime state. They must not be presented as lifetime or crash-resumable counters unless separately reconstructed from durable queue/corpus records.
+5. **Legacy checkpoint compatibility — NOT SUPPORTED BY CURRENT CLEAN-BREAK POLICY.** ARG4 is explicitly rejected by the current ARG5 loader. Preserve this observed behavior until an explicit, tested compatibility migration is approved; do not describe ARG4 restore as implemented.
+
+### 10.4 Safe next implementation order
+
+1. Add a versioned optimizer/training configuration identity and compatibility comparison without changing the ARG5 byte layout in the first increment.
+2. Design a backward-readable journal extension that records `ModelStateIdentity.fingerprint`; continue reading journal v1 and keep its current recovery semantics, while marking legacy identity as unverified rather than inventing one.
+3. Add a durable replay-session descriptor (session ID, source snapshot fingerprint, seed, policy, epochs, and schedule format) only with a versioned Room migration and transactionally consistent enqueue path. Keep existing queue rows as the authoritative per-item cursor.
+4. Add fault-injection tests for crashes between PREPARED, optimizer mutation, COMMITTED, checkpoint replacement, Room commit, and item finalization.
+5. Only after those contracts and migrations are complete should the full build, lint, JVM/native validation, and relevant device checks run in the authorized validation sequence.
+
+Do not retrofit RNG persistence for a training sampler that does not exist. Do not break the existing queue/journal recovery path merely to add metadata.
