@@ -17,7 +17,7 @@ on:
       - "tools/native-tests/**"
       - "tools/ci/**"
       - ".github/workflows/validate-native.yml"
-      - ".github/workflows/build.yml"
+      - ".github/workflows/argus-main-release.yml"
 
 permissions:
   contents: read

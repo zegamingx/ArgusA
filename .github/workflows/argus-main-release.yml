@@ -1,4 +1,4 @@
-name: Argus Android Build
+name: Argus Main Release
 
 # Every matching main push builds, signs, and publishes the verified APK automatically.
 on:
@@ -17,7 +17,8 @@ on:
       - "tools/native-tests/**"
       - "tools/ci/**"
       - "README.md"
-      - ".github/workflows/build.yml"
+      - ".github/workflows/argus-main-release.yml"
+      - ".github/workflows/validate-native.yml"
 permissions:
   contents: read
 
