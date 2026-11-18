@@ -3898,6 +3898,7 @@ class ArgusNeuralEngine private constructor(
                 }
             }
             if (!verified) {
+                checkpointRestoreBlocked = true
                 Log.e(TAG, "ARG6 checkpoint read-back verification failed.")
             }
             verified
