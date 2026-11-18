@@ -1,24 +1,8 @@
 name: Argus Native Validation
 
 on:
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - "app/**"
-      - "gradle/**"
-      - "gradlew"
-      - "build.gradle.kts"
-      - "settings.gradle.kts"
-      - "gradle.properties"
-      - "version.properties"
-      - "tools/cmake-compat/**"
-      - "tools/native-tests/**"
-      - "tools/ci/**"
-      - ".github/workflows/validate-native.yml"
-      - ".github/workflows/build.yml"
   pull_request:
+    types: [opened, synchronize, reopened]
     branches:
       - main
     paths:
@@ -34,13 +18,12 @@ on:
       - "tools/ci/**"
       - ".github/workflows/validate-native.yml"
       - ".github/workflows/build.yml"
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: argus-native-validation-\${{ github.event.pull_request.number || github.ref }}
+  group: argus-native-validation-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -186,22 +169,22 @@ jobs:
           $gradleExitCode = $LASTEXITCODE
           if ($gradleExitCode -ne 0) { exit $gradleExitCode }
 
-      - name: Prepare escaped Android SDK metadata for lint
+      - name: Remove runner-local Android SDK metadata before lint
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
           $ErrorActionPreference = 'Stop'
-          $sdkRoot = [IO.Path]::GetFullPath($env:ANDROID_SDK_ROOT)
-          $sdkRoot = $sdkRoot.Replace([string][char]92, '/')
-          if ($sdkRoot -match '^[A-Za-z]:') {
-            $sdkRoot = $sdkRoot.Insert(1, [string][char]92)
-          }
           $localProperties = Join-Path $env:GITHUB_WORKSPACE 'local.properties'
-          [IO.File]::WriteAllText(
-            $localProperties,
-            "sdk.dir=$sdkRoot`n",
-            [Text.UTF8Encoding]::new($false)
-          )
-          Write-Host "Prepared CI-local SDK metadata from ANDROID_SDK_ROOT: $env:ANDROID_SDK_ROOT"
+          if (Test-Path -LiteralPath $localProperties) {
+            Remove-Item -LiteralPath $localProperties -Force
+          }
+          if (Test-Path -LiteralPath $localProperties) {
+            throw 'Runner-local local.properties must not be present during Android Lint.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:ANDROID_HOME) -or
+              [string]::IsNullOrWhiteSpace($env:ANDROID_SDK_ROOT)) {
+            throw 'Android SDK environment variables must be available to Gradle.'
+          }
+          Write-Host 'Gradle will resolve Android SDK from the verified machine environment.'
 
       - name: Run native build, lint and unit tests
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
