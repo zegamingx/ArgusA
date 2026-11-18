@@ -2830,7 +2830,7 @@ class ArgusNeuralEngine private constructor(
                 return Float.NaN
             }
             if (totalNorm > optimizerConfig.maximumGradientNorm) {
-                optimizerConfig.maximumGradientNorm / (totalNorm + optimizerConfig.gradientNormEpsilon)
+                optimizerConfig.maximumGradientNorm / (totalNorm + 1.0e-6f)
             } else {
                 1.0f
             }
@@ -3055,7 +3055,7 @@ class ArgusNeuralEngine private constructor(
             val clipFactor = if (clippedOnGpu) {
                 1.0f
             } else if (totalNorm > optimizerConfig.maximumGradientNorm) {
-                optimizerConfig.maximumGradientNorm / (totalNorm + optimizerConfig.gradientNormEpsilon)
+                optimizerConfig.maximumGradientNorm / (totalNorm + 1.0e-6f)
             } else {
                 1.0f
             }

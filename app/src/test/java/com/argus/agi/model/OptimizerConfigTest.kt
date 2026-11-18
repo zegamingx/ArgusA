@@ -31,7 +31,7 @@ class OptimizerConfigTest {
             OptimizerConfig.DEFAULT.copy(beta2 = 0.998f),
             OptimizerConfig.DEFAULT.copy(epsilon = 1.0e-7f),
             OptimizerConfig.DEFAULT.copy(maximumGradientNorm = 0.9f),
-            OptimizerConfig.DEFAULT.copy(gradientNormEpsilon = 2.0e-6f)
+            OptimizerConfig.DEFAULT.copy(gradientClippingPolicyId = "global_l2_after_normalization_epsilon_2e-6_v1")
         )
         variants.forEach { changed -> assertNotEquals(fingerprint, changed.fingerprint) }
     }
@@ -45,8 +45,7 @@ class OptimizerConfigTest {
             runCatching { OptimizerConfig.DEFAULT.copy(beta1 = 1f) },
             runCatching { OptimizerConfig.DEFAULT.copy(beta2 = Float.POSITIVE_INFINITY) },
             runCatching { OptimizerConfig.DEFAULT.copy(epsilon = 0f) },
-            runCatching { OptimizerConfig.DEFAULT.copy(maximumGradientNorm = -1f) },
-            runCatching { OptimizerConfig.DEFAULT.copy(gradientNormEpsilon = Float.NaN) }
+            runCatching { OptimizerConfig.DEFAULT.copy(maximumGradientNorm = -1f) }
         )
         invalid.forEach { result -> assertNotNull(result.exceptionOrNull()) }
     }

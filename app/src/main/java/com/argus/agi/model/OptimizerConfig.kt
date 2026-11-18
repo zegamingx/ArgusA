@@ -15,7 +15,7 @@ internal data class OptimizerConfig(
     val algorithmId: String = "adamw",
     val learningRateScheduleId: String = "inverse_time_decay_v1",
     val gradientNormalizationPolicyId: String = "mean_by_valid_targets_v1",
-    val gradientClippingPolicyId: String = "global_l2_after_normalization_v1",
+    val gradientClippingPolicyId: String = "global_l2_after_normalization_epsilon_1e-6_v1",
     val weightDecayPolicyId: String = "transformer_projection_weights_only_v1",
     val baseLearningRate: Float = 0.005f,
     val learningRateDecay: Float = 0.0002f,
@@ -23,8 +23,7 @@ internal data class OptimizerConfig(
     val beta1: Float = 0.9f,
     val beta2: Float = 0.999f,
     val epsilon: Float = 1.0e-8f,
-    val maximumGradientNorm: Float = 1.0f,
-    val gradientNormEpsilon: Float = 1.0e-6f
+    val maximumGradientNorm: Float = 1.0f
 ) {
     init {
         require(schemaVersion > 0)
@@ -40,7 +39,6 @@ internal data class OptimizerConfig(
         require(beta2.isFinite() && beta2 >= 0f && beta2 < 1f)
         require(epsilon.isFinite() && epsilon > 0f)
         require(maximumGradientNorm.isFinite() && maximumGradientNorm > 0f)
-        require(gradientNormEpsilon.isFinite() && gradientNormEpsilon > 0f)
     }
 
     /** Stable SHA-256 identity; float values use raw IEEE-754 bits, not decimal text. */
@@ -59,8 +57,7 @@ internal data class OptimizerConfig(
             append(beta1.toStableBits()).append('\n')
             append(beta2.toStableBits()).append('\n')
             append(epsilon.toStableBits()).append('\n')
-            append(maximumGradientNorm.toStableBits()).append('\n')
-            append(gradientNormEpsilon.toStableBits())
+            append(maximumGradientNorm.toStableBits())
         }
         MessageDigest.getInstance("SHA-256")
             .digest(canonical.toByteArray(StandardCharsets.UTF_8))
