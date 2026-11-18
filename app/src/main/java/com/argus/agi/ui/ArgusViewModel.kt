@@ -14,6 +14,7 @@ import com.argus.agi.model.GenesisLifecycleStage
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.TextModalityProcessor
+import com.argus.agi.model.Tokenizer
 import com.argus.agi.model.ReasoningOutputParser
 import com.argus.agi.model.TrainingSessionMetrics
 import com.argus.agi.model.WorldEntity
@@ -478,13 +479,17 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     .filter { it.text.isNotBlank() }
                 val multiTurnPrompt = buildString {
                     if (worldSummary.isNotBlank()) {
-                        append("<SYSTEM> ").append(worldSummary.take(120)).append(" ")
+                        append("<SYSTEM> ").append(Tokenizer.escapeLiteralControlTokens(worldSummary.take(120))).append(" ")
                     }
                     priorMessages.forEach { msg ->
-                        if (msg.isUser) append("<USER> ").append(msg.text).append(" ")
-                        else append("<ASSISTANT> ").append(msg.text).append(" <EOS> ")
+                        if (msg.isUser) {
+                            append("<USER> ").append(Tokenizer.escapeLiteralControlTokens(msg.text)).append(" ")
+                        } else {
+                            append("<ASSISTANT> ").append(Tokenizer.escapeLiteralControlTokens(msg.text))
+                                .append(" <EOS> ")
+                        }
                     }
-                    append("<USER> ").append(text).append(" <ASSISTANT>")
+                    append("<USER> ").append(Tokenizer.escapeLiteralControlTokens(text)).append(" <ASSISTANT>")
                 }
 
                 val explicitWebQuery = WebSearchIntentRouter.extractQuery(text)

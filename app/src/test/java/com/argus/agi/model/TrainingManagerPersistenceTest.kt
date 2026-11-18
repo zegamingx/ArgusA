@@ -180,7 +180,7 @@ class TrainingManagerPersistenceTest {
                     loraRank = 2,
                     tokenizerConfig = TokenizerConfig(
                         maxVocabularySize = 512,
-                        maxTokenLength = 16
+                        maxTokenLength = 32
                     )
                 )
             )

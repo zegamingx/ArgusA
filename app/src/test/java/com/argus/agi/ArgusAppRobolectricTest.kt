@@ -120,40 +120,33 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun arg3CheckpointPreservesSavedArchitectureAndTokenizerContract() {
+    fun preReleaseCheckpointFallsBackToCurrentDeviceAndBpeContract() {
         val checkpoint = java.io.File(context.filesDir, "argus_model_weights.bin")
         val previousBytes = checkpoint.takeIf { it.isFile }?.readBytes()
 
         try {
-            val header = ByteBuffer.allocate(48).order(ByteOrder.LITTLE_ENDIAN)
-            header.put(byteArrayOf(0x41, 0x52, 0x47, 0x33))
-            header.putInt(3)
-            header.putInt(96)
-            header.putInt(4)
-            header.putInt(384)
-            header.putInt(128)
-            header.putInt(4)
-            header.putInt(120)
-            header.putInt(160)
-            header.putInt(25)
-            header.putInt(0)
-            header.position(48)
-            checkpoint.writeBytes(header.array())
+            val legacyHeader = ByteBuffer.allocate(48).order(ByteOrder.LITTLE_ENDIAN)
+            legacyHeader.put(byteArrayOf(0x41, 0x52, 0x47, 0x33))
+            legacyHeader.putInt(3)
+            checkpoint.writeBytes(legacyHeader.array())
 
             val resolved = ArgusNeuralEngine.resolveConfig(
                 context = context,
                 totalRamGb = 4,
-                maxHeapMb = 192L
+                maxHeapMb = 192L,
+                availableRamGb = 4.0f,
+                cpuCores = 4
             )
 
-            assertEquals(96, resolved.dModel)
+            assertEquals(ArgusDeviceModelTier.COMPACT, resolved.modelTier)
+            assertEquals(128, resolved.dModel)
             assertEquals(4, resolved.nHeads)
             assertEquals(384, resolved.dFf)
-            assertEquals(128, resolved.maxSeqLen)
+            assertEquals(64, resolved.maxSeqLen)
             assertEquals(4, resolved.loraRank)
-            assertEquals(160, resolved.initialVocabularyCapacity)
+            assertEquals(1_024, resolved.initialVocabularyCapacity)
             assertEquals(
-                ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
+                ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V1,
                 resolved.tokenizerConfig.algorithm
             )
         } finally {
@@ -191,37 +184,44 @@ class ArgusAppRobolectricTest {
         val id2 = tokenizer.registerToken("beta")
         assertTrue("Monotonic IDs should be unique", id1 != id2)
 
-        // Same token returns existing ID
         assertEquals(id1, tokenizer.registerToken("alpha"))
 
-        // Attempting to assign an existing ID to a different token must throw IllegalArgumentException
         try {
             tokenizer.registerToken("gamma", id1)
-            fail("Should throw IllegalArgumentException when registering token with already assigned ID")
-        } catch (_: IllegalArgumentException) {}
+            fail("Should throw IllegalArgumentException when registering token with an occupied ID")
+        } catch (_: IllegalArgumentException) {
+        }
     }
 
     @Test
     fun testTokenizerImportVocabValidation() {
-        val tokenizer = Tokenizer(
-            TokenizerConfig(algorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1)
-        )
-        val validEntries = listOf(
-            Pair("test1", 10),
-            Pair("test2", 11)
-        )
-        tokenizer.importVocab(validEntries)
-        assertEquals(10, tokenizer.encode("test1").first())
+        val source = Tokenizer()
+        val canonicalEntries = source.exportVocab()
+        assertEquals(288, canonicalEntries.size)
 
-        // Duplicate IDs in import must be rejected
-        val duplicateIdEntries = listOf(
-            Pair("dup1", 20),
-            Pair("dup2", 20)
-        )
-        try {
-            tokenizer.importVocab(duplicateIdEntries)
-            fail("Should throw IllegalArgumentException on duplicate IDs in importVocab")
-        } catch (_: IllegalArgumentException) {}
+        val restored = Tokenizer()
+        restored.importVocab(canonicalEntries)
+        assertEquals(canonicalEntries, restored.exportVocab())
+        val sample = "Argus byte-level vocabulary round trip 🎯"
+        assertArrayEquals(source.encodeToIds(sample), restored.encodeToIds(sample))
+
+        val duplicateIdEntries = canonicalEntries.mapIndexed { index, entry ->
+            if (index == 1) entry.first to canonicalEntries.first().second else entry
+        }
+        val duplicateIdFailure = runCatching {
+            restored.importVocab(duplicateIdEntries)
+        }.exceptionOrNull()
+        assertTrue(duplicateIdFailure is IllegalArgumentException)
+        assertEquals(canonicalEntries, restored.exportVocab())
+
+        val duplicateTokenEntries = canonicalEntries.mapIndexed { index, entry ->
+            if (index == 1) canonicalEntries.first().first to entry.second else entry
+        }
+        val duplicateTokenFailure = runCatching {
+            restored.importVocab(duplicateTokenEntries)
+        }.exceptionOrNull()
+        assertTrue(duplicateTokenFailure is IllegalArgumentException)
+        assertEquals(canonicalEntries, restored.exportVocab())
     }
 
     @Test

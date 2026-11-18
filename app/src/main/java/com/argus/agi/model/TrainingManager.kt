@@ -1634,7 +1634,7 @@ class TrainingManager(
     fun enqueueData(source: String, title: String, content: String) {
         if (content.isBlank() || closed) return
 
-        if (neuralEngine.tokenizer.encode(content, autoRegister = false).size > 380) {
+        if (neuralEngine.tokenizer.encodeToIds(content, autoRegister = false).size > 380) {
             scope.launch {
                 runSuspendCatching { enqueueDocument(source, title, content) }
                     .onFailure { error ->
@@ -2874,7 +2874,7 @@ class TrainingManager(
             .map { it.groupValues[1] }
             .toList()
         val reasoningTokenCount = reasoningSpans.sumOf { reasoningText ->
-            neuralEngine.tokenizer.encode(reasoningText, autoRegister = false).size.toLong()
+            neuralEngine.tokenizer.encodeToIds(reasoningText, autoRegister = false).size.toLong()
         }
         val finished = item.copy(
             status = TrainingStatus.COMPLETED,

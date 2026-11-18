@@ -15,7 +15,7 @@ concurrency:
 jobs:
   build-release:
     if: >-
-      (startsWith(github.event.release.tag_name, 'v') || github.event.release.tag_name == 'Release') &&
+      startsWith(github.event.release.tag_name, 'v') &&
       github.event.release.tag_name != 'v1.0.6'
     name: Lint, test, sign and publish APK
     runs-on: ubuntu-24.04
@@ -100,8 +100,8 @@ jobs:
           patch="$(awk -F= '$1 == "VERSION_PATCH" { print $2 }' version.properties)"
           expected_tag="v${major}.${minor}.${patch}"
 
-          if [[ "${release_tag}" != "${expected_tag}" && "${release_tag}" != "Release" ]]; then
-            echo "::error::Release tag ${release_tag} does not match version.properties (${expected_tag}) or 'Release'."
+          if [[ "${release_tag}" != "${expected_tag}" ]]; then
+            echo "::error::Release tag ${release_tag} does not match version.properties (${expected_tag})."
             exit 1
           fi
 

@@ -124,6 +124,17 @@ android {
     }
 }
 
+// Android Lint reads machine-local files such as local.properties, but AGP does
+// not consistently model those files as lint task inputs. Reusing a cached
+// PropertyEscape result can therefore analyse a different runner SDK path.
+// Re-run only Lint tasks on every validation; keep compile/native/test tasks cacheable.
+tasks.configureEach {
+    if (name.startsWith("lint")) {
+        outputs.cacheIf("Lint consumes machine-local Android SDK metadata.") { false }
+        outputs.upToDateWhen { false }
+    }
+}
+
 // Android local unit-test tasks run on the JUnit Platform. Vintage keeps the
 // existing JUnit 4 Robolectric runners operational while Jupiter 6 is available
 // for new tests and gradual migration.

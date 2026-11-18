@@ -1,21 +1,8 @@
 name: Argus Native Validation
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "app/**"
-      - "gradle/**"
-      - "gradlew"
-      - "build.gradle.kts"
-      - "settings.gradle.kts"
-      - "gradle.properties"
-      - "version.properties"
-      - "tools/cmake-compat/**"
-      - "tools/native-tests/**"
-      - ".github/workflows/validate-native.yml"
   pull_request:
+    types: [opened, synchronize, reopened]
     branches:
       - main
     paths:
@@ -28,8 +15,9 @@ on:
       - "version.properties"
       - "tools/cmake-compat/**"
       - "tools/native-tests/**"
+      - "tools/ci/**"
       - ".github/workflows/validate-native.yml"
-  workflow_dispatch:
+      - ".github/workflows/build.yml"
 
 permissions:
   contents: read

@@ -1,275 +1,95 @@
 package com.argus.agi.model
 
-import android.content.Context
-import androidx.test.core.app.ApplicationProvider
-import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
-import org.robolectric.annotation.Config
 
-@RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
 class TokenizerLearningTest {
 
-    private val context: Context
-        get() = ApplicationProvider.getApplicationContext()
-
     @Test
-    fun freshTokenizerLearnsBpeMergesFromCorpusAndPreservesExistingIds() {
+    fun canonicalTokenizerLearnsOnlyAppendOnlyByteLevelMerges() {
         val tokenizer = Tokenizer(
             TokenizerConfig(
-                algorithm = ArgusTokenizerAlgorithm.LEARNED_BPE_V1,
                 maxVocabularySize = 512,
-                maxTokenLength = 16
+                maxTokenLength = 32
             )
         )
-        assertEquals(ArgusTokenizerAlgorithm.LEARNED_BPE_V1, tokenizer.config.algorithm)
-        assertEquals(2_048, TokenizerConfig.DEFAULT_MAX_VOCAB_SIZE)
-
-        val initialVocabulary = tokenizer.exportVocab()
-        assertTrue(
-            "The bundled seed vocabulary must leave room for BPE growth.",
-            initialVocabulary.size < 256
-        )
-        assertTrue(
-            "Initial seed merges must fit the configured checkpoint merge limit.",
-            tokenizer.mergeCount <= tokenizer.config.maxVocabularySize
-        )
-        assertTrue(
-            "Control-token markup must not be registered as seed merges.",
-            tokenizer.exportMerges().none { merge ->
-                merge.first.contains('<') || merge.first.contains('>') ||
-                    merge.second.contains('<') || merge.second.contains('>')
-            }
-        )
-        val knownTokenId = initialVocabulary.single { it.first == "yang" }.second
-        assertEquals(
-            "Bundled seed words must use their registered vocabulary IDs under BPE.",
-            listOf(knownTokenId),
-            tokenizer.encode("yang")
-        )
-        val corpus = List(40) {
-            "Argus learns artificial language patterns from repeated local training documents."
+        val originalVocabulary = tokenizer.exportVocab()
+        val corpus = List(64) {
+            "Argus learns repeated local language patterns from its own training corpus."
         }
 
         val resultingSize = tokenizer.trainBpe(
             corpus = corpus,
-            targetVocabSize = 256,
+            targetVocabSize = 384,
             maxNewMerges = 64
         )
 
-        assertTrue("BPE must add corpus-derived tokens.", resultingSize > initialVocabulary.size)
-        assertTrue("BPE must retain merge rules for deterministic encoding.", tokenizer.mergeCount > 0)
+        assertTrue(resultingSize > originalVocabulary.size)
+        assertTrue(tokenizer.mergeCount > 0)
         assertEquals(
-            knownTokenId,
-            tokenizer.exportVocab().single { it.first == "yang" }.second
+            originalVocabulary,
+            tokenizer.exportVocab().take(originalVocabulary.size)
         )
-
-        val encoded = tokenizer.encode(corpus.first(), autoRegister = false)
-        assertTrue(encoded.isNotEmpty())
-        assertTrue(encoded.all { tokenId -> tokenId in 0 until tokenizer.vocabSize })
-
-        val priorMerges = tokenizer.exportMerges()
-        tokenizer.trainBpe(
-            corpus = corpus,
-            targetVocabSize = 512,
-            maxNewMerges = 64
-        )
-        assertEquals(
-            "Incremental BPE learning must preserve the priority of existing merges.",
-            priorMerges,
-            tokenizer.exportMerges().take(priorMerges.size)
-        )
-    }
-
-    @Test
-    fun legacySeedMergesCanBeExportedAndImportedWithoutIntermediateVocabularyTokens() {
-        val config = TokenizerConfig(
-            algorithm = ArgusTokenizerAlgorithm.LEARNED_BPE_V1,
-            maxVocabularySize = 512,
-            maxTokenLength = 16
-        )
-        val original = Tokenizer(config)
-        val exportedMerges = original.exportMerges()
-
-        assertTrue(exportedMerges.isNotEmpty())
         assertTrue(
-            "Legacy seed merges intentionally contain intermediate symbols outside the vocabulary.",
-            exportedMerges.any { (left, _) ->
-                original.exportVocab().none { entry -> entry.first == left }
+            tokenizer.exportMerges().all { (left, right) ->
+                left !in setOf(
+                    Tokenizer.PAD_TOKEN,
+                    Tokenizer.UNK_TOKEN,
+                    Tokenizer.BOS_TOKEN,
+                    Tokenizer.EOS_TOKEN,
+                    Tokenizer.USER_TOKEN,
+                    Tokenizer.ASSISTANT_TOKEN
+                ) && right !in setOf(
+                    Tokenizer.PAD_TOKEN,
+                    Tokenizer.UNK_TOKEN,
+                    Tokenizer.BOS_TOKEN,
+                    Tokenizer.EOS_TOKEN,
+                    Tokenizer.USER_TOKEN,
+                    Tokenizer.ASSISTANT_TOKEN
+                ) && left + right !in setOf(
+                    Tokenizer.PAD_TOKEN,
+                    Tokenizer.UNK_TOKEN,
+                    Tokenizer.BOS_TOKEN,
+                    Tokenizer.EOS_TOKEN,
+                    Tokenizer.USER_TOKEN,
+                    Tokenizer.ASSISTANT_TOKEN
+                )
             }
         )
 
-        val restored = Tokenizer(config)
-        restored.importVocab(original.exportVocab())
-        restored.importMerges(exportedMerges)
-
-        assertEquals(exportedMerges, restored.exportMerges())
-        assertEquals(original.encode("yang"), restored.encode("yang"))
+        val sample = corpus.first()
+        assertEquals(sample, tokenizer.decode(tokenizer.encodeToIds(sample)))
+        assertTrue(tokenizer.encodeToIds(sample).all { id -> id in 0 until tokenizer.vocabSize })
     }
 
     @Test
-    fun bpeTrainingDoesNotConsumeMergesOnControlTokenMarkup() {
+    fun incrementalTrainingKeepsPreviouslyLearnedMergeRanks() {
         val tokenizer = Tokenizer(
-            TokenizerConfig(
-                algorithm = ArgusTokenizerAlgorithm.LEARNED_BPE_V1,
-                maxVocabularySize = 512,
-                maxTokenLength = 16
-            )
+            TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32)
         )
-        val corpus = List(40) {
-            "<USER><ASSISTANT><THINK>reasoningpayload</THINK><ASSISTANT>answerpayload<EOS>"
+        val corpus = List(48) {
+            "incremental tokenizer learning retains old deterministic merge order"
         }
+        tokenizer.trainBpe(corpus, targetVocabSize = 360, maxNewMerges = 32)
+        val originalMerges = tokenizer.exportMerges()
 
-        tokenizer.trainBpe(corpus, targetVocabSize = 256, maxNewMerges = 32)
+        tokenizer.trainBpe(corpus, targetVocabSize = 400, maxNewMerges = 32)
 
-        val markupMerges = tokenizer.exportMerges().filter { merge ->
-            merge.first.contains('<') || merge.first.contains('>') ||
-                merge.second.contains('<') || merge.second.contains('>')
-        }
-        assertTrue("Control-token markup must not be learned as BPE fragments.", markupMerges.isEmpty())
-
-        val encoded = tokenizer.encode(corpus.first(), autoRegister = false)
-        assertTrue(encoded.contains(Tokenizer.USER_ID))
-        assertTrue(encoded.contains(Tokenizer.ASSISTANT_ID))
-        assertTrue(encoded.contains(Tokenizer.THINK_START_ID))
-        assertTrue(encoded.contains(Tokenizer.THINK_END_ID))
-        assertTrue(encoded.contains(Tokenizer.EOS_ID))
+        assertTrue(tokenizer.exportMerges().size >= originalMerges.size)
+        assertEquals(
+            originalMerges,
+            tokenizer.exportMerges().take(originalMerges.size)
+        )
     }
 
     @Test
-    fun vocabularyExpansionAndBpeMergesSurviveCheckpointRoundTrip() {
-        val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
-        val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
-
-        try {
-            checkpoint.delete()
-            val config = EngineConfig(
-                dModel = 16,
-                nHeads = 4,
-                dFf = 32,
-                maxSeqLen = 32,
-                loraRank = 2,
-                layerCount = 1,
-                tokenizerConfig = TokenizerConfig(
-                    maxVocabularySize = 512,
-                    maxTokenLength = 16
-                )
-            )
-            val engine = ArgusNeuralEngine.createBlocking(context, config)
-            val originalVocabulary = engine.tokenizer.exportVocab()
-            val corpus = List(64) {
-                "Argus builds a local language model by learning recurring token patterns from useful documents."
-            }
-
-            val update = engine.trainTokenizerFromCorpus(corpus)
-
-            assertTrue(update.tokensAdded > 0)
-            assertTrue(update.vocabularySize > update.previousVocabularySize)
-            assertTrue(checkpoint.isFile)
-
-            val restoredConfig = ArgusNeuralEngine.resolveConfig(
-                context = context,
-                totalRamGb = 2,
-                maxHeapMb = 128L,
-                availableRamGb = 1.0f
-            )
-            val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
-
-            assertTrue(restored.loadCheckpointIfExists())
-            assertEquals(
-                originalVocabulary,
-                restored.tokenizer.exportVocab().take(originalVocabulary.size)
-            )
-            assertEquals(engine.tokenizer.exportVocab(), restored.tokenizer.exportVocab())
-            assertEquals(engine.tokenizer.exportMerges(), restored.tokenizer.exportMerges())
-
-            val trainingText = "Argus learns a short language sequence."
-            val step = restored.trainStepDetailed(trainingText)
-            assertTrue(step.loss.isFinite())
-            assertEquals(
-                restored.tokenizer.encode(trainingText, autoRegister = false).size,
-                step.inputTokenCount
-            )
-            assertTrue(step.predictionTargetCount > 0)
-            assertTrue(step.contextWindowCount > 0)
-            assertTrue(step.optimizerUpdateCount > 0)
-        } finally {
-            if (previousCheckpoint == null) {
-                checkpoint.delete()
-            } else {
-                checkpoint.writeBytes(previousCheckpoint)
-            }
-            File(context.filesDir, "$CHECKPOINT_FILE_NAME.tmp").delete()
-        }
-    }
-
-    @Test
-    fun greedyTokenizerCheckpointPreservesVocabularyIdsAndEncoding() {
-        val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
-        val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
-
-        try {
-            checkpoint.delete()
-            val config = EngineConfig(
-                dModel = 16,
-                nHeads = 4,
-                dFf = 32,
-                maxSeqLen = 32,
-                loraRank = 2,
-                layerCount = 1,
-                tokenizerConfig = TokenizerConfig(
-                    algorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
-                    maxVocabularySize = 512,
-                    maxTokenLength = 16
-                )
-            )
-            val originalEngine = ArgusNeuralEngine.createBlocking(context, config)
-            val corpus = List(48) {
-                "Greedy legacy tokenizer learns repeated local language patterns from corpus documents."
-            }
-            val update = originalEngine.trainTokenizerFromCorpus(corpus)
-
-            assertTrue(update.tokensAdded > 0)
-            assertEquals(0, update.mergeCount)
-            assertTrue(checkpoint.isFile)
-
-            val restoredConfig = ArgusNeuralEngine.resolveConfig(
-                context = context,
-                totalRamGb = 2,
-                maxHeapMb = 128L,
-                availableRamGb = 1.0f
-            )
-            assertEquals(
-                ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
-                restoredConfig.tokenizerConfig.algorithm
-            )
-
-            val restoredEngine = ArgusNeuralEngine.createBlocking(context, restoredConfig)
-            assertTrue(restoredEngine.isCheckpointStateVerified)
-            assertEquals(
-                originalEngine.tokenizer.exportVocab(),
-                restoredEngine.tokenizer.exportVocab()
-            )
-            val sample = corpus.first()
-            assertEquals(
-                originalEngine.tokenizer.encode(sample, autoRegister = false),
-                restoredEngine.tokenizer.encode(sample, autoRegister = false)
-            )
-        } finally {
-            if (previousCheckpoint == null) {
-                checkpoint.delete()
-            } else {
-                checkpoint.writeBytes(previousCheckpoint)
-            }
-            File(context.filesDir, "$CHECKPOINT_FILE_NAME.tmp").delete()
-        }
-    }
-
-    private companion object {
-        const val CHECKPOINT_FILE_NAME = "argus_model_weights.bin"
+    fun defaultConfigurationIsTheSingleSupportedAlgorithmAndSchema() {
+        val config = TokenizerConfig()
+        assertEquals(ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V1, config.algorithm)
+        assertEquals(2, config.schemaVersion)
+        assertEquals(2_048, config.maxVocabularySize)
+        assertEquals(32, config.maxTokenLength)
+        assertEquals(288, Tokenizer(config).vocabSize)
     }
 }

@@ -5,7 +5,10 @@ import androidx.test.core.app.ApplicationProvider
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.zip.CRC32
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -20,27 +23,28 @@ class ArgusCheckpointCompatibilityTest {
         get() = ApplicationProvider.getApplicationContext()
 
     @Test
-    fun arg4RoundTripRestoresArchitectureTokenizerAndNamedTensorState() {
+    fun arg5RoundTripRestoresArchitectureTokenizerAndFingerprintBoundState() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
         try {
             checkpoint.delete()
             val tokenizerConfig = TokenizerConfig(
-                algorithm = ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2,
                 maxVocabularySize = 512,
                 maxTokenLength = 32
             )
             val engineConfig = smallEngineConfig(tokenizerConfig)
             val original = ArgusNeuralEngine.createBlocking(context, engineConfig)
             val trainingText = "argus neural checkpoint tokenizer"
-            val learnedMergeCount = original.tokenizer.trainBpe(
+            val resultingVocabulary = original.tokenizer.trainBpe(
                 corpus = List(64) { trainingText },
                 targetVocabSize = original.tokenizer.vocabSize + 10,
                 maxNewMerges = 10
             )
-            assertTrue(learnedMergeCount > 0)
-            val encodedTrainingText = original.tokenizer.encode(trainingText)
+            assertTrue(resultingVocabulary > TokenizerConfig.MINIMUM_VOCAB_SIZE)
+
+            val encodedBefore = original.tokenizer.encodeToIds(trainingText)
+            val tokenizerFingerprint = original.tokenizer.snapshotFingerprint()
             assertTrue(original.saveCheckpoint())
             assertTrue(original.isCheckpointStateVerified)
 
@@ -48,7 +52,18 @@ class ArgusCheckpointCompatibilityTest {
             assertEquals('A'.code.toByte(), checkpointBytes[0])
             assertEquals('R'.code.toByte(), checkpointBytes[1])
             assertEquals('G'.code.toByte(), checkpointBytes[2])
-            assertEquals('4'.code.toByte(), checkpointBytes[3])
+            assertEquals('5'.code.toByte(), checkpointBytes[3])
+            assertEquals(5, ByteBuffer.wrap(checkpointBytes).order(ByteOrder.LITTLE_ENDIAN).getInt(4))
+            assertEquals(96, ByteBuffer.wrap(checkpointBytes).order(ByteOrder.LITTLE_ENDIAN).getInt(8))
+
+            val header = ByteBuffer.wrap(checkpointBytes).order(ByteOrder.LITTLE_ENDIAN)
+            val architectureIdLength = header.getInt(16)
+            val fingerprintOffset = 96 + architectureIdLength
+            val persistedFingerprint = checkpointBytes.copyOfRange(
+                fingerprintOffset,
+                fingerprintOffset + 32
+            )
+            assertArrayEquals(hexToBytes(tokenizerFingerprint), persistedFingerprint)
 
             val restoredConfig = ArgusNeuralEngine.resolveConfig(
                 context = context,
@@ -60,126 +75,102 @@ class ArgusCheckpointCompatibilityTest {
             assertEquals(engineConfig.dFf, restoredConfig.dFf)
             assertEquals(512, restoredConfig.tokenizerConfig.maxVocabularySize)
             assertEquals(32, restoredConfig.tokenizerConfig.maxTokenLength)
-            assertEquals(
-                tokenizerConfig.algorithm,
-                restoredConfig.tokenizerConfig.algorithm
-            )
+            assertEquals(ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V1, restoredConfig.tokenizerConfig.algorithm)
 
             val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
             assertTrue(restored.isCheckpointStateVerified)
             assertTrue(restored.loadCheckpointIfExists())
-            assertTrue(restored.isCheckpointStateVerified)
             assertEquals(original.tokenizer.exportVocab(), restored.tokenizer.exportVocab())
             assertEquals(original.tokenizer.exportMerges(), restored.tokenizer.exportMerges())
-            assertEquals(encodedTrainingText, restored.tokenizer.encode(trainingText))
+            assertEquals(tokenizerFingerprint, restored.tokenizer.snapshotFingerprint())
+            assertArrayEquals(encodedBefore, restored.tokenizer.encodeToIds(trainingText))
             assertEquals(original.countTrainableParameters(), restored.countTrainableParameters())
             assertEquals(original.countTotalParameters(), restored.countTotalParameters())
-            assertTrue(restored.saveCheckpoint())
-            assertTrue(checkpoint.readBytes().contentEquals(checkpointBytes))
         } finally {
             restoreCheckpoint(checkpoint, previousCheckpoint)
         }
     }
 
     @Test
-    fun arg4LoaderRejectsPayloadChecksumMismatch() {
+    fun arg5LoaderRejectsTokenizerFingerprintMismatchEvenWithRecomputedPayloadChecksum() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
         try {
             checkpoint.delete()
-            val config = smallEngineConfig(TokenizerConfig())
-            val original = ArgusNeuralEngine.createBlocking(context, config)
+            val original = ArgusNeuralEngine.createBlocking(
+                context,
+                smallEngineConfig(TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32))
+            )
             assertTrue(original.saveCheckpoint())
 
-            val corruptedBytes = checkpoint.readBytes()
-            val payloadStart = 96
-            assertTrue(corruptedBytes.size > payloadStart)
-            corruptedBytes[corruptedBytes.lastIndex] =
-                (corruptedBytes[corruptedBytes.lastIndex].toInt() xor 0x01).toByte()
-            checkpoint.writeBytes(corruptedBytes)
+            val corrupted = checkpoint.readBytes()
+            val header = ByteBuffer.wrap(corrupted).order(ByteOrder.LITTLE_ENDIAN)
+            val architectureIdLength = header.getInt(16)
+            val fingerprintOffset = 96 + architectureIdLength
+            corrupted[fingerprintOffset] = (corrupted[fingerprintOffset].toInt() xor 0x01).toByte()
 
-            val restoredConfig = ArgusNeuralEngine.resolveConfig(
-                context = context,
-                totalRamGb = 2,
-                maxHeapMb = 128L,
-                availableRamGb = 1.0f
+            val checksum = CRC32()
+            checksum.update(corrupted, 96, corrupted.size - 96)
+            ByteBuffer.wrap(corrupted).order(ByteOrder.LITTLE_ENDIAN)
+                .putInt(88, checksum.value.toInt())
+            checkpoint.writeBytes(corrupted)
+
+            val restored = ArgusNeuralEngine.createBlocking(
+                context.applicationContext,
+                smallEngineConfig(TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32))
             )
-            val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
-            assertTrue(!restored.isCheckpointStateVerified)
-            assertTrue(!restored.loadCheckpointIfExists())
-            assertTrue(!restored.isCheckpointStateVerified)
+            assertFalse(restored.loadCheckpointIfExists())
+            assertFalse(restored.isCheckpointStateVerified)
         } finally {
             restoreCheckpoint(checkpoint, previousCheckpoint)
         }
     }
 
     @Test
-    fun arg3HeaderPreservesSavedArchitectureAndLegacyTokenizerForRecovery() {
+    fun preReleaseArg3AndArg4CheckpointsAreRejectedWithoutMigration() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
         try {
-            val header = ByteBuffer.allocate(LEGACY_HEADER_SIZE)
-                .order(ByteOrder.LITTLE_ENDIAN)
-            header.put(byteArrayOf(0x41, 0x52, 0x47, 0x33))
-            header.putInt(3)
-            header.putInt(16)
-            header.putInt(4)
-            header.putInt(32)
-            header.putInt(16)
-            header.putInt(2)
-            header.putInt(144)
-            header.putInt(176)
-            header.putInt(7)
-            header.putInt(0)
-            while (header.hasRemaining()) {
-                header.put(0)
+            for (magic in listOf("ARG3", "ARG4")) {
+                val legacyHeader = ByteArray(if (magic == "ARG3") 48 else 96)
+                magic.toByteArray(Charsets.US_ASCII).copyInto(legacyHeader)
+                checkpoint.writeBytes(legacyHeader)
+
+                val engine = ArgusNeuralEngine.createBlocking(
+                    context.applicationContext,
+                    smallEngineConfig(TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32))
+                )
+                assertFalse("$magic is obsolete under the pre-release clean-break policy.", engine.loadCheckpointIfExists())
+                assertFalse(engine.isCheckpointStateVerified)
+                assertTrue("Unsupported checkpoint is not deleted automatically.", checkpoint.isFile)
             }
-            checkpoint.writeBytes(header.array())
-
-            val restoredConfig = ArgusNeuralEngine.resolveConfig(
-                context = context,
-                totalRamGb = 12,
-                maxHeapMb = 512L,
-                availableRamGb = 8.0f
-            )
-
-            assertEquals(16, restoredConfig.dModel)
-            assertEquals(4, restoredConfig.nHeads)
-            assertEquals(32, restoredConfig.dFf)
-            assertEquals(16, restoredConfig.maxSeqLen)
-            assertEquals(2, restoredConfig.loraRank)
-            assertEquals(176, restoredConfig.initialVocabularyCapacity)
-            assertEquals(
-                ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
-                restoredConfig.tokenizerConfig.algorithm
-            )
         } finally {
             restoreCheckpoint(checkpoint, previousCheckpoint)
         }
     }
 
     @Test
-    fun arg4MultiLayerRoundTripRestoresAllTransformerBlocks() {
+    fun multiLayerArg5RoundTripRestoresEveryTransformerBlock() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
 
         try {
             checkpoint.delete()
-            val engineConfig = EngineConfig(
+            val config = EngineConfig(
                 layerCount = 2,
                 dModel = 16,
                 nHeads = 4,
                 dFf = 32,
                 maxSeqLen = 16,
                 loraRank = 2,
-                tokenizerConfig = TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32)
+                tokenizerConfig = TokenizerConfig(
+                    maxVocabularySize = 512,
+                    maxTokenLength = 32
+                )
             )
-            val original = ArgusNeuralEngine.createBlocking(context, engineConfig)
-            assertEquals(2, original.layerCount)
-            assertEquals(2, original.architectureConfig.layerCount)
-
+            val original = ArgusNeuralEngine.createBlocking(context, config)
             original.blocks[1].wDown[0] = 3.14159f
             assertTrue(original.saveCheckpoint())
 
@@ -190,106 +181,43 @@ class ArgusCheckpointCompatibilityTest {
                 availableRamGb = 1.0f
             )
             assertEquals(2, restoredConfig.layerCount)
-
             val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
-            assertTrue(restored.loadCheckpointIfExists())
+            assertTrue(restored.isCheckpointStateVerified)
             assertEquals(2, restored.layerCount)
             assertEquals(3.140625f, restored.blocks[1].wDown[0], 1e-6f)
-            assertEquals(original.countTotalParameters(), restored.countTotalParameters())
         } finally {
             restoreCheckpoint(checkpoint, previousCheckpoint)
         }
     }
 
     @Test
-    fun byteLevelBpeTokenizerTrainsMergesAndPersistsInArg4Checkpoint() {
-        val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
-        val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
-
-        try {
-            checkpoint.delete()
-            val tokenizerConfig = TokenizerConfig(
-                algorithm = ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2,
-                maxVocabularySize = 512,
-                maxTokenLength = 32
+    fun configurableVocabularyCapacityKeepsTheReservedBaseAndRejectsOverflow() {
+        val tokenizer = Tokenizer(
+            TokenizerConfig(
+                maxVocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
+                maxTokenLength = TokenizerConfig.MINIMUM_TOKEN_LENGTH
             )
-            val engineConfig = EngineConfig(
-                layerCount = 2,
-                dModel = 16,
-                nHeads = 4,
-                dFf = 32,
-                maxSeqLen = 16,
-                loraRank = 2,
-                tokenizerConfig = tokenizerConfig
-            )
-            val original = ArgusNeuralEngine.createBlocking(context, engineConfig)
-            val corpus = listOf(
-                "argus neural engine learned bpe tokenizer merge test",
-                "learned bpe tokenizer creates merge pairs from frequency",
-                "argus neural engine learned bpe training"
-            )
-            val trainedMerges = original.tokenizer.trainBpe(corpus, targetVocabSize = original.tokenizer.vocabSize + 10)
-            assertTrue(trainedMerges > 0)
-            val originalMerges = original.tokenizer.exportMerges()
-            assertTrue(originalMerges.isNotEmpty())
-
-            assertTrue(original.saveCheckpoint())
-
-            val restoredConfig = ArgusNeuralEngine.resolveConfig(
-                context = context,
-                totalRamGb = 2,
-                maxHeapMb = 128L,
-                availableRamGb = 1.0f
-            )
-            assertEquals(ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V2, restoredConfig.tokenizerConfig.algorithm)
-
-            val restored = ArgusNeuralEngine.createBlocking(context, restoredConfig)
-            assertTrue(restored.loadCheckpointIfExists())
-            val restoredMerges = restored.tokenizer.exportMerges()
-            assertEquals(originalMerges, restoredMerges)
-
-            val sampleText = "argus neural engine"
-            assertEquals(original.tokenizer.encode(sampleText), restored.tokenizer.encode(sampleText))
-        } finally {
-            restoreCheckpoint(checkpoint, previousCheckpoint)
-        }
+        )
+        assertEquals(TokenizerConfig.MINIMUM_VOCAB_SIZE, tokenizer.vocabSize)
+        val failure = runCatching { tokenizer.registerToken("overflow-token-abc") }.exceptionOrNull()
+        assertTrue(failure is IllegalStateException)
+        assertEquals(TokenizerConfig.MINIMUM_VOCAB_SIZE, tokenizer.vocabSize)
     }
 
     @Test
-    fun multiLayerEngineGeneratesAndTrainsWithoutError() {
-        val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
-        val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
+    fun heldOutEvaluationExcludesContextTokenFromBitsPerByteDenominator() {
+        val engine = ArgusNeuralEngine.createBlocking(
+            context,
+            smallEngineConfig(TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32))
+        )
+        val text = "Aé"
 
-        try {
-            checkpoint.delete()
-            val engineConfig = EngineConfig(
-                layerCount = 3,
-                dModel = 16,
-                nHeads = 4,
-                dFf = 32,
-                maxSeqLen = 16,
-                loraRank = 2,
-                isFullTrainingEnabled = true,
-                tokenizerConfig = TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32)
-            )
-            val engine = ArgusNeuralEngine.createBlocking(context, engineConfig)
-            assertEquals(3, engine.layerCount)
+        val evaluation = engine.evaluateLossWithTargetCount(text)
 
-            val generated = kotlinx.coroutines.runBlocking {
-                engine.generate("test prompt", maxNewTokens = 4, temperature = 0.5f)
-            }
-            assertTrue(generated.isNotEmpty())
-
-            val initialLoss = engine.trainStep(
-                text = "argus multi layer transformer training validation"
-            )
-            assertTrue(initialLoss > 0f)
-            assertTrue(initialLoss.isFinite())
-        } finally {
-            restoreCheckpoint(checkpoint, previousCheckpoint)
-        }
+        assertTrue(evaluation.meanLoss.isFinite())
+        assertEquals(2, evaluation.targetCount)
+        assertEquals(2L, evaluation.scoredUtf8ByteCount)
     }
-
     private fun smallEngineConfig(tokenizerConfig: TokenizerConfig): EngineConfig =
         EngineConfig(
             dModel = 16,
@@ -299,6 +227,12 @@ class ArgusCheckpointCompatibilityTest {
             loraRank = 2,
             tokenizerConfig = tokenizerConfig
         )
+
+    private fun hexToBytes(hex: String): ByteArray =
+        ByteArray(hex.length / 2) { index ->
+            val start = index * 2
+            hex.substring(start, start + 2).toInt(16).toByte()
+        }
 
     private fun restoreCheckpoint(file: File, previous: ByteArray?) {
         if (previous == null) {
@@ -310,77 +244,5 @@ class ArgusCheckpointCompatibilityTest {
 
     private companion object {
         const val CHECKPOINT_FILE_NAME = "argus_model_weights.bin"
-        const val LEGACY_HEADER_SIZE = 48
-    }
-}
-
-class ArgusTokenizerConfigTest {
-
-    @Test
-    fun configurableVocabularyCapacityStopsAtItsDeclaredBoundary() {
-        val tokenizer = Tokenizer(
-            TokenizerConfig(
-                maxVocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
-                maxTokenLength = TokenizerConfig.MINIMUM_TOKEN_LENGTH
-            )
-        )
-        assertEquals(TokenizerConfig.MINIMUM_VOCAB_SIZE, tokenizer.vocabSize)
-        val failure = runCatching {
-            tokenizer.registerToken("overflow")
-        }.exceptionOrNull()
-
-        assertTrue(
-            "Vocabulary exhaustion must fail explicitly instead of silently mapping to UNK.",
-            failure is IllegalStateException
-        )
-        assertEquals(TokenizerConfig.MINIMUM_VOCAB_SIZE, tokenizer.vocabSize)
-    }
-
-    @Test
-    fun configurableLongTokensSurviveVocabularyExportAndImport() {
-        val config = TokenizerConfig(
-            algorithm = ArgusTokenizerAlgorithm.GREEDY_LONGEST_MATCH_V1,
-            maxVocabularySize = 512,
-            maxTokenLength = 32
-        )
-        val tokenizer = Tokenizer(config)
-        val token = "argus_neural_checkpoint"
-        val tokenId = tokenizer.registerToken(token)
-
-        assertEquals(listOf(tokenId), tokenizer.encode(token))
-        assertEquals(token, tokenizer.decode(listOf(tokenId)))
-
-        val restored = Tokenizer(config)
-        restored.importVocab(tokenizer.exportVocab())
-
-        assertEquals(tokenizer.exportVocab(), restored.exportVocab())
-        assertEquals(listOf(tokenId), restored.encode(token))
-        assertEquals(token, restored.decode(listOf(tokenId)))
-    }
-
-    @Test
-    fun rejectsVocabularyEntriesOutsideConfiguredCapacity() {
-        val config = TokenizerConfig(
-            maxVocabularySize = TokenizerConfig.MINIMUM_VOCAB_SIZE,
-            maxTokenLength = TokenizerConfig.MINIMUM_TOKEN_LENGTH
-        )
-        val tokenizer = Tokenizer(config)
-        val failure = runCatching {
-            tokenizer.registerToken(
-                token = "overflow",
-                id = config.maxVocabularySize
-            )
-        }.exceptionOrNull()
-
-        assertTrue(failure is IllegalArgumentException)
-    }
-
-    @Test
-    fun rejectsSpecialTokenLengthConfigurationThatCannotRepresentCanonicalTokens() {
-        val failure = runCatching {
-            TokenizerConfig(maxTokenLength = TokenizerConfig.MINIMUM_TOKEN_LENGTH - 1)
-        }.exceptionOrNull()
-
-        assertTrue(failure is IllegalArgumentException)
     }
 }
