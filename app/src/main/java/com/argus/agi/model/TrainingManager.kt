@@ -1863,29 +1863,40 @@ class TrainingManager(
         // state represented by this journal is durably saved. A checkpoint that is
         // ahead of the journal is an inconsistency, not a valid committed transaction.
         if (snapshot.checkpointSha256Fingerprint == null) {
-            // Journal v3 can be upgraded after its committed checkpoint has been verified.
+            // Older committed journals are upgraded only when both semantic identities
+            // exist; v1/v2 remain readable without manufacturing missing fingerprints.
             check(neuralEngine.saveCheckpoint()) {
                 "The committed optimizer checkpoint could not be secured during recovery."
             }
-            val checkpointFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
-            TrainingCommitJournal.writeCommitted(
-                file = trainingCommitJournalFile,
-                baselineOptimizerStep = snapshot.baselineOptimizerStep,
-                committedOptimizerStep = committedOptimizerStep,
-                entries = snapshot.entries,
-                modelIdentityFingerprint = snapshot.modelIdentityFingerprint,
-                optimizerConfigFingerprint = snapshot.optimizerConfigFingerprint,
-                checkpointSha256Fingerprint = checkpointFingerprint
-            )
-            val checkpointBoundJournal = requireNotNull(
-                TrainingCommitJournal.read(trainingCommitJournalFile)
+            if (
+                snapshot.modelIdentityFingerprint != null &&
+                snapshot.optimizerConfigFingerprint != null
             ) {
-                "The recovered checkpoint-bound journal could not be read back."
+                val checkpointFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
+                TrainingCommitJournal.writeCommitted(
+                    file = trainingCommitJournalFile,
+                    baselineOptimizerStep = snapshot.baselineOptimizerStep,
+                    committedOptimizerStep = committedOptimizerStep,
+                    entries = snapshot.entries,
+                    modelIdentityFingerprint = snapshot.modelIdentityFingerprint,
+                    optimizerConfigFingerprint = snapshot.optimizerConfigFingerprint,
+                    checkpointSha256Fingerprint = checkpointFingerprint
+                )
+                val checkpointBoundJournal = requireNotNull(
+                    TrainingCommitJournal.read(trainingCommitJournalFile)
+                ) {
+                    "The recovered checkpoint-bound journal could not be read back."
+                }
+                check(
+                    checkpointBoundJournal.checkpointSha256Fingerprint == checkpointFingerprint
+                ) {
+                    "The recovered checkpoint file identity was not persisted in the journal."
+                }
+                requireJournalCompatibility(
+                    checkpointBoundJournal,
+                    "committed-batch recovery after checkpoint write"
+                )
             }
-            requireJournalCompatibility(
-                checkpointBoundJournal,
-                "committed-batch recovery after checkpoint write"
-            )
         }
 
         val committedItems = ArrayList<TrainingData>(snapshot.entries.size)
@@ -2921,6 +2932,11 @@ class TrainingManager(
             TrainingCommitJournal.read(trainingCommitJournalFile)
         ) {
             "The checkpoint-bound training journal could not be read back."
+        }
+        check(
+            checkpointBoundJournal.checkpointSha256Fingerprint == committedCheckpointFingerprint
+        ) {
+            "The committed checkpoint SHA-256 was not persisted in the journal."
         }
         requireJournalCompatibility(
             checkpointBoundJournal,

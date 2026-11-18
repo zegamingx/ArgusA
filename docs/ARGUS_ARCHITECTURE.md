@@ -289,7 +289,7 @@ This audit describes the current `master` implementation, not a claim that every
 ### 10.4 Safe next implementation order
 
 1. **COMPLETED:** immutable optimizer configuration identity is persisted and verified in ARG6; journal v4 now binds committed state to the exact checkpoint-file SHA-256 after checkpoint replacement. ARG5 remains backward-readable with optimizer compatibility explicitly unverified.
-2. **COMPLETED in journal v3:** new writes record both `ModelStateIdentity.fingerprint` and the optimizer-configuration fingerprint; the reader accepts v1, v2, and v3. Legacy v1/v2 optimizer compatibility remains explicitly unverified. A later transaction-format increment may add the exact checkpoint-file digest if crash-safe ordering is designed and tested.
+2. **COMPLETED in journal v4:** new writes record model identity and optimizer configuration in v3, then bind the committed journal to the exact checkpoint-file SHA-256 in v4 after checkpoint replacement. Readers accept v1-v4. Legacy v1/v2 remain explicitly unverified; v3 is the documented fallback for a crash between checkpoint replacement and the v4 journal rewrite.
 3. Add a durable replay-session descriptor (session ID, source snapshot fingerprint, seed, policy, epochs, and schedule format) only with a versioned Room migration and transactionally consistent enqueue path. Keep existing queue rows as the authoritative per-item cursor.
 4. Add fault-injection tests for crashes between PREPARED, optimizer mutation, COMMITTED, checkpoint replacement, Room commit, and item finalization.
 5. Only after those contracts and migrations are complete should the full build, lint, JVM/native validation, and relevant device checks run in the authorized validation sequence.
