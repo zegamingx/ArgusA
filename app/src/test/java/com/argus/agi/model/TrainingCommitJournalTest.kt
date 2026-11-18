@@ -260,6 +260,97 @@ class TrainingCommitJournalTest {
     }
 
     @Test
+    fun versionFourCommittedJournalBindsExactCheckpointFileSha256() {
+        val directory = Files.createTempDirectory("argus-training-journal-v4").toFile()
+        val file = File(directory, TrainingCommitJournal.FILE_NAME)
+        val modelFingerprint = "1234567890abcdef".repeat(4)
+        val optimizerFingerprint = OptimizerConfig.DEFAULT.fingerprint
+        val checkpointFingerprint = "fedcba0987654321".repeat(4)
+        val result = NeuralTrainingStepResult(
+            loss = 0.25f,
+            inputTokenCount = 8,
+            predictionTargetCount = 7,
+            contextWindowCount = 1,
+            optimizerUpdateCount = 1,
+            vocabularySize = 512
+        )
+        try {
+            TrainingCommitJournal.writeCommitted(
+                file = file,
+                baselineOptimizerStep = 30,
+                committedOptimizerStep = 31,
+                entries = listOf(
+                    TrainingCommitJournalEntry(
+                        itemId = "checkpoint-bound",
+                        result = result,
+                        stepDurationMs = 10L
+                    )
+                ),
+                modelIdentityFingerprint = modelFingerprint,
+                optimizerConfigFingerprint = optimizerFingerprint,
+                checkpointSha256Fingerprint = checkpointFingerprint
+            )
+
+            val bytes = file.readBytes()
+            assertEquals(
+                4,
+                java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.BIG_ENDIAN).getInt(8)
+            )
+            val restored = requireNotNull(TrainingCommitJournal.read(file))
+            assertEquals(modelFingerprint, restored.modelIdentityFingerprint)
+            assertEquals(optimizerFingerprint, restored.optimizerConfigFingerprint)
+            assertEquals(checkpointFingerprint, restored.checkpointSha256Fingerprint)
+            assertTrue(
+                TrainingCommitJournal.matchesCheckpointFileFingerprint(
+                    restored,
+                    checkpointFingerprint
+                )
+            )
+            assertFalse(
+                TrainingCommitJournal.matchesCheckpointFileFingerprint(
+                    restored,
+                    "a".repeat(64)
+                )
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun versionFourRejectsMalformedCheckpointFileFingerprint() {
+        val directory = Files.createTempDirectory("argus-training-journal-v4-invalid").toFile()
+        val file = File(directory, TrainingCommitJournal.FILE_NAME)
+        val result = NeuralTrainingStepResult(
+            loss = 0.25f,
+            inputTokenCount = 8,
+            predictionTargetCount = 7,
+            contextWindowCount = 1,
+            optimizerUpdateCount = 1,
+            vocabularySize = 512
+        )
+        try {
+            val failure = runCatching {
+                TrainingCommitJournal.writeCommitted(
+                    file = file,
+                    baselineOptimizerStep = 4,
+                    committedOptimizerStep = 5,
+                    entries = listOf(
+                        TrainingCommitJournalEntry("invalid-digest", result, 1L)
+                    ),
+                    modelIdentityFingerprint = "f".repeat(64),
+                    optimizerConfigFingerprint = OptimizerConfig.DEFAULT.fingerprint,
+                    checkpointSha256Fingerprint = "not-a-checkpoint-hash"
+                )
+            }.exceptionOrNull()
+            assertNotNull(failure)
+            assertFalse(file.exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun versionTwoCommittedJournalKeepsModelIdentityAlongsideTrainingResults() {
         val directory = Files.createTempDirectory("argus-training-journal-v2-committed").toFile()
         val file = File(directory, TrainingCommitJournal.FILE_NAME)

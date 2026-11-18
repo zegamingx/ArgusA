@@ -363,6 +363,32 @@ class ArgusNeuralEngine private constructor(
     val isCheckpointRestoreBlocked: Boolean
         get() = checkpointRestoreBlocked
 
+    /**
+     * Computes the full checkpoint file identity after independent read-back validation.
+     * The bounded streaming read avoids materializing model-sized checkpoint files in memory.
+     */
+    internal fun checkpointFileSha256Fingerprint(): String = synchronized(modelLock) {
+        check(checkpointStateVerified && !checkpointRestoreBlocked) {
+            "A verified, recoverable checkpoint is required before computing its file identity."
+        }
+        val file = File(context.filesDir, "argus_model_weights.bin")
+        check(file.isFile) {
+            "The committed model checkpoint is missing."
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+        BufferedInputStream(FileInputStream(file)).use { input ->
+            val buffer = ByteArray(TENSOR_WRITE_BUFFER_BYTES)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        digest.digest().joinToString(separator = "") { byte ->
+            "%02x".format(java.util.Locale.ROOT, byte.toInt() and 0xFF)
+        }
+    }
+
     val optimizerStep: Int
         get() = synchronized(modelLock) { adamStep }
 

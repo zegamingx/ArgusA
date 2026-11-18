@@ -1779,6 +1779,19 @@ class TrainingManager(
                 )
             }
         }
+        val expectedCheckpointFingerprint = snapshot.checkpointSha256Fingerprint
+        if (expectedCheckpointFingerprint != null) {
+            val actualCheckpointFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
+            check(
+                TrainingCommitJournal.matchesCheckpointFileFingerprint(
+                    snapshot,
+                    actualCheckpointFingerprint
+                )
+            ) {
+                "Training journal checkpoint-file SHA-256 mismatch during $recoveryPhase. " +
+                    "The checkpoint was preserved and queue recovery was stopped."
+            }
+        }
     }
 
     private suspend fun reconcilePersistedTrainingCommit(
@@ -1849,8 +1862,30 @@ class TrainingManager(
         // Room must never publish COMMITTED until the exact model and optimizer
         // state represented by this journal is durably saved. A checkpoint that is
         // ahead of the journal is an inconsistency, not a valid committed transaction.
-        check(neuralEngine.saveCheckpoint()) {
-            "The committed optimizer checkpoint could not be secured during recovery."
+        if (snapshot.checkpointSha256Fingerprint == null) {
+            // Journal v3 can be upgraded after its committed checkpoint has been verified.
+            check(neuralEngine.saveCheckpoint()) {
+                "The committed optimizer checkpoint could not be secured during recovery."
+            }
+            val checkpointFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
+            TrainingCommitJournal.writeCommitted(
+                file = trainingCommitJournalFile,
+                baselineOptimizerStep = snapshot.baselineOptimizerStep,
+                committedOptimizerStep = committedOptimizerStep,
+                entries = snapshot.entries,
+                modelIdentityFingerprint = snapshot.modelIdentityFingerprint,
+                optimizerConfigFingerprint = snapshot.optimizerConfigFingerprint,
+                checkpointSha256Fingerprint = checkpointFingerprint
+            )
+            val checkpointBoundJournal = requireNotNull(
+                TrainingCommitJournal.read(trainingCommitJournalFile)
+            ) {
+                "The recovered checkpoint-bound journal could not be read back."
+            }
+            requireJournalCompatibility(
+                checkpointBoundJournal,
+                "committed-batch recovery after checkpoint write"
+            )
         }
 
         val committedItems = ArrayList<TrainingData>(snapshot.entries.size)
@@ -2872,6 +2907,25 @@ class TrainingManager(
         check(neuralEngine.saveCheckpoint()) {
             "The committed optimizer state could not be checkpointed."
         }
+        val committedCheckpointFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
+        TrainingCommitJournal.writeCommitted(
+            file = trainingCommitJournalFile,
+            baselineOptimizerStep = baselineOptimizerStep,
+            committedOptimizerStep = neuralEngine.optimizerStep,
+            entries = commitEntries,
+            modelIdentityFingerprint = baselineModelIdentityFingerprint,
+            optimizerConfigFingerprint = baselineOptimizerConfigFingerprint,
+            checkpointSha256Fingerprint = committedCheckpointFingerprint
+        )
+        val checkpointBoundJournal = requireNotNull(
+            TrainingCommitJournal.read(trainingCommitJournalFile)
+        ) {
+            "The checkpoint-bound training journal could not be read back."
+        }
+        requireJournalCompatibility(
+            checkpointBoundJournal,
+            "live batch commit after checkpoint write"
+        )
 
         val committedItems = items.zip(commitEntries).map { (item, entry) ->
             val result = requireNotNull(entry.result)

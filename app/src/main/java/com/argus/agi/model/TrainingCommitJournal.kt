@@ -26,7 +26,8 @@ internal data class TrainingCommitJournalSnapshot(
     val committedOptimizerStep: Int?,
     val entries: List<TrainingCommitJournalEntry>,
     val modelIdentityFingerprint: String? = null,
-    val optimizerConfigFingerprint: String? = null
+    val optimizerConfigFingerprint: String? = null,
+    val checkpointSha256Fingerprint: String? = null
 ) {
     val isCommitted: Boolean
         get() = committedOptimizerStep != null
@@ -44,7 +45,9 @@ internal object TrainingCommitJournal {
     private const val MAGIC = 0x4154474A // ATGJ
     private const val LEGACY_VERSION = 1
     private const val MODEL_IDENTITY_VERSION = 2
-    private const val CURRENT_VERSION = 3
+    private const val OPTIMIZER_CONFIGURATION_VERSION = 3
+    private const val CHECKPOINT_DIGEST_VERSION = 4
+    private const val CURRENT_VERSION = CHECKPOINT_DIGEST_VERSION
     private const val SHA256_FINGERPRINT_BYTES = 32
     private const val SHA256_FINGERPRINT_HEX_LENGTH = SHA256_FINGERPRINT_BYTES * 2
     private const val STATE_PREPARED = 0
@@ -103,7 +106,8 @@ internal object TrainingCommitJournal {
         committedOptimizerStep: Int,
         entries: List<TrainingCommitJournalEntry>,
         modelIdentityFingerprint: String? = null,
-        optimizerConfigFingerprint: String? = null
+        optimizerConfigFingerprint: String? = null,
+        checkpointSha256Fingerprint: String? = null
     ) {
         require(baselineOptimizerStep >= 0)
         require(committedOptimizerStep >= baselineOptimizerStep) {
@@ -131,13 +135,14 @@ internal object TrainingCommitJournal {
             committedOptimizerStep = committedOptimizerStep,
             entries = entries,
             modelIdentityFingerprint = modelIdentityFingerprint,
-            optimizerConfigFingerprint = optimizerConfigFingerprint
+            optimizerConfigFingerprint = optimizerConfigFingerprint,
+            checkpointSha256Fingerprint = checkpointSha256Fingerprint
         )
     }
 
     /**
-     * Version-1 journals have no model identity; version 2 adds architecture/tokenizer
-     * identity; version 3 additionally binds recovery to the active optimizer configuration.
+     * Version 1 has no identity; version 2 adds model identity; version 3 binds optimizer
+     * configuration; version 4 binds the committed transaction to the exact checkpoint file.
      * Legacy journal versions remain readable and retain their explicitly unverified path.
      */
     fun matchesModelIdentity(
@@ -152,6 +157,13 @@ internal object TrainingCommitJournal {
         activeOptimizerConfigFingerprint: String
     ): Boolean = snapshot.optimizerConfigFingerprint?.let { expected ->
         expected == activeOptimizerConfigFingerprint
+    } ?: true
+
+    fun matchesCheckpointFileFingerprint(
+        snapshot: TrainingCommitJournalSnapshot,
+        activeCheckpointSha256Fingerprint: String
+    ): Boolean = snapshot.checkpointSha256Fingerprint?.let { expected ->
+        expected == activeCheckpointSha256Fingerprint
     } ?: true
 
     /**
@@ -219,7 +231,14 @@ internal object TrainingCommitJournal {
                 } else {
                     null
                 }
-                val optimizerConfigFingerprint = if (version >= CURRENT_VERSION) {
+                val optimizerConfigFingerprint = if (version >= OPTIMIZER_CONFIGURATION_VERSION) {
+                    val fingerprintBytes = ByteArray(SHA256_FINGERPRINT_BYTES)
+                    body.readFully(fingerprintBytes)
+                    fingerprintBytes.toHexFingerprint()
+                } else {
+                    null
+                }
+                val checkpointSha256Fingerprint = if (version >= CHECKPOINT_DIGEST_VERSION) {
                     val fingerprintBytes = ByteArray(SHA256_FINGERPRINT_BYTES)
                     body.readFully(fingerprintBytes)
                     fingerprintBytes.toHexFingerprint()
@@ -293,7 +312,8 @@ internal object TrainingCommitJournal {
                     },
                     entries = entries,
                     modelIdentityFingerprint = modelIdentityFingerprint,
-                    optimizerConfigFingerprint = optimizerConfigFingerprint
+                    optimizerConfigFingerprint = optimizerConfigFingerprint,
+                    checkpointSha256Fingerprint = checkpointSha256Fingerprint
                 )
             }
         }
@@ -338,17 +358,25 @@ internal object TrainingCommitJournal {
         committedOptimizerStep: Int?,
         entries: List<TrainingCommitJournalEntry>,
         modelIdentityFingerprint: String?,
-        optimizerConfigFingerprint: String?
+        optimizerConfigFingerprint: String?,
+        checkpointSha256Fingerprint: String? = null
     ) {
         require((modelIdentityFingerprint == null) == (optimizerConfigFingerprint == null)) {
             "Model identity and optimizer configuration fingerprints must be written together."
         }
+        require(checkpointSha256Fingerprint == null || (
+            state == STATE_COMMITTED && modelIdentityFingerprint != null && optimizerConfigFingerprint != null
+        )) {
+            "A checkpoint digest requires a committed journal with model and optimizer identities."
+        }
         val fingerprintBytes = modelIdentityFingerprint?.toSha256FingerprintBytes()
         val optimizerFingerprintBytes = optimizerConfigFingerprint?.toSha256FingerprintBytes()
+        val checkpointDigestBytes = checkpointSha256Fingerprint?.toSha256FingerprintBytes()
         val version = when {
             fingerprintBytes == null -> LEGACY_VERSION
             optimizerFingerprintBytes == null -> MODEL_IDENTITY_VERSION
-            else -> CURRENT_VERSION
+            checkpointDigestBytes == null -> OPTIMIZER_CONFIGURATION_VERSION
+            else -> CHECKPOINT_DIGEST_VERSION
         }
         val payloadBuffer = ByteArrayOutputStream()
         DataOutputStream(payloadBuffer).use { output ->
@@ -363,6 +391,9 @@ internal object TrainingCommitJournal {
             }
             if (optimizerFingerprintBytes != null) {
                 output.write(optimizerFingerprintBytes)
+            }
+            if (checkpointDigestBytes != null) {
+                output.write(checkpointDigestBytes)
             }
             for (entry in entries) {
                 val idBytes = entry.itemId.toByteArray(Charsets.UTF_8)
