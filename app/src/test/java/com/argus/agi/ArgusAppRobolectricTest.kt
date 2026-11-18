@@ -159,6 +159,41 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
+    fun testTokenizerEncodingDecoding() {
+        val tokenizer = Tokenizer()
+        val text = "A.R.G.U.S on device neural intelligence"
+        val tokens = tokenizer.encode(text, autoRegister = true)
+        assertTrue("Tokens should not be empty", tokens.isNotEmpty())
+        val decoded = tokenizer.decode(tokens)
+        assertEquals(text, decoded)
+    }
+
+    @Test
+    fun testSpecialTokens() {
+        val tokenizer = Tokenizer()
+        val text = "${Tokenizer.USER_TOKEN}Hello${Tokenizer.ASSISTANT_TOKEN}"
+        val tokens = tokenizer.encode(text, autoRegister = true)
+        assertTrue("Tokens should contain user token", tokens.contains(Tokenizer.USER_ID))
+        assertTrue("Tokens should contain assistant token", tokens.contains(Tokenizer.ASSISTANT_ID))
+    }
+
+    @Test
+    fun testTokenizerCollisionRejectionAndMonotonicId() {
+        val tokenizer = Tokenizer()
+        val id1 = tokenizer.registerToken("alpha")
+        val id2 = tokenizer.registerToken("beta")
+        assertTrue("Monotonic IDs should be unique", id1 != id2)
+
+        assertEquals(id1, tokenizer.registerToken("alpha"))
+
+        try {
+            tokenizer.registerToken("gamma", id1)
+            fail("Should throw IllegalArgumentException when registering token with an occupied ID")
+        } catch (_: IllegalArgumentException) {
+        }
+    }
+
+    @Test
     fun testTokenizerImportVocabValidation() {
         val source = Tokenizer()
         val canonicalEntries = source.exportVocab()
