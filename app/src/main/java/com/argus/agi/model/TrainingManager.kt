@@ -6,6 +6,7 @@ import android.util.Log
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceProvenance
+import com.argus.agi.data.local.entity.TrainingReplaySessionEntity
 import com.argus.agi.runtime.DeviceAdaptiveRuntimePolicy
 import com.argus.agi.runtime.RuntimeConfigurationPlanner
 import com.argus.agi.runtime.RuntimeDeferReason
@@ -142,7 +143,8 @@ class TrainingManager(
     private sealed interface QueuePersistenceOperation {
         data class Save(
             val generation: Long,
-            val items: List<TrainingData>
+            val items: List<TrainingData>,
+            val replaySession: TrainingReplaySessionEntity? = null
         ) : QueuePersistenceOperation
 
         data class Clear(
@@ -1302,7 +1304,6 @@ class TrainingManager(
                         memoryActiveDocumentIds - persistedActiveDocumentIds
 
                     if (replayDocumentIds.isNotEmpty()) {
-                        activeRepository.markCorpusDocumentsQueued(replayDocumentIds)
                         for (documentId in replayDocumentIds.sorted()) {
                             val document = activeRepository.getCorpusDocument(documentId)
                                 ?: throw IllegalStateException(
@@ -1568,6 +1569,17 @@ class TrainingManager(
             seed = seed,
             policy = policy
         )
+        val replaySessionId = UUID.randomUUID().toString()
+        val replaySession = TrainingReplaySessionEntity(
+            id = replaySessionId,
+            sourceSnapshotFingerprint = CorpusReplayScheduler.sourceSnapshotFingerprint(sources),
+            seed = seed,
+            policy = policy.name,
+            epochs = epochs,
+            schedulerFormatVersion = CorpusReplayScheduler.SCHEDULER_FORMAT_VERSION,
+            scheduledDocumentCount = requestedDocumentIds.size,
+            scheduledChunkCount = schedule.size
+        )
         check(schedule.size.toLong() == requestedChunkCount) {
             "Replay scheduler produced an unexpected number of queue items."
         }
@@ -1587,7 +1599,8 @@ class TrainingManager(
                 totalChunks = scheduled.documentTotalChunks,
                 documentTitle = scheduled.document.title,
                 status = TrainingStatus.QUEUED,
-                documentId = scheduled.document.id
+                documentId = scheduled.document.id,
+                replaySessionId = replaySessionId
             )
         }
 
@@ -1602,13 +1615,11 @@ class TrainingManager(
             "Corpus replay would duplicate in-memory training work: ${memoryConflicts.joinToString()}."
         }
 
-        activeRepository.markCorpusDocumentsQueued(requestedDocumentIds)
-
         val orderedItems = synchronized(queueLock) {
             if (closed) {
                 emptyList()
             } else {
-                appendPersistingQueueItems(items).also { queued ->
+                appendPersistingQueueItems(items, replaySession).also { queued ->
                     val firstItem = queued.firstOrNull()
                     if (_activeDocument.value == null && firstItem != null) {
                         val firstDocumentId = requireNotNull(firstItem.documentId)
@@ -2561,7 +2572,10 @@ class TrainingManager(
         }
     }
 
-    private fun appendPersistingQueueItems(items: List<TrainingData>): List<TrainingData> {
+    private fun appendPersistingQueueItems(
+        items: List<TrainingData>,
+        replaySession: TrainingReplaySessionEntity? = null
+    ): List<TrainingData> {
         if (items.isEmpty()) return emptyList()
 
         val orderedItems = assignPersistentQueueOrder(items)
@@ -2570,7 +2584,8 @@ class TrainingManager(
 
         val operation = QueuePersistenceOperation.Save(
             generation = queueGeneration,
-            items = orderedItems
+            items = orderedItems,
+            replaySession = replaySession
         )
         val sendResult = persistenceOperations.trySend(operation)
         if (sendResult.isFailure) {
@@ -2653,7 +2668,12 @@ class TrainingManager(
                         "Training queue persistence is unavailable.",
                         repositoryInitialization.exceptionOrNull()
                     )
-                    repository.saveTrainingItems(operation.items)
+                    val replaySession = operation.replaySession
+                    if (replaySession == null) {
+                        repository.saveTrainingItems(operation.items)
+                    } else {
+                        repository.saveCorpusReplaySession(replaySession, operation.items)
+                    }
                 }.exceptionOrNull()
 
                 synchronized(queueLock) {

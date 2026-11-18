@@ -200,7 +200,11 @@ class ArgusDatabaseMigrationTest {
             ArgusDatabase::class.java,
             databaseName
         )
-            .addMigrations(migrationWithRetainedCorpus, ArgusDatabase.MIGRATION_2_3)
+            .addMigrations(
+                migrationWithRetainedCorpus,
+                ArgusDatabase.MIGRATION_2_3,
+                ArgusDatabase.MIGRATION_3_4
+            )
             .allowMainThreadQueries()
             .build()
 
@@ -220,15 +224,28 @@ class ArgusDatabaseMigrationTest {
                 assertEquals("Keep this memory", cursor.getString(0))
             }
             database.query(
-                "SELECT `content`, `documentId` FROM `training_items` " +
+                "SELECT `content`, `documentId`, `replaySessionId` FROM `training_items` " +
                     "WHERE `id` = 'legacy-training'"
             ).use { cursor ->
                 assertTrue(cursor.moveToFirst())
                 assertEquals("Keep this queued text", cursor.getString(0))
                 assertNull(cursor.getString(1))
+                assertNull(cursor.getString(2))
             }
 
-            assertEquals(3, database.version)
+            assertEquals(4, database.version)
+
+            val trainingColumns = buildSet {
+                database.query("PRAGMA table_info(`training_items`)").use { cursor ->
+                    val nameIndex = cursor.getColumnIndexOrThrow("name")
+                    while (cursor.moveToNext()) add(cursor.getString(nameIndex))
+                }
+            }
+            assertTrue(trainingColumns.contains("replaySessionId"))
+            database.query("SELECT COUNT(*) FROM `training_replay_sessions`").use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(0, cursor.getInt(0))
+            }
 
             database.query(
                 "SELECT `title`, `rightsStatus` FROM `corpus_documents` WHERE `id` = 'legacy-doc'"

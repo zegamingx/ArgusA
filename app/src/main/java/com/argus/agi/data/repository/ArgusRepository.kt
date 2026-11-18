@@ -10,6 +10,7 @@ import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceEntity
 import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.data.local.entity.TrainingItemEntity
+import com.argus.agi.data.local.entity.TrainingReplaySessionEntity
 import com.argus.agi.data.local.entity.WorldMemoryEntity
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingStatus
@@ -29,6 +30,7 @@ class ArgusRepository(
     private val chatMessageDao = db.chatMessageDao()
     private val worldMemoryDao = db.worldMemoryDao()
     private val trainingQueueDao = db.trainingQueueDao()
+    private val trainingReplaySessionDao = db.trainingReplaySessionDao()
     private val corpusDao = db.corpusDao()
 
     // =========================================================================
@@ -150,6 +152,50 @@ class ArgusRepository(
         db.withTransaction {
             validateTrainingDocumentReferences(items)
             trainingQueueDao.insertItems(items.map { it.toEntity() })
+        }
+    }
+
+    /**
+     * Persists a materialized corpus replay as one database transaction.
+     * Session provenance, every queue row, and corpus READY state either all commit or none do.
+     */
+    suspend fun saveCorpusReplaySession(
+        session: TrainingReplaySessionEntity,
+        items: List<TrainingData>
+    ) = withContext(Dispatchers.IO) {
+        require(items.isNotEmpty()) {
+            "A corpus replay session must contain queue items."
+        }
+        require(session.scheduledChunkCount == items.size) {
+            "Replay session chunk count does not match its queue item count."
+        }
+        require(items.all { it.replaySessionId == session.id }) {
+            "Every replay queue item must reference the session being persisted."
+        }
+        val documentIds = items.mapNotNull(TrainingData::documentId).distinct()
+        require(documentIds.size == session.scheduledDocumentCount) {
+            "Replay session document count does not match its queue items."
+        }
+        require(items.all { it.documentId != null }) {
+            "Corpus replay queue items must reference retained corpus documents."
+        }
+
+        db.withTransaction {
+            validateTrainingDocumentReferences(items)
+            trainingReplaySessionDao.insert(session)
+            trainingQueueDao.insertItems(items.map { it.toEntity() })
+            documentIds.forEach { documentId ->
+                check(
+                    corpusDao.updateTrainingState(
+                        documentId = documentId,
+                        status = "READY",
+                        trainedAtEpochMs = null,
+                        completedPassCount = 0
+                    ) == 1
+                ) {
+                    "Corpus document could not be marked READY for replay: $documentId"
+                }
+            }
         }
     }
 
@@ -504,7 +550,8 @@ class ArgusRepository(
         status = runCatching { TrainingStatus.valueOf(status) }.getOrDefault(TrainingStatus.QUEUED),
         finalLoss = finalLoss,
         stepDurationMs = stepDurationMs,
-        documentId = documentId
+        documentId = documentId,
+        replaySessionId = replaySessionId
     )
 
     private fun TrainingData.toEntity() = TrainingItemEntity(
@@ -519,6 +566,7 @@ class ArgusRepository(
         status = status.name,
         finalLoss = finalLoss,
         stepDurationMs = stepDurationMs,
-        documentId = documentId
+        documentId = documentId,
+        replaySessionId = replaySessionId
     )
 }

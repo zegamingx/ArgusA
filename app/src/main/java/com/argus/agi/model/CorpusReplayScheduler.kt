@@ -2,6 +2,10 @@ package com.argus.agi.model
 
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.Random
 
 /**
@@ -37,6 +41,9 @@ internal data class ScheduledCorpusChunk(
 
 internal object CorpusReplayScheduler {
 
+    const val SCHEDULER_FORMAT_VERSION = 1
+    private const val SOURCE_SNAPSHOT_FORMAT_VERSION = 1
+
     private data class Cursor(
         val source: CorpusReplaySource,
         var nextChunkIndex: Int = 0
@@ -57,38 +64,7 @@ internal object CorpusReplayScheduler {
         }
         require(sources.isNotEmpty()) { "At least one training corpus document is required." }
 
-        val stableSources = sources
-            .sortedWith(
-                compareBy<CorpusReplaySource>(
-                    { it.document.createdAtEpochMs },
-                    { it.document.id }
-                )
-            )
-            .map { source ->
-                source.copy(chunks = source.chunks.sortedBy { it.chunkIndex })
-            }
-        require(stableSources.map { it.document.id }.toSet().size == stableSources.size) {
-            "A corpus document may appear only once in a replay plan."
-        }
-
-        stableSources.forEach { source ->
-            require(source.document.datasetSplit == "TRAIN") {
-                "Validation-only documents cannot enter a corpus replay plan."
-            }
-            require(source.document.validationText == null) {
-                "Training documents cannot contain a validation text payload."
-            }
-            require(source.chunks.size == source.document.chunkCount && source.chunks.isNotEmpty()) {
-                "Corpus document ${source.document.id} has missing or inconsistent chunks."
-            }
-
-            require(source.chunks.all { it.documentId == source.document.id }) {
-                "Corpus document ${source.document.id} contains a foreign chunk reference."
-            }
-            require(source.chunks.map { it.chunkIndex } == (1..source.chunks.size).toList()) {
-                "Corpus document ${source.document.id} has non-contiguous chunk indexes."
-            }
-        }
+        val stableSources = canonicalSources(sources)
 
         val perEpochChunkCount = stableSources.sumOf { it.chunks.size.toLong() }
         val totalChunkCount = Math.multiplyExact(perEpochChunkCount, epochs.toLong())
@@ -144,6 +120,106 @@ internal object CorpusReplayScheduler {
         }
 
         return result
+    }
+
+    /**
+     * Hashes the exact retained source snapshot independently of the replay policy and seed.
+     * Variable-length fields are length-prefixed; document and chunk ordering is canonical.
+     */
+    fun sourceSnapshotFingerprint(sources: List<CorpusReplaySource>): String {
+        val stableSources = canonicalSources(sources)
+        val digest = MessageDigest.getInstance("SHA-256")
+        val integerBuffer = ByteBuffer.allocate(Int.SIZE_BYTES).order(ByteOrder.BIG_ENDIAN)
+        val longBuffer = ByteBuffer.allocate(Long.SIZE_BYTES).order(ByteOrder.BIG_ENDIAN)
+
+        fun updateInt(value: Int) {
+            integerBuffer.clear()
+            integerBuffer.putInt(value)
+            digest.update(integerBuffer.array())
+        }
+
+        fun updateLong(value: Long) {
+            longBuffer.clear()
+            longBuffer.putLong(value)
+            digest.update(longBuffer.array())
+        }
+
+        fun updateString(value: String) {
+            val bytes = value.toByteArray(StandardCharsets.UTF_8)
+            updateInt(bytes.size)
+            digest.update(bytes)
+        }
+
+        fun updateNullableString(value: String?) {
+            digest.update(if (value == null) 0.toByte() else 1.toByte())
+            if (value != null) updateString(value)
+        }
+
+        updateString("ARGUS-CORPUS-REPLAY-SOURCE")
+        updateInt(SOURCE_SNAPSHOT_FORMAT_VERSION)
+        updateInt(stableSources.size)
+        stableSources.forEach { source ->
+            val document = source.document
+            updateString(document.id)
+            updateString(document.contentFingerprint)
+            updateString(document.fingerprintAlgorithm)
+            updateString(document.source)
+            updateString(document.title)
+            updateNullableString(document.language)
+            updateNullableString(document.canonicalUrl)
+            updateString(document.datasetSplit)
+            updateLong(document.createdAtEpochMs)
+            updateInt(source.chunks.size)
+            source.chunks.forEach { chunk ->
+                updateString(chunk.id)
+                updateInt(chunk.chunkIndex)
+                updateInt(chunk.characterCount)
+                updateString(chunk.content)
+            }
+        }
+
+        return digest.digest().joinToString(separator = "") { byte ->
+            "%02x".format(java.util.Locale.ROOT, byte.toInt() and 0xFF)
+        }
+    }
+
+    private fun canonicalSources(
+        sources: List<CorpusReplaySource>
+    ): List<CorpusReplaySource> {
+        require(sources.isNotEmpty()) {
+            "At least one training corpus document is required."
+        }
+        val stableSources = sources
+            .sortedWith(
+                compareBy<CorpusReplaySource>(
+                    { it.document.createdAtEpochMs },
+                    { it.document.id }
+                )
+            )
+            .map { source ->
+                source.copy(chunks = source.chunks.sortedBy { it.chunkIndex })
+            }
+        require(stableSources.map { it.document.id }.toSet().size == stableSources.size) {
+            "A corpus document may appear only once in a replay plan."
+        }
+        stableSources.forEach { source ->
+            require(source.document.datasetSplit == "TRAIN") {
+                "Validation-only documents cannot enter a corpus replay plan."
+            }
+            require(source.document.validationText == null) {
+                "Training documents cannot contain a validation text payload."
+            }
+            require(source.chunks.size == source.document.chunkCount && source.chunks.isNotEmpty()) {
+                "Corpus document ${source.document.id} has missing or inconsistent chunks."
+            }
+            require(source.chunks.all { it.documentId == source.document.id }) {
+                "Corpus document ${source.document.id} contains a foreign chunk reference."
+            }
+            require(source.chunks.map { it.chunkIndex } == (1..source.chunks.size).toList()) {
+                "Corpus document ${source.document.id} has non-contiguous chunk indexes."
+            }
+        }
+        return stableSources
     }
 
     private fun appendDocumentEpoch(
