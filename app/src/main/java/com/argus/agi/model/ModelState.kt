@@ -103,7 +103,8 @@ internal data class ModelState(
     val identity: ModelStateIdentity,
     val optimizerStep: Int,
     val checkpointFormat: ModelCheckpointFormat,
-    val checkpointVerified: Boolean
+    val checkpointVerified: Boolean,
+    val optimizerConfiguration: OptimizerConfigIdentity = OptimizerConfig.DEFAULT.identity
 ) {
     init {
         require(optimizerStep >= 0) {

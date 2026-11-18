@@ -25,7 +25,8 @@ internal data class TrainingCommitJournalSnapshot(
     val baselineOptimizerStep: Int,
     val committedOptimizerStep: Int?,
     val entries: List<TrainingCommitJournalEntry>,
-    val modelIdentityFingerprint: String? = null
+    val modelIdentityFingerprint: String? = null,
+    val optimizerConfigFingerprint: String? = null
 ) {
     val isCommitted: Boolean
         get() = committedOptimizerStep != null
@@ -42,10 +43,10 @@ internal object TrainingCommitJournal {
 
     private const val MAGIC = 0x4154474A // ATGJ
     private const val LEGACY_VERSION = 1
-    private const val CURRENT_VERSION = 2
-    private const val MODEL_IDENTITY_FINGERPRINT_BYTES = 32
-    private const val MODEL_IDENTITY_FINGERPRINT_HEX_LENGTH =
-        MODEL_IDENTITY_FINGERPRINT_BYTES * 2
+    private const val MODEL_IDENTITY_VERSION = 2
+    private const val CURRENT_VERSION = 3
+    private const val SHA256_FINGERPRINT_BYTES = 32
+    private const val SHA256_FINGERPRINT_HEX_LENGTH = SHA256_FINGERPRINT_BYTES * 2
     private const val STATE_PREPARED = 0
     private const val STATE_COMMITTED = 1
     private const val MAX_JOURNAL_BYTES = 64 * 1024
@@ -66,7 +67,8 @@ internal object TrainingCommitJournal {
         file: File,
         baselineOptimizerStep: Int,
         itemIds: List<String>,
-        modelIdentityFingerprint: String? = null
+        modelIdentityFingerprint: String? = null,
+        optimizerConfigFingerprint: String? = null
     ) {
         require(baselineOptimizerStep >= 0) {
             "Baseline optimizer step cannot be negative."
@@ -90,7 +92,8 @@ internal object TrainingCommitJournal {
             baselineOptimizerStep = baselineOptimizerStep,
             committedOptimizerStep = null,
             entries = entries,
-            modelIdentityFingerprint = modelIdentityFingerprint
+            modelIdentityFingerprint = modelIdentityFingerprint,
+            optimizerConfigFingerprint = optimizerConfigFingerprint
         )
     }
 
@@ -99,7 +102,8 @@ internal object TrainingCommitJournal {
         baselineOptimizerStep: Int,
         committedOptimizerStep: Int,
         entries: List<TrainingCommitJournalEntry>,
-        modelIdentityFingerprint: String? = null
+        modelIdentityFingerprint: String? = null,
+        optimizerConfigFingerprint: String? = null
     ) {
         require(baselineOptimizerStep >= 0)
         require(committedOptimizerStep >= baselineOptimizerStep) {
@@ -131,15 +135,22 @@ internal object TrainingCommitJournal {
     }
 
     /**
-     * Version-1 journals have no model identity and retain their original
-     * optimizer-step-only recovery behavior. Version 2 journals require an exact
-     * architecture/tokenizer identity match before recovery can mutate Room state.
+     * Version-1 journals have no model identity; version 2 adds architecture/tokenizer
+     * identity; version 3 additionally binds recovery to the active optimizer configuration.
+     * Legacy journal versions remain readable and retain their explicitly unverified path.
      */
     fun matchesModelIdentity(
         snapshot: TrainingCommitJournalSnapshot,
         activeModelIdentityFingerprint: String
     ): Boolean = snapshot.modelIdentityFingerprint?.let { expected ->
         expected == activeModelIdentityFingerprint
+    } ?: true
+
+    fun matchesOptimizerConfiguration(
+        snapshot: TrainingCommitJournalSnapshot,
+        activeOptimizerConfigFingerprint: String
+    ): Boolean = snapshot.optimizerConfigFingerprint?.let { expected ->
+        expected == activeOptimizerConfigFingerprint
     } ?: true
 
     fun read(file: File): TrainingCommitJournalSnapshot? {
@@ -180,8 +191,15 @@ internal object TrainingCommitJournal {
                 val committedOptimizerStep = body.readInt()
                 val count = body.readInt()
                 require(baselineOptimizerStep >= 0 && count in 1..MAX_ITEMS)
-                val modelIdentityFingerprint = if (version >= CURRENT_VERSION) {
-                    val fingerprintBytes = ByteArray(MODEL_IDENTITY_FINGERPRINT_BYTES)
+                val modelIdentityFingerprint = if (version >= MODEL_IDENTITY_VERSION) {
+                    val fingerprintBytes = ByteArray(SHA256_FINGERPRINT_BYTES)
+                    body.readFully(fingerprintBytes)
+                    fingerprintBytes.toHexFingerprint()
+                } else {
+                    null
+                }
+                val optimizerConfigFingerprint = if (version >= CURRENT_VERSION) {
+                    val fingerprintBytes = ByteArray(SHA256_FINGERPRINT_BYTES)
                     body.readFully(fingerprintBytes)
                     fingerprintBytes.toHexFingerprint()
                 } else {
@@ -253,7 +271,8 @@ internal object TrainingCommitJournal {
                         null
                     },
                     entries = entries,
-                    modelIdentityFingerprint = modelIdentityFingerprint
+                    modelIdentityFingerprint = modelIdentityFingerprint,
+                    optimizerConfigFingerprint = optimizerConfigFingerprint
                 )
             }
         }
@@ -271,21 +290,21 @@ internal object TrainingCommitJournal {
     }
 
     private fun String.toSha256FingerprintBytes(): ByteArray {
-        require(length == MODEL_IDENTITY_FINGERPRINT_HEX_LENGTH) {
-            "Model identity fingerprint must contain exactly 32 SHA-256 bytes."
+        require(length == SHA256_FINGERPRINT_HEX_LENGTH) {
+            "Fingerprint must contain exactly 32 SHA-256 bytes."
         }
         require(all { character ->
             character in '0'..'9' || character in 'a'..'f'
         }) {
-            "Model identity fingerprint must be lowercase hexadecimal."
+            "Fingerprint must be lowercase hexadecimal."
         }
-        return ByteArray(MODEL_IDENTITY_FINGERPRINT_BYTES) { index ->
+        return ByteArray(SHA256_FINGERPRINT_BYTES) { index ->
             substring(index * 2, index * 2 + 2).toInt(16).toByte()
         }
     }
 
     private fun ByteArray.toHexFingerprint(): String {
-        require(size == MODEL_IDENTITY_FINGERPRINT_BYTES)
+        require(size == SHA256_FINGERPRINT_BYTES)
         return joinToString(separator = "") { byte ->
             "%02x".format(java.util.Locale.ROOT, byte.toInt() and 0xFF)
         }
@@ -297,10 +316,19 @@ internal object TrainingCommitJournal {
         baselineOptimizerStep: Int,
         committedOptimizerStep: Int?,
         entries: List<TrainingCommitJournalEntry>,
-        modelIdentityFingerprint: String?
+        modelIdentityFingerprint: String?,
+        optimizerConfigFingerprint: String?
     ) {
+        require((modelIdentityFingerprint == null) == (optimizerConfigFingerprint == null)) {
+            "Model identity and optimizer configuration fingerprints must be written together."
+        }
         val fingerprintBytes = modelIdentityFingerprint?.toSha256FingerprintBytes()
-        val version = if (fingerprintBytes == null) LEGACY_VERSION else CURRENT_VERSION
+        val optimizerFingerprintBytes = optimizerConfigFingerprint?.toSha256FingerprintBytes()
+        val version = when {
+            fingerprintBytes == null -> LEGACY_VERSION
+            optimizerFingerprintBytes == null -> MODEL_IDENTITY_VERSION
+            else -> CURRENT_VERSION
+        }
         val payloadBuffer = ByteArrayOutputStream()
         DataOutputStream(payloadBuffer).use { output ->
             output.writeInt(MAGIC)
@@ -311,6 +339,9 @@ internal object TrainingCommitJournal {
             output.writeInt(entries.size)
             if (fingerprintBytes != null) {
                 output.write(fingerprintBytes)
+            }
+            if (optimizerFingerprintBytes != null) {
+                output.write(optimizerFingerprintBytes)
             }
             for (entry in entries) {
                 val idBytes = entry.itemId.toByteArray(Charsets.UTF_8)

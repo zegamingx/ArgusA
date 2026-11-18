@@ -104,8 +104,58 @@ class TrainingCommitJournalTest {
 
             val restored = requireNotNull(TrainingCommitJournal.read(file))
             assertEquals(fingerprint, restored.modelIdentityFingerprint)
+            assertNull(restored.optimizerConfigFingerprint)
             assertTrue(TrainingCommitJournal.matchesModelIdentity(restored, fingerprint))
             assertFalse(TrainingCommitJournal.matchesModelIdentity(restored, "f".repeat(64)))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun versionThreeJournalBindsModelAndOptimizerConfigurationIdentities() {
+        val directory = Files.createTempDirectory("argus-training-journal-v3").toFile()
+        val file = File(directory, TrainingCommitJournal.FILE_NAME)
+        val modelFingerprint = "0123456789abcdef".repeat(4)
+        val optimizerFingerprint = OptimizerConfig.DEFAULT.fingerprint
+        try {
+            TrainingCommitJournal.writePrepared(
+                file = file,
+                baselineOptimizerStep = 13,
+                itemIds = listOf("item-a"),
+                modelIdentityFingerprint = modelFingerprint,
+                optimizerConfigFingerprint = optimizerFingerprint
+            )
+            val bytes = file.readBytes()
+            assertEquals(3, java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.BIG_ENDIAN).getInt(8))
+            val restored = requireNotNull(TrainingCommitJournal.read(file))
+            assertEquals(modelFingerprint, restored.modelIdentityFingerprint)
+            assertEquals(optimizerFingerprint, restored.optimizerConfigFingerprint)
+            assertTrue(TrainingCommitJournal.matchesModelIdentity(restored, modelFingerprint))
+            assertFalse(TrainingCommitJournal.matchesModelIdentity(restored, "f".repeat(64)))
+            assertTrue(TrainingCommitJournal.matchesOptimizerConfiguration(restored, optimizerFingerprint))
+            assertFalse(TrainingCommitJournal.matchesOptimizerConfiguration(restored, "a".repeat(64)))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun versionThreeRejectsMalformedOptimizerConfigurationFingerprint() {
+        val directory = Files.createTempDirectory("argus-training-journal-v3-invalid").toFile()
+        val file = File(directory, TrainingCommitJournal.FILE_NAME)
+        try {
+            val failure = runCatching {
+                TrainingCommitJournal.writePrepared(
+                    file = file,
+                    baselineOptimizerStep = 3,
+                    itemIds = listOf("item-a"),
+                    modelIdentityFingerprint = "f".repeat(64),
+                    optimizerConfigFingerprint = "not-a-fingerprint"
+                )
+            }.exceptionOrNull()
+            assertNotNull(failure)
+            assertFalse(file.exists())
         } finally {
             directory.deleteRecursively()
         }

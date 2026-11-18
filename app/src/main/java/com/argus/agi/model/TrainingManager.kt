@@ -1728,20 +1728,38 @@ class TrainingManager(
         snapshot: TrainingCommitJournalSnapshot,
         recoveryPhase: String
     ) {
-        val journalFingerprint = snapshot.modelIdentityFingerprint
-        if (journalFingerprint == null) {
+        val activeModelState = neuralEngine.snapshotModelState()
+        if (snapshot.modelIdentityFingerprint == null) {
             Log.w(
                 TAG,
-                "Training journal v1 has no model identity fingerprint; preserving its legacy optimizer-step recovery path."
+                "Legacy training journal has no model identity fingerprint; preserving its prior optimizer-step recovery path."
             )
-            return
+        } else {
+            check(
+                TrainingCommitJournal.matchesModelIdentity(
+                    snapshot,
+                    activeModelState.identity.fingerprint
+                )
+            ) {
+                "Training journal model identity mismatch during $recoveryPhase. " +
+                    "The checkpoint was preserved and queue recovery was stopped."
+            }
         }
-        val activeFingerprint = neuralEngine.snapshotModelState().identity.fingerprint
-        check(
-            TrainingCommitJournal.matchesModelIdentity(snapshot, activeFingerprint)
-        ) {
-            "Training journal model identity mismatch during $recoveryPhase. " +
-                "The checkpoint was preserved and queue recovery was stopped."
+        if (snapshot.optimizerConfigFingerprint == null) {
+            Log.w(
+                TAG,
+                "Legacy training journal has no optimizer configuration fingerprint; compatibility is unverified."
+            )
+        } else {
+            check(
+                TrainingCommitJournal.matchesOptimizerConfiguration(
+                    snapshot,
+                    activeModelState.optimizerConfiguration.fingerprint
+                )
+            ) {
+                "Training journal optimizer configuration mismatch during $recoveryPhase. " +
+                    "The checkpoint was preserved and queue recovery was stopped."
+            }
         }
     }
 
@@ -2783,16 +2801,18 @@ class TrainingManager(
         check(neuralEngine.saveCheckpoint()) {
             "The pre-batch model checkpoint could not be secured."
         }
-        val baselineModelIdentityFingerprint =
-            neuralEngine.snapshotModelState().identity.fingerprint
-        val baselineOptimizerStep = neuralEngine.optimizerStep
+        val baselineModelState = neuralEngine.snapshotModelState()
+        val baselineModelIdentityFingerprint = baselineModelState.identity.fingerprint
+        val baselineOptimizerConfigFingerprint = baselineModelState.optimizerConfiguration.fingerprint
+        val baselineOptimizerStep = baselineModelState.optimizerStep
         activeBatchBaselineOptimizerStep = baselineOptimizerStep
         activeBatchRoomCommitted = false
         TrainingCommitJournal.writePrepared(
             file = trainingCommitJournalFile,
             baselineOptimizerStep = baselineOptimizerStep,
             itemIds = items.map(TrainingData::id),
-            modelIdentityFingerprint = baselineModelIdentityFingerprint
+            modelIdentityFingerprint = baselineModelIdentityFingerprint,
+            optimizerConfigFingerprint = baselineOptimizerConfigFingerprint
         )
 
         val startNs = System.nanoTime()
@@ -2819,7 +2839,8 @@ class TrainingManager(
             baselineOptimizerStep = baselineOptimizerStep,
             committedOptimizerStep = neuralEngine.optimizerStep,
             entries = commitEntries,
-            modelIdentityFingerprint = baselineModelIdentityFingerprint
+            modelIdentityFingerprint = baselineModelIdentityFingerprint,
+            optimizerConfigFingerprint = baselineOptimizerConfigFingerprint
         )
         val committedJournal = requireNotNull(
             TrainingCommitJournal.read(trainingCommitJournalFile)

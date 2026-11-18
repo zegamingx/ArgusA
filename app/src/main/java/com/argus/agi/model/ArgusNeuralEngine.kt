@@ -373,7 +373,8 @@ class ArgusNeuralEngine private constructor(
             ),
             optimizerStep = adamStep,
             checkpointFormat = ModelCheckpointFormat.ARG5,
-            checkpointVerified = checkpointStateVerified
+            checkpointVerified = checkpointStateVerified,
+            optimizerConfiguration = optimizerConfig.identity
         )
     }
 
@@ -533,12 +534,7 @@ class ArgusNeuralEngine private constructor(
     val vWDown get() = blocks[0].vWDown
 
     private var adamStep = 0
-    private val weightDecay = 0.01f
-    private val baseLearningRate = 0.005f
-    private val beta1 = 0.9f
-    private val beta2 = 0.999f
-    private val epsilon = 1e-8f
-    private val maxGradNorm = 1.0f
+    private val optimizerConfig = OptimizerConfig.DEFAULT
 
     // Reusable scratch buffer untuk attention weights
     private val attnWeightsCache: Array<Array<FloatArray>> =
@@ -1845,7 +1841,7 @@ class ArgusNeuralEngine private constructor(
         val advancesOptimizerStep = updateParameters && gradientAccumulator == null
         val nextAdamStep = if (advancesOptimizerStep) Math.addExact(adamStep, 1) else adamStep
         val lr = if (advancesOptimizerStep) {
-            baseLearningRate / (1f + 0.0002f * nextAdamStep)
+            optimizerConfig.baseLearningRate / (1f + optimizerConfig.learningRateDecay * nextAdamStep)
         } else {
             0f
         }
@@ -2787,8 +2783,8 @@ class ArgusNeuralEngine private constructor(
             return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
 
-        val beta1Pow = Math.pow(beta1.toDouble(), nextAdamStep.toDouble()).toFloat()
-        val beta2Pow = Math.pow(beta2.toDouble(), nextAdamStep.toDouble()).toFloat()
+        val beta1Pow = Math.pow(optimizerConfig.beta1.toDouble(), nextAdamStep.toDouble()).toFloat()
+        val beta2Pow = Math.pow(optimizerConfig.beta2.toDouble(), nextAdamStep.toDouble()).toFloat()
         val biasCorr1 = 1f - beta1Pow
         val biasCorr2 = 1f - beta2Pow
 
@@ -2805,13 +2801,13 @@ class ArgusNeuralEngine private constructor(
             val b = blocks[l]
             val lg = layerGrads[l]
 
-            parameterList.add(b.wDown); gradientList.add(lg.gradWDown); firstMomentList.add(b.mWDown); secondMomentList.add(b.vWDown); weightDecayList.add(weightDecay)
-            parameterList.add(b.wUp); gradientList.add(lg.gradWUp); firstMomentList.add(b.mWUp); secondMomentList.add(b.vWUp); weightDecayList.add(weightDecay)
-            parameterList.add(b.wGate); gradientList.add(lg.gradWGate); firstMomentList.add(b.mWGate); secondMomentList.add(b.vWGate); weightDecayList.add(weightDecay)
-            parameterList.add(b.wO); gradientList.add(lg.gradWO); firstMomentList.add(b.mWO); secondMomentList.add(b.vWO); weightDecayList.add(weightDecay)
-            parameterList.add(b.wQ); gradientList.add(lg.gradWQ); firstMomentList.add(b.mWQ); secondMomentList.add(b.vWQ); weightDecayList.add(weightDecay)
-            parameterList.add(b.wK); gradientList.add(lg.gradWK); firstMomentList.add(b.mWK); secondMomentList.add(b.vWK); weightDecayList.add(weightDecay)
-            parameterList.add(b.wV); gradientList.add(lg.gradWV); firstMomentList.add(b.mWV); secondMomentList.add(b.vWV); weightDecayList.add(weightDecay)
+            parameterList.add(b.wDown); gradientList.add(lg.gradWDown); firstMomentList.add(b.mWDown); secondMomentList.add(b.vWDown); weightDecayList.add(optimizerConfig.weightDecay)
+            parameterList.add(b.wUp); gradientList.add(lg.gradWUp); firstMomentList.add(b.mWUp); secondMomentList.add(b.vWUp); weightDecayList.add(optimizerConfig.weightDecay)
+            parameterList.add(b.wGate); gradientList.add(lg.gradWGate); firstMomentList.add(b.mWGate); secondMomentList.add(b.vWGate); weightDecayList.add(optimizerConfig.weightDecay)
+            parameterList.add(b.wO); gradientList.add(lg.gradWO); firstMomentList.add(b.mWO); secondMomentList.add(b.vWO); weightDecayList.add(optimizerConfig.weightDecay)
+            parameterList.add(b.wQ); gradientList.add(lg.gradWQ); firstMomentList.add(b.mWQ); secondMomentList.add(b.vWQ); weightDecayList.add(optimizerConfig.weightDecay)
+            parameterList.add(b.wK); gradientList.add(lg.gradWK); firstMomentList.add(b.mWK); secondMomentList.add(b.vWK); weightDecayList.add(optimizerConfig.weightDecay)
+            parameterList.add(b.wV); gradientList.add(lg.gradWV); firstMomentList.add(b.mWV); secondMomentList.add(b.vWV); weightDecayList.add(optimizerConfig.weightDecay)
 
             parameterList.add(b.loraQa); gradientList.add(lg.gradLoraQa); firstMomentList.add(b.mLoraQa); secondMomentList.add(b.vLoraQa); weightDecayList.add(0f)
             parameterList.add(b.loraQb); gradientList.add(lg.gradLoraQb); firstMomentList.add(b.mLoraQb); secondMomentList.add(b.vLoraQb); weightDecayList.add(0f)
@@ -2821,7 +2817,7 @@ class ArgusNeuralEngine private constructor(
 
         val gradientGroups = gradientList.toTypedArray()
         val clippedOnGpu =
-            tryNormalizeAndClipGradientsOnVulkan(gradientGroups, maxGradNorm)
+            tryNormalizeAndClipGradientsOnVulkan(gradientGroups, optimizerConfig.maximumGradientNorm)
         val clipFactor = if (clippedOnGpu) {
             1.0f
         } else {
@@ -2833,8 +2829,8 @@ class ArgusNeuralEngine private constructor(
             if (!totalNorm.isFinite()) {
                 return Float.NaN
             }
-            if (totalNorm > maxGradNorm) {
-                maxGradNorm / (totalNorm + 1e-6f)
+            if (totalNorm > optimizerConfig.maximumGradientNorm) {
+                optimizerConfig.maximumGradientNorm / (totalNorm + optimizerConfig.gradientNormEpsilon)
             } else {
                 1.0f
             }
@@ -3023,7 +3019,7 @@ class ArgusNeuralEngine private constructor(
                 accumulator = residentAccumulator,
                 destinationTensors = gradients,
                 targetCount = accumulator.targetCount,
-                maximumGradientNorm = maxGradNorm,
+                maximumGradientNorm = optimizerConfig.maximumGradientNorm,
                 retainResidentBuffer = true
             )
             if (clippedOnGpu) {
@@ -3058,22 +3054,22 @@ class ArgusNeuralEngine private constructor(
             }
             val clipFactor = if (clippedOnGpu) {
                 1.0f
-            } else if (totalNorm > maxGradNorm) {
-                maxGradNorm / (totalNorm + 1e-6f)
+            } else if (totalNorm > optimizerConfig.maximumGradientNorm) {
+                optimizerConfig.maximumGradientNorm / (totalNorm + optimizerConfig.gradientNormEpsilon)
             } else {
                 1.0f
             }
 
             val nextAdamStep = Math.addExact(adamStep, 1)
-            val learningRate = baseLearningRate / (1f + 0.0002f * nextAdamStep)
+            val learningRate = optimizerConfig.baseLearningRate / (1f + optimizerConfig.learningRateDecay * nextAdamStep)
             val biasCorrection1 = 1f -
-                Math.pow(beta1.toDouble(), nextAdamStep.toDouble()).toFloat()
+                Math.pow(optimizerConfig.beta1.toDouble(), nextAdamStep.toDouble()).toFloat()
             val biasCorrection2 = 1f -
-                Math.pow(beta2.toDouble(), nextAdamStep.toDouble()).toFloat()
+                Math.pow(optimizerConfig.beta2.toDouble(), nextAdamStep.toDouble()).toFloat()
             val weightDecayByGroup = FloatArray(parameters.size).also { values ->
                 for (layer in 0 until layerCount) {
                     val offset = 2 + layer * 11
-                    for (index in 0 until 7) values[offset + index] = weightDecay
+                    for (index in 0 until 7) values[offset + index] = optimizerConfig.weightDecay
                 }
             }
 
@@ -3226,10 +3222,10 @@ class ArgusNeuralEngine private constructor(
                 }
 
                 val nextFirstMoment =
-                    beta1 * oldFirstMoment + (1f - beta1) * clippedGradient
+                    optimizerConfig.beta1 * oldFirstMoment + (1f - optimizerConfig.beta1) * clippedGradient
                 val nextSecondMoment =
-                    beta2 * oldSecondMoment +
-                        (1f - beta2) * clippedGradient * clippedGradient
+                    optimizerConfig.beta2 * oldSecondMoment +
+                        (1f - optimizerConfig.beta2) * clippedGradient * clippedGradient
                 require(
                     nextFirstMoment.isFinite() &&
                         nextSecondMoment.isFinite() &&
@@ -3240,7 +3236,7 @@ class ArgusNeuralEngine private constructor(
                 val correctedFirstMoment = nextFirstMoment / biasCorrection1
                 val correctedSecondMoment = nextSecondMoment / biasCorrection2
                 val update =
-                    correctedFirstMoment / (sqrt(correctedSecondMoment) + epsilon) +
+                    correctedFirstMoment / (sqrt(correctedSecondMoment) + optimizerConfig.epsilon) +
                         weightDecayValue * oldParameter
                 Float16Codec.fromFiniteFloat(oldParameter - learningRate * update)
             }
@@ -3308,11 +3304,11 @@ class ArgusNeuralEngine private constructor(
         for (index in 0 until limit) {
             val gradient = grad[index]
             val parameter = param[index]
-            m[index] = beta1 * m[index] + (1f - beta1) * gradient
-            v[index] = beta2 * v[index] + (1f - beta2) * gradient * gradient
+            m[index] = optimizerConfig.beta1 * m[index] + (1f - optimizerConfig.beta1) * gradient
+            v[index] = optimizerConfig.beta2 * v[index] + (1f - optimizerConfig.beta2) * gradient * gradient
             val correctedFirstMoment = m[index] / biasCorr1
             val correctedSecondMoment = v[index] / biasCorr2
-            val update = correctedFirstMoment / (sqrt(correctedSecondMoment) + epsilon) +
+            val update = correctedFirstMoment / (sqrt(correctedSecondMoment) + optimizerConfig.epsilon) +
                 wd * parameter
             val updatedParameter = parameter - lr * update
             require(updatedParameter.isFinite()) {
@@ -3335,11 +3331,11 @@ class ArgusNeuralEngine private constructor(
         val limit = min(param.size, grad.size)
         for (i in 0 until limit) {
             val g = grad[i]
-            m[i] = beta1 * m[i] + (1f - beta1) * g
-            v[i] = beta2 * v[i] + (1f - beta2) * g * g
+            m[i] = optimizerConfig.beta1 * m[i] + (1f - optimizerConfig.beta1) * g
+            v[i] = optimizerConfig.beta2 * v[i] + (1f - optimizerConfig.beta2) * g * g
             val mHat = m[i] / biasCorr1
             val vHat = v[i] / biasCorr2
-            param[i] -= lr * (mHat / (sqrt(vHat) + epsilon) + wd * param[i])
+            param[i] -= lr * (mHat / (sqrt(vHat) + optimizerConfig.epsilon) + wd * param[i])
         }
     }
 
