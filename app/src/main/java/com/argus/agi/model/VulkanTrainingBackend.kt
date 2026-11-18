@@ -1,5 +1,6 @@
 package com.argus.agi.model
 
+import com.argus.agi.device.DeviceProfile
 import com.argus.agi.runtime.AdaptiveComputeOperation
 import com.argus.agi.runtime.AdaptiveComputePerformanceMonitor
 
@@ -548,6 +549,9 @@ internal object VulkanTrainingBackend {
     val deviceCapabilities: StateFlow<VulkanDeviceCapabilities?> =
         _deviceCapabilities.asStateFlow()
 
+    private val _deviceProfile = MutableStateFlow<DeviceProfile?>(null)
+    val deviceProfile: StateFlow<DeviceProfile?> = _deviceProfile.asStateFlow()
+
     private val _gpuPerformanceMetrics = MutableStateFlow(VulkanGpuPerformanceMetrics())
     val gpuPerformanceMetrics: StateFlow<VulkanGpuPerformanceMetrics> =
         _gpuPerformanceMetrics.asStateFlow()
@@ -844,7 +848,7 @@ internal object VulkanTrainingBackend {
     }
 
     private fun calculateTotalTensorResidencyBudgetBytes(
-        capabilities: VulkanDeviceCapabilities?
+        deviceProfile: DeviceProfile?
     ): Long {
         val runtime = Runtime.getRuntime()
         val maximumAppHeapBytes = runtime.maxMemory().coerceAtLeast(0L)
@@ -853,9 +857,9 @@ internal object VulkanTrainingBackend {
                 (maximumAppHeapBytes - runtime.totalMemory()).coerceAtLeast(0L)
             ).coerceAtLeast(0L)
         val deviceLocalHeadroomBytes =
-            capabilities?.deviceLocalMemoryBudgetHeadroomBytes?.minOrNull()
+            deviceProfile?.memory?.deviceLocalMemoryBudgetHeadroomBytes?.minOrNull()
         val maximumStorageBufferRangeBytes =
-            capabilities?.maxStorageBufferRangeBytes ?: 0L
+            deviceProfile?.limits?.maxStorageBufferRangeBytes ?: 0L
 
         return DeviceAdaptiveRuntimePolicy.calculateTensorArenaBudget(
             maximumAppHeapBytes = maximumAppHeapBytes,
@@ -873,16 +877,16 @@ internal object VulkanTrainingBackend {
      * gradient capacity; the remaining equal shares hold both candidate sets.
      */
     private fun calculateModelTensorResidencyBudgetBytes(
-        capabilities: VulkanDeviceCapabilities?
-    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) / 12L
+        deviceProfile: DeviceProfile?
+    ): Long = calculateTotalTensorResidencyBudgetBytes(deviceProfile) / 12L
 
     private fun calculateActivationTensorResidencyBudgetBytes(
-        capabilities: VulkanDeviceCapabilities?
-    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) / 6L
+        deviceProfile: DeviceProfile?
+    ): Long = calculateTotalTensorResidencyBudgetBytes(deviceProfile) / 6L
 
     private fun calculateOptimizerStateResidencyBudgetBytes(
-        capabilities: VulkanDeviceCapabilities?
-    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) / 3L
+        deviceProfile: DeviceProfile?
+    ): Long = calculateTotalTensorResidencyBudgetBytes(deviceProfile) / 3L
 
     /**
      * Allocates persistent Vulkan storage. New contents are undefined until uploaded
@@ -1079,13 +1083,15 @@ internal object VulkanTrainingBackend {
         runCatching {
             VulkanDeviceCapabilities.fromJson(nativeGetDeviceCapabilities())
         }.onSuccess { capabilities ->
+            val detectedProfile = capabilities.toDeviceProfile()
             _deviceCapabilities.value = capabilities
+            _deviceProfile.value = detectedProfile
             _modelTensorResidencyBudgetBytes.value =
-                calculateModelTensorResidencyBudgetBytes(capabilities)
+                calculateModelTensorResidencyBudgetBytes(detectedProfile)
             _activationTensorResidencyBudgetBytes.value =
-                calculateActivationTensorResidencyBudgetBytes(capabilities)
+                calculateActivationTensorResidencyBudgetBytes(detectedProfile)
             _optimizerStateResidencyBudgetBytes.value =
-                calculateOptimizerStateResidencyBudgetBytes(capabilities)
+                calculateOptimizerStateResidencyBudgetBytes(detectedProfile)
             lastMemoryBudgetRefreshNanos = nowNanos
             Log.i(
                 TAG,
@@ -1849,6 +1855,7 @@ internal object VulkanTrainingBackend {
         _activationTensorResidencyBudgetBytes.value = 0L
         _optimizerStateResidencyBudgetBytes.value = 0L
         _deviceCapabilities.value = null
+        _deviceProfile.value = null
         _gpuPerformanceMetrics.value = VulkanGpuPerformanceMetrics()
         _tensorArenaMetrics.value = VulkanTensorArenaMetrics()
         _currentBackend = "Kotlin CPU"
@@ -1908,13 +1915,15 @@ internal object VulkanTrainingBackend {
                 }.onFailure { error ->
                     Log.w(TAG, "Vulkan runtime started but capability metadata could not be parsed.", error)
                 }.getOrNull()
+                val detectedProfile = detectedCapabilities?.toDeviceProfile()
                 _deviceCapabilities.value = detectedCapabilities
+                _deviceProfile.value = detectedProfile
                 _modelTensorResidencyBudgetBytes.value =
-                    calculateModelTensorResidencyBudgetBytes(detectedCapabilities)
+                    calculateModelTensorResidencyBudgetBytes(detectedProfile)
                 _activationTensorResidencyBudgetBytes.value =
-                    calculateActivationTensorResidencyBudgetBytes(detectedCapabilities)
+                    calculateActivationTensorResidencyBudgetBytes(detectedProfile)
                 _optimizerStateResidencyBudgetBytes.value =
-                    calculateOptimizerStateResidencyBudgetBytes(detectedCapabilities)
+                    calculateOptimizerStateResidencyBudgetBytes(detectedProfile)
                 Log.i(
                     TAG,
                     "FP16 model-residency budget: ${_modelTensorResidencyBudgetBytes.value} bytes."
