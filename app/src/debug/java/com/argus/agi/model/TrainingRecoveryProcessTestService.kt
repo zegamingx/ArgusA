@@ -171,7 +171,8 @@ class TrainingRecoveryProcessTestService : Service() {
                         // TrainingManager finally block or Room close can run.
                         Process.killProcess(Process.myPid())
                     }
-                }
+                },
+                initiallyPaused = true
             )
             manager = activeManager
             val itemTitle = "Cold-start recovery boundary " + boundaryName
