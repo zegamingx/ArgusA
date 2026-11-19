@@ -59,37 +59,33 @@ Run release checks and build:
 ./gradlew :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
 ```
 
-A release build requires the Argus release signing key at `signing/argus-release.p12`, or a different path supplied through `KEYSTORE_PATH`. The alias is `upload`; the keystore format is PKCS#12.
+Release APKs are intentionally unsigned in this branch. The previously distributed v1.0.13 signer was present in an unencrypted private-repository release asset and must be treated as compromised. Do not sign new APKs with that identity. A new release signing pipeline will be introduced only after an Android signing-certificate lineage has been generated with the old and replacement keys, and an in-place update has been tested on an existing v1.0.13 installation.
 
 ## GitHub releases
 
-Pushes to `main` are validated by the native-validation workflow. They do not
-sign or publish an APK.
+Signed release publication is temporarily suspended.
 
-A signed APK is produced only by manually dispatching
-`Argus Signed Release` from the `main` branch. The job uses a dedicated
-GitHub Environment named `release-signing`. Before dispatching the workflow,
-configure required reviewers and add these environment secrets:
+The signing identity used by the distributed Argus v1.0.13 APK was previously
+stored as an unencrypted PKCS#12 GitHub Release asset. Removing that asset does
+not undo prior exposure. Treat the old private key as compromised and do not
+use it for new releases.
 
-- `ARGUS_SIGNING_KEY_BASE64`: Base64-encoded encrypted PKCS#12 keystore.
-- `ARGUS_SIGNING_STORE_PASSWORD`: PKCS#12 store password.
-- `ARGUS_SIGNING_KEY_PASSWORD`: private-key password.
+Before signed releases resume, create an Android signing-certificate lineage
+from the old signer to a new offline-generated signer, using the official
+`apksigner rotate` and rotated-signing workflow. The migration APK must be
+built and installed over an existing v1.0.13 installation with `adb install -r`;
+verify that app data remains intact and that subsequent updates signed by the
+new identity are accepted. Keep the old key only for the controlled migration
+operation, then remove it from CI and retain it only in encrypted offline
+recovery storage for as long as required.
 
-The signing certificate is pinned in the workflow to the SHA-256 fingerprint
-of the currently distributed Argus v1.0.13 APK. A different certificate causes
-the release job to fail closed. Update that pin only as part of a tested Android
-app-signing key-rotation and migration plan.
+The certificate fingerprint from v1.0.13 is recorded in the private migration
+notes, not used as an approval pin for future release signing. A new workflow
+will be added after the replacement certificate, lineage, and update path have
+been verified. Until then, `:app:assembleRelease` produces an unsigned APK.
 
-The encrypted keystore is decoded only into the runner's temporary directory,
-used for the signed build, and deleted when the signing step exits. The
-keystore is not committed, uploaded as a release asset, or retained in the
-workspace. Do not add signing material to GitHub Releases, workflow artifacts,
-job outputs, caches, or repository files.
+Repository validation and debug builds do not receive signing keys.
 
-The workflow publishes the verified APK and SHA-256 checksums to the rolling
-`Release` GitHub Release. Repository pushes and pull-request validation never
-receive signing secrets.
- 
 ## Runtime crash diagnostics
 
 On startup, Argus reads Android's historical process-exit record and keeps a bounded
