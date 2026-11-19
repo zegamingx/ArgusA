@@ -3,6 +3,8 @@ package com.argus.agi.model
 import android.content.Context
 import com.argus.agi.data.repository.ArgusRepository
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -42,6 +44,7 @@ class WorldModel(
         private const val MAX_ENTITIES = 200
         private const val ENTITY_TTL_MS = 24L * 60 * 60 * 1000 // 24 jam
         private const val SNIPPET_MAX_LEN = 120
+        private const val SCREEN_CONTEXT_TTL_MS = 5L * 60L * 1000L
 
         private val TIME_FORMATTER: DateTimeFormatter =
             DateTimeFormatter.ofPattern("HH:mm:ss")
@@ -57,6 +60,8 @@ class WorldModel(
     }
 
     private val entities = ConcurrentHashMap<String, WorldEntity>()
+    private val screenContextLock = Any()
+    private var screenContextExpiryJob: Job? = null
     private val _entitiesFlow = MutableStateFlow<List<WorldEntity>>(emptyList())
     val entitiesFlow: StateFlow<List<WorldEntity>> = _entitiesFlow.asStateFlow()
 
@@ -80,6 +85,11 @@ class WorldModel(
         scope.launch {
             repo?.let { r ->
                 runCatching {
+                    // These two keys were persisted by older releases when
+                    // Accessibility screen capture was still stored as durable memory.
+                    // Remove them before loading any user memories into the live World Model.
+                    r.deleteScreenContextMemories()
+
                     val saved = r.getMemoriesSnapshot()
                     if (saved.isNotEmpty()) {
                         saved.forEach { entities[it.key] = it }
@@ -137,6 +147,14 @@ class WorldModel(
                 .take(entities.size - MAX_ENTITIES)
                 .forEach { (key, entity) -> entities.remove(key, entity) }
         }
+
+        if (!entities.containsKey("active_screen_app") ||
+            !entities.containsKey("last_screen_content")
+        ) {
+            if (_currentContextSummary.value.startsWith("App: ")) {
+                _currentContextSummary.value = "System ready."
+            }
+        }
     }
 
     private fun pruneIfNeeded() {
@@ -160,20 +178,40 @@ class WorldModel(
      */
     fun updateScreenContext(packageName: String, visibleTextSnippet: String) {
         val cleanSnippet = sanitizeSnippet(visibleTextSnippet)
-        updateTransientEntities(
-            WorldEntity("active_screen_app", packageName, "Accessibility Perception"),
-            WorldEntity("last_screen_content", cleanSnippet, "Screen OCR/Text Parser")
-        )
-        val timeStr = TIME_FORMATTER.format(Instant.now().atZone(ZoneId.systemDefault()))
-        _currentContextSummary.value =
-            "App: $packageName | Detected: \"$cleanSnippet\" ($timeStr)"
+        synchronized(screenContextLock) {
+            updateTransientEntities(
+                WorldEntity("active_screen_app", packageName, "Accessibility Perception"),
+                WorldEntity("last_screen_content", cleanSnippet, "Screen OCR/Text Parser")
+            )
+            val timeStr = TIME_FORMATTER.format(Instant.now().atZone(ZoneId.systemDefault()))
+            _currentContextSummary.value =
+                "App: $packageName | Detected: \"$cleanSnippet\" ($timeStr)"
+
+            screenContextExpiryJob?.cancel()
+            screenContextExpiryJob = scope.launch {
+                delay(SCREEN_CONTEXT_TTL_MS)
+                synchronized(screenContextLock) {
+                    if (screenContextExpiryJob === coroutineContext[kotlinx.coroutines.Job]) {
+                        screenContextExpiryJob = null
+                        entities.remove("active_screen_app")
+                        entities.remove("last_screen_content")
+                        publishSnapshot()
+                        _currentContextSummary.value = "System ready."
+                    }
+                }
+            }
+        }
     }
 
     fun clearScreenContext() {
-        entities.remove("active_screen_app")
-        entities.remove("last_screen_content")
-        publishSnapshot()
-        _currentContextSummary.value = "System ready."
+        synchronized(screenContextLock) {
+            screenContextExpiryJob?.cancel()
+            screenContextExpiryJob = null
+            entities.remove("active_screen_app")
+            entities.remove("last_screen_content")
+            publishSnapshot()
+            _currentContextSummary.value = "System ready."
+        }
     }
 
     private fun sanitizeSnippet(raw: String): String {
