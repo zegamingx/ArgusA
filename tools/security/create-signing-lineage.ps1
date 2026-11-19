@@ -133,7 +133,7 @@ function Get-CertificateFingerprints {
 
     $matches = [regex]::Matches(
         $Report,
-        '(?i)certificate SHA-256 digest:\s*([0-9a-f:]{64,95})'
+        '(?i)certificate SHA-256 digest:[ \t]*([0-9a-f:]{64,95})'
     )
     $fingerprints = @()
     foreach ($match in $matches) {
@@ -236,7 +236,7 @@ try {
     $lineageReport = Get-LineageReport -LineagePath $lineagePath
     $lineageMatches = [regex]::Matches(
         $lineageReport,
-        '(?i)SHA-256 digest:\s*([0-9a-f:]{64,95})'
+        '(?i)SHA-256 digest:[ \t]*([0-9a-f:]{64,95})'
     )
     $lineageFingerprints = @(
         foreach ($match in $lineageMatches) {
@@ -296,7 +296,7 @@ try {
             throw "adb is unavailable. Install Android SDK Platform-Tools."
         }
         $deviceSdk = (& adb shell getprop ro.build.version.sdk 2>$null | Out-String).Trim()
-        if ($LASTEXITCODE -ne 0 -or $deviceSdk -notmatch '^\d+$' -or [int]$deviceSdk -lt 34) {
+        if ($LASTEXITCODE -ne 0 -or $deviceSdk -notmatch '^[0-9]+$' -or [int]$deviceSdk -lt 34) {
             throw "A connected Android 14+ device is required for this migration test."
         }
 
