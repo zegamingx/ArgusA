@@ -343,6 +343,15 @@ class ArgusNeuralEngine private constructor(
     @Volatile
     private var checkpointStateVerified = false
 
+    @Volatile
+    private var checkpointRestoreBlocked = false
+
+    @Volatile
+    private var activeCheckpointFormat = ModelCheckpointFormat.ARG6
+
+    @Volatile
+    private var checkpointOptimizerConfigurationFingerprint: String? = null
+
     /**
      * True only after an existing checkpoint has been fully restored or a new
      * checkpoint has been atomically written and verified on local storage.
@@ -350,8 +359,64 @@ class ArgusNeuralEngine private constructor(
     val isCheckpointStateVerified: Boolean
         get() = checkpointStateVerified
 
+    /** True while an existing checkpoint has failed restoration and must not be overwritten. */
+    val isCheckpointRestoreBlocked: Boolean
+        get() = checkpointRestoreBlocked
+
+    /**
+     * Computes the full checkpoint file identity after independent read-back validation.
+     * The bounded streaming read avoids materializing model-sized checkpoint files in memory.
+     */
+    internal fun checkpointFileSha256Fingerprint(): String = synchronized(modelLock) {
+        check(checkpointStateVerified && !checkpointRestoreBlocked) {
+            "A verified, recoverable checkpoint is required before computing its file identity."
+        }
+        val file = File(context.filesDir, "argus_model_weights.bin")
+        check(file.isFile) {
+            "The committed model checkpoint is missing."
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+        BufferedInputStream(FileInputStream(file)).use { input ->
+            val buffer = ByteArray(TENSOR_WRITE_BUFFER_BYTES)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        digest.digest().joinToString(separator = "") { byte ->
+            "%02x".format(java.util.Locale.ROOT, byte.toInt() and 0xFF)
+        }
+    }
+
     val optimizerStep: Int
         get() = synchronized(modelLock) { adamStep }
+
+    /**
+     * Captures the exact active architecture, tokenizer, optimizer progress and
+     * checkpoint verification state without exposing mutable engine arrays.
+     */
+    internal fun snapshotModelState(): ModelState = synchronized(modelLock) {
+        val tokenizerConfig = tokenizer.config
+        ModelState(
+            identity = ModelStateIdentity(
+                architecture = architectureConfig,
+                tokenizer = TokenizerModelState(
+                    schemaVersion = tokenizerConfig.schemaVersion,
+                    algorithm = tokenizerConfig.algorithm,
+                    maximumVocabularySize = tokenizerConfig.maxVocabularySize,
+                    maxTokenLength = tokenizerConfig.maxTokenLength,
+                    vocabularySize = tokenizer.vocabSize,
+                    snapshotFingerprint = tokenizer.snapshotFingerprint()
+                )
+            ),
+            optimizerStep = adamStep,
+            checkpointFormat = activeCheckpointFormat,
+            checkpointVerified = checkpointStateVerified,
+            optimizerConfiguration = optimizerConfig.identity,
+            checkpointOptimizerConfigurationFingerprint = checkpointOptimizerConfigurationFingerprint
+        )
+    }
 
     val optimizerBackend: String
         get() = VulkanTrainingBackend.currentBackend
@@ -509,12 +574,7 @@ class ArgusNeuralEngine private constructor(
     val vWDown get() = blocks[0].vWDown
 
     private var adamStep = 0
-    private val weightDecay = 0.01f
-    private val baseLearningRate = 0.005f
-    private val beta1 = 0.9f
-    private val beta2 = 0.999f
-    private val epsilon = 1e-8f
-    private val maxGradNorm = 1.0f
+    private val optimizerConfig = OptimizerConfig.DEFAULT
 
     // Reusable scratch buffer untuk attention weights
     private val attnWeightsCache: Array<Array<FloatArray>> =
@@ -541,9 +601,12 @@ class ArgusNeuralEngine private constructor(
         private const val MAGIC_1 = 0x52.toByte()  // 'R'
         private const val MAGIC_2 = 0x47.toByte()  // 'G'
         private const val MAGIC_5 = 0x35.toByte()  // '5'
+        private const val MAGIC_6 = 0x36.toByte()  // '6'
         private const val ARG5_HEADER_SIZE = 96
-        private const val ARG5_CHECKPOINT_VERSION = 5
-        private const val ARG5_CHECKSUM_OFFSET = 88
+        private val ARG5_CHECKPOINT_VERSION = ModelCheckpointFormat.ARG5.version
+        private val ARG6_CHECKPOINT_VERSION = ModelCheckpointFormat.ARG6.version
+        private const val CHECKPOINT_CHECKSUM_OFFSET = 88
+        private const val ARG6_OPTIMIZER_FINGERPRINT_FLAG = 1
         private const val TOKENIZER_FINGERPRINT_BYTES = 32
         private const val FLOAT32_TENSOR_TYPE = 1
         private const val TENSOR_WRITE_BUFFER_BYTES = 64 * 1024
@@ -590,9 +653,10 @@ class ArgusNeuralEngine private constructor(
                 val prefix = readCheckpointPrefix(checkpoint)
                 if (
                     prefix[0] == MAGIC_0 && prefix[1] == MAGIC_1 &&
-                    prefix[2] == MAGIC_2 && prefix[3] == MAGIC_5
+                    prefix[2] == MAGIC_2 &&
+                    (prefix[3] == MAGIC_5 || prefix[3] == MAGIC_6)
                 ) {
-                    readArg5Config(checkpoint)
+                    readCheckpointConfig(checkpoint)
                 } else {
                     null
                 }
@@ -678,21 +742,31 @@ class ArgusNeuralEngine private constructor(
             }
         }
 
-        private fun readArg5Config(file: File): EngineConfig {
+        private fun readCheckpointConfig(file: File): EngineConfig {
             require(file.length() >= ARG5_HEADER_SIZE.toLong()) {
-                "ARG5 checkpoint header is incomplete."
+                "Checkpoint header is incomplete."
             }
-            val bytes = readFilePrefix(file, ARG5_HEADER_SIZE)
-            val header = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            val headerBytes = readFilePrefix(file, ARG5_HEADER_SIZE)
+            val header = ByteBuffer.wrap(headerBytes).order(ByteOrder.LITTLE_ENDIAN)
             require(
                 header.get() == MAGIC_0 && header.get() == MAGIC_1 &&
-                    header.get() == MAGIC_2 && header.get() == MAGIC_5
-            ) { "Invalid ARG5 checkpoint magic." }
-            require(header.int == ARG5_CHECKPOINT_VERSION) {
-                "Unsupported ARG5 checkpoint version."
+                    header.get() == MAGIC_2
+            ) { "Checkpoint magic is invalid." }
+            val magicVersion = header.get()
+            val isArg6 = magicVersion == MAGIC_6
+            require(isArg6 || magicVersion == MAGIC_5) {
+                "Checkpoint format is unsupported."
+            }
+            val expectedCheckpointVersion = if (isArg6) {
+                ARG6_CHECKPOINT_VERSION
+            } else {
+                ARG5_CHECKPOINT_VERSION
+            }
+            require(header.int == expectedCheckpointVersion) {
+                "Checkpoint format version is unsupported."
             }
             require(header.int == ARG5_HEADER_SIZE) {
-                "Invalid ARG5 checkpoint header size."
+                "Checkpoint fixed header size is invalid."
             }
 
             val architectureSchemaVersion = header.int
@@ -720,35 +794,42 @@ class ArgusNeuralEngine private constructor(
                 "Unsupported Argus architecture schema."
             }
             require(architectureIdLength in 1..512) {
-                "ARG5 architecture ID length is invalid."
+                "Checkpoint architecture ID length is invalid."
             }
             require(layerCount in 1..32) {
-                "ARG5 layer count is invalid: $layerCount."
+                "Checkpoint layer count is invalid: $layerCount."
             }
             require(savedVocabSize > 0) {
-                "ARG5 vocabulary size is invalid."
+                "Checkpoint vocabulary size is invalid."
             }
             require(savedVocabCap >= savedVocabSize) {
-                "ARG5 vocabulary capacity is invalid."
+                "Checkpoint vocabulary capacity is invalid."
             }
             require(vocabularyEntryCount in 1..tokenizerMaxVocab) {
-                "ARG5 vocabulary entry count is invalid."
+                "Checkpoint vocabulary entry count is invalid."
             }
             require(tensorCount in 1..2048) {
-                "ARG5 tensor count is invalid: $tensorCount."
+                "Checkpoint tensor count is invalid: $tensorCount."
             }
-            val minimumPayloadBytes = Math.addExact(
+            var minimumPayloadBytes = Math.addExact(
                 architectureIdLength.toLong(),
                 TOKENIZER_FINGERPRINT_BYTES.toLong()
             )
+            if (isArg6) {
+                minimumPayloadBytes = Math.addExact(
+                    minimumPayloadBytes,
+                    TOKENIZER_FINGERPRINT_BYTES.toLong()
+                )
+            }
             require(payloadBytes >= minimumPayloadBytes) {
-                "ARG5 payload length cannot contain its architecture ID and tokenizer fingerprint."
+                "Checkpoint payload is too short for its identity manifest."
             }
             require(savedVocabSize == vocabularyEntryCount) {
-                "ARG5 vocabulary size does not match its entry count."
+                "Checkpoint vocabulary size does not match its entry count."
             }
-            require(flags == 0) {
-                "ARG5 checkpoint uses unsupported architecture flags."
+            val expectedFlags = if (isArg6) ARG6_OPTIMIZER_FINGERPRINT_FLAG else 0
+            require(flags == expectedFlags) {
+                "Checkpoint uses unsupported format flags."
             }
 
             val tokenizerConfig = TokenizerConfig(
@@ -1821,7 +1902,7 @@ class ArgusNeuralEngine private constructor(
         val advancesOptimizerStep = updateParameters && gradientAccumulator == null
         val nextAdamStep = if (advancesOptimizerStep) Math.addExact(adamStep, 1) else adamStep
         val lr = if (advancesOptimizerStep) {
-            baseLearningRate / (1f + 0.0002f * nextAdamStep)
+            optimizerConfig.baseLearningRate / (1f + optimizerConfig.learningRateDecay * nextAdamStep)
         } else {
             0f
         }
@@ -2763,8 +2844,8 @@ class ArgusNeuralEngine private constructor(
             return if (validSteps > 0) totalLoss / validSteps else Float.NaN
         }
 
-        val beta1Pow = Math.pow(beta1.toDouble(), nextAdamStep.toDouble()).toFloat()
-        val beta2Pow = Math.pow(beta2.toDouble(), nextAdamStep.toDouble()).toFloat()
+        val beta1Pow = Math.pow(optimizerConfig.beta1.toDouble(), nextAdamStep.toDouble()).toFloat()
+        val beta2Pow = Math.pow(optimizerConfig.beta2.toDouble(), nextAdamStep.toDouble()).toFloat()
         val biasCorr1 = 1f - beta1Pow
         val biasCorr2 = 1f - beta2Pow
 
@@ -2781,13 +2862,13 @@ class ArgusNeuralEngine private constructor(
             val b = blocks[l]
             val lg = layerGrads[l]
 
-            parameterList.add(b.wDown); gradientList.add(lg.gradWDown); firstMomentList.add(b.mWDown); secondMomentList.add(b.vWDown); weightDecayList.add(weightDecay)
-            parameterList.add(b.wUp); gradientList.add(lg.gradWUp); firstMomentList.add(b.mWUp); secondMomentList.add(b.vWUp); weightDecayList.add(weightDecay)
-            parameterList.add(b.wGate); gradientList.add(lg.gradWGate); firstMomentList.add(b.mWGate); secondMomentList.add(b.vWGate); weightDecayList.add(weightDecay)
-            parameterList.add(b.wO); gradientList.add(lg.gradWO); firstMomentList.add(b.mWO); secondMomentList.add(b.vWO); weightDecayList.add(weightDecay)
-            parameterList.add(b.wQ); gradientList.add(lg.gradWQ); firstMomentList.add(b.mWQ); secondMomentList.add(b.vWQ); weightDecayList.add(weightDecay)
-            parameterList.add(b.wK); gradientList.add(lg.gradWK); firstMomentList.add(b.mWK); secondMomentList.add(b.vWK); weightDecayList.add(weightDecay)
-            parameterList.add(b.wV); gradientList.add(lg.gradWV); firstMomentList.add(b.mWV); secondMomentList.add(b.vWV); weightDecayList.add(weightDecay)
+            parameterList.add(b.wDown); gradientList.add(lg.gradWDown); firstMomentList.add(b.mWDown); secondMomentList.add(b.vWDown); weightDecayList.add(optimizerConfig.weightDecay)
+            parameterList.add(b.wUp); gradientList.add(lg.gradWUp); firstMomentList.add(b.mWUp); secondMomentList.add(b.vWUp); weightDecayList.add(optimizerConfig.weightDecay)
+            parameterList.add(b.wGate); gradientList.add(lg.gradWGate); firstMomentList.add(b.mWGate); secondMomentList.add(b.vWGate); weightDecayList.add(optimizerConfig.weightDecay)
+            parameterList.add(b.wO); gradientList.add(lg.gradWO); firstMomentList.add(b.mWO); secondMomentList.add(b.vWO); weightDecayList.add(optimizerConfig.weightDecay)
+            parameterList.add(b.wQ); gradientList.add(lg.gradWQ); firstMomentList.add(b.mWQ); secondMomentList.add(b.vWQ); weightDecayList.add(optimizerConfig.weightDecay)
+            parameterList.add(b.wK); gradientList.add(lg.gradWK); firstMomentList.add(b.mWK); secondMomentList.add(b.vWK); weightDecayList.add(optimizerConfig.weightDecay)
+            parameterList.add(b.wV); gradientList.add(lg.gradWV); firstMomentList.add(b.mWV); secondMomentList.add(b.vWV); weightDecayList.add(optimizerConfig.weightDecay)
 
             parameterList.add(b.loraQa); gradientList.add(lg.gradLoraQa); firstMomentList.add(b.mLoraQa); secondMomentList.add(b.vLoraQa); weightDecayList.add(0f)
             parameterList.add(b.loraQb); gradientList.add(lg.gradLoraQb); firstMomentList.add(b.mLoraQb); secondMomentList.add(b.vLoraQb); weightDecayList.add(0f)
@@ -2797,7 +2878,7 @@ class ArgusNeuralEngine private constructor(
 
         val gradientGroups = gradientList.toTypedArray()
         val clippedOnGpu =
-            tryNormalizeAndClipGradientsOnVulkan(gradientGroups, maxGradNorm)
+            tryNormalizeAndClipGradientsOnVulkan(gradientGroups, optimizerConfig.maximumGradientNorm)
         val clipFactor = if (clippedOnGpu) {
             1.0f
         } else {
@@ -2809,8 +2890,8 @@ class ArgusNeuralEngine private constructor(
             if (!totalNorm.isFinite()) {
                 return Float.NaN
             }
-            if (totalNorm > maxGradNorm) {
-                maxGradNorm / (totalNorm + 1e-6f)
+            if (totalNorm > optimizerConfig.maximumGradientNorm) {
+                optimizerConfig.maximumGradientNorm / (totalNorm + 1.0e-6f)
             } else {
                 1.0f
             }
@@ -2999,7 +3080,7 @@ class ArgusNeuralEngine private constructor(
                 accumulator = residentAccumulator,
                 destinationTensors = gradients,
                 targetCount = accumulator.targetCount,
-                maximumGradientNorm = maxGradNorm,
+                maximumGradientNorm = optimizerConfig.maximumGradientNorm,
                 retainResidentBuffer = true
             )
             if (clippedOnGpu) {
@@ -3034,22 +3115,22 @@ class ArgusNeuralEngine private constructor(
             }
             val clipFactor = if (clippedOnGpu) {
                 1.0f
-            } else if (totalNorm > maxGradNorm) {
-                maxGradNorm / (totalNorm + 1e-6f)
+            } else if (totalNorm > optimizerConfig.maximumGradientNorm) {
+                optimizerConfig.maximumGradientNorm / (totalNorm + 1.0e-6f)
             } else {
                 1.0f
             }
 
             val nextAdamStep = Math.addExact(adamStep, 1)
-            val learningRate = baseLearningRate / (1f + 0.0002f * nextAdamStep)
+            val learningRate = optimizerConfig.baseLearningRate / (1f + optimizerConfig.learningRateDecay * nextAdamStep)
             val biasCorrection1 = 1f -
-                Math.pow(beta1.toDouble(), nextAdamStep.toDouble()).toFloat()
+                Math.pow(optimizerConfig.beta1.toDouble(), nextAdamStep.toDouble()).toFloat()
             val biasCorrection2 = 1f -
-                Math.pow(beta2.toDouble(), nextAdamStep.toDouble()).toFloat()
+                Math.pow(optimizerConfig.beta2.toDouble(), nextAdamStep.toDouble()).toFloat()
             val weightDecayByGroup = FloatArray(parameters.size).also { values ->
                 for (layer in 0 until layerCount) {
                     val offset = 2 + layer * 11
-                    for (index in 0 until 7) values[offset + index] = weightDecay
+                    for (index in 0 until 7) values[offset + index] = optimizerConfig.weightDecay
                 }
             }
 
@@ -3136,11 +3217,11 @@ class ArgusNeuralEngine private constructor(
                 secondMoments = secondMoments,
                 weightDecayByGroup = weightDecayByGroup,
                 learningRate = learningRate,
-                beta1 = beta1,
-                beta2 = beta2,
+                beta1 = optimizerConfig.beta1,
+                beta2 = optimizerConfig.beta2,
                 biasCorrection1 = biasCorrection1,
                 biasCorrection2 = biasCorrection2,
-                epsilon = epsilon,
+                epsilon = optimizerConfig.epsilon,
                 gradientClipFactor = gradientClipFactor,
                 residentGradient = residentGradient
             )
@@ -3202,10 +3283,10 @@ class ArgusNeuralEngine private constructor(
                 }
 
                 val nextFirstMoment =
-                    beta1 * oldFirstMoment + (1f - beta1) * clippedGradient
+                    optimizerConfig.beta1 * oldFirstMoment + (1f - optimizerConfig.beta1) * clippedGradient
                 val nextSecondMoment =
-                    beta2 * oldSecondMoment +
-                        (1f - beta2) * clippedGradient * clippedGradient
+                    optimizerConfig.beta2 * oldSecondMoment +
+                        (1f - optimizerConfig.beta2) * clippedGradient * clippedGradient
                 require(
                     nextFirstMoment.isFinite() &&
                         nextSecondMoment.isFinite() &&
@@ -3216,7 +3297,7 @@ class ArgusNeuralEngine private constructor(
                 val correctedFirstMoment = nextFirstMoment / biasCorrection1
                 val correctedSecondMoment = nextSecondMoment / biasCorrection2
                 val update =
-                    correctedFirstMoment / (sqrt(correctedSecondMoment) + epsilon) +
+                    correctedFirstMoment / (sqrt(correctedSecondMoment) + optimizerConfig.epsilon) +
                         weightDecayValue * oldParameter
                 Float16Codec.fromFiniteFloat(oldParameter - learningRate * update)
             }
@@ -3284,11 +3365,11 @@ class ArgusNeuralEngine private constructor(
         for (index in 0 until limit) {
             val gradient = grad[index]
             val parameter = param[index]
-            m[index] = beta1 * m[index] + (1f - beta1) * gradient
-            v[index] = beta2 * v[index] + (1f - beta2) * gradient * gradient
+            m[index] = optimizerConfig.beta1 * m[index] + (1f - optimizerConfig.beta1) * gradient
+            v[index] = optimizerConfig.beta2 * v[index] + (1f - optimizerConfig.beta2) * gradient * gradient
             val correctedFirstMoment = m[index] / biasCorr1
             val correctedSecondMoment = v[index] / biasCorr2
-            val update = correctedFirstMoment / (sqrt(correctedSecondMoment) + epsilon) +
+            val update = correctedFirstMoment / (sqrt(correctedSecondMoment) + optimizerConfig.epsilon) +
                 wd * parameter
             val updatedParameter = parameter - lr * update
             require(updatedParameter.isFinite()) {
@@ -3311,11 +3392,11 @@ class ArgusNeuralEngine private constructor(
         val limit = min(param.size, grad.size)
         for (i in 0 until limit) {
             val g = grad[i]
-            m[i] = beta1 * m[i] + (1f - beta1) * g
-            v[i] = beta2 * v[i] + (1f - beta2) * g * g
+            m[i] = optimizerConfig.beta1 * m[i] + (1f - optimizerConfig.beta1) * g
+            v[i] = optimizerConfig.beta2 * v[i] + (1f - optimizerConfig.beta2) * g * g
             val mHat = m[i] / biasCorr1
             val vHat = v[i] / biasCorr2
-            param[i] -= lr * (mHat / (sqrt(vHat) + epsilon) + wd * param[i])
+            param[i] -= lr * (mHat / (sqrt(vHat) + optimizerConfig.epsilon) + wd * param[i])
         }
     }
 
@@ -3793,22 +3874,32 @@ class ArgusNeuralEngine private constructor(
     }
 
     // =====================================================================
-    // Checkpoint (ARG5 streaming writer and reader)
+    // Checkpoint (ARG6 streaming writer; ARG5/ARG6 readers)
     // =====================================================================
     fun saveCheckpoint(): Boolean {
         return try {
             synchronized(modelLock) {
+                check(!checkpointRestoreBlocked) {
+                    "An existing checkpoint could not be restored; refusing to overwrite it without explicit recovery."
+                }
                 check(VulkanTrainingBackend.synchronizeTrainingStateMirrors()) {
                     "GPU model or optimizer state could not be recovered before checkpoint serialization."
                 }
-                writeArg5Checkpoint()
+                writeArg6Checkpoint()
             }
             val file = File(context.filesDir, "argus_model_weights.bin")
             checkpointStateVerified = false
-            val verified = verifyArg5CheckpointFile(file)
-            checkpointStateVerified = verified
+            val verified = verifyArg6CheckpointFile(file)
+            synchronized(modelLock) {
+                checkpointStateVerified = verified
+                if (verified) {
+                    activeCheckpointFormat = ModelCheckpointFormat.ARG6
+                    checkpointOptimizerConfigurationFingerprint = optimizerConfig.fingerprint
+                }
+            }
             if (!verified) {
-                Log.e(TAG, "ARG5 checkpoint read-back verification failed.")
+                checkpointRestoreBlocked = true
+                Log.e(TAG, "ARG6 checkpoint read-back verification failed.")
             }
             verified
         } catch (t: Throwable) {
@@ -3818,15 +3909,14 @@ class ArgusNeuralEngine private constructor(
     }
 
     /**
-     * Independently re-reads the committed ARG5 file and verifies its declared length
-     * and payload CRC32 before a Genesis identity or checkpoint-ready state is published.
-     * The payload is streamed through a bounded buffer; no complete checkpoint copy is
-     * materialized in the app heap.
+     * Independently re-reads the committed ARG6 file and verifies its declared length,
+     * optimizer configuration identity, and payload CRC32 before checkpoint-ready state
+     * is published. The payload is streamed through a bounded buffer.
      */
-    private fun verifyArg5CheckpointFile(file: File): Boolean {
+    private fun verifyArg6CheckpointFile(file: File): Boolean {
         return try {
             require(file.isFile && file.length() >= ARG5_HEADER_SIZE.toLong()) {
-                "ARG5 checkpoint is missing or shorter than its fixed header."
+                "ARG6 checkpoint is missing or shorter than its fixed header."
             }
 
             val headerBytes = FileInputStream(file).use { input ->
@@ -3835,26 +3925,34 @@ class ArgusNeuralEngine private constructor(
             val header = ByteBuffer.wrap(headerBytes).order(ByteOrder.LITTLE_ENDIAN)
             require(
                 header.get() == MAGIC_0 && header.get() == MAGIC_1 &&
-                    header.get() == MAGIC_2 && header.get() == MAGIC_5
+                    header.get() == MAGIC_2 && header.get() == MAGIC_6
             ) {
-                "ARG5 checkpoint read-back magic is invalid."
+                "ARG6 checkpoint read-back magic is invalid."
             }
-            require(header.int == ARG5_CHECKPOINT_VERSION) {
-                "ARG5 checkpoint read-back version is unsupported."
+            require(header.int == ARG6_CHECKPOINT_VERSION) {
+                "ARG6 checkpoint read-back version is unsupported."
             }
             require(header.int == ARG5_HEADER_SIZE) {
-                "ARG5 checkpoint read-back header size is invalid."
+                "ARG6 checkpoint read-back header size is invalid."
+            }
+            val architectureIdLength = header.getInt(16)
+            require(architectureIdLength in 1..512) {
+                "ARG6 checkpoint architecture ID length is invalid."
             }
 
             header.position(ARG5_HEADER_SIZE - 16)
             val payloadByteCount = header.long
             val expectedChecksum = header.int.toLong() and 0xFFFF_FFFFL
             val flags = header.int
-            require(payloadByteCount > 0L) {
-                "ARG5 checkpoint read-back payload length is invalid."
+            val minimumPayloadBytes = Math.addExact(
+                architectureIdLength.toLong(),
+                TOKENIZER_FINGERPRINT_BYTES.toLong() * 2L
+            )
+            require(payloadByteCount >= minimumPayloadBytes) {
+                "ARG6 checkpoint payload length is invalid."
             }
-            require(flags == 0) {
-                "ARG5 checkpoint read-back contains unsupported flags."
+            require(flags == ARG6_OPTIMIZER_FINGERPRINT_FLAG) {
+                "ARG6 checkpoint read-back contains unsupported flags."
             }
 
             val expectedFileLength = Math.addExact(
@@ -3862,7 +3960,7 @@ class ArgusNeuralEngine private constructor(
                 payloadByteCount
             )
             require(file.length() == expectedFileLength) {
-                "ARG5 checkpoint read-back length does not match the committed payload."
+                "ARG6 checkpoint read-back length does not match the committed payload."
             }
 
             val actualChecksum = CRC32()
@@ -3874,22 +3972,39 @@ class ArgusNeuralEngine private constructor(
                     val requested = min(remaining, buffer.size.toLong()).toInt()
                     val count = input.read(buffer, 0, requested)
                     require(count > 0) {
-                        "ARG5 checkpoint read-back payload ended unexpectedly."
+                        "ARG6 checkpoint read-back payload ended unexpectedly."
                     }
                     actualChecksum.update(buffer, 0, count)
                     remaining -= count.toLong()
                 }
                 require(input.read() == -1) {
-                    "ARG5 checkpoint read-back contains trailing bytes."
+                    "ARG6 checkpoint read-back contains trailing bytes."
                 }
             }
-
             require(actualChecksum.value == expectedChecksum) {
-                "ARG5 checkpoint read-back checksum does not match."
+                "ARG6 checkpoint read-back checksum does not match."
+            }
+
+            val persistedOptimizerFingerprint = BufferedInputStream(FileInputStream(file)).use { input ->
+                skipFully(
+                    input,
+                    ARG5_HEADER_SIZE.toLong() +
+                        architectureIdLength.toLong() +
+                        TOKENIZER_FINGERPRINT_BYTES.toLong()
+                )
+                input.readFully(TOKENIZER_FINGERPRINT_BYTES)
+            }
+            require(
+                MessageDigest.isEqual(
+                    persistedOptimizerFingerprint,
+                    checkpointFingerprintBytes(optimizerConfig.fingerprint)
+                )
+            ) {
+                "ARG6 optimizer configuration fingerprint does not match the active optimizer."
             }
             true
         } catch (error: Exception) {
-            Log.e(TAG, "ARG5 checkpoint read-back verification failed.", error)
+            Log.e(TAG, "ARG6 checkpoint read-back verification failed.", error)
             false
         }
     }
@@ -3978,9 +4093,9 @@ class ArgusNeuralEngine private constructor(
         return list
     }
 
-    private fun tokenizerFingerprintBytes(hexFingerprint: String): ByteArray {
+    private fun checkpointFingerprintBytes(hexFingerprint: String): ByteArray {
         require(hexFingerprint.length == TOKENIZER_FINGERPRINT_BYTES * 2) {
-            "Tokenizer fingerprint must contain exactly 32 SHA-256 bytes."
+            "Checkpoint fingerprint must contain exactly 32 SHA-256 bytes."
         }
         return ByteArray(TOKENIZER_FINGERPRINT_BYTES) { index ->
             val start = index * 2
@@ -3988,7 +4103,7 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
-    private fun writeArg5Checkpoint() {
+    private fun writeArg6Checkpoint() {
         ensureVocabCapacity(tokenizer.vocabSize)
         require(vocabCap >= tokenizer.vocabSize) {
             "Embedding capacity is smaller than the active tokenizer vocabulary."
@@ -3996,28 +4111,33 @@ class ArgusNeuralEngine private constructor(
 
         val target = File(context.filesDir, "argus_model_weights.bin")
         val temporary = File(context.filesDir, "argus_model_weights.bin.tmp")
+        val activeModelState = snapshotModelState()
+        val architecture = activeModelState.identity.architecture
+        val tokenizerState = activeModelState.identity.tokenizer
         val vocabEntries = tokenizer.exportVocab()
-        val isLearnedBpe = config.tokenizerConfig.algorithm.usesBpeMerges
+        val isLearnedBpe = tokenizerState.algorithm.usesBpeMerges
         val merges = if (isLearnedBpe) tokenizer.exportMerges() else emptyList()
         val tensors = checkpointTensors()
-        val architecture = architectureConfig
         val architectureIdBytes = architecture.architectureId.toByteArray(Charsets.UTF_8)
-        val tokenizerFingerprint = tokenizerFingerprintBytes(tokenizer.snapshotFingerprint())
+        val tokenizerFingerprint = checkpointFingerprintBytes(tokenizerState.snapshotFingerprint)
+        val optimizerConfigurationFingerprint =
+            checkpointFingerprintBytes(activeModelState.optimizerConfiguration.fingerprint)
         require(architecture.layerCount in 1..32) {
-            "ARG5 writer supports 1..32 Transformer blocks."
+            "ARG6 writer supports 1..32 Transformer blocks."
         }
         require(architectureIdBytes.size in 1..512) {
             "Architecture ID length is invalid."
         }
-        require(vocabEntries.size <= config.tokenizerConfig.maxVocabularySize) {
+        require(vocabEntries.size == tokenizerState.vocabularySize) {
             "Tokenizer vocabulary exceeds its configured checkpoint capacity."
         }
 
         var payloadLength = architectureIdBytes.size.toLong()
         payloadLength = Math.addExact(payloadLength, tokenizerFingerprint.size.toLong())
+        payloadLength = Math.addExact(payloadLength, optimizerConfigurationFingerprint.size.toLong())
         for ((token, _) in vocabEntries) {
             val tokenBytes = token.toByteArray(Charsets.UTF_8)
-            require(tokenBytes.isNotEmpty() && tokenBytes.size <= config.tokenizerConfig.maxTokenLength * 4) {
+            require(tokenBytes.isNotEmpty() && tokenBytes.size <= tokenizerState.maxTokenLength * 4) {
                 "Checkpoint token byte length is invalid."
             }
             payloadLength = Math.addExact(payloadLength, 8L + tokenBytes.size.toLong())
@@ -4040,8 +4160,8 @@ class ArgusNeuralEngine private constructor(
         }
 
         val header = ByteBuffer.allocate(ARG5_HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN)
-        header.put(MAGIC_0).put(MAGIC_1).put(MAGIC_2).put(MAGIC_5)
-        header.putInt(ARG5_CHECKPOINT_VERSION)
+        header.put(MAGIC_0).put(MAGIC_1).put(MAGIC_2).put(MAGIC_6)
+        header.putInt(ARG6_CHECKPOINT_VERSION)
         header.putInt(ARG5_HEADER_SIZE)
         header.putInt(architecture.schemaVersion)
         header.putInt(architectureIdBytes.size)
@@ -4053,18 +4173,18 @@ class ArgusNeuralEngine private constructor(
         header.putInt(architecture.adapterRank)
         header.putInt(vocabEntries.size) // Persist the actual tokenizer entry count.
         header.putInt(vocabCap)
-        header.putInt(adamStep)
-        header.putInt(config.tokenizerConfig.schemaVersion)
-        header.putInt(config.tokenizerConfig.algorithm.checkpointId)
-        header.putInt(config.tokenizerConfig.maxVocabularySize)
-        header.putInt(config.tokenizerConfig.maxTokenLength)
+        header.putInt(activeModelState.optimizerStep)
+        header.putInt(tokenizerState.schemaVersion)
+        header.putInt(tokenizerState.algorithm.checkpointId)
+        header.putInt(tokenizerState.maximumVocabularySize)
+        header.putInt(tokenizerState.maxTokenLength)
         header.putInt(vocabEntries.size)
         header.putInt(tensors.size)
         header.putLong(payloadLength)
         header.putInt(0) // CRC32 of the payload is patched after streaming.
-        header.putInt(0) // Reserved architecture flags.
+        header.putInt(ARG6_OPTIMIZER_FINGERPRINT_FLAG)
         require(header.position() == ARG5_HEADER_SIZE) {
-            "ARG5 fixed header layout is inconsistent."
+            "ARG6 fixed header layout is inconsistent."
         }
 
         val checksum = CRC32()
@@ -4076,6 +4196,7 @@ class ArgusNeuralEngine private constructor(
 
                     checked.write(architectureIdBytes)
                     checked.write(tokenizerFingerprint)
+                    checked.write(optimizerConfigurationFingerprint)
                     for ((token, id) in vocabEntries) {
                         val tokenBytes = token.toByteArray(Charsets.UTF_8)
                         writeIntLittleEndian(checked, id)
@@ -4114,7 +4235,7 @@ class ArgusNeuralEngine private constructor(
             }
 
             RandomAccessFile(temporary, "rw").use { randomAccessFile ->
-                randomAccessFile.seek(ARG5_CHECKSUM_OFFSET.toLong())
+                randomAccessFile.seek(CHECKPOINT_CHECKSUM_OFFSET.toLong())
                 val checksumBytes = ByteBuffer.allocate(4)
                     .order(ByteOrder.LITTLE_ENDIAN)
                     .putInt(checksum.value.toInt())
@@ -4259,7 +4380,17 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
-    private fun loadArg5Checkpoint(file: File): Boolean {
+    private fun loadArg5Checkpoint(file: File): Boolean =
+        loadCheckpointFile(file, ModelCheckpointFormat.ARG5)
+
+    private fun loadArg6Checkpoint(file: File): Boolean =
+        loadCheckpointFile(file, ModelCheckpointFormat.ARG6)
+
+    private fun loadCheckpointFile(
+        file: File,
+        format: ModelCheckpointFormat
+    ): Boolean {
+        val isArg6 = format == ModelCheckpointFormat.ARG6
         return try {
             require(file.length() >= ARG5_HEADER_SIZE.toLong()) {
                 "ARG5 checkpoint is shorter than its fixed header."
@@ -4268,13 +4399,14 @@ class ArgusNeuralEngine private constructor(
             val header = ByteBuffer.wrap(headerBytes).order(ByteOrder.LITTLE_ENDIAN)
             require(
                 header.get() == MAGIC_0 && header.get() == MAGIC_1 &&
-                    header.get() == MAGIC_2 && header.get() == MAGIC_5
-            ) { "Invalid ARG5 checkpoint magic." }
-            require(header.int == ARG5_CHECKPOINT_VERSION) {
-                "Unsupported ARG5 checkpoint version."
+                    header.get() == MAGIC_2 &&
+                    header.get() == (if (isArg6) MAGIC_6 else MAGIC_5)
+            ) { "Checkpoint magic does not match the selected format." }
+            require(header.int == format.version) {
+                "Checkpoint version does not match the selected format."
             }
             require(header.int == ARG5_HEADER_SIZE) {
-                "ARG5 checkpoint header size does not match."
+                "Checkpoint header size does not match."
             }
 
             val savedArchitectureSchema = header.int
@@ -4299,55 +4431,62 @@ class ArgusNeuralEngine private constructor(
             val flags = header.int
 
             require(savedArchitectureSchema == architectureConfig.schemaVersion) {
-                "ARG5 architecture schema mismatch."
+                "Checkpoint architecture schema mismatch."
             }
             require(savedLayerCount in 1..32) {
-                "ARG5 layer count must be between 1 and 32: $savedLayerCount."
+                "Checkpoint layer count must be between 1 and 32: $savedLayerCount."
             }
             require(savedLayerCount == layerCount) {
-                "ARG5 layer count ($savedLayerCount) does not match the active engine ($layerCount)."
+                "Checkpoint layer count ($savedLayerCount) does not match the active engine ($layerCount)."
             }
             require(
                 savedDModel == dModel && savedNHeads == nHeads &&
                     savedDFf == dFf && savedMaxSeq == maxSeqLen &&
                     savedLoraRank == loraRank
-            ) { "ARG5 architecture dimensions do not match the active engine." }
+            ) { "Checkpoint architecture dimensions do not match the active engine." }
             require(savedVocabSize > 0) {
-                "ARG5 vocabulary size is invalid."
+                "Checkpoint vocabulary size is invalid."
             }
             require(savedVocabCap >= savedVocabSize) {
-                "ARG5 vocabulary capacity is invalid."
+                "Checkpoint vocabulary capacity is invalid."
             }
             requireSafeVocabularyCapacity(savedVocabCap)
-            require(savedAdamStep >= 0) { "ARG5 optimizer step cannot be negative." }
+            require(savedAdamStep >= 0) { "Checkpoint optimizer step cannot be negative." }
             require(savedTokenizerSchema == config.tokenizerConfig.schemaVersion) {
-                "ARG5 tokenizer schema mismatch."
+                "Checkpoint tokenizer schema mismatch."
             }
             require(savedTokenizerAlgorithm == config.tokenizerConfig.algorithm.checkpointId) {
-                "ARG5 tokenizer algorithm mismatch."
+                "Checkpoint tokenizer algorithm mismatch."
             }
             require(savedTokenizerMaxVocab == config.tokenizerConfig.maxVocabularySize) {
-                "ARG5 tokenizer vocabulary capacity mismatch."
+                "Checkpoint tokenizer vocabulary capacity mismatch."
             }
             require(savedTokenizerMaxTokenLength == config.tokenizerConfig.maxTokenLength) {
-                "ARG5 tokenizer token length mismatch."
+                "Checkpoint tokenizer token length mismatch."
             }
             require(
                 savedVocabularyEntryCount in 1..config.tokenizerConfig.maxVocabularySize
-            ) { "ARG5 vocabulary entry count is invalid." }
-            require(savedTensorCount in 1..2048) { "ARG5 tensor count is invalid: $savedTensorCount." }
-            require(architectureIdLength in 1..512) { "ARG5 architecture ID length is invalid." }
-            val minimumPayloadBytes = Math.addExact(
+            ) { "Checkpoint vocabulary entry count is invalid." }
+            require(savedTensorCount in 1..2048) { "Checkpoint tensor count is invalid: $savedTensorCount." }
+            require(architectureIdLength in 1..512) { "Checkpoint architecture ID length is invalid." }
+            var minimumPayloadBytes = Math.addExact(
                 architectureIdLength.toLong(),
                 TOKENIZER_FINGERPRINT_BYTES.toLong()
             )
+            if (isArg6) {
+                minimumPayloadBytes = Math.addExact(
+                    minimumPayloadBytes,
+                    TOKENIZER_FINGERPRINT_BYTES.toLong()
+                )
+            }
             require(savedPayloadBytes >= minimumPayloadBytes) {
-                "ARG5 payload cannot contain its architecture ID and tokenizer fingerprint."
+                "Checkpoint payload cannot contain its identity manifest."
             }
             require(savedVocabSize == savedVocabularyEntryCount) {
                 "ARG5 vocabulary size does not match its entry count."
             }
-            require(flags == 0) { "ARG5 checkpoint contains unsupported flags." }
+            val expectedFlags = if (isArg6) ARG6_OPTIMIZER_FINGERPRINT_FLAG else 0
+            require(flags == expectedFlags) { "Checkpoint contains unsupported format flags." }
             require(savedPayloadBytes >= 0L) {
                 "ARG5 payload byte count cannot be negative."
             }
@@ -4356,7 +4495,7 @@ class ArgusNeuralEngine private constructor(
                 savedPayloadBytes
             )
             require(file.length() == expectedFileLength) {
-                "ARG5 checkpoint length does not match its payload metadata."
+                "Checkpoint length does not match its payload metadata."
             }
 
             val checksum = CRC32()
@@ -4367,14 +4506,14 @@ class ArgusNeuralEngine private constructor(
                 while (remaining > 0L) {
                     val requested = min(remaining, buffer.size.toLong()).toInt()
                     val count = input.read(buffer, 0, requested)
-                    if (count < 0) throw IllegalStateException("ARG5 payload ended unexpectedly.")
+                    if (count < 0) throw IllegalStateException("Checkpoint payload ended unexpectedly.")
                     checksum.update(buffer, 0, count)
                     remaining -= count.toLong()
                 }
-                require(input.read() == -1) { "ARG5 checkpoint contains trailing bytes." }
+                require(input.read() == -1) { "Checkpoint contains trailing bytes." }
             }
             require(checksum.value == savedChecksum) {
-                "ARG5 payload checksum mismatch."
+                "Checkpoint payload checksum mismatch."
             }
 
             BufferedInputStream(FileInputStream(file)).use { input ->
@@ -4382,7 +4521,7 @@ class ArgusNeuralEngine private constructor(
                 val architectureIdBytes = input.readFully(architectureIdLength)
                 val savedArchitectureId = String(architectureIdBytes, Charsets.UTF_8)
                 require(savedArchitectureId == architectureConfig.architectureId) {
-                    "ARG5 architecture ID mismatch."
+                    "Checkpoint architecture ID mismatch."
                 }
                 val savedTokenizerFingerprint = input.readFully(TOKENIZER_FINGERPRINT_BYTES)
 
@@ -4390,6 +4529,24 @@ class ArgusNeuralEngine private constructor(
                     architectureIdLength.toLong(),
                     savedTokenizerFingerprint.size.toLong()
                 )
+                val savedOptimizerConfigurationFingerprint = if (isArg6) {
+                    val fingerprintBytes = input.readFully(TOKENIZER_FINGERPRINT_BYTES)
+                    require(
+                        MessageDigest.isEqual(
+                            fingerprintBytes,
+                            checkpointFingerprintBytes(optimizerConfig.fingerprint)
+                        )
+                    ) {
+                        "ARG6 optimizer configuration fingerprint does not match the active optimizer."
+                    }
+                    measuredPayloadBytes = Math.addExact(
+                        measuredPayloadBytes,
+                        fingerprintBytes.size.toLong()
+                    )
+                    optimizerConfig.fingerprint
+                } else {
+                    null
+                }
                 val vocabulary = ArrayList<Pair<String, Int>>(savedVocabularyEntryCount)
                 repeat(savedVocabularyEntryCount) {
                     val tokenId = readIntLittleEndian(input)
@@ -4441,7 +4598,7 @@ class ArgusNeuralEngine private constructor(
                     "ARG5 tokenizer vocabulary entry count does not match its metadata."
                 }
                 val calculatedTokenizerFingerprint =
-                    tokenizerFingerprintBytes(candidateTokenizer.snapshotFingerprint())
+                    checkpointFingerprintBytes(candidateTokenizer.snapshotFingerprint())
                 require(
                     MessageDigest.isEqual(
                         savedTokenizerFingerprint,
@@ -4516,12 +4673,14 @@ class ArgusNeuralEngine private constructor(
                         readFloatArrayLittleEndian(input, targetTensor)
                     }
                     adamStep = savedAdamStep
+                    activeCheckpointFormat = format
+                    checkpointOptimizerConfigurationFingerprint = savedOptimizerConfigurationFingerprint
                 }
-                require(input.read() == -1) { "ARG5 tensor payload has trailing bytes." }
+                require(input.read() == -1) { "Checkpoint tensor payload has trailing bytes." }
             }
             true
         } catch (e: Exception) {
-            Log.e(TAG, "ARG5 checkpoint load failed", e)
+            Log.e(TAG, "Checkpoint load failed", e)
             false
         }
     }
@@ -4544,28 +4703,44 @@ class ArgusNeuralEngine private constructor(
     fun loadCheckpointIfExists(): Boolean {
         checkpointStateVerified = false
         val file = File(context.filesDir, "argus_model_weights.bin")
-        if (!file.isFile || file.length() < 4L) return false
+        if (!file.isFile) {
+            checkpointRestoreBlocked = false
+            return false
+        }
+        checkpointRestoreBlocked = true
+        if (file.length() < 4L) return false
 
         val restored = try {
             val magic = FileInputStream(file).use { it.readFully(4) }
-            val isCurrentCheckpoint =
+            val format = when {
                 magic[0] == MAGIC_0 &&
                     magic[1] == MAGIC_1 &&
                     magic[2] == MAGIC_2 &&
-                    magic[3] == MAGIC_5
+                    magic[3] == MAGIC_6 -> ModelCheckpointFormat.ARG6
+                magic[0] == MAGIC_0 &&
+                    magic[1] == MAGIC_1 &&
+                    magic[2] == MAGIC_2 &&
+                    magic[3] == MAGIC_5 -> ModelCheckpointFormat.ARG5
+                else -> null
+            }
 
-            if (isCurrentCheckpoint) {
-                loadArg5Checkpoint(file)
-            } else {
-                Log.w(TAG, "Pre-release checkpoint format is unsupported by the current clean-break model.")
-                false
+            when (format) {
+                ModelCheckpointFormat.ARG6 -> loadArg6Checkpoint(file)
+                ModelCheckpointFormat.ARG5 -> loadArg5Checkpoint(file)
+                null -> {
+                    Log.w(TAG, "Pre-release checkpoint format is unsupported by the current clean-break model.")
+                    false
+                }
             }
         } catch (exception: Exception) {
-            Log.e(TAG, "ARG5 checkpoint header read failed", exception)
+            Log.e(TAG, "Checkpoint header read failed", exception)
             false
         }
 
-        checkpointStateVerified = restored
+        synchronized(modelLock) {
+            checkpointStateVerified = restored
+            if (restored) checkpointRestoreBlocked = false
+        }
         return restored
     }
 

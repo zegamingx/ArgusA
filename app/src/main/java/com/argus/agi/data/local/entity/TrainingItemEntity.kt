@@ -4,7 +4,13 @@ import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
-@Entity(tableName = "training_items", indices = [Index(value = ["documentId"])])
+@Entity(
+    tableName = "training_items",
+    indices = [
+        Index(value = ["documentId"]),
+        Index(value = ["replaySessionId"])
+    ]
+)
 data class TrainingItemEntity(
     @PrimaryKey
     val id: String,
@@ -18,5 +24,6 @@ data class TrainingItemEntity(
     val status: String = "QUEUED",
     val finalLoss: Float? = null,
     val stepDurationMs: Long = 0L,
-    val documentId: String? = null
+    val documentId: String? = null,
+    val replaySessionId: String? = null
 )

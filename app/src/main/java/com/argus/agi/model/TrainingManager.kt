@@ -6,6 +6,12 @@ import android.util.Log
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceProvenance
+import com.argus.agi.data.local.entity.TrainingReplaySessionEntity
+import com.argus.agi.runtime.DeviceAdaptiveRuntimePolicy
+import com.argus.agi.runtime.RuntimeConfigurationPlanner
+import com.argus.agi.runtime.RuntimeDeferReason
+import com.argus.agi.runtime.RuntimeModelConstraints
+import com.argus.agi.runtime.RuntimeResourceSnapshot
 import com.argus.agi.sensor.DeviceGuard
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -71,7 +77,8 @@ data class TrainingData(
     val status: TrainingStatus = TrainingStatus.QUEUED,
     val finalLoss: Float? = null,
     val stepDurationMs: Long = 0L,
-    val documentId: String? = null
+    val documentId: String? = null,
+    val replaySessionId: String? = null
 )
 
 data class ActiveDocumentTraining(
@@ -137,7 +144,8 @@ class TrainingManager(
     private sealed interface QueuePersistenceOperation {
         data class Save(
             val generation: Long,
-            val items: List<TrainingData>
+            val items: List<TrainingData>,
+            val replaySession: TrainingReplaySessionEntity? = null
         ) : QueuePersistenceOperation
 
         data class Clear(
@@ -1331,7 +1339,6 @@ class TrainingManager(
                         memoryActiveDocumentIds - persistedActiveDocumentIds
 
                     if (replayDocumentIds.isNotEmpty()) {
-                        activeRepository.markCorpusDocumentsQueued(replayDocumentIds)
                         for (documentId in replayDocumentIds.sorted()) {
                             val document = activeRepository.getCorpusDocument(documentId)
                                 ?: throw IllegalStateException(
@@ -1597,6 +1604,17 @@ class TrainingManager(
             seed = seed,
             policy = policy
         )
+        val replaySessionId = UUID.randomUUID().toString()
+        val replaySession = TrainingReplaySessionEntity(
+            id = replaySessionId,
+            sourceSnapshotFingerprint = CorpusReplayScheduler.sourceSnapshotFingerprint(sources),
+            seed = seed,
+            policy = policy.name,
+            epochs = epochs,
+            schedulerFormatVersion = CorpusReplayScheduler.SCHEDULER_FORMAT_VERSION,
+            scheduledDocumentCount = requestedDocumentIds.size,
+            scheduledChunkCount = schedule.size
+        )
         check(schedule.size.toLong() == requestedChunkCount) {
             "Replay scheduler produced an unexpected number of queue items."
         }
@@ -1616,7 +1634,8 @@ class TrainingManager(
                 totalChunks = scheduled.documentTotalChunks,
                 documentTitle = scheduled.document.title,
                 status = TrainingStatus.QUEUED,
-                documentId = scheduled.document.id
+                documentId = scheduled.document.id,
+                replaySessionId = replaySessionId
             )
         }
 
@@ -1631,13 +1650,11 @@ class TrainingManager(
             "Corpus replay would duplicate in-memory training work: ${memoryConflicts.joinToString()}."
         }
 
-        activeRepository.markCorpusDocumentsQueued(requestedDocumentIds)
-
         val orderedItems = synchronized(queueLock) {
             if (closed) {
                 emptyList()
             } else {
-                appendPersistingQueueItems(items).also { queued ->
+                appendPersistingQueueItems(items, replaySession).also { queued ->
                     val firstItem = queued.firstOrNull()
                     if (_activeDocument.value == null && firstItem != null) {
                         val firstDocumentId = requireNotNull(firstItem.documentId)
@@ -1753,6 +1770,76 @@ class TrainingManager(
     // Worker
     // =====================================================================
 
+    private fun requireJournalCompatibility(
+        snapshot: TrainingCommitJournalSnapshot,
+        recoveryPhase: String
+    ) {
+        val activeModelState = neuralEngine.snapshotModelState()
+        if (snapshot.modelIdentityFingerprint == null) {
+            Log.w(
+                TAG,
+                "Legacy training journal has no model identity fingerprint; preserving its prior optimizer-step recovery path."
+            )
+        } else {
+            check(
+                TrainingCommitJournal.matchesModelIdentity(
+                    snapshot,
+                    activeModelState.identity.fingerprint
+                )
+            ) {
+                "Training journal model identity mismatch during $recoveryPhase. " +
+                    "The checkpoint was preserved and queue recovery was stopped."
+            }
+        }
+        if (snapshot.optimizerConfigFingerprint == null) {
+            Log.w(
+                TAG,
+                "Legacy training journal has no optimizer configuration fingerprint; compatibility is unverified."
+            )
+        } else {
+            check(
+                TrainingCommitJournal.matchesOptimizerConfiguration(
+                    snapshot,
+                    activeModelState.optimizerConfiguration.fingerprint
+                )
+            ) {
+                "Training journal optimizer configuration mismatch during $recoveryPhase. " +
+                    "The checkpoint was preserved and queue recovery was stopped."
+            }
+            check(
+                TrainingCommitJournal.allowsCheckpointForRecovery(
+                    snapshot = snapshot,
+                    checkpointFormat = activeModelState.checkpointFormat,
+                    checkpointVerified = activeModelState.checkpointVerified,
+                    checkpointOptimizerConfigFingerprint =
+                        activeModelState.checkpointOptimizerConfigurationFingerprint
+                )
+            ) {
+                "Training journal optimizer configuration cannot be reconciled with the verified checkpoint during $recoveryPhase. " +
+                    "The checkpoint was preserved and queue recovery was stopped."
+            }
+            if (activeModelState.checkpointFormat == ModelCheckpointFormat.ARG5) {
+                Log.w(
+                    TAG,
+                    "Journal v3 is being recovered from a verified ARG5 checkpoint without embedded optimizer identity; checkpoint optimizer compatibility remains unverified."
+                )
+            }
+        }
+        val expectedCheckpointFingerprint = snapshot.checkpointSha256Fingerprint
+        if (expectedCheckpointFingerprint != null) {
+            val actualCheckpointFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
+            check(
+                TrainingCommitJournal.matchesCheckpointFileFingerprint(
+                    snapshot,
+                    actualCheckpointFingerprint
+                )
+            ) {
+                "Training journal checkpoint-file SHA-256 mismatch during $recoveryPhase. " +
+                    "The checkpoint was preserved and queue recovery was stopped."
+            }
+        }
+    }
+
     private suspend fun reconcilePersistedTrainingCommit(
         repository: com.argus.agi.data.repository.ArgusRepository
     ) {
@@ -1773,6 +1860,7 @@ class TrainingManager(
             ) {
                 "The prepared training batch could not be rolled back to its exact optimizer baseline."
             }
+            requireJournalCompatibility(snapshot, "PREPARED-batch rollback")
             neuralEngine.resumeVulkanTensorResidencyAfterForeground()
             TrainingCommitJournal.delete(trainingCommitJournalFile)
             activeBatchBaselineOptimizerStep = null
@@ -1807,6 +1895,7 @@ class TrainingManager(
             ) {
                 "The committed batch could not be rolled back to its exact saved baseline."
             }
+            requireJournalCompatibility(snapshot, "COMMITTED-batch baseline rollback")
             neuralEngine.resumeVulkanTensorResidencyAfterForeground()
             TrainingCommitJournal.delete(trainingCommitJournalFile)
             activeBatchBaselineOptimizerStep = null
@@ -1814,11 +1903,46 @@ class TrainingManager(
             return
         }
 
+        requireJournalCompatibility(snapshot, "COMMITTED-batch recovery")
+
         // Room must never publish COMMITTED until the exact model and optimizer
         // state represented by this journal is durably saved. A checkpoint that is
         // ahead of the journal is an inconsistency, not a valid committed transaction.
-        check(neuralEngine.saveCheckpoint()) {
-            "The committed optimizer checkpoint could not be secured during recovery."
+        if (snapshot.checkpointSha256Fingerprint == null) {
+            // Older committed journals are upgraded only when both semantic identities
+            // exist; v1/v2 remain readable without manufacturing missing fingerprints.
+            check(neuralEngine.saveCheckpoint()) {
+                "The committed optimizer checkpoint could not be secured during recovery."
+            }
+            if (
+                snapshot.modelIdentityFingerprint != null &&
+                snapshot.optimizerConfigFingerprint != null
+            ) {
+                val checkpointFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
+                TrainingCommitJournal.writeCommitted(
+                    file = trainingCommitJournalFile,
+                    baselineOptimizerStep = snapshot.baselineOptimizerStep,
+                    committedOptimizerStep = committedOptimizerStep,
+                    entries = snapshot.entries,
+                    modelIdentityFingerprint = snapshot.modelIdentityFingerprint,
+                    optimizerConfigFingerprint = snapshot.optimizerConfigFingerprint,
+                    checkpointSha256Fingerprint = checkpointFingerprint
+                )
+                val checkpointBoundJournal = requireNotNull(
+                    TrainingCommitJournal.read(trainingCommitJournalFile)
+                ) {
+                    "The recovered checkpoint-bound journal could not be read back."
+                }
+                check(
+                    checkpointBoundJournal.checkpointSha256Fingerprint == checkpointFingerprint
+                ) {
+                    "The recovered checkpoint file identity was not persisted in the journal."
+                }
+                requireJournalCompatibility(
+                    checkpointBoundJournal,
+                    "committed-batch recovery after checkpoint write"
+                )
+            }
         }
 
         val committedItems = ArrayList<TrainingData>(snapshot.entries.size)
@@ -1922,6 +2046,7 @@ class TrainingManager(
         if (!TrainingCommitJournal.isExactCommittedCheckpoint(snapshot, neuralEngine.optimizerStep)) {
             return false
         }
+        requireJournalCompatibility(snapshot, "live committed-batch recovery")
         check(neuralEngine.saveCheckpoint()) {
             "The optimizer committed the batch, but its checkpoint could not be secured."
         }
@@ -2035,8 +2160,12 @@ class TrainingManager(
             true
         } else {
             runCatching {
-                neuralEngine.loadCheckpointIfExists() &&
+                val restored = neuralEngine.loadCheckpointIfExists() &&
                     neuralEngine.optimizerStep == baselineStep
+                if (restored && journal != null) {
+                    requireJournalCompatibility(journal, "OOM batch rollback")
+                }
+                restored
             }.getOrDefault(false)
         }
         if (!rolledBack) {
@@ -2118,7 +2247,11 @@ class TrainingManager(
 
     private suspend fun processCommittedItem(item: TrainingData): Boolean {
         val journalEntry = runCatching {
-            TrainingCommitJournal.read(trainingCommitJournalFile)
+            val snapshot = TrainingCommitJournal.read(trainingCommitJournalFile)
+            if (snapshot?.isCommitted == true) {
+                requireJournalCompatibility(snapshot, "committed-item finalization")
+            }
+            snapshot
                 ?.takeIf(TrainingCommitJournalSnapshot::isCommitted)
                 ?.entries
                 ?.firstOrNull { entry -> entry.itemId == item.id }
@@ -2322,40 +2455,36 @@ class TrainingManager(
                         }
                         val safetySnapshot = deviceGuard.safetyState.value
                         val memorySnapshot = captureTrainingMemorySnapshot()
-                        val thermalBatchLimit = DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
-                            configuredBatchSize = neuralEngine.config.trainingBatchSize,
-                            thermalStatus = safetySnapshot.thermalStatus,
-                            availableHeapBytes = memorySnapshot.availableHeapBytes,
-                            maximumHeapBytes = memorySnapshot.maximumHeapBytes,
-                            availableSystemMemoryBytes = memorySnapshot.availableSystemMemoryBytes,
-                            systemLowMemory = memorySnapshot.isSystemLowMemory,
-                            isPowerSaveMode = safetySnapshot.isPowerSaveMode,
-                            isCharging = safetySnapshot.isCharging,
-                            batteryPct = safetySnapshot.batteryPct,
-                            memoryRecovery = memoryRecovery
+                        val runtimeConfiguration = RuntimeConfigurationPlanner.create(
+                            backend = VulkanTrainingBackend,
+                            resources = RuntimeResourceSnapshot(
+                                availableAppHeapBytes = memorySnapshot.availableHeapBytes,
+                                maximumAppHeapBytes = memorySnapshot.maximumHeapBytes,
+                                availableSystemMemoryBytes = memorySnapshot.availableSystemMemoryBytes,
+                                systemLowMemory = memorySnapshot.isSystemLowMemory,
+                                thermalStatus = safetySnapshot.thermalStatus,
+                                temperatureCelsius = safetySnapshot.temperatureCelsius,
+                                isPowerSaveMode = safetySnapshot.isPowerSaveMode,
+                                isCharging = safetySnapshot.isCharging,
+                                batteryPct = safetySnapshot.batteryPct,
+                                memoryRecovery = memoryRecovery
+                            ),
+                            model = RuntimeModelConstraints(
+                                configuredBatchSize = neuralEngine.config.trainingBatchSize,
+                                configuredContextLength = neuralEngine.config.maxSeqLen,
+                                dModel = neuralEngine.config.dModel,
+                                feedForwardSize = neuralEngine.config.dFf,
+                                vocabularySize = neuralEngine.tokenizer.vocabSize,
+                                layerCount = neuralEngine.config.layerCount,
+                                headCount = neuralEngine.config.nHeads
+                            )
                         )
-                        if (thermalBatchLimit == 0) {
+
+                        if (runtimeConfiguration.deferReason == RuntimeDeferReason.THERMAL_LIMIT) {
                             prependPersistingQueueItems(listOf(firstItem))
                             continue
                         }
-
-                        val runtimeContextLength = DeviceAdaptiveRuntimePolicy.trainingContextLimit(
-                            configuredContextLength = neuralEngine.config.maxSeqLen,
-                            availableHeapBytes = memorySnapshot.availableHeapBytes,
-                            maximumHeapBytes = memorySnapshot.maximumHeapBytes,
-                            dModel = neuralEngine.config.dModel,
-                            feedForwardSize = neuralEngine.config.dFf,
-                            vocabularySize = neuralEngine.tokenizer.vocabSize,
-                            layerCount = neuralEngine.config.layerCount,
-                            headCount = neuralEngine.config.nHeads,
-                            thermalStatus = safetySnapshot.thermalStatus,
-                            availableSystemMemoryBytes = memorySnapshot.availableSystemMemoryBytes,
-                            systemLowMemory = memorySnapshot.isSystemLowMemory,
-                            isPowerSaveMode = safetySnapshot.isPowerSaveMode,
-                            isCharging = safetySnapshot.isCharging,
-                            memoryRecovery = memoryRecovery
-                        )
-                        if (runtimeContextLength == 0) {
+                        if (!runtimeConfiguration.canTrain) {
                             // Even the minimum legal context exceeds current live
                             // workspace headroom. Return the claim to durable QUEUED
                             // state without touching model/checkpoint/optimizer state.
@@ -2370,9 +2499,11 @@ class TrainingManager(
                             continue
                         }
 
-                        val batchItems = ArrayList<TrainingData>(thermalBatchLimit)
+                        val batchItems = ArrayList<TrainingData>(
+                            runtimeConfiguration.effectiveTrainingBatchSize
+                        )
                         batchItems += firstItem
-                        while (batchItems.size < thermalBatchLimit) {
+                        while (batchItems.size < runtimeConfiguration.effectiveTrainingBatchSize) {
                             val nextItem = popNext(expectedStatus = TrainingStatus.QUEUED) ?: break
                             batchItems += nextItem
                         }
@@ -2383,7 +2514,7 @@ class TrainingManager(
                         updateActiveDocumentEntering(activeItems.first())
 
                         try {
-                            if (!processBatch(activeItems, runtimeContextLength)) {
+                            if (!processBatch(activeItems, runtimeConfiguration.effectiveContextLength)) {
                                 validationRunHadFailures = true
                             } else {
                                 synchronized(queueLock) {
@@ -2427,8 +2558,12 @@ class TrainingManager(
                                     val baseline = activeBatchBaselineOptimizerStep
                                         ?: journal.baselineOptimizerStep
                                     val rolledBack = released && runCatching {
-                                        neuralEngine.loadCheckpointIfExists() &&
+                                        val restored = neuralEngine.loadCheckpointIfExists() &&
                                             neuralEngine.optimizerStep == baseline
+                                        if (restored) {
+                                            requireJournalCompatibility(journal, "failed-batch rollback")
+                                        }
+                                        restored
                                     }.getOrDefault(false)
                                     if (!rolledBack) {
                                         _isTrainingPaused.value = true
@@ -2472,7 +2607,10 @@ class TrainingManager(
         }
     }
 
-    private fun appendPersistingQueueItems(items: List<TrainingData>): List<TrainingData> {
+    private fun appendPersistingQueueItems(
+        items: List<TrainingData>,
+        replaySession: TrainingReplaySessionEntity? = null
+    ): List<TrainingData> {
         if (items.isEmpty()) return emptyList()
 
         val orderedItems = assignPersistentQueueOrder(items)
@@ -2481,7 +2619,8 @@ class TrainingManager(
 
         val operation = QueuePersistenceOperation.Save(
             generation = queueGeneration,
-            items = orderedItems
+            items = orderedItems,
+            replaySession = replaySession
         )
         val sendResult = persistenceOperations.trySend(operation)
         if (sendResult.isFailure) {
@@ -2564,7 +2703,12 @@ class TrainingManager(
                         "Training queue persistence is unavailable.",
                         repositoryInitialization.exceptionOrNull()
                     )
-                    repository.saveTrainingItems(operation.items)
+                    val replaySession = operation.replaySession
+                    if (replaySession == null) {
+                        repository.saveTrainingItems(operation.items)
+                    } else {
+                        repository.saveCorpusReplaySession(replaySession, operation.items)
+                    }
                 }.exceptionOrNull()
 
                 synchronized(queueLock) {
@@ -2776,13 +2920,18 @@ class TrainingManager(
         check(neuralEngine.saveCheckpoint()) {
             "The pre-batch model checkpoint could not be secured."
         }
-        val baselineOptimizerStep = neuralEngine.optimizerStep
+        val baselineModelState = neuralEngine.snapshotModelState()
+        val baselineModelIdentityFingerprint = baselineModelState.identity.fingerprint
+        val baselineOptimizerConfigFingerprint = baselineModelState.optimizerConfiguration.fingerprint
+        val baselineOptimizerStep = baselineModelState.optimizerStep
         activeBatchBaselineOptimizerStep = baselineOptimizerStep
         activeBatchRoomCommitted = false
         TrainingCommitJournal.writePrepared(
             file = trainingCommitJournalFile,
             baselineOptimizerStep = baselineOptimizerStep,
-            itemIds = items.map(TrainingData::id)
+            itemIds = items.map(TrainingData::id),
+            modelIdentityFingerprint = baselineModelIdentityFingerprint,
+            optimizerConfigFingerprint = baselineOptimizerConfigFingerprint
         )
 
         val startNs = System.nanoTime()
@@ -2808,14 +2957,46 @@ class TrainingManager(
             file = trainingCommitJournalFile,
             baselineOptimizerStep = baselineOptimizerStep,
             committedOptimizerStep = neuralEngine.optimizerStep,
-            entries = commitEntries
+            entries = commitEntries,
+            modelIdentityFingerprint = baselineModelIdentityFingerprint,
+            optimizerConfigFingerprint = baselineOptimizerConfigFingerprint
         )
+        val committedJournal = requireNotNull(
+            TrainingCommitJournal.read(trainingCommitJournalFile)
+        ) {
+            "The committed training journal could not be read back."
+        }
+        requireJournalCompatibility(committedJournal, "live batch commit before checkpoint write")
 
         // The write-ahead COMMITTED marker is durable before the model checkpoint.
         // Room is updated only after that checkpoint is atomically secured.
         check(neuralEngine.saveCheckpoint()) {
             "The committed optimizer state could not be checkpointed."
         }
+        val committedCheckpointFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
+        TrainingCommitJournal.writeCommitted(
+            file = trainingCommitJournalFile,
+            baselineOptimizerStep = baselineOptimizerStep,
+            committedOptimizerStep = neuralEngine.optimizerStep,
+            entries = commitEntries,
+            modelIdentityFingerprint = baselineModelIdentityFingerprint,
+            optimizerConfigFingerprint = baselineOptimizerConfigFingerprint,
+            checkpointSha256Fingerprint = committedCheckpointFingerprint
+        )
+        val checkpointBoundJournal = requireNotNull(
+            TrainingCommitJournal.read(trainingCommitJournalFile)
+        ) {
+            "The checkpoint-bound training journal could not be read back."
+        }
+        check(
+            checkpointBoundJournal.checkpointSha256Fingerprint == committedCheckpointFingerprint
+        ) {
+            "The committed checkpoint SHA-256 was not persisted in the journal."
+        }
+        requireJournalCompatibility(
+            checkpointBoundJournal,
+            "live batch commit after checkpoint write"
+        )
 
         val committedItems = items.zip(commitEntries).map { (item, entry) ->
             val result = requireNotNull(entry.result)

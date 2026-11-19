@@ -1,6 +1,11 @@
 package com.argus.agi.model
 
+import com.argus.agi.backend.ComputeBackend
+import com.argus.agi.backend.ComputeBackendKind
+import com.argus.agi.device.DeviceProfile
 import com.argus.agi.runtime.AdaptiveComputeOperation
+import com.argus.agi.runtime.DeviceAdaptiveRuntimePolicy
+import com.argus.agi.runtime.RuntimeConfigurationPlanner
 import com.argus.agi.runtime.AdaptiveComputePerformanceMonitor
 
 import android.util.Log
@@ -478,9 +483,11 @@ data class VulkanDeviceCapabilities(
  * enabled device capabilities, kernel availability, and resource checks permit it.
  * Kotlin execution is reserved for unavailable, unsupported, or failed Vulkan paths.
  */
-internal object VulkanTrainingBackend {
+internal object VulkanTrainingBackend : ComputeBackend {
 
     private const val TAG = "VulkanTrainingBackend"
+
+    override val kind: ComputeBackendKind = ComputeBackendKind.VULKAN
     private const val MEMORY_BUDGET_REFRESH_INTERVAL_NANOS = 5_000_000_000L
 
     internal fun recordCpuLinearTiming(operationCount: Long, elapsedNanoseconds: Long) {
@@ -547,6 +554,9 @@ internal object VulkanTrainingBackend {
     private val _deviceCapabilities = MutableStateFlow<VulkanDeviceCapabilities?>(null)
     val deviceCapabilities: StateFlow<VulkanDeviceCapabilities?> =
         _deviceCapabilities.asStateFlow()
+
+    private val _deviceProfile = MutableStateFlow<DeviceProfile?>(null)
+    override val deviceProfile: StateFlow<DeviceProfile?> = _deviceProfile.asStateFlow()
 
     private val _gpuPerformanceMetrics = MutableStateFlow(VulkanGpuPerformanceMetrics())
     val gpuPerformanceMetrics: StateFlow<VulkanGpuPerformanceMetrics> =
@@ -707,8 +717,14 @@ internal object VulkanTrainingBackend {
     val isRuntimeAvailable: Boolean
         get() = nativeReady && !disabledAfterRuntimeFailure
 
+    override val isReady: Boolean
+        get() = isRuntimeAvailable
+
     val isFp16ComputeAvailable: Boolean
         get() = isRuntimeAvailable && fp16RuntimeReady && !fp16DisabledAfterRuntimeFailure
+
+    override val isFp16ComputeReady: Boolean
+        get() = isFp16ComputeAvailable
 
     internal val isResidentActivationLinearAvailable: Boolean
         get() = isRuntimeAvailable && residentActivationLinearReady
@@ -844,7 +860,7 @@ internal object VulkanTrainingBackend {
     }
 
     private fun calculateTotalTensorResidencyBudgetBytes(
-        capabilities: VulkanDeviceCapabilities?
+        deviceProfile: DeviceProfile?
     ): Long {
         val runtime = Runtime.getRuntime()
         val maximumAppHeapBytes = runtime.maxMemory().coerceAtLeast(0L)
@@ -852,16 +868,10 @@ internal object VulkanTrainingBackend {
             runtime.freeMemory() +
                 (maximumAppHeapBytes - runtime.totalMemory()).coerceAtLeast(0L)
             ).coerceAtLeast(0L)
-        val deviceLocalHeadroomBytes =
-            capabilities?.deviceLocalMemoryBudgetHeadroomBytes?.minOrNull()
-        val maximumStorageBufferRangeBytes =
-            capabilities?.maxStorageBufferRangeBytes ?: 0L
-
-        return DeviceAdaptiveRuntimePolicy.calculateTensorArenaBudget(
+        return RuntimeConfigurationPlanner.calculateTensorArenaBudget(
+            deviceProfile = deviceProfile,
             maximumAppHeapBytes = maximumAppHeapBytes,
-            availableAppHeapBytes = availableAppHeapBytes,
-            deviceLocalHeadroomBytes = deviceLocalHeadroomBytes,
-            maximumStorageBufferRangeBytes = maximumStorageBufferRangeBytes
+            availableAppHeapBytes = availableAppHeapBytes
         ).totalBytes
     }
 
@@ -873,16 +883,16 @@ internal object VulkanTrainingBackend {
      * gradient capacity; the remaining equal shares hold both candidate sets.
      */
     private fun calculateModelTensorResidencyBudgetBytes(
-        capabilities: VulkanDeviceCapabilities?
-    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) / 12L
+        deviceProfile: DeviceProfile?
+    ): Long = calculateTotalTensorResidencyBudgetBytes(deviceProfile) / 12L
 
     private fun calculateActivationTensorResidencyBudgetBytes(
-        capabilities: VulkanDeviceCapabilities?
-    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) / 6L
+        deviceProfile: DeviceProfile?
+    ): Long = calculateTotalTensorResidencyBudgetBytes(deviceProfile) / 6L
 
     private fun calculateOptimizerStateResidencyBudgetBytes(
-        capabilities: VulkanDeviceCapabilities?
-    ): Long = calculateTotalTensorResidencyBudgetBytes(capabilities) / 3L
+        deviceProfile: DeviceProfile?
+    ): Long = calculateTotalTensorResidencyBudgetBytes(deviceProfile) / 3L
 
     /**
      * Allocates persistent Vulkan storage. New contents are undefined until uploaded
@@ -1040,6 +1050,15 @@ internal object VulkanTrainingBackend {
     internal fun synchronizeTrainingStateMirrors(): Boolean =
         synchronizeModelParameterMirrors() && synchronizeOptimizerStateMirrors()
 
+    override fun synchronizeAuthoritativeState(): Boolean =
+        synchronizeTrainingStateMirrors()
+
+    override fun releaseDeviceResourcesForMemoryPressure(): Boolean =
+        releaseModelTensorResidencyForMemoryPressure()
+
+    override fun resumeDeviceResourcesAfterForeground() =
+        resumeModelTensorResidencyAfterForeground()
+
     /** Drops optimizer replicas only after the exact GPU moments have been recovered. */
     @Synchronized
     internal fun invalidateOptimizerStateResidency(): Boolean {
@@ -1079,13 +1098,15 @@ internal object VulkanTrainingBackend {
         runCatching {
             VulkanDeviceCapabilities.fromJson(nativeGetDeviceCapabilities())
         }.onSuccess { capabilities ->
+            val detectedProfile = capabilities.toDeviceProfile()
             _deviceCapabilities.value = capabilities
+            _deviceProfile.value = detectedProfile
             _modelTensorResidencyBudgetBytes.value =
-                calculateModelTensorResidencyBudgetBytes(capabilities)
+                calculateModelTensorResidencyBudgetBytes(detectedProfile)
             _activationTensorResidencyBudgetBytes.value =
-                calculateActivationTensorResidencyBudgetBytes(capabilities)
+                calculateActivationTensorResidencyBudgetBytes(detectedProfile)
             _optimizerStateResidencyBudgetBytes.value =
-                calculateOptimizerStateResidencyBudgetBytes(capabilities)
+                calculateOptimizerStateResidencyBudgetBytes(detectedProfile)
             lastMemoryBudgetRefreshNanos = nowNanos
             Log.i(
                 TAG,
@@ -1849,6 +1870,7 @@ internal object VulkanTrainingBackend {
         _activationTensorResidencyBudgetBytes.value = 0L
         _optimizerStateResidencyBudgetBytes.value = 0L
         _deviceCapabilities.value = null
+        _deviceProfile.value = null
         _gpuPerformanceMetrics.value = VulkanGpuPerformanceMetrics()
         _tensorArenaMetrics.value = VulkanTensorArenaMetrics()
         _currentBackend = "Kotlin CPU"
@@ -1861,7 +1883,7 @@ internal object VulkanTrainingBackend {
     }
 
     @Synchronized
-    fun initializeAfterModelReady(): Boolean {
+    override fun initializeAfterModelReady(): Boolean {
         if (isRuntimeAvailable) {
             publishInitializationProgress(
                 status = "Vulkan runtime verified",
@@ -1908,13 +1930,15 @@ internal object VulkanTrainingBackend {
                 }.onFailure { error ->
                     Log.w(TAG, "Vulkan runtime started but capability metadata could not be parsed.", error)
                 }.getOrNull()
+                val detectedProfile = detectedCapabilities?.toDeviceProfile()
                 _deviceCapabilities.value = detectedCapabilities
+                _deviceProfile.value = detectedProfile
                 _modelTensorResidencyBudgetBytes.value =
-                    calculateModelTensorResidencyBudgetBytes(detectedCapabilities)
+                    calculateModelTensorResidencyBudgetBytes(detectedProfile)
                 _activationTensorResidencyBudgetBytes.value =
-                    calculateActivationTensorResidencyBudgetBytes(detectedCapabilities)
+                    calculateActivationTensorResidencyBudgetBytes(detectedProfile)
                 _optimizerStateResidencyBudgetBytes.value =
-                    calculateOptimizerStateResidencyBudgetBytes(detectedCapabilities)
+                    calculateOptimizerStateResidencyBudgetBytes(detectedProfile)
                 Log.i(
                     TAG,
                     "FP16 model-residency budget: ${_modelTensorResidencyBudgetBytes.value} bytes."

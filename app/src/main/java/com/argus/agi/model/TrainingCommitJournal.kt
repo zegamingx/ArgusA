@@ -24,7 +24,10 @@ internal data class TrainingCommitJournalEntry(
 internal data class TrainingCommitJournalSnapshot(
     val baselineOptimizerStep: Int,
     val committedOptimizerStep: Int?,
-    val entries: List<TrainingCommitJournalEntry>
+    val entries: List<TrainingCommitJournalEntry>,
+    val modelIdentityFingerprint: String? = null,
+    val optimizerConfigFingerprint: String? = null,
+    val checkpointSha256Fingerprint: String? = null
 ) {
     val isCommitted: Boolean
         get() = committedOptimizerStep != null
@@ -40,7 +43,13 @@ internal object TrainingCommitJournal {
     const val FILE_NAME = "argus_training_commit.journal"
 
     private const val MAGIC = 0x4154474A // ATGJ
-    private const val VERSION = 1
+    private const val LEGACY_VERSION = 1
+    private const val MODEL_IDENTITY_VERSION = 2
+    private const val OPTIMIZER_CONFIGURATION_VERSION = 3
+    private const val CHECKPOINT_DIGEST_VERSION = 4
+    private const val CURRENT_VERSION = CHECKPOINT_DIGEST_VERSION
+    private const val SHA256_FINGERPRINT_BYTES = 32
+    private const val SHA256_FINGERPRINT_HEX_LENGTH = SHA256_FINGERPRINT_BYTES * 2
     private const val STATE_PREPARED = 0
     private const val STATE_COMMITTED = 1
     private const val MAX_JOURNAL_BYTES = 64 * 1024
@@ -60,7 +69,9 @@ internal object TrainingCommitJournal {
     fun writePrepared(
         file: File,
         baselineOptimizerStep: Int,
-        itemIds: List<String>
+        itemIds: List<String>,
+        modelIdentityFingerprint: String? = null,
+        optimizerConfigFingerprint: String? = null
     ) {
         require(baselineOptimizerStep >= 0) {
             "Baseline optimizer step cannot be negative."
@@ -83,7 +94,9 @@ internal object TrainingCommitJournal {
             state = STATE_PREPARED,
             baselineOptimizerStep = baselineOptimizerStep,
             committedOptimizerStep = null,
-            entries = entries
+            entries = entries,
+            modelIdentityFingerprint = modelIdentityFingerprint,
+            optimizerConfigFingerprint = optimizerConfigFingerprint
         )
     }
 
@@ -91,7 +104,10 @@ internal object TrainingCommitJournal {
         file: File,
         baselineOptimizerStep: Int,
         committedOptimizerStep: Int,
-        entries: List<TrainingCommitJournalEntry>
+        entries: List<TrainingCommitJournalEntry>,
+        modelIdentityFingerprint: String? = null,
+        optimizerConfigFingerprint: String? = null,
+        checkpointSha256Fingerprint: String? = null
     ) {
         require(baselineOptimizerStep >= 0)
         require(committedOptimizerStep >= baselineOptimizerStep) {
@@ -117,8 +133,57 @@ internal object TrainingCommitJournal {
             state = STATE_COMMITTED,
             baselineOptimizerStep = baselineOptimizerStep,
             committedOptimizerStep = committedOptimizerStep,
-            entries = entries
+            entries = entries,
+            modelIdentityFingerprint = modelIdentityFingerprint,
+            optimizerConfigFingerprint = optimizerConfigFingerprint,
+            checkpointSha256Fingerprint = checkpointSha256Fingerprint
         )
+    }
+
+    /**
+     * Version 1 has no identity; version 2 adds model identity; version 3 binds optimizer
+     * configuration; version 4 binds the committed transaction to the exact checkpoint file.
+     * Legacy journal versions remain readable and retain their explicitly unverified path.
+     */
+    fun matchesModelIdentity(
+        snapshot: TrainingCommitJournalSnapshot,
+        activeModelIdentityFingerprint: String
+    ): Boolean = snapshot.modelIdentityFingerprint?.let { expected ->
+        expected == activeModelIdentityFingerprint
+    } ?: true
+
+    fun matchesOptimizerConfiguration(
+        snapshot: TrainingCommitJournalSnapshot,
+        activeOptimizerConfigFingerprint: String
+    ): Boolean = snapshot.optimizerConfigFingerprint?.let { expected ->
+        expected == activeOptimizerConfigFingerprint
+    } ?: true
+
+    fun matchesCheckpointFileFingerprint(
+        snapshot: TrainingCommitJournalSnapshot,
+        activeCheckpointSha256Fingerprint: String
+    ): Boolean = snapshot.checkpointSha256Fingerprint?.let { expected ->
+        expected == activeCheckpointSha256Fingerprint
+    } ?: true
+
+    /**
+     * Determines whether a verified checkpoint can participate in this journal's recovery.
+     * ARG5 predates the embedded optimizer identity, so it remains readable as explicitly
+     * unverified; ARG6 must match the journal fingerprint exactly.
+     */
+    fun allowsCheckpointForRecovery(
+        snapshot: TrainingCommitJournalSnapshot,
+        checkpointFormat: ModelCheckpointFormat,
+        checkpointVerified: Boolean,
+        checkpointOptimizerConfigFingerprint: String?
+    ): Boolean {
+        val journalFingerprint = snapshot.optimizerConfigFingerprint ?: return true
+        if (!checkpointVerified) return false
+        return when (checkpointFormat) {
+            ModelCheckpointFormat.ARG5 -> checkpointOptimizerConfigFingerprint == null
+            ModelCheckpointFormat.ARG6 ->
+                checkpointOptimizerConfigFingerprint == journalFingerprint
+        }
     }
 
     fun read(file: File): TrainingCommitJournalSnapshot? {
@@ -147,8 +212,9 @@ internal object TrainingCommitJournal {
                 require(body.readInt() == MAGIC) {
                     "Training commit journal magic is invalid."
                 }
-                require(body.readInt() == VERSION) {
-                    "Training commit journal version is unsupported."
+                val version = body.readInt()
+                require(version in LEGACY_VERSION..CURRENT_VERSION) {
+                    "Training commit journal version is unsupported: $version."
                 }
                 val state = body.readInt()
                 require(state == STATE_PREPARED || state == STATE_COMMITTED) {
@@ -158,10 +224,36 @@ internal object TrainingCommitJournal {
                 val committedOptimizerStep = body.readInt()
                 val count = body.readInt()
                 require(baselineOptimizerStep >= 0 && count in 1..MAX_ITEMS)
+                val modelIdentityFingerprint = if (version >= MODEL_IDENTITY_VERSION) {
+                    val fingerprintBytes = ByteArray(SHA256_FINGERPRINT_BYTES)
+                    body.readFully(fingerprintBytes)
+                    fingerprintBytes.toHexFingerprint()
+                } else {
+                    null
+                }
+                val optimizerConfigFingerprint = if (version >= OPTIMIZER_CONFIGURATION_VERSION) {
+                    val fingerprintBytes = ByteArray(SHA256_FINGERPRINT_BYTES)
+                    body.readFully(fingerprintBytes)
+                    fingerprintBytes.toHexFingerprint()
+                } else {
+                    null
+                }
+                val checkpointSha256Fingerprint = if (version >= CHECKPOINT_DIGEST_VERSION) {
+                    val fingerprintBytes = ByteArray(SHA256_FINGERPRINT_BYTES)
+                    body.readFully(fingerprintBytes)
+                    fingerprintBytes.toHexFingerprint()
+                } else {
+                    null
+                }
                 require(
                     if (state == STATE_COMMITTED) committedOptimizerStep >= baselineOptimizerStep
                     else committedOptimizerStep == -1
                 ) { "Training commit journal optimizer-step metadata is inconsistent." }
+                require(
+                    version < CHECKPOINT_DIGEST_VERSION || state == STATE_COMMITTED
+                ) {
+                    "Checkpoint-bound journal versions require COMMITTED state."
+                }
 
                 val entries = ArrayList<TrainingCommitJournalEntry>(count)
                 repeat(count) {
@@ -223,7 +315,10 @@ internal object TrainingCommitJournal {
                     } else {
                         null
                     },
-                    entries = entries
+                    entries = entries,
+                    modelIdentityFingerprint = modelIdentityFingerprint,
+                    optimizerConfigFingerprint = optimizerConfigFingerprint,
+                    checkpointSha256Fingerprint = checkpointSha256Fingerprint
                 )
             }
         }
@@ -240,21 +335,71 @@ internal object TrainingCommitJournal {
         }
     }
 
+    private fun String.toSha256FingerprintBytes(): ByteArray {
+        require(length == SHA256_FINGERPRINT_HEX_LENGTH) {
+            "Fingerprint must contain exactly 32 SHA-256 bytes."
+        }
+        require(all { character ->
+            character in '0'..'9' || character in 'a'..'f'
+        }) {
+            "Fingerprint must be lowercase hexadecimal."
+        }
+        return ByteArray(SHA256_FINGERPRINT_BYTES) { index ->
+            substring(index * 2, index * 2 + 2).toInt(16).toByte()
+        }
+    }
+
+    private fun ByteArray.toHexFingerprint(): String {
+        require(size == SHA256_FINGERPRINT_BYTES)
+        return joinToString(separator = "") { byte ->
+            "%02x".format(java.util.Locale.ROOT, byte.toInt() and 0xFF)
+        }
+    }
+
     private fun writeSnapshot(
         file: File,
         state: Int,
         baselineOptimizerStep: Int,
         committedOptimizerStep: Int?,
-        entries: List<TrainingCommitJournalEntry>
+        entries: List<TrainingCommitJournalEntry>,
+        modelIdentityFingerprint: String?,
+        optimizerConfigFingerprint: String?,
+        checkpointSha256Fingerprint: String? = null
     ) {
+        require((modelIdentityFingerprint == null) == (optimizerConfigFingerprint == null)) {
+            "Model identity and optimizer configuration fingerprints must be written together."
+        }
+        require(checkpointSha256Fingerprint == null || (
+            state == STATE_COMMITTED && modelIdentityFingerprint != null && optimizerConfigFingerprint != null
+        )) {
+            "A checkpoint digest requires a committed journal with model and optimizer identities."
+        }
+        val fingerprintBytes = modelIdentityFingerprint?.toSha256FingerprintBytes()
+        val optimizerFingerprintBytes = optimizerConfigFingerprint?.toSha256FingerprintBytes()
+        val checkpointDigestBytes = checkpointSha256Fingerprint?.toSha256FingerprintBytes()
+        val version = when {
+            fingerprintBytes == null -> LEGACY_VERSION
+            optimizerFingerprintBytes == null -> MODEL_IDENTITY_VERSION
+            checkpointDigestBytes == null -> OPTIMIZER_CONFIGURATION_VERSION
+            else -> CHECKPOINT_DIGEST_VERSION
+        }
         val payloadBuffer = ByteArrayOutputStream()
         DataOutputStream(payloadBuffer).use { output ->
             output.writeInt(MAGIC)
-            output.writeInt(VERSION)
+            output.writeInt(version)
             output.writeInt(state)
             output.writeInt(baselineOptimizerStep)
             output.writeInt(committedOptimizerStep ?: -1)
             output.writeInt(entries.size)
+            if (fingerprintBytes != null) {
+                output.write(fingerprintBytes)
+            }
+            if (optimizerFingerprintBytes != null) {
+                output.write(optimizerFingerprintBytes)
+            }
+            if (checkpointDigestBytes != null) {
+                output.write(checkpointDigestBytes)
+            }
             for (entry in entries) {
                 val idBytes = entry.itemId.toByteArray(Charsets.UTF_8)
                 require(idBytes.isNotEmpty() && idBytes.size <= MAX_ITEM_ID_BYTES)

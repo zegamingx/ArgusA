@@ -9,12 +9,14 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import com.argus.agi.data.local.dao.ChatMessageDao
 import com.argus.agi.data.local.dao.CorpusDao
 import com.argus.agi.data.local.dao.TrainingQueueDao
+import com.argus.agi.data.local.dao.TrainingReplaySessionDao
 import com.argus.agi.data.local.dao.WorldMemoryDao
 import com.argus.agi.data.local.entity.ChatMessageEntity
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceEntity
 import com.argus.agi.data.local.entity.TrainingItemEntity
+import com.argus.agi.data.local.entity.TrainingReplaySessionEntity
 import com.argus.agi.data.local.entity.WorldMemoryEntity
 
 @Database(
@@ -22,17 +24,19 @@ import com.argus.agi.data.local.entity.WorldMemoryEntity
         ChatMessageEntity::class,
         WorldMemoryEntity::class,
         TrainingItemEntity::class,
+        TrainingReplaySessionEntity::class,
         CorpusDocumentEntity::class,
         CorpusSourceEntity::class,
         CorpusChunkEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class ArgusDatabase : RoomDatabase() {
     abstract fun chatMessageDao(): ChatMessageDao
     abstract fun worldMemoryDao(): WorldMemoryDao
     abstract fun trainingQueueDao(): TrainingQueueDao
+    abstract fun trainingReplaySessionDao(): TrainingReplaySessionDao
     abstract fun corpusDao(): CorpusDao
 
     companion object {
@@ -41,6 +45,38 @@ abstract class ArgusDatabase : RoomDatabase() {
          * Version 2 adds retained corpus tables and a nullable document reference.
          * This migration is additive; it does not erase any existing user data.
          */
+        val MIGRATION_3_4: Migration = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE `training_items` ADD COLUMN `replaySessionId` TEXT"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_training_items_replaySessionId` " +
+                        "ON `training_items` (`replaySessionId`)"
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `training_replay_sessions` (
+                        `id` TEXT NOT NULL,
+                        `sourceSnapshotFingerprint` TEXT NOT NULL,
+                        `seed` INTEGER NOT NULL,
+                        `policy` TEXT NOT NULL,
+                        `epochs` INTEGER NOT NULL,
+                        `schedulerFormatVersion` INTEGER NOT NULL,
+                        `scheduledDocumentCount` INTEGER NOT NULL,
+                        `scheduledChunkCount` INTEGER NOT NULL,
+                        `createdAtEpochMs` INTEGER NOT NULL,
+                        PRIMARY KEY(`id`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_training_replay_sessions_createdAtEpochMs` " +
+                        "ON `training_replay_sessions` (`createdAtEpochMs`)"
+                )
+            }
+        }
+
         val MIGRATION_2_3: Migration = object : Migration(2, 3) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE `corpus_sources` ADD COLUMN `licenseIdentifier` TEXT")
@@ -208,7 +244,7 @@ abstract class ArgusDatabase : RoomDatabase() {
                     ArgusDatabase::class.java,
                     "argus_ondevice.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .build()
                     .also { database -> INSTANCE = database }
             }

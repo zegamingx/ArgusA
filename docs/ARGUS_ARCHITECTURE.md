@@ -207,16 +207,18 @@ Before serialization, CPU fallback, backend restart, or recovery, all authoritat
 
 Checkpoints must be backend- and GPU-vendor-independent. The canonical format must be versioned and validate magic, header size, architecture identity, tokenizer identity, named tensor manifest, tensor types/shapes, declared payload length, checksum, and end-of-file. Writes must use a temporary file, durable flush, atomic replacement where supported, and independent read-back verification.
 
-The current ARG4 implementation already:
+The current ARG6 implementation already:
 - stores architecture and tokenizer metadata, named model tensors, Adam first/second moments, and optimizer step;
 - serializes tensor values through a canonical float32 representation, even where in-memory model parameters use FP16;
 - validates architecture dimensions/ID, tokenizer schema/algorithm/capacity, tensor manifest, payload length, and CRC32;
 - synchronizes Vulkan model/optimizer mirrors before checkpoint serialization;
 - verifies the saved file by reading its header and streaming the payload checksum.
 
+The active writer emits ARG6 with the same 96-byte fixed header and existing ARG5 payload representation, plus a 32-byte optimizer-configuration SHA-256 fingerprint immediately after the tokenizer fingerprint. The loader remains backward-compatible with ARG5 and validates the optimizer fingerprint before mutating the active tokenizer or tensor state. If an existing checkpoint cannot be restored, subsequent saves are blocked so a random or incompatible model cannot silently overwrite user data; a successfully restored ARG5 checkpoint can still be saved forward as ARG6. Journal v3 recovery can continue from an independently verified ARG5 checkpoint with an explicit warning that its embedded optimizer identity is absent; ARG6 recovery requires an exact checkpoint-to-journal optimizer fingerprint match. The current clean-break loader explicitly rejects pre-release ARG3 and ARG4 files; this is covered by `preReleaseArg3AndArg4CheckpointsAreRejectedWithoutMigration`. Therefore this branch does **not** provide ARG3/ARG4 restore compatibility. Any future legacy restore must be an explicit versioned reader with preservation tests, not an implicit change to ARG6.
+
 The training queue transaction is separate: `TrainingCommitJournal` and Room queue state coordinate prepared/committed optimizer updates and recovery. Do not conflate the model checkpoint with queue persistence.
 
-Before claiming full training-session continuity, separately verify whether optimizer hyperparameters, learning-rate schedule position, random-number-generator/sampler state, dataset cursor, and all pending queue metadata are persisted or deterministically reconstructed. Missing state must be reported as a gap, not assumed to be in ARG4.
+Before claiming full training-session continuity, separately verify whether optimizer hyperparameters, learning-rate schedule position, random-number-generator/sampler state, dataset cursor, and all pending queue metadata are persisted or deterministically reconstructed. Missing state must be reported as a gap, not assumed to be in ARG6.
 
 A checkpoint load must reject incompatible architecture/tokenizer state without modifying the currently active model. Any future migration requires a new format/schema version and explicit compatibility tests.
 
@@ -226,7 +228,7 @@ A checkpoint load must reject incompatible architecture/tokenizer state without 
 2. **Package ownership is not yet enforced.** Device/runtime/training/backend/memory/checkpoint classes remain concentrated in `model/`. Introduce the boundaries incrementally; do not duplicate the existing policies under new names.
 3. **The device capability report is broad, but kernel coverage is narrower.** Report feature support separately from actual compiled and selected kernels. In particular, capability reporting for subgroup, integer dot product, cooperative matrix, ARM tensor, or shader-core features must not be marketed as working Argus kernels until the corresponding shader/dispatch/test path exists.
 4. **Capacity recommendations are not the training model selector.** `ArgusDeviceModelPolicy` chooses the current locally executable training family. `DeviceModelCapacityPolicy` contains much larger RAM-based parameter recommendations and explicitly is not proof that the current Argus trainer can build or train those model sizes. Keep these concepts separate until the capacity estimator is reconciled with the actual backend memory/compute implementation.
-5. **Checkpoint continuity needs a complete state inventory.** ARG4 model/optimizer tensor persistence and the queue transaction journal are substantial foundations, but they do not by themselves prove that all training-session state (schedule, RNG/sampler, dataset cursor, and pending work) is durable.
+5. **Checkpoint continuity needs a complete state inventory.** ARG6 model/optimizer tensor persistence and the queue transaction journal are substantial foundations, but they do not by themselves prove that all training-session state (schedule, RNG/sampler, dataset cursor, and pending work) is durable.
 
 ## 7. Safe migration sequence
 
@@ -240,3 +242,56 @@ A checkpoint load must reject incompatible architecture/tokenizer state without 
 ## 8. Completion criteria
 
 The architecture foundation is complete only when the production code—not merely this document—enforces the contracts above; no existing feature has been lost during migration; model/optimizer state survives backend release/reinitialization; checkpoint compatibility and transaction recovery are tested; GPU dispatch does not deliberately use CPU for calibration; and the relevant build, unit, native, and device-level validation evidence is recorded.
+
+
+## 9. Implementation progress after the baseline audit
+
+The audited source tree and package inventory in section 2 describe the baseline revision recorded at the top of this document. They are historical audit evidence, not a claim that the current `master` tree is unchanged.
+
+The following architecture increments have since been committed to `master`:
+
+- **Device profile:** immutable `com.argus.agi.device.DeviceProfile` now represents physical-device identity, Vulkan limits, feature support versus enablement, and memory-heap budgets. The existing JNI report remains the parsing boundary through `VulkanDeviceCapabilities.toDeviceProfile()`.
+- **Runtime configuration:** `DeviceAdaptiveRuntimePolicy` now belongs to `com.argus.agi.runtime`. `RuntimeConfigurationPlanner` combines a device profile with live heap, system-memory, thermal, battery, and active-model constraints. It calculates execution batch/context limits without changing persisted architecture dimensions.
+- **Compute backend contract:** `com.argus.agi.backend.ComputeBackend` is implemented by the Vulkan backend for readiness, FP16 self-test readiness, device profile, state synchronization, and device-resource recovery. The Kotlin CPU path remains the engine's existing fallback; it has not been replaced with an empty backend stub.
+- **Model state:** `ModelState` captures architecture identity, tokenizer configuration and snapshot fingerprint, optimizer step, active optimizer-configuration identity, checkpoint format, read-back verification state, and the optimizer-configuration fingerprint actually persisted in the checkpoint. ARG6 persists and verifies that fingerprint; ARG5 remains readable but reports no persisted optimizer identity. ARG6 keeps the 96-byte fixed header and extends the payload with the 32-byte optimizer fingerprint. `ModelCheckpointFormat.ARG6` is the active writer version.
+
+These are implementation increments, not completion evidence. The current changes have not yet passed a complete Android build, lint, JVM unit-test suite, native validation, or device-level validation. No merge to `main` is authorized by this status note.
+
+Remaining architecture work includes routing model operations through the backend contract where appropriate, auditing end-to-end checkpoint and training-session recovery (including schedule, RNG/sampler, dataset cursor, and pending queue state), and completing the existing M1–M10 validation sequence. The cross-GPU evidence audit remains deferred until implementation and milestone validation are complete.
+
+## 10. Training-session persistence audit
+
+This audit describes the current `master` implementation, not a claim that every item below has passed CI or device validation.
+
+### 10.1 Durable state already present
+
+- **Model and optimizer tensors:** ARG6 stores named model tensors, Adam first/second moments, optimizer step, and optimizer-configuration fingerprint. Tensor payload values use the checkpoint's canonical float32 representation. The tokenizer manifest and snapshot fingerprint are stored with the architecture metadata. ARG5 remains readable through the legacy-format loader without a persisted optimizer identity.
+- **Checkpoint integrity:** the writer uses a temporary file, flushes and syncs it, atomically replaces the destination where supported, then independently verifies header, declared length, and CRC32. The loader validates architecture dimensions/ID, tokenizer schema/algorithm/configuration/fingerprint, tensor manifest and shapes, payload length, checksum, and end-of-file before accepting the restored state.
+- **Queue and dataset position:** each `TrainingItemEntity` stores item ID, source/title/content, document ID, replay-session ID, chunk index, total chunk count, timestamp, status, final loss, and step duration. A `TrainingReplaySessionEntity` stores the immutable source snapshot SHA-256, seed, policy, epochs, scheduler format version, and materialized document/chunk counts. The session descriptor, queue rows, and corpus READY transitions are inserted atomically in one Room transaction. The queue rows remain the authoritative materialized replay cursor; there is no separate persisted integer cursor.
+- **Batch transaction:** new `TrainingCommitJournal` v3 records PREPARED/COMMITTED state, baseline and committed optimizer steps, item IDs, per-item loss/token/context/optimizer metrics, CRC32, model identity, and optimizer-configuration identity. After the checkpoint is atomically written and read-back verified, the COMMITTED journal is rewritten as v4 with the exact checkpoint-file SHA-256; recovery verifies that digest before Room mutation or finalization. If the process crashes in the narrow interval after checkpoint replacement but before the v4 journal rewrite, v3 step/model/optimizer checks remain the fallback. Readers remain backward-compatible with v1-v3; legacy v1/v2 have no optimizer fingerprint, while v3 has optimizer identity but no file digest.
+- **Startup recovery:** the worker reconciles the journal against the restored optimizer step before converting interrupted Room `TRAINING` rows back to `QUEUED`. It restores the remaining committed and pending rows in persisted timestamp order. A committed row is finalized without applying the optimizer update again.
+- **Validation promotion:** `ConversationalValidationPersistence` separately stores baseline/latest reports, decision/status, and an accepted checkpoint filename plus SHA-256. This is validation-promotion state, not a replacement for the training batch journal.
+
+### 10.2 RNG, replay scheduling, and cursor semantics
+
+- The active training update path does not currently use a stochastic sample selector. The engine's Kotlin `Random` calls are used for initial/new tensor weight initialization and generation sampling; generation sampling is not training sampler state. Restored weights make the initialization RNG unnecessary after a valid checkpoint exists.
+- `CorpusReplayScheduler` uses `java.util.Random(seed)` to create the complete deterministic order for the requested source snapshot, epoch count, seed, and policy. The scheduler materializes every selected chunk into queue items before worker execution. Room then persists those rows and their timestamps; restart continues the already-materialized order without needing to restore the RNG stream.
+- Every replay now has a durable session ID, source snapshot fingerprint, seed, policy, epoch count, scheduler format version, and scheduled document/chunk counts. The source fingerprint is deterministic over canonical document/chunk order and length-prefixed UTF-8 fields, including exact chunk content, fingerprint algorithm, rights status, and planned document epochs. The fully materialized queue order and chunk cursor remain authoritative for continuation; the descriptor provides provenance for audit and future regeneration.
+
+### 10.3 Remaining gaps
+
+1. **Optimizer configuration identity — CHECKPOINTED FOR ARG6.** The optimizer hyperparameters and semantic policy IDs are centralized in immutable, validated `OptimizerConfig`; the stable SHA-256 fingerprint uses raw IEEE-754 float bits and is persisted in ARG6 after the tokenizer fingerprint. The loader verifies it against the active optimizer configuration before restoring mutable model state. ARG5 remains readable but its optimizer compatibility is unverified; no fingerprint is invented for legacy files. Future optimizer changes require an explicit version/migration decision instead of silently resuming with changed semantics.
+2. **Journal-to-model identity — PARTIAL.** Journal v2 stores and verifies `ModelStateIdentity.fingerprint`; v3 additionally binds optimizer configuration; v4 binds the exact committed checkpoint file with SHA-256 after checkpoint replacement. Legacy v1/v2 remain readable without optimizer identity. A crash between checkpoint replacement and the v4 journal rewrite leaves a v3 journal, so recovery falls back to checkpoint CRC, optimizer step, model identity, and optimizer identity rather than a file digest in that narrow interval. These identities are not substitutes for the checkpoint's payload CRC32.
+3. **Replay provenance — IMPLEMENTED.** Room schema v4 adds immutable replay-session metadata and nullable `training_items.replaySessionId`. The queue insertion, session descriptor insertion, and corpus document READY-state updates commit atomically. Existing queue rows migrate with a null session ID and remain readable.
+4. **Training-session telemetry — SESSION-LOCAL.** `TrainingSessionMetrics`, loss history, active-document UI state, and transient retry counters are in-memory runtime state. They must not be presented as lifetime or crash-resumable counters unless separately reconstructed from durable queue/corpus records.
+5. **Legacy checkpoint compatibility — PARTIAL.** ARG5 remains readable by the ARG6 loader and is explicitly marked as lacking persisted optimizer configuration identity. Pre-release ARG3 and ARG4 checkpoints remain unsupported by the current clean-break policy. Preserve this behavior until an explicit, tested compatibility migration is approved; do not describe ARG3/ARG4 restore as implemented.
+
+### 10.4 Safe next implementation order
+
+1. **COMPLETED:** immutable optimizer configuration identity is persisted and verified in ARG6; journal v4 now binds committed state to the exact checkpoint-file SHA-256 after checkpoint replacement. ARG5 remains backward-readable with optimizer compatibility explicitly unverified.
+2. **COMPLETED in journal v4:** new writes record model identity and optimizer configuration in v3, then bind the committed journal to the exact checkpoint-file SHA-256 in v4 after checkpoint replacement. Readers accept v1-v4. Legacy v1/v2 remain explicitly unverified; v3 is the documented fallback for a crash between checkpoint replacement and the v4 journal rewrite.
+3. **COMPLETED:** Room v4 persists replay-session provenance and atomically inserts the descriptor, materialized queue rows, and corpus READY states. Existing queue rows remain the authoritative per-item cursor.
+4. Add fault-injection tests for crashes between PREPARED, optimizer mutation, COMMITTED, checkpoint replacement, Room commit, and item finalization.
+5. Only after those contracts and migrations are complete should the full build, lint, JVM/native validation, and relevant device checks run in the authorized validation sequence.
+
+Do not retrofit RNG persistence for a training sampler that does not exist. Do not break the existing queue/journal recovery path merely to add metadata.
