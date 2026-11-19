@@ -100,6 +100,15 @@ try {
 
     Push-Location $mirrorPath
     try {
+        # GitHub pull-request refs may not be copied by every mirror transport.
+        # Fetch them explicitly so the sanitized mirror can report all affected PR refs.
+        Invoke-Git -Arguments @(
+            "fetch",
+            "--force",
+            "origin",
+            "+refs/pull/*:refs/pull/*"
+        )
+
         Write-Host "Rewriting signing files and credential assignments..."
         Invoke-Git -Arguments @(
             "filter-repo",
