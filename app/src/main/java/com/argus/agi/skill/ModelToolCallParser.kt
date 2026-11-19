@@ -12,7 +12,7 @@ internal object ModelToolCallParser {
     private const val MAX_QUERY_LENGTH = 300
 
     private val webSearchPattern = Regex(
-        pattern = """^\\s*<WEB_SEARCH>\\s*([^<>]*?)\\s*</WEB_SEARCH>\\s*$""",
+        pattern = """^\s*<WEB_SEARCH>\s*([^<>]*?)\s*</WEB_SEARCH>\s*$""",
         options = setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
     )
 
