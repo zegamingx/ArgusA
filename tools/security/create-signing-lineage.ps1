@@ -228,9 +228,18 @@ try {
         throw "apksigner did not create a lineage file."
     }
 
-    $lineageReport = (Get-LineageReport -LineagePath $lineagePath).ToLowerInvariant()
-    if (-not $lineageReport.Contains($oldFingerprint) -or
-        -not $lineageReport.Contains($newFingerprint)) {
+    $lineageReport = Get-LineageReport -LineagePath $lineagePath
+    $lineageMatches = [regex]::Matches(
+        $lineageReport,
+        '(?i)SHA-256 digest:\\s*([0-9a-f:]{64,95})'
+    )
+    $lineageFingerprints = @(
+        foreach ($match in $lineageMatches) {
+            $match.Groups[1].Value.Replace(":", "").ToLowerInvariant()
+        }
+    )
+    if ($oldFingerprint -notin $lineageFingerprints -or
+        $newFingerprint -notin $lineageFingerprints) {
         throw "The lineage does not contain both the old and replacement certificates."
     }
 
