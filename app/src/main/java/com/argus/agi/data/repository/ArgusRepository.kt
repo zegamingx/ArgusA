@@ -259,6 +259,10 @@ class ArgusRepository(
         trainingQueueDao.getItem(id)?.toDomain()
     }
 
+    suspend fun deleteTrainingItem(id: String) = withContext(Dispatchers.IO) {
+        trainingQueueDao.deleteItem(id)
+    }
+
     suspend fun recoverInterruptedTrainingItems(): Int = withContext(Dispatchers.IO) {
         trainingQueueDao.recoverInterruptedTrainingItems()
     }
