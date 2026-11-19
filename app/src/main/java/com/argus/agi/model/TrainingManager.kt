@@ -13,6 +13,7 @@ import com.argus.agi.runtime.RuntimeDeferReason
 import com.argus.agi.runtime.RuntimeModelConstraints
 import com.argus.agi.runtime.RuntimeResourceSnapshot
 import com.argus.agi.sensor.DeviceGuard
+import com.argus.agi.sensor.PrivacyAppHeuristics
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -188,6 +189,9 @@ class TrainingManager internal constructor(
         private const val SCREEN_SOURCE_PREFIX = "Screen ("
         private const val SCREEN_PRIVACY_PREFERENCES = "argus_excluded_apps"
         private const val SCREEN_TRAINING_CONSENT_KEY = "screen_training_enabled"
+        private const val SCREEN_ALLOWED_PACKAGES_KEY = "allowed_screen_packages"
+        private const val SCREEN_TRAINING_ALLOWED_PACKAGES_KEY = "allowed_screen_training_packages"
+        private const val SCREEN_PROTECTED_PACKAGES_KEY = "protected_screen_packages"
         private const val SCREEN_DATA_CLEAR_POLL_MS = 100L
         private const val SCREEN_DATA_CLEAR_TIMEOUT_MS = 120_000L
         private val REASONING_BLOCK_PATTERN = Regex(
@@ -1707,7 +1711,7 @@ class TrainingManager internal constructor(
             content.isBlank() ||
             closed ||
             screenTrainingPurgePending ||
-            !isScreenTrainingConsentEnabled()
+            !isScreenTrainingConsentEnabled(packageName)
         ) {
             return
         }
@@ -1732,7 +1736,7 @@ class TrainingManager internal constructor(
         }
 
         synchronized(queueLock) {
-            if (closed || screenTrainingPurgePending || !isScreenTrainingConsentEnabled()) return
+            if (closed || screenTrainingPurgePending || !isScreenTrainingConsentEnabled(packageName)) return
             val current = _nextQueue.value
             val nonDuplicates = newItems.filter { item ->
                 current.none {
@@ -1805,8 +1809,29 @@ class TrainingManager internal constructor(
     private fun String.isScreenTrainingSource(): Boolean =
         startsWith(SCREEN_SOURCE_PREFIX)
 
-    private fun isScreenTrainingConsentEnabled(): Boolean =
-        trainingPreferences.getBoolean(SCREEN_TRAINING_CONSENT_KEY, false)
+    private fun isScreenTrainingConsentEnabled(packageName: String): Boolean {
+        if (!trainingPreferences.getBoolean(SCREEN_TRAINING_CONSENT_KEY, false)) return false
+        if (PrivacyAppHeuristics.isPrivacySensitiveApp("", packageName)) return false
+
+        val allowedForReading = trainingPreferences
+            .getStringSet(SCREEN_ALLOWED_PACKAGES_KEY, emptySet())
+            .orEmpty()
+        val allowedForTraining = trainingPreferences
+            .getStringSet(SCREEN_TRAINING_ALLOWED_PACKAGES_KEY, emptySet())
+            .orEmpty()
+        val protectedPackages = trainingPreferences
+            .getStringSet(SCREEN_PROTECTED_PACKAGES_KEY, emptySet())
+            .orEmpty()
+
+        return packageName in allowedForReading &&
+            packageName in allowedForTraining &&
+            packageName !in protectedPackages
+    }
+
+    private fun String.screenTrainingPackageName(): String? {
+        if (!startsWith(SCREEN_SOURCE_PREFIX) || !endsWith(")")) return null
+        return removePrefix(SCREEN_SOURCE_PREFIX).removeSuffix(")").takeIf(String::isNotBlank)
+    }
 
     fun enqueueData(source: String, title: String, content: String) {
         if (content.isBlank() || closed) return
@@ -2979,7 +3004,7 @@ class TrainingManager internal constructor(
             if (
                 first.status == TrainingStatus.QUEUED &&
                 first.source.isScreenTrainingSource() &&
-                !isScreenTrainingConsentEnabled()
+                first.source.screenTrainingPackageName()?.let(::isScreenTrainingConsentEnabled) != true
             ) {
                 val deletion = persistenceOperations.trySend(
                     QueuePersistenceOperation.DeleteItem(first.id)
