@@ -35,3 +35,7 @@ keystore.properties
 
 # Generated CMake compatibility launcher and local CMake path metadata.
 /tools/cmake-compat/runtime/
+
+# Local Android signing lineage and signature sidecars.
+*.lineage
+*.idsig
