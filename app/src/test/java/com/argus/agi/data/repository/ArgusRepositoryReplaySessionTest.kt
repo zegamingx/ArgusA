@@ -10,9 +10,11 @@ import com.argus.agi.data.local.entity.TrainingReplaySessionEntity
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingStatus
 import com.argus.agi.model.WorldEntity
+import com.argus.agi.model.WorldModel
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -273,6 +275,26 @@ class ArgusRepositoryReplaySessionTest {
         assertTrue("active screen app memory must be deleted", "active_screen_app" !in memories)
         assertTrue("screen content memory must be deleted", "last_screen_content" !in memories)
         assertEquals("Retained local memory", memories["user_fact"]?.value)
+    }
+
+    @Test
+    fun screenContextUpdatesAreTransientAndDoNotPersistToRoom() = runBlocking {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val worldModel = WorldModel(context, repository)
+
+        worldModel.updateScreenContext(
+            packageName = "com.example.reader",
+            visibleTextSnippet = "A private screen sample that must remain in transient memory."
+        )
+
+        assertTrue(worldModel.getAllEntities().any { it.key == "last_screen_content" })
+        val persistedKeys = repository.getMemoriesSnapshot().map(WorldEntity::key).toSet()
+        assertFalse("Screen app must not persist to Room", "active_screen_app" in persistedKeys)
+        assertFalse("Screen content must not persist to Room", "last_screen_content" in persistedKeys)
+
+        worldModel.clearScreenContext()
+        assertFalse(worldModel.getAllEntities().any { it.key == "active_screen_app" })
+        assertFalse(worldModel.getAllEntities().any { it.key == "last_screen_content" })
     }
 
     @Test
