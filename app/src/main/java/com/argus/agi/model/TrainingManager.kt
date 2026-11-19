@@ -2937,10 +2937,8 @@ class TrainingManager internal constructor(
         val startCompletion = CompletableDeferred<Result<Unit>>()
         val reservation = synchronized(queueLock) {
             val list = _nextQueue.value
+            if (screenTrainingPurgePending) return@synchronized null
             val first = list.firstOrNull() ?: return@synchronized null
-            if (screenTrainingPurgePending && first.source.isScreenTrainingSource()) {
-                return@synchronized null
-            }
             if (expectedStatus != null && first.status != expectedStatus) {
                 return@synchronized null
             }
