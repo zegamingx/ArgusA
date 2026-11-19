@@ -38,10 +38,13 @@ object ReasoningOutputParser {
                 .removeSuffix(Tokenizer.EOS_TOKEN)
                 .trim()
 
-            if (reasoningBody.isBlank() || answer.isBlank()) {
+            if (answer.isBlank()) {
                 return ParsedReasoningOutput(answer = source, reasoning = null)
             }
-            return ParsedReasoningOutput(answer = answer, reasoning = reasoningBody)
+            return ParsedReasoningOutput(
+                answer = answer,
+                reasoning = reasoningBody.takeIf(String::isNotBlank)
+            )
         }
 
         val reasoningContentStart = reasoningStart + Tokenizer.THINK_START.length

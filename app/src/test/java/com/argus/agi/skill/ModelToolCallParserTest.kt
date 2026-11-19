@@ -45,6 +45,19 @@ class ModelToolCallParserTest {
     }
 
     @Test
+    fun parsesToolCallWhenModelClosesAnEmptyReasoningPrefix() {
+        val parsed = ReasoningOutputParser.parse(
+            "</THINK><WEB_SEARCH>Android 37 release notes</WEB_SEARCH>"
+        )
+
+        assertNull(parsed.reasoning)
+        assertEquals(
+            "Android 37 release notes",
+            ModelToolCallParser.extractWebSearchQuery(parsed.answer)
+        )
+    }
+
+    @Test
     fun doesNotSearchWhenModelOnlyExpressesUncertainty() {
         assertNull(
             ModelToolCallParser.extractWebSearchQuery(
