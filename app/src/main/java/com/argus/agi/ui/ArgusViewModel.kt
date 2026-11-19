@@ -1558,7 +1558,9 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         // a safe deletion boundary. A failed deletion never silently re-enables them.
         excludedAppsManager.setScreenPerceptionEnabled(false)
         excludedAppsManager.setScreenTrainingEnabled(false)
-        _screenDataClearMessage.value = "Screen access disabled. Removing stored screen-derived records..."
+        excludedAppsManager.clearScreenAppAllowlist()
+        loadInstalledApps()
+        _screenDataClearMessage.value = "Screen access disabled and per-app grants cleared. Removing stored screen-derived records..."
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
