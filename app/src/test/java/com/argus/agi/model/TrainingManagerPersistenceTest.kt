@@ -241,6 +241,12 @@ class TrainingManagerPersistenceTest {
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
         val journalFile = File(context.filesDir, TrainingCommitJournal.FILE_NAME)
         val previousJournal = journalFile.takeIf(File::isFile)?.readBytes()
+        val validationMetadataFile = File(context.filesDir, "argus_conversation_quality.json")
+        val previousValidationMetadata = validationMetadataFile.takeIf(File::isFile)?.readBytes()
+        val previousAcceptedCheckpointNames = context.filesDir.listFiles()
+            .orEmpty()
+            .filter { it.name.startsWith("argus_accepted_") && it.name.endsWith(".bin") }
+            .mapTo(HashSet()) { it.name }
         val database = Room.inMemoryDatabaseBuilder(
             context,
             ArgusDatabase::class.java
@@ -255,6 +261,7 @@ class TrainingManagerPersistenceTest {
 
         try {
             checkpoint.delete()
+            validationMetadataFile.delete()
             check(!journalFile.exists() || journalFile.delete()) {
                 "The previous training transaction journal could not be cleared for the test."
             }
@@ -273,6 +280,22 @@ class TrainingManagerPersistenceTest {
                     )
                 )
             )
+            check(engine.saveCheckpoint()) {
+                "The deterministic validation fixture checkpoint could not be saved."
+            }
+            val validationPersistence = ConversationalValidationPersistence(context.filesDir)
+            check(validationPersistence.ensureAcceptedCheckpoint(checkpoint)) {
+                "The accepted checkpoint fixture could not be secured."
+            }
+            val baselineReport = ConversationalValidationEvaluator.evaluate(
+                cases = ConversationValidationSuite.cases
+            ) { "Deterministic baseline fixture answer." }
+            check(ConversationValidationContract.isCurrent(baselineReport)) {
+                "The deterministic validation baseline does not match the active contract."
+            }
+            check(validationPersistence.saveBaseline(baselineReport)) {
+                "The deterministic validation baseline fixture could not be persisted."
+            }
             val deviceGuard = DeviceGuard(context)
             val worldModel = WorldModel(context, repository)
             val activeManager = TrainingManager(
@@ -305,6 +328,19 @@ class TrainingManagerPersistenceTest {
                 journalFile.writeBytes(previousJournal)
             }
             File(context.filesDir, "${TrainingCommitJournal.FILE_NAME}.tmp").delete()
+            context.filesDir.listFiles()
+                .orEmpty()
+                .filter {
+                    it.name.startsWith("argus_accepted_") &&
+                        it.name.endsWith(".bin") &&
+                        it.name !in previousAcceptedCheckpointNames
+                }
+                .forEach(File::delete)
+            if (previousValidationMetadata == null) {
+                validationMetadataFile.delete()
+            } else {
+                validationMetadataFile.writeBytes(previousValidationMetadata)
+            }
         }
     }
 
