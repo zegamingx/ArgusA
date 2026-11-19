@@ -317,7 +317,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
 
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Clearing removes screen memories, queued/completed screen samples, and legacy screen-only corpus records. It cannot selectively reverse model-weight updates from screen text that was trained previously.",
+                        text = "Clearing disables screen reading, screen training and accessibility clicks, revokes every per-app Read/Train grant, and removes screen memories, queued/completed samples and legacy screen-only corpus records. Previously applied model-weight updates cannot be selectively reversed.",
                         style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                         color = ArgusTextMuted,
                         lineHeight = 15.sp
@@ -335,7 +335,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                         shape = RoundedCornerShape(12.dp)
                     ) {
                         Text(
-                            text = if (isClearingScreenData) "Clearing screen data…" else "Disable & clear screen data",
+                            text = if (isClearingScreenData) "Clearing screen data…" else "Disable all screen access & clear data",
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 12.sp
                         )
