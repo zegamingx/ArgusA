@@ -60,7 +60,7 @@ if (Test-Path -LiteralPath $mirrorPath) {
 # Build the sensitive variable name from fragments so this scrubber does not
 # preserve the exact legacy identifier in the new repository history.
 $legacyPasswordIdentifier = "default" + "Pass"
-$redactionRule = "regex:(?im)^.*" + [regex]::Escape($legacyPasswordIdentifier) + ".*$==>REDACTED_BY_HISTORY_CLEANUP"
+$redactionRule = ('regex:(?im)^.*' + [regex]::Escape($legacyPasswordIdentifier) + '.*$==>REDACTED_BY_HISTORY_CLEANUP')
 Set-Content -LiteralPath $rulesPath -Value $redactionRule -Encoding utf8
 
 try {
@@ -113,7 +113,7 @@ try {
         Write-Host ""
         Write-Host "History rewrite verification passed."
         Write-Host "Changed pull-request refs: $($changedPullRefs.Count)"
-        Write-Host "First changed commits and ref details are recorded under .git/filter-repo/."
+        Write-Host "First changed commits and ref details are recorded under the mirror's filter-repo/ metadata directory."
         Write-Host "Review those files before any remote push."
 
         if ($PushCleanedHistory) {
