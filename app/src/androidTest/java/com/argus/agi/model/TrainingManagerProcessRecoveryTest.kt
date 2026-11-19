@@ -37,6 +37,7 @@ class TrainingManagerProcessRecoveryTest {
                 boundary = "PREPARED_JOURNAL_DURABLE",
                 expectedStatus = "QUEUED",
                 expectedCommittedCheckpoint = false,
+                expectedJournalCommitted = false,
                 expectedJournal = false
             ),
             BoundaryCase(
@@ -44,6 +45,7 @@ class TrainingManagerProcessRecoveryTest {
                 boundary = "OPTIMIZER_UPDATE_APPLIED",
                 expectedStatus = "QUEUED",
                 expectedCommittedCheckpoint = false,
+                expectedJournalCommitted = false,
                 expectedJournal = false
             ),
             BoundaryCase(
@@ -51,6 +53,7 @@ class TrainingManagerProcessRecoveryTest {
                 boundary = "COMMITTED_JOURNAL_DURABLE",
                 expectedStatus = "QUEUED",
                 expectedCommittedCheckpoint = false,
+                expectedJournalCommitted = true,
                 expectedJournal = false
             ),
             BoundaryCase(
@@ -58,6 +61,7 @@ class TrainingManagerProcessRecoveryTest {
                 boundary = "CHECKPOINT_FILE_REPLACED",
                 expectedStatus = "OPTIMIZER_COMMITTED",
                 expectedCommittedCheckpoint = true,
+                expectedJournalCommitted = true,
                 expectedJournal = true
             ),
             BoundaryCase(
@@ -65,6 +69,7 @@ class TrainingManagerProcessRecoveryTest {
                 boundary = "CHECKPOINT_BOUND_JOURNAL_DURABLE",
                 expectedStatus = "OPTIMIZER_COMMITTED",
                 expectedCommittedCheckpoint = true,
+                expectedJournalCommitted = true,
                 expectedJournal = true
             ),
             BoundaryCase(
@@ -72,6 +77,7 @@ class TrainingManagerProcessRecoveryTest {
                 boundary = "ROOM_OPTIMIZER_STATE_COMMITTED",
                 expectedStatus = "OPTIMIZER_COMMITTED",
                 expectedCommittedCheckpoint = true,
+                expectedJournalCommitted = true,
                 expectedJournal = true
             ),
             BoundaryCase(
@@ -79,6 +85,7 @@ class TrainingManagerProcessRecoveryTest {
                 boundary = "QUEUE_ITEM_FINALIZED",
                 expectedStatus = "COMPLETED",
                 expectedCommittedCheckpoint = true,
+                expectedJournalCommitted = true,
                 expectedJournal = false
             )
         )
@@ -125,6 +132,15 @@ class TrainingManagerProcessRecoveryTest {
             assertEquals(case.id, crash.getString("caseId"))
             assertEquals(case.boundary, crash.getString("boundary"))
             assertTrue(
+                "The crash point must leave its durable transaction journal on disk.",
+                crash.getBoolean("journalExists")
+            )
+            assertEquals(
+                "The journal state at the kill point must match the selected transaction boundary.",
+                case.expectedJournalCommitted,
+                crash.getBoolean("journalIsCommitted")
+            )
+            assertTrue(
                 "The crash marker must identify its remote Android process.",
                 crash.getInt("pid") > 0
             )
@@ -155,6 +171,28 @@ class TrainingManagerProcessRecoveryTest {
             assertEquals(case.expectedJournal, recovery.getBoolean("journalExists"))
             assertTrue(recovery.getInt("optimizerStep") >= 0)
             assertTrue(recovery.getString("checkpointSha256Fingerprint").isNotBlank())
+
+            val optimizerStepAtBoundary = crash.getInt("optimizerStepAtBoundary")
+            val baselineOptimizerStep = crash.getInt("baselineOptimizerStep")
+            when (case.boundary) {
+                "PREPARED_JOURNAL_DURABLE" -> assertEquals(
+                    "PREPARED must be durable before any optimizer update.",
+                    baselineOptimizerStep,
+                    optimizerStepAtBoundary
+                )
+
+                "OPTIMIZER_UPDATE_APPLIED",
+                "COMMITTED_JOURNAL_DURABLE" -> assertTrue(
+                    "The optimizer update must already be applied at this boundary.",
+                    optimizerStepAtBoundary > baselineOptimizerStep
+                )
+
+                else -> assertEquals(
+                    "The checkpoint/Room/finalization boundary must match the committed optimizer step.",
+                    crash.getInt("journalCommittedOptimizerStep"),
+                    optimizerStepAtBoundary
+                )
+            }
 
             if (!case.expectedCommittedCheckpoint || case.expectedStatus == "COMPLETED") {
                 assertEquals(
@@ -308,6 +346,7 @@ class TrainingManagerProcessRecoveryTest {
         val boundary: String,
         val expectedStatus: String,
         val expectedCommittedCheckpoint: Boolean,
+        val expectedJournalCommitted: Boolean,
         val expectedJournal: Boolean
     )
 
