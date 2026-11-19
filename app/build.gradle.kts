@@ -243,7 +243,7 @@ abstract class BumpVersionTask : DefaultTask() {
 
 val exportReleaseApk = tasks.register<CopyApkTask>("exportReleaseApk") {
     group = "distribution"
-    description = "Builds and exports the signed release APK to the repository root."
+    description = "Builds and exports an unsigned release APK; signing is suspended pending verified key rotation."
     dependsOn("assembleRelease")
     apk.from(layout.buildDirectory.file("outputs/apk/release/app-release.apk"))
     target.set(layout.projectDirectory.file("../ARGUS.apk"))
