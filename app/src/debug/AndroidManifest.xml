@@ -1,0 +1,13 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <permission
+        android:name="com.argus.agi.permission.PROCESS_RECOVERY_TEST"
+        android:protectionLevel="signature" />
+
+    <application>
+        <service
+            android:name="com.argus.agi.model.TrainingRecoveryProcessTestService"
+            android:exported="true"
+            android:permission="com.argus.agi.permission.PROCESS_RECOVERY_TEST"
+            android:process=":training_recovery_test" />
+    </application>
+</manifest>
