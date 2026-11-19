@@ -86,7 +86,7 @@ if ($filterRepoExitCode -ne 0 -or
 $legacyPasswordIdentifier = "default" + "Pass"
 $redactionRules = @(
     ('regex:(?im)^.*' + [regex]::Escape($legacyPasswordIdentifier) + '.*$==>REDACTED_BY_HISTORY_CLEANUP'),
-    "regex:(?im)^.*(?:storePassword|keyPassword)\s*=\s*['"][^'"]+['"].*$==>REDACTED_BY_HISTORY_CLEANUP"
+    'regex:(?im)^.*(?:storePassword|keyPassword)\s*=\s*["''][^"'']+["''].*$==>REDACTED_BY_HISTORY_CLEANUP'
 )
 [System.IO.File]::WriteAllLines(
     $rulesPath,
