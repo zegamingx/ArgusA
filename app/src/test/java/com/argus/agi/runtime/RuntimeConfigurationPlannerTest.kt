@@ -147,6 +147,8 @@ class RuntimeConfigurationPlannerTest {
 
         override fun initializeAfterModelReady(): Boolean = isReady
 
+        override fun resetForRetry() = Unit
+
         override fun synchronizeAuthoritativeState(): Boolean = true
 
         override fun releaseDeviceResourcesForMemoryPressure(): Boolean = true
