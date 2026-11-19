@@ -243,10 +243,10 @@ class TrainingManagerPersistenceTest {
         val previousJournal = journalFile.takeIf(File::isFile)?.readBytes()
         val validationMetadataFile = File(context.filesDir, "argus_conversation_quality.json")
         val previousValidationMetadata = validationMetadataFile.takeIf(File::isFile)?.readBytes()
-        val previousAcceptedCheckpointNames = context.filesDir.listFiles()
+        val previousAcceptedCheckpoints = context.filesDir.listFiles()
             .orEmpty()
             .filter { it.name.startsWith("argus_accepted_") && it.name.endsWith(".bin") }
-            .mapTo(HashSet()) { it.name }
+            .associate { it.name to it.readBytes() }
         val database = Room.inMemoryDatabaseBuilder(
             context,
             ArgusDatabase::class.java
@@ -262,6 +262,14 @@ class TrainingManagerPersistenceTest {
         try {
             checkpoint.delete()
             validationMetadataFile.delete()
+            context.filesDir.listFiles()
+                .orEmpty()
+                .filter { it.name.startsWith("argus_accepted_") && it.name.endsWith(".bin") }
+                .forEach { acceptedCheckpoint ->
+                    check(acceptedCheckpoint.delete()) {
+                        "An existing accepted checkpoint could not be isolated for the test."
+                    }
+                }
             check(!journalFile.exists() || journalFile.delete()) {
                 "The previous training transaction journal could not be cleared for the test."
             }
@@ -330,12 +338,11 @@ class TrainingManagerPersistenceTest {
             File(context.filesDir, "${TrainingCommitJournal.FILE_NAME}.tmp").delete()
             context.filesDir.listFiles()
                 .orEmpty()
-                .filter {
-                    it.name.startsWith("argus_accepted_") &&
-                        it.name.endsWith(".bin") &&
-                        it.name !in previousAcceptedCheckpointNames
-                }
+                .filter { it.name.startsWith("argus_accepted_") && it.name.endsWith(".bin") }
                 .forEach(File::delete)
+            previousAcceptedCheckpoints.forEach { (fileName, contents) ->
+                File(context.filesDir, fileName).writeBytes(contents)
+            }
             if (previousValidationMetadata == null) {
                 validationMetadataFile.delete()
             } else {
