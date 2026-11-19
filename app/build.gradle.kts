@@ -11,16 +11,8 @@ plugins {
     alias(libs.plugins.google.devtools.ksp)
 }
 
-// Signing inputs are declared at script scope because the release validation task
-// runs outside the Android DSL block.
-val releaseStorePassword = providers.environmentVariable("STORE_PASSWORD")
-val releaseKeyPassword = providers.environmentVariable("KEY_PASSWORD")
-// Local release signing material is ignored by Git. CI supplies an encrypted
-// PKCS#12 file through KEYSTORE_PATH from the protected release environment.
-val defaultKeystore = rootProject.file("signing/argus-release.p12")
-val releaseKeystorePath = providers.environmentVariable("KEYSTORE_PATH")
-    .orElse(defaultKeystore.absolutePath)
-    .get()
+// Release APKs remain unsigned until the exposed historical signing identity
+// has been migrated through a verified Android signing-certificate lineage.
 
 android {
     namespace = "com.argus.agi"
@@ -62,22 +54,6 @@ android {
 
     }
 
-    // A release must never silently fall back to the Android debug identity.
-    // The ignored local PKCS#12 path is only a location default; passwords remain
-    // required environment inputs and are validated by validateSigningRelease.
-    val releaseKeyAlias = providers.environmentVariable("KEY_ALIAS")
-        .orElse("upload")
-        .get()
-
-    signingConfigs {
-        create("release") {
-            storeFile = file(releaseKeystorePath)
-            storePassword = releaseStorePassword.orNull
-            keyAlias = releaseKeyAlias
-            keyPassword = releaseKeyPassword.orNull
-        }
-    }
-
     buildTypes {
         release {
             isCrunchPngs = false
@@ -86,7 +62,6 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("release")
         }
         debug {
             // Debug builds use AGP's machine-local debug signer.
@@ -291,16 +266,3 @@ tasks.register<BumpVersionTask>("bumpVersion") {
     outputs.upToDateWhen { false }
 }
 
-tasks.matching { it.name == "validateSigningRelease" }.configureEach {
-    doFirst {
-        check(releaseStorePassword.isPresent) {
-            "STORE_PASSWORD must be provided to build a signed release APK."
-        }
-        check(releaseKeyPassword.isPresent) {
-            "KEY_PASSWORD must be provided to build a signed release APK."
-        }
-        check(file(releaseKeystorePath).isFile) {
-            "Release keystore not found: $releaseKeystorePath"
-        }
-    }
-}
