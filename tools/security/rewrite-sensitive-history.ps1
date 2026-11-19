@@ -49,7 +49,10 @@ function Get-RefMap {
 
     $map = @{}
     foreach ($line in $Lines) {
-        if ($line -match '^([0-9a-fA-F]+)\s+(.+)$') {
+        $separator = $line.IndexOf(' ')
+        if ($separator -gt 0) {
+            $map[$line.Substring($separator + 1)] = $line.Substring(0, $separator).ToLowerInvariant()
+        }
             $map[$Matches[2]] = $Matches[1].ToLowerInvariant()
         }
     }
@@ -87,7 +90,7 @@ if ($filterRepoExitCode -ne 0 -or
 $legacyPasswordIdentifier = "default" + "Pass"
 $redactionRules = @(
     ('regex:(?im)^.*' + [regex]::Escape($legacyPasswordIdentifier) + '.*$==>REDACTED_BY_HISTORY_CLEANUP'),
-    'regex:(?im)^.*(?:storePassword|keyPassword)\s*=\s*["''][^"'']+["''].*$==>REDACTED_BY_HISTORY_CLEANUP'
+    'regex:(?im)^.*(?:storePassword|keyPassword)[ \t]*=[ \t]*["''][^"'']+["''].*$==>REDACTED_BY_HISTORY_CLEANUP'
 )
 [System.IO.File]::WriteAllLines(
     $rulesPath,
@@ -142,12 +145,14 @@ try {
             throw "Could not enumerate rewritten Git objects."
         }
 
-        $sensitivePathPattern = '(?i)(^|/)([^/]+\.(jks|keystore|jceks|bks|p12|pfx|pem|pk8|key|cer|crt|der|mobileprovision|idsig|lineage)|\.env(?:\.[^/]*)?)$|(^|/)signing/'
+        $sensitivePathPattern = '(?i)(^|/)([^/]+[.](jks|keystore|jceks|bks|p12|pfx|pem|pk8|key|cer|crt|der|mobileprovision|idsig|lineage)|[.]env([.][^/]*)?)$|(^|/)signing/'
         $sensitivePaths = @(
             $objectPaths | ForEach-Object {
-                $objectEntry = ([string]$_) -split '\s+', 2
-                if ($objectEntry.Count -eq 2 -and $objectEntry[1] -match $sensitivePathPattern) {
-                    $objectEntry[1]
+                $entry = [string]$_
+                $separator = $entry.IndexOf(' ')
+                if ($separator -gt 0) {
+                    $objectPath = $entry.Substring($separator + 1)
+                    if ($objectPath -match $sensitivePathPattern) { $objectPath }
                 }
             }
         )
@@ -156,7 +161,7 @@ try {
         }
 
         $credentialPattern = [regex]::Escape($legacyPasswordIdentifier) +
-            '|(storePassword|keyPassword)[[:space:]]*=[[:space:]]*[''"][^''"]+[''"]'
+            '|(storePassword|keyPassword)[[:space:]]*=[[:space:]]*["''][^"'']+["'']'
         $credentialMatches = & git log --all --format="%H" -G $credentialPattern --
         if ($LASTEXITCODE -ne 0) {
             throw "Could not scan rewritten commit contents for credential assignments."
@@ -172,7 +177,7 @@ try {
 
         $changedRefs = @(Get-Content -LiteralPath $changedRefsPath)
         $changedPullRefs = @(
-            $changedRefs | Where-Object { $_ -match '^refs/pull/\d+/(head|merge)$' }
+            $changedRefs | Where-Object { $_.StartsWith('refs/pull/') -and ($_.EndsWith('/head') -or $_.EndsWith('/merge')) }
         )
 
         Write-Host ""
@@ -214,7 +219,7 @@ try {
 
         $localRefs = Get-RefMap -Lines @($localRefLines)
         $remoteRefs = Get-RefMap -Lines @(
-            $remoteRefLines | Where-Object { $_ -notmatch '\^\{\}$' }
+            $remoteRefLines | Where-Object { -not $_.EndsWith('^{}') }
         )
 
         $refMismatches = @()
