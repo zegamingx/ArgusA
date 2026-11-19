@@ -596,6 +596,65 @@ class CorpusPersistenceTest {
     }
 
     @Test
+    fun explicitlySelectedJsonlRejectsMalformedRecordsWithoutPartialPersistence() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(
+                context,
+                EngineConfig(maxSeqLen = 64)
+            ),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val validRecord = """{"instruction":"first prompt","response":"first answer"}"""
+            val malformedRecord = """{"instruction":"second prompt","response":}"""
+            val failure = runCatching {
+                manager.enqueueDocumentStream(
+                    source = "Explicit JSONL malformed-record regression",
+                    title = "Must be rejected atomically",
+                    reader = StringReader("$validRecord\n$malformedRecord"),
+                    chunkSize = 380,
+                    overlap = 0,
+                    strictJsonLines = true
+                )
+            }.exceptionOrNull()
+
+            assertTrue(
+                "Explicit JSONL imports must reject malformed records.",
+                failure is IllegalArgumentException
+            )
+            assertTrue(
+                "The error must identify the malformed source line.",
+                failure?.message.orEmpty().contains("line 2")
+            )
+            assertTrue(
+                "A valid prefix must not be persisted when a later record is malformed.",
+                repository.getCorpusDocuments().isEmpty()
+            )
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            assertTrue(
+                "The staging file must be deleted after strict JSONL rejection.",
+                context.cacheDir.listFiles().orEmpty().none { file ->
+                    file.name.startsWith("argus-ingest-")
+                }
+            )
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
+    @Test
     fun streamedPlainTextConversationIsProcessedOnlyAfterTheCompleteTranscriptArrives() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val database = Room.inMemoryDatabaseBuilder(
@@ -675,7 +734,8 @@ class CorpusPersistenceTest {
                 title = "JSONL records remain atomic",
                 reader = StringReader(jsonl),
                 chunkSize = 8,
-                overlap = 0
+                overlap = 0,
+                strictJsonLines = true
             )
             assertEquals("Each JSONL source record must remain its own sample.", 2, jsonlQueued)
             manager.awaitQueuePersistenceIdle()
