@@ -67,9 +67,9 @@ Pushes to `main` are validated by the native-validation workflow. They do not
 sign or publish an APK.
 
 A signed APK is produced only by manually dispatching
-`Argus Signed Release` from the `main` branch. The job uses the protected
-GitHub Environment named `release-signing`. Configure that environment with
-required reviewers and these environment secrets:
+`Argus Signed Release` from the `main` branch. The job uses a dedicated
+GitHub Environment named `release-signing`. Before dispatching the workflow,
+configure required reviewers and add these environment secrets:
 
 - `ARGUS_SIGNING_KEY_BASE64`: Base64-encoded encrypted PKCS#12 keystore.
 - `ARGUS_SIGNING_STORE_PASSWORD`: PKCS#12 store password.
