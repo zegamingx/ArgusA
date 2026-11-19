@@ -17,7 +17,8 @@ data class InstalledAppItem(
     val packageName: String,
     val icon: Drawable?,
     val isExcluded: Boolean,
-    val isSystemApp: Boolean = false
+    val isSystemApp: Boolean = false,
+    val isTrainingAllowed: Boolean = false
 )
 
 /**
@@ -33,6 +34,7 @@ class ExcludedAppsManager(private val context: Context) {
         private const val TAG = "ExcludedAppsManager"
         private const val PREFS_NAME = "argus_excluded_apps"
         private const val KEY_ALLOWED_PACKAGES = "allowed_screen_packages"
+        private const val KEY_TRAINING_ALLOWED_PACKAGES = "allowed_screen_training_packages"
         private const val KEY_PROTECTED_PACKAGES = "protected_screen_packages"
         private const val KEY_SCREEN_PERCEPTION = "screen_perception_enabled"
         private const val KEY_SCREEN_TRAINING = "screen_training_enabled"
@@ -67,6 +69,30 @@ class ExcludedAppsManager(private val context: Context) {
 
     fun isAccessibilityActionsEnabled(): Boolean =
         prefs.getBoolean(KEY_ACCESSIBILITY_ACTIONS, false)
+
+    fun isAppTrainingAllowed(packageName: String): Boolean {
+        if (!isScreenTrainingEnabled() || isAppExcluded(packageName)) return false
+        val trainingAllowed = prefs.getStringSet(KEY_TRAINING_ALLOWED_PACKAGES, emptySet()).orEmpty()
+        return packageName in trainingAllowed
+    }
+
+    fun toggleAppTrainingAccess(packageName: String) {
+        val protected = prefs.getStringSet(KEY_PROTECTED_PACKAGES, emptySet()).orEmpty()
+        if (packageName in protected ||
+            PrivacyAppHeuristics.isPrivacySensitiveApp("", packageName)
+        ) {
+            return
+        }
+
+        val allowedForScreen = prefs.getStringSet(KEY_ALLOWED_PACKAGES, emptySet()).orEmpty()
+        if (packageName !in allowedForScreen) return
+
+        val current = prefs.getStringSet(KEY_TRAINING_ALLOWED_PACKAGES, emptySet())
+            .orEmpty()
+            .toMutableSet()
+        if (!current.add(packageName)) current.remove(packageName)
+        prefs.edit().putStringSet(KEY_TRAINING_ALLOWED_PACKAGES, current.toSet()).apply()
+    }
 
     fun setScreenPerceptionEnabled(enabled: Boolean) {
         prefs.edit()
@@ -123,7 +149,16 @@ class ExcludedAppsManager(private val context: Context) {
             .orEmpty()
             .toMutableSet()
         val isNowAllowed = current.add(packageName)
-        if (!isNowAllowed) current.remove(packageName)
+        if (!isNowAllowed) {
+            current.remove(packageName)
+            val trainingAllowed = prefs.getStringSet(KEY_TRAINING_ALLOWED_PACKAGES, emptySet())
+                .orEmpty()
+                .toMutableSet()
+            trainingAllowed.remove(packageName)
+            prefs.edit()
+                .putStringSet(KEY_TRAINING_ALLOWED_PACKAGES, trainingAllowed.toSet())
+                .apply()
+        }
 
         prefs.edit().putStringSet(KEY_ALLOWED_PACKAGES, current.toSet()).apply()
         updateExcludedPackageSnapshot(packageName, isExcluded = !isNowAllowed)
@@ -184,7 +219,11 @@ class ExcludedAppsManager(private val context: Context) {
                     packageName = packageName,
                     icon = icon,
                     isExcluded = packageName in protectedPackages || isAppExcluded(packageName),
-                    isSystemApp = isSystemApp
+                    isSystemApp = isSystemApp,
+                    isTrainingAllowed = packageName in prefs.getStringSet(
+                        KEY_TRAINING_ALLOWED_PACKAGES,
+                        emptySet()
+                    ).orEmpty()
                 )
             }
 
