@@ -278,6 +278,34 @@ class ArgusRepositoryReplaySessionTest {
     }
 
     @Test
+    fun worldModelStartupDeletesLegacyScreenMemoriesButRetainsUserFacts() = runBlocking {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        repository.saveMemories(
+            listOf(
+                WorldEntity("active_screen_app", "com.example.reader", "Accessibility Perception"),
+                WorldEntity("last_screen_content", "Legacy private screen text", "Screen OCR/Text Parser"),
+                WorldEntity("user_fact", "Keep this user-authored fact", "User")
+            )
+        )
+
+        val worldModel = WorldModel(context, repository)
+        withTimeout(5_000L) {
+            while (repository.getMemoriesSnapshot().any { memory ->
+                    memory.key == "active_screen_app" || memory.key == "last_screen_content"
+                }
+            ) {
+                delay(20L)
+            }
+        }
+
+        val persisted = repository.getMemoriesSnapshot().associateBy(WorldEntity::key)
+        assertFalse("legacy active app memory must be deleted", "active_screen_app" in persisted)
+        assertFalse("legacy screen text must be deleted", "last_screen_content" in persisted)
+        assertEquals("Keep this user-authored fact", persisted["user_fact"]?.value)
+        assertFalse(worldModel.getAllEntities().any { it.key == "last_screen_content" })
+    }
+
+    @Test
     fun screenContextUpdatesAreTransientAndDoNotPersistToRoom() = runBlocking {
         val context: Context = ApplicationProvider.getApplicationContext()
         val worldModel = WorldModel(context, repository)
