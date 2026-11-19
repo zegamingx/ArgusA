@@ -189,6 +189,7 @@ class TrainingManager internal constructor(
         private const val SCREEN_SOURCE_PREFIX = "Screen ("
         private const val SCREEN_PRIVACY_PREFERENCES = "argus_excluded_apps"
         private const val SCREEN_TRAINING_CONSENT_KEY = "screen_training_enabled"
+        private const val SCREEN_PERCEPTION_CONSENT_KEY = "screen_perception_enabled"
         private const val SCREEN_ALLOWED_PACKAGES_KEY = "allowed_screen_packages"
         private const val SCREEN_TRAINING_ALLOWED_PACKAGES_KEY = "allowed_screen_training_packages"
         private const val SCREEN_PROTECTED_PACKAGES_KEY = "protected_screen_packages"
@@ -1810,7 +1811,11 @@ class TrainingManager internal constructor(
         startsWith(SCREEN_SOURCE_PREFIX)
 
     private fun isScreenTrainingConsentEnabled(packageName: String): Boolean {
-        if (!trainingPreferences.getBoolean(SCREEN_TRAINING_CONSENT_KEY, false)) return false
+        if (!trainingPreferences.getBoolean(SCREEN_PERCEPTION_CONSENT_KEY, false) ||
+            !trainingPreferences.getBoolean(SCREEN_TRAINING_CONSENT_KEY, false)
+        ) {
+            return false
+        }
         if (PrivacyAppHeuristics.isPrivacySensitiveApp("", packageName)) return false
 
         val allowedForReading = trainingPreferences
