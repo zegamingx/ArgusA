@@ -553,7 +553,7 @@ class ArgusAppRobolectricTest {
         assertTrue("Bitwarden must be excluded by keyword", manager.isAppExcluded("com.x8bit.bitwarden"))
         assertTrue("1Password must be excluded by keyword", manager.isAppExcluded("com.agilebits.onepassword"))
         assertTrue("Banking apps must be excluded by keyword", manager.isAppExcluded("com.bca.mobilebanking"))
-        assertFalse("General non-sensitive apps should not be excluded", manager.isAppExcluded("com.example.calculator"))
+        assertTrue("Unapproved apps must be blocked by default", manager.isAppExcluded("com.example.calculator"))
     }
 
     @Test
