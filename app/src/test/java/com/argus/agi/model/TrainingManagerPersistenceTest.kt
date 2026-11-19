@@ -339,7 +339,7 @@ class TrainingManagerPersistenceTest {
             context.filesDir.listFiles()
                 .orEmpty()
                 .filter { it.name.startsWith("argus_accepted_") && it.name.endsWith(".bin") }
-                .forEach(File::delete)
+                .forEach { acceptedCheckpoint -> acceptedCheckpoint.delete() }
             previousAcceptedCheckpoints.forEach { (fileName, contents) ->
                 File(context.filesDir, fileName).writeBytes(contents)
             }
