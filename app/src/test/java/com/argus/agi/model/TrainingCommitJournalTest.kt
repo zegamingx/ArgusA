@@ -550,4 +550,26 @@ class TrainingCommitJournalTest {
             directory.deleteRecursively()
         }
     }
+
+    @Test
+    fun optimizerConfigurationFingerprintRequiresModelIdentityFingerprint() {
+        val directory = Files.createTempDirectory("argus-training-journal-invalid-identity").toFile()
+        val file = File(directory, TrainingCommitJournal.FILE_NAME)
+        try {
+            val failure = runCatching {
+                TrainingCommitJournal.writePrepared(
+                    file = file,
+                    baselineOptimizerStep = 9,
+                    itemIds = listOf("item-a"),
+                    optimizerConfigFingerprint = OptimizerConfig.DEFAULT.fingerprint
+                )
+            }.exceptionOrNull()
+
+            assertNotNull(failure)
+            assertFalse(file.exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
 }
