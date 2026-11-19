@@ -1541,6 +1541,9 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setScreenPerceptionEnabled(enabled: Boolean) {
         excludedAppsManager.setScreenPerceptionEnabled(enabled)
+        if (!enabled) {
+            worldModel.clearScreenContext()
+        }
     }
 
     fun setScreenTrainingEnabled(enabled: Boolean) {
@@ -1593,6 +1596,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleAppAccess(packageName: String) {
         excludedAppsManager.toggleAppAccess(packageName)
+        worldModel.clearScreenContext()
         loadInstalledApps()
     }
 
