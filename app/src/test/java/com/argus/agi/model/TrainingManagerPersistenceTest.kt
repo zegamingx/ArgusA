@@ -6,7 +6,9 @@ import androidx.test.core.app.ApplicationProvider
 import com.argus.agi.data.local.ArgusDatabase
 import com.argus.agi.data.repository.ArgusRepository
 import com.argus.agi.sensor.DeviceGuard
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
@@ -141,6 +143,86 @@ class TrainingManagerPersistenceTest {
         }
     }
 
+    @Test
+    fun injectedFailuresAtEveryDurableCommitBoundaryPreserveTheCorrectState() = runBlocking {
+        val cases = listOf(
+            TrainingCommitBoundary.PREPARED_JOURNAL_DURABLE to TrainingStatus.FAILED,
+            TrainingCommitBoundary.OPTIMIZER_UPDATE_APPLIED to TrainingStatus.FAILED,
+            TrainingCommitBoundary.COMMITTED_JOURNAL_DURABLE to TrainingStatus.OPTIMIZER_COMMITTED,
+            TrainingCommitBoundary.CHECKPOINT_FILE_REPLACED to TrainingStatus.OPTIMIZER_COMMITTED,
+            TrainingCommitBoundary.CHECKPOINT_BOUND_JOURNAL_DURABLE to TrainingStatus.OPTIMIZER_COMMITTED,
+            TrainingCommitBoundary.ROOM_OPTIMIZER_STATE_COMMITTED to TrainingStatus.OPTIMIZER_COMMITTED,
+            TrainingCommitBoundary.QUEUE_ITEM_FINALIZED to TrainingStatus.COMPLETED
+        )
+
+        for ((boundary, expectedStatus) in cases) {
+            val failureInjected = CompletableDeferred<Unit>()
+            withTrainingManager(
+                onCommitBoundary = { reachedBoundary ->
+                    if (reachedBoundary == boundary && failureInjected.complete(Unit)) {
+                        throw IllegalStateException("Injected fault after $boundary")
+                    }
+                }
+            ) { _, repository, manager ->
+                manager.pauseTraining()
+                manager.enqueueData(
+                    source = "transaction-fault-injection",
+                    title = "Fault boundary $boundary",
+                    content = "A deterministic sample used to verify durable optimizer transaction recovery."
+                )
+                awaitPersistence(manager)
+                val item = manager.nextQueue.value.single()
+
+                manager.triggerImmediateTrainingStep()
+                withTimeout(30_000L) { failureInjected.await() }
+                awaitTrainingStatus(repository, item.id, expectedStatus)
+
+                val journalFile = File(context.filesDir, TrainingCommitJournal.FILE_NAME)
+                val journal = TrainingCommitJournal.read(journalFile)
+                when (expectedStatus) {
+                    TrainingStatus.FAILED -> assertNull(
+                        "A pre-commit fault must roll back and remove its PREPARED journal.",
+                        journal
+                    )
+                    TrainingStatus.OPTIMIZER_COMMITTED -> {
+                        val committed = requireNotNull(journal) {
+                            "A durable optimizer commit must retain its recovery journal."
+                        }
+                        assertTrue(committed.isCommitted)
+                        assertTrue(!committed.checkpointSha256Fingerprint.isNullOrBlank())
+                        assertEquals(
+                            item.id,
+                            repository.getOptimizerCommittedTrainingItemsSnapshot().single().id
+                        )
+                    }
+                    TrainingStatus.COMPLETED -> {
+                        val committed = requireNotNull(journal) {
+                            "A completed item keeps the commit journal until batch finalization resolves."
+                        }
+                        assertTrue(committed.isCommitted)
+                        assertEquals(
+                            TrainingStatus.COMPLETED,
+                            requireNotNull(repository.getTrainingItem(item.id)).status
+                        )
+                    }
+                    else -> throw AssertionError("Unexpected injected-boundary expectation: $expectedStatus")
+                }
+            }
+        }
+    }
+
+    private suspend fun awaitTrainingStatus(
+        repository: ArgusRepository,
+        itemId: String,
+        expectedStatus: TrainingStatus
+    ) {
+        withTimeout(30_000L) {
+            while (repository.getTrainingItem(itemId)?.status != expectedStatus) {
+                delay(20L)
+            }
+        }
+    }
+
     private suspend fun awaitPersistence(manager: TrainingManager) {
         withTimeout(5_000L) {
             manager.awaitQueuePersistenceIdle()
@@ -148,6 +230,7 @@ class TrainingManagerPersistenceTest {
     }
 
     private suspend fun withTrainingManager(
+        onCommitBoundary: (TrainingCommitBoundary) -> Unit = {},
         test: suspend (
             ArgusDatabase,
             ArgusRepository,
@@ -156,6 +239,8 @@ class TrainingManagerPersistenceTest {
     ) {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
+        val journalFile = File(context.filesDir, TrainingCommitJournal.FILE_NAME)
+        val previousJournal = journalFile.takeIf(File::isFile)?.readBytes()
         val database = Room.inMemoryDatabaseBuilder(
             context,
             ArgusDatabase::class.java
@@ -192,7 +277,8 @@ class TrainingManagerPersistenceTest {
                 deviceGuard = deviceGuard,
                 worldModel = worldModel,
                 trainingDispatcher = trainingDispatcher,
-                repository = repository
+                repository = repository,
+                onCommitBoundary = onCommitBoundary
             )
             manager = activeManager
             test(database, repository, activeManager)
@@ -209,6 +295,12 @@ class TrainingManagerPersistenceTest {
                 checkpoint.writeBytes(previousCheckpoint)
             }
             File(context.filesDir, "$CHECKPOINT_FILE_NAME.tmp").delete()
+            if (previousJournal == null) {
+                journalFile.delete()
+            } else {
+                journalFile.writeBytes(previousJournal)
+            }
+            File(context.filesDir, "${TrainingCommitJournal.FILE_NAME}.tmp").delete()
         }
     }
 

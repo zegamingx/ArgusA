@@ -120,13 +120,14 @@ data class ValidationCorpusEvaluation(
     val reasoningPerplexity: Float = Float.NaN
 )
 
-class TrainingManager(
+class TrainingManager internal constructor(
     context: Context,
     private val neuralEngine: ArgusNeuralEngine,
     private val deviceGuard: DeviceGuard,
     private val worldModel: WorldModel,
     private val trainingDispatcher: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1),
-    private val repository: com.argus.agi.data.repository.ArgusRepository? = null
+    private val repository: com.argus.agi.data.repository.ArgusRepository? = null,
+    private val onCommitBoundary: (TrainingCommitBoundary) -> Unit = {}
 ) : Closeable {
 
     private val repositoryInitialization =
@@ -2933,6 +2934,7 @@ class TrainingManager(
             modelIdentityFingerprint = baselineModelIdentityFingerprint,
             optimizerConfigFingerprint = baselineOptimizerConfigFingerprint
         )
+        onCommitBoundary(TrainingCommitBoundary.PREPARED_JOURNAL_DURABLE)
 
         val startNs = System.nanoTime()
         val batchResult = neuralEngine.trainBatchDetailed(
@@ -2940,6 +2942,7 @@ class TrainingManager(
             runtimeContextLength = runtimeContextLength,
             autoCheckpoint = false
         )
+        onCommitBoundary(TrainingCommitBoundary.OPTIMIZER_UPDATE_APPLIED)
         val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
         require(batchResult.samples.size == items.size) {
             "Neural engine returned ${batchResult.samples.size} results for ${items.size} samples."
@@ -2967,12 +2970,14 @@ class TrainingManager(
             "The committed training journal could not be read back."
         }
         requireJournalCompatibility(committedJournal, "live batch commit before checkpoint write")
+        onCommitBoundary(TrainingCommitBoundary.COMMITTED_JOURNAL_DURABLE)
 
         // The write-ahead COMMITTED marker is durable before the model checkpoint.
         // Room is updated only after that checkpoint is atomically secured.
         check(neuralEngine.saveCheckpoint()) {
             "The committed optimizer state could not be checkpointed."
         }
+        onCommitBoundary(TrainingCommitBoundary.CHECKPOINT_FILE_REPLACED)
         val committedCheckpointFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
         TrainingCommitJournal.writeCommitted(
             file = trainingCommitJournalFile,
@@ -2983,6 +2988,7 @@ class TrainingManager(
             optimizerConfigFingerprint = baselineOptimizerConfigFingerprint,
             checkpointSha256Fingerprint = committedCheckpointFingerprint
         )
+        onCommitBoundary(TrainingCommitBoundary.CHECKPOINT_BOUND_JOURNAL_DURABLE)
         val checkpointBoundJournal = requireNotNull(
             TrainingCommitJournal.read(trainingCommitJournalFile)
         ) {
@@ -3009,11 +3015,14 @@ class TrainingManager(
         repository.markTrainingItemsOptimizerCommitted(committedItems)
         committedItems.forEachIndexed { index, item -> items[index] = item }
         activeBatchRoomCommitted = true
+        onCommitBoundary(TrainingCommitBoundary.ROOM_OPTIMIZER_STATE_COMMITTED)
 
         var allItemsSucceeded = true
         for ((item, entry) in items.zip(commitEntries)) {
             val result = requireNotNull(entry.result)
-            if (!processItem(item, result, entry.stepDurationMs)) {
+            val itemSucceeded = processItem(item, result, entry.stepDurationMs)
+            onCommitBoundary(TrainingCommitBoundary.QUEUE_ITEM_FINALIZED)
+            if (!itemSucceeded) {
                 allItemsSucceeded = false
                 item.documentId?.let(validationRunFailedDocumentIds::add)
             }
