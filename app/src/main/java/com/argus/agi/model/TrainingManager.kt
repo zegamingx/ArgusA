@@ -1703,7 +1703,14 @@ class TrainingManager internal constructor(
      * opt-ins; this method is called only after the service rechecks both.
      */
     fun enqueueScreenData(packageName: String, title: String, content: String) {
-        if (content.isBlank() || closed || screenTrainingPurgePending) return
+        if (
+            content.isBlank() ||
+            closed ||
+            screenTrainingPurgePending ||
+            !isScreenTrainingConsentEnabled()
+        ) {
+            return
+        }
 
         val source = "$SCREEN_SOURCE_PREFIX$packageName)"
         val processed = TextModalityProcessor.process(
@@ -1725,7 +1732,7 @@ class TrainingManager internal constructor(
         }
 
         synchronized(queueLock) {
-            if (closed || screenTrainingPurgePending) return
+            if (closed || screenTrainingPurgePending || !isScreenTrainingConsentEnabled()) return
             val current = _nextQueue.value
             val nonDuplicates = newItems.filter { item ->
                 current.none {
