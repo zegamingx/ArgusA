@@ -3,10 +3,11 @@ package com.argus.agi.sensor
 import java.util.Locale
 
 /**
- * Identifies applications that deserve an explicit privacy review.
+ * Conservatively identifies applications whose visible content commonly contains
+ * financial, credential, private-communication, health, or personal-media data.
  *
- * This classifier does not grant or revoke accessibility access and does not
- * replace the user's persisted excluded-app selection.
+ * Matching is a defense-in-depth block, not a replacement for the default-deny
+ * app allowlist or the user's explicit consent.
  */
 object PrivacyAppHeuristics {
     private val sensitiveTerms = setOf(
@@ -24,6 +25,7 @@ object PrivacyAppHeuristics {
         "crypto",
         "binance",
         "indodax",
+        "tokocrypto",
         "authenticator",
         "password",
         "bitwarden",
@@ -33,11 +35,25 @@ object PrivacyAppHeuristics {
         "keychain",
         "whatsapp",
         "telegram",
-        "signal"
+        "signal",
+        "messenger",
+        "instagram",
+        "facebook",
+        "discord",
+        "snapchat",
+        "gmail",
+        "outlook",
+        "mail",
+        "messages",
+        "sms",
+        "health",
+        "medical",
+        "photos",
+        "gallery"
     )
 
     fun isPrivacySensitiveApp(appName: String, packageName: String): Boolean {
         val identity = "$appName $packageName".lowercase(Locale.ROOT)
-        return sensitiveTerms.any { term -> identity.contains(term) }
+        return sensitiveTerms.any(identity::contains)
     }
 }
