@@ -1,78 +1,68 @@
 # ArgusA repository security and public-release checklist
 
-This checklist separates GitHub repository publication from distributing the Android app. Do not make the repository public while historical signing credentials remain in Git history.
+Keep repository visibility private until historical signing material has been removed from all refs and the remaining controls below have been verified.
 
-## Current protected-release design
+## Signing incident and current release state
 
-The release workflow in this branch is manual-only and limited to `main`. It uses a dedicated GitHub Environment named `release-signing` and expects three environment secrets:
+- The supplied Argus v1.0.13 APK uses the standalone release certificate.
+- That standalone PKCS#12 identity was previously distributed as an unencrypted GitHub Release asset. Removing the asset does not undo prior exposure. Treat the private key as compromised.
+- A separate historical JKS-named PKCS#12 file was committed to Git history. The README identifies this legacy upload identity as separate from the standalone identity. Treat both as exposed until fingerprints and actual APK distribution channels are mapped.
+- The signed-release workflow has been removed from this branch. Gradle release variants are unsigned. Do not sign new APKs with either exposed identity.
 
-- `ARGUS_SIGNING_KEY_BASE64`: base64 of an encrypted PKCS#12 file
-- `ARGUS_SIGNING_STORE_PASSWORD`: PKCS#12 store password
-- `ARGUS_SIGNING_KEY_PASSWORD`: private-key password
+## Signing migration
 
-Set required reviewers on the Environment. Do not put the private key in a repository secret if a protected environment secret can be used instead. Do not upload keystores as release assets, workflow artifacts, caches, or logs.
+The local helper `tools/security/create-signing-lineage.ps1` checks that the old keystore matches the supplied v1.0.13 APK, checks that the replacement keystore has a different certificate, creates a lineage with `apksigner rotate`, signs an unsigned APK with the old/new signer lineage, and verifies the output.
 
-The workflow pins the certificate SHA-256 taken from the supplied v1.0.13 APK. It intentionally fails when the uploaded signing key does not match. Do not change this fingerprint as a workaround.
+Run it only on an encrypted, trusted workstation. The old key is used only for this controlled migration and must not be restored to CI. Keep passwords separate from keystores. The script never uploads either keystore or the lineage file.
 
-## Signing migration prerequisites
+After producing the migration APK:
 
-1. Keep the old signing material on encrypted local storage only while establishing the update path.
-2. Compare the signer SHA-256 fingerprints of every APK distribution channel and the historical `my-upload-key.jks` identity.
-3. Determine whether the old JKS-named file and the standalone PKCS#12 key are the same certificate. Do not assume that they are.
-4. Before rotating any signer, use Android signing lineage and test an in-place update from each supported installed APK. Confirm app data survives.
-5. Encrypt the retained signing identity in PKCS#12 with a strong, unique password. Store the password separately from the file.
-6. Configure the three `release-signing` environment secrets and required reviewers. Run the manual release workflow only after the exact certificate pin passes.
+- Install it over an existing v1.0.13 installation using `adb install -r`.
+- Verify package identity, launch, local database, model/checkpoint files, and user data.
+- Install a second APK signed with the replacement identity and the same lineage to verify subsequent updates.
+- Test on a physical Android 14+ device and emulator/device API boundaries.
+- If the old signer key is unavailable, do not create an unrelated key and call it an update. Preserve the existing installation and plan a separate package/application migration.
 
-If an identity cannot be retrieved or its private key is unavailable, do not generate an unrelated key and publish it as an update. Plan a new package/application migration instead.
+Only after migration succeeds should a protected signing workflow be designed around the replacement signer and its verified SHA-256 fingerprint. A GitHub Environment is an access-control layer, not a remedy for a compromised key.
 
 ## Historical Git cleanup
 
-The repository previously contained a JKS-named PKCS#12 file in Git history and a hard-coded password assignment in a historical Gradle file. Removing a file from the current tree is not enough.
+The repository previously contained a JKS-named PKCS#12 file in Git history and a hard-coded password assignment in a historical Gradle file. Removing files from the current tree does not remove historical Git objects.
 
 The PowerShell helper `tools/security/rewrite-sensitive-history.ps1`:
 
 - mirror-clones the repository into an existing encrypted working folder;
 - removes `my-upload-key.jks` from all refs;
-- redacts historical lines containing the legacy password variable identifier;
-- checks that common signing-material filenames and the Gradle identifier are absent;
-- does not push unless a separate explicit switch and confirmation are supplied.
+- redacts historical Gradle lines containing the legacy password variable identifier;
+- checks common signing-material filenames and the Gradle identifier are absent;
+- does not push without a separate explicit switch and confirmation.
 
-Before the remote rewrite:
+Before rewriting remote refs, finish or close active pull requests, freeze pushes, tell collaborators not to push old clones, inspect `.git/filter-repo/changed-refs`, and review the rewritten refs. GitHub-managed `refs/pull/*` refs are not force-pushable. After rewriting branches and tags, contact GitHub Support to request removal of cached views and affected PR references. Re-clone the sanitized repository; do not reuse an old clone.
 
-- merge or close all open pull requests;
-- stop all pushes and ask collaborators not to push old clones;
-- verify the rewritten mirror and check `.git/filter-repo/changed-refs`;
-- record the first changed commits and the count/list of affected pull requests;
-- temporarily disable branch protection only if it blocks the mirror push, then restore it immediately afterward.
+## Repository controls required before public visibility
 
-After the remote rewrite, contact GitHub Support to request removal of cached views and affected pull-request references. GitHub-managed `refs/pull/*` refs cannot be force-pushed by the mirror operation.
-
-Do not reuse an old clone after this operation. Re-clone the sanitized repository.
-
-## Repository controls required before changing visibility
-
-- Protect `main`: require pull requests, required successful validation checks, code-owner review, conversation resolution, stale approval dismissal, and no force-push or deletion.
-- Keep signing secrets only in the protected release Environment.
-- Enable secret scanning and push protection; run a full-history credential scan after the rewrite.
+- Protect `main`: require pull requests, passing validation checks, code-owner review, conversation resolution, stale approval dismissal, and prohibit force-push and deletion.
+- Enable secret scanning and push protection. Run a full-history credential scan after the rewrite.
+- Review every branch, tag, release, Actions log/artifact, issue, pull request, wiki page, and discussion for private data.
 - Keep Dependabot enabled for Gradle and GitHub Actions.
-- Review GitHub Actions logs and artifacts, all issues and pull requests, tags, releases, wiki content, and repository discussions for sensitive data.
-- Choose and add an explicit license before describing Argus as open source. No license is selected by this checklist.
-- Confirm that the root README accurately describes behavior and capabilities.
+- Decide whether Argus is intended to be open source. No license has been selected. Public visibility alone does not grant reuse rights.
+- Verify README feature claims, metadata, permissions, and release instructions.
 
 ## Application privacy boundary
 
-Screen text perception, screen-derived training, and accessibility clicks are separate opt-ins and default to off in this branch. Application access is default-deny. Sensitive app categories remain protected. The broad `QUERY_ALL_PACKAGES` permission was removed; the app list is limited to launchable applications.
+Screen perception, screen-derived training, and accessibility clicks are separate opt-ins and disabled by default in this branch. App access is default-deny; sensitive app categories remain protected. The broad `QUERY_ALL_PACKAGES` permission has been removed; the app list uses a launcher-intent query.
 
-Before app-store distribution, review the final UX and runtime behavior against current Google Play User Data, Accessibility API, and package-visibility policies. The in-app disclosure must be prominent during normal app use and must immediately precede the corresponding consent action. The tests in this branch cover default-off consent and allowlist policy, but a full Android build and emulator validation remain required.
+The normal app flow displays a disclosure. Settings explains what is read and stored locally and exposes separate controls. This implementation still needs a complete Android build, lint, unit tests, and emulator validation. Re-review it against current Google Play User Data, Accessibility API, and package-visibility policies before Play distribution.
 
 ## Go/no-go
 
-Repository visibility must remain private until all of the following are true:
+Keep repository visibility private until:
 
-- signing identity and update lineage are verified;
-- the protected Environment secrets are configured and manual release validation succeeds;
-- the complete Git history is rewritten and verified;
-- GitHub Support has been contacted about cached and PR refs;
-- all branch protections, secret scanning, and push protection are enabled;
-- license decision is recorded;
-- the privacy implementation passes Gradle, unit, lint, and emulator validation.
+- each signing identity has been mapped to APKs users actually installed;
+- the v1.0.13 signer is rotated through a tested lineage, or a separate package migration is chosen;
+- legacy signing material and passwords have been removed from all Git refs and GitHub cached views have been addressed;
+- a replacement-key release workflow has passed validation;
+- branch protection, secret scanning, and push protection are enabled;
+- a license decision is recorded;
+- Android build, lint, unit, and emulator validation pass;
+- screen privacy controls pass code review and runtime tests.
