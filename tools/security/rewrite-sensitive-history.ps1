@@ -53,8 +53,6 @@ function Get-RefMap {
         if ($separator -gt 0) {
             $map[$line.Substring($separator + 1)] = $line.Substring(0, $separator).ToLowerInvariant()
         }
-            $map[$Matches[2]] = $Matches[1].ToLowerInvariant()
-        }
     }
     return $map
 }

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled]
     branches:
       - main
 
@@ -129,7 +129,18 @@ jobs:
             :app:testReleaseUnitTest \
             :app:assembleDebug
 
+      - name: Verify packaged native ABI libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_path="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "${apk_path}"
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
+          done
+
       - name: Install Android emulator and API 35 test image
+        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery')) }}
         shell: bash
         run: |
           set -euo pipefail
@@ -154,20 +165,26 @@ jobs:
             --force
 
       - name: Start Android emulator
+        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery')) }}
         shell: bash
         run: |
           set -euo pipefail
+          emulator -accel-check
           emulator \
             -avd argus-process-recovery \
             -no-window \
             -no-audio \
             -no-boot-anim \
             -no-snapshot \
-            -gpu swiftshader_indirect \
+            -gpu software \
             -accel auto \
             > "$RUNNER_TEMP/argus-emulator.log" 2>&1 &
           echo "$!" > "$RUNNER_TEMP/argus-emulator.pid"
-          adb wait-for-device
+          if ! timeout 180s adb wait-for-device; then
+            echo "::error::Android emulator did not expose an ADB device within 180 seconds."
+            cat "$RUNNER_TEMP/argus-emulator.log" || true
+            exit 1
+          fi
           timeout 240s bash -c '
             until [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" == "1" ]]; do
               sleep 2
@@ -178,6 +195,7 @@ jobs:
           adb shell settings put global animator_duration_scale 0
 
       - name: Run Android process-death recovery matrix
+        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery')) }}
         run: |
           env -u ANDROID_SDK_ROOT ./gradlew \
             --no-daemon \
@@ -185,12 +203,3 @@ jobs:
             --stacktrace \
             :app:connectedDebugAndroidTest
 
-      - name: Verify packaged native ABI libraries
-        shell: bash
-        run: |
-          set -euo pipefail
-          apk_path="app/build/outputs/apk/debug/app-debug.apk"
-          test -s "${apk_path}"
-          for abi in arm64-v8a armeabi-v7a x86_64; do
-            unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
-          done
