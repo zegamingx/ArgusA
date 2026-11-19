@@ -548,6 +548,10 @@ class ArgusAppRobolectricTest {
 
     @Test
     fun testExcludedAppsManagerSensitivityHeuristic() {
+        context.getSharedPreferences("argus_excluded_apps", Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .commit()
         val manager = com.argus.agi.sensor.ExcludedAppsManager(context)
         assertTrue("Authenticator must be excluded", manager.isAppExcluded("com.google.android.apps.authenticator2"))
         assertTrue("Bitwarden must be excluded by keyword", manager.isAppExcluded("com.x8bit.bitwarden"))
