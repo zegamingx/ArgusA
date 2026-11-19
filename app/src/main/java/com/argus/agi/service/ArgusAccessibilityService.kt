@@ -149,7 +149,7 @@ class ArgusAccessibilityService : AccessibilityService() {
 
                         ArgusApp.worldModel.updateScreenContext(rootPackage, fullText)
 
-                        if (excludedAppsManager.isScreenTrainingEnabled()) {
+                        if (excludedAppsManager.isAppTrainingAllowed(rootPackage)) {
                             ArgusApp.trainingManager.enqueueScreenData(
                                 packageName = rootPackage,
                                 title = "Layar: ${rootPackage.substringAfterLast('.')}",
