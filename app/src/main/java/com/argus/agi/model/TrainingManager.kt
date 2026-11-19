@@ -1825,6 +1825,15 @@ class TrainingManager internal constructor(
         return removePrefix(prefix).removeSuffix(")").takeIf(String::isNotBlank)
     }
 
+    private suspend fun purgeLegacyScreenCorpusIfResolved(
+        repository: com.argus.agi.data.repository.ArgusRepository
+    ) {
+        // Never remove source documents while any legacy queue row may still be
+        // referenced by a committed optimizer journal or interrupted worker.
+        if (repository.getLegacyScreenTrainingItemsSnapshot().isNotEmpty()) return
+        repository.deleteLegacyScreenCorpusDocuments()
+    }
+
     private fun isScreenTrainingConsentEnabled(packageName: String): Boolean {
         if (!trainingPreferences.getBoolean(SCREEN_PERCEPTION_CONSENT_KEY, false) ||
             !trainingPreferences.getBoolean(SCREEN_TRAINING_CONSENT_KEY, false)
@@ -2488,6 +2497,9 @@ class TrainingManager internal constructor(
         val duration = journalEntry?.stepDurationMs ?: item.stepDurationMs
         val completed = processItem(item, result, duration)
         deleteTrainingCommitJournalWhenResolved()
+        if (item.source.isLegacyScreenTrainingSource()) {
+            purgeLegacyScreenCorpusIfResolved(requireNotNull(repo))
+        }
         synchronized(queueLock) {
             oomRecoveryItemIds.remove(item.id)
             oomRetryCounts.remove(item.id)
@@ -2551,6 +2563,7 @@ class TrainingManager internal constructor(
                         .forEach { legacyItem ->
                             repository.deleteTrainingItem(legacyItem.id)
                         }
+                    purgeLegacyScreenCorpusIfResolved(repository)
                     synchronized(queueLock) {
                         _nextQueue.value = _nextQueue.value.filterNot {
                             it.source.isLegacyScreenTrainingSource()
@@ -3392,6 +3405,9 @@ class TrainingManager internal constructor(
         } else {
             pushCompleted(failed)
         }
+        if (item.source.isLegacyScreenTrainingSource()) {
+            purgeLegacyScreenCorpusIfResolved(repository)
+        }
         if (!reason.isNullOrBlank()) {
             Log.w(TAG, "Training item '${item.title}' failed: $reason")
         }
@@ -3533,6 +3549,7 @@ class TrainingManager internal constructor(
             synchronized(queueLock) {
                 _completedQueue.value = _completedQueue.value.filterNot { it.id == finished.id }
             }
+            purgeLegacyScreenCorpusIfResolved(repository)
         } else {
             pushCompleted(finished)
         }
