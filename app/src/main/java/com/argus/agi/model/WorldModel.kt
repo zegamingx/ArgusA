@@ -88,9 +88,15 @@ class WorldModel(
                     // These two keys were persisted by older releases when
                     // Accessibility screen capture was still stored as durable memory.
                     // Remove them before loading any user memories into the live World Model.
-                    r.deleteScreenContextMemories()
+                    runCatching { r.deleteScreenContextMemories() }
 
                     val saved = r.getMemoriesSnapshot()
+                        .filterNot { entity ->
+                            entity.key == "active_screen_app" ||
+                                entity.key == "last_screen_content" ||
+                                entity.source == "Accessibility Perception" ||
+                                entity.source == "Screen OCR/Text Parser"
+                        }
                     if (saved.isNotEmpty()) {
                         saved.forEach { entities[it.key] = it }
                     }
