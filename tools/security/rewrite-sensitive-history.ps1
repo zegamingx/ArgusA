@@ -50,6 +50,14 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command git-filter-repo -ErrorAction SilentlyContinue)) {
     throw "git-filter-repo >= 2.47 is required. Install it before running this script."
 }
+$filterRepoVersion = (& git filter-repo --version 2>$null | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $filterRepoVersion -notmatch '^\d+\.\d+') {
+    throw "Could not determine git-filter-repo version."
+}
+$parsedFilterRepoVersion = [version]$filterRepoVersion
+if ($parsedFilterRepoVersion -lt [version]"2.47.0") {
+    throw "git-filter-repo 2.47.0 or newer is required; detected $filterRepoVersion."
+}
 if (-not (Test-Path -LiteralPath $WorkingRoot -PathType Container)) {
     throw "WorkingRoot must be an existing folder on encrypted storage."
 }
@@ -60,8 +68,11 @@ if (Test-Path -LiteralPath $mirrorPath) {
 # Build the sensitive variable name from fragments so this scrubber does not
 # preserve the exact legacy identifier in the new repository history.
 $legacyPasswordIdentifier = "default" + "Pass"
-$redactionRule = ('regex:(?im)^.*' + [regex]::Escape($legacyPasswordIdentifier) + '.*$==>REDACTED_BY_HISTORY_CLEANUP')
-Set-Content -LiteralPath $rulesPath -Value $redactionRule -Encoding utf8
+$redactionRules = @(
+    ('regex:(?im)^.*' + [regex]::Escape($legacyPasswordIdentifier) + '.*$==>REDACTED_BY_HISTORY_CLEANUP'),
+    'regex:(?im)^.*(?:storePassword|keyPassword)\s*=\s*["''][^"'']+["''].*$==>REDACTED_BY_HISTORY_CLEANUP'
+)
+Set-Content -LiteralPath $rulesPath -Value $redactionRules -Encoding utf8
 
 try {
     Write-Host "Cloning the complete repository history to encrypted working storage..."
@@ -75,7 +86,12 @@ try {
             "--sensitive-data-removal",
             "--force",
             "--invert-paths",
-            "--path", "my-upload-key.jks",
+            "--path-glob", "*.jks",
+            "--path-glob", "*.keystore",
+            "--path-glob", "*.p12",
+            "--path-glob", "*.pfx",
+            "--path-glob", "*.pem",
+            "--path-glob", "*.key",
             "--replace-text", $rulesPath
         )
 
@@ -93,7 +109,8 @@ try {
             throw "Signing material paths remain in rewritten history. Do not push."
         }
 
-        $passwordMatches = & git log --all --format="%H" -G $legacyPasswordIdentifier -- "*.gradle" "*.gradle.kts"
+        $passwordPattern = '(?i)(?:' + [regex]::Escape($legacyPasswordIdentifier) + '|(?:storePassword|keyPassword)\s*=\s*["''][^"'']+["''])'
+        $passwordMatches = & git log --all --format="%H" -G $passwordPattern -- "*.gradle" "*.gradle.kts"
         if ($LASTEXITCODE -ne 0) {
             throw "Could not verify historical Gradle signing configuration."
         }
