@@ -2,7 +2,6 @@ package com.argus.agi.sensor
 
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import android.os.Build
@@ -21,172 +20,174 @@ data class InstalledAppItem(
     val isSystemApp: Boolean = false
 )
 
+/**
+ * Owns the user's local screen-perception policy.
+ *
+ * Screen perception, screen-derived training, and accessibility actions are
+ * separate opt-ins. App access is default-deny and protected categories cannot
+ * be added to the allowlist.
+ */
 class ExcludedAppsManager(private val context: Context) {
 
     companion object {
         private const val TAG = "ExcludedAppsManager"
+        private const val PREFS_NAME = "argus_excluded_apps"
+        private const val KEY_ALLOWED_PACKAGES = "allowed_screen_packages"
+        private const val KEY_SCREEN_PERCEPTION = "screen_perception_enabled"
+        private const val KEY_SCREEN_TRAINING = "screen_training_enabled"
+        private const val KEY_ACCESSIBILITY_ACTIONS = "accessibility_actions_enabled"
     }
 
-    private val prefs = context.getSharedPreferences("argus_excluded_apps", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
     private val _excludedPackages = MutableStateFlow<Set<String>>(emptySet())
     val excludedPackages: StateFlow<Set<String>> = _excludedPackages.asStateFlow()
 
-    init {
-        val saved = prefs.getStringSet("excluded_set", null)
-        if (saved == null) {
-            // Seed sensitive package patterns by default
-            val defaults = setOf(
-                "com.google.android.apps.authenticator2",
-                "com.whatsapp",
-                "org.telegram.messenger",
-                "com.bca",
-                "id.co.bri.brimo",
-                "com.bankmandiri.livin",
-                "id.bca.mybca",
-                "com.telkom.indonesia.digitallife",
-                "com.binance.dev",
-                "com.tokocrypto.app"
-            )
-            prefs.edit().putStringSet("excluded_set", defaults).apply()
-            _excludedPackages.value = defaults
-        } else {
-            _excludedPackages.value = saved
+    private val _screenPerceptionEnabled = MutableStateFlow(
+        prefs.getBoolean(KEY_SCREEN_PERCEPTION, false)
+    )
+    val screenPerceptionEnabled: StateFlow<Boolean> = _screenPerceptionEnabled.asStateFlow()
+
+    private val _screenTrainingEnabled = MutableStateFlow(
+        prefs.getBoolean(KEY_SCREEN_TRAINING, false)
+    )
+    val screenTrainingEnabled: StateFlow<Boolean> = _screenTrainingEnabled.asStateFlow()
+
+    private val _accessibilityActionsEnabled = MutableStateFlow(
+        prefs.getBoolean(KEY_ACCESSIBILITY_ACTIONS, false)
+    )
+    val accessibilityActionsEnabled: StateFlow<Boolean> = _accessibilityActionsEnabled.asStateFlow()
+
+    fun isScreenPerceptionEnabled(): Boolean =
+        prefs.getBoolean(KEY_SCREEN_PERCEPTION, false)
+
+    fun isScreenTrainingEnabled(): Boolean =
+        isScreenPerceptionEnabled() && prefs.getBoolean(KEY_SCREEN_TRAINING, false)
+
+    fun isAccessibilityActionsEnabled(): Boolean =
+        prefs.getBoolean(KEY_ACCESSIBILITY_ACTIONS, false)
+
+    fun setScreenPerceptionEnabled(enabled: Boolean) {
+        prefs.edit()
+            .putBoolean(KEY_SCREEN_PERCEPTION, enabled)
+            .apply()
+        _screenPerceptionEnabled.value = enabled
+
+        if (!enabled) {
+            prefs.edit().putBoolean(KEY_SCREEN_TRAINING, false).apply()
+            _screenTrainingEnabled.value = false
         }
     }
 
-    fun isAppExcluded(packageName: String): Boolean {
-        if (_excludedPackages.value.contains(packageName)) return true
-        val lower = packageName.lowercase()
-        return lower.contains("authenticator") ||
-                lower.contains("password") ||
-                lower.contains("bitwarden") ||
-                lower.contains("1password") ||
-                lower.contains("keepass") ||
-                lower.contains("autofill") ||
-                lower.contains("keychain") ||
-                lower.contains("bank")
+    fun setScreenTrainingEnabled(enabled: Boolean) {
+        val permitted = enabled && isScreenPerceptionEnabled()
+        prefs.edit()
+            .putBoolean(KEY_SCREEN_TRAINING, permitted)
+            .apply()
+        _screenTrainingEnabled.value = permitted
     }
 
-    fun toggleAppExclusion(packageName: String) {
-        val current = _excludedPackages.value.toMutableSet()
-        if (current.contains(packageName)) {
-            current.remove(packageName)
-        } else {
-            current.add(packageName)
-        }
-        prefs.edit().putStringSet("excluded_set", current).apply()
-        _excludedPackages.value = current
+    fun setAccessibilityActionsEnabled(enabled: Boolean) {
+        prefs.edit()
+            .putBoolean(KEY_ACCESSIBILITY_ACTIONS, enabled)
+            .apply()
+        _accessibilityActionsEnabled.value = enabled
     }
 
     /**
-     * Discovers ALL applications installed on device by combining multiple package manager queries:
-     * 1. Querying all launcher intent activities (guarantees every app the user can open on home screen).
-     * 2. Querying all installed applications (including user utilities, social media, banking, and services).
-     * 3. Querying installed packages.
-     * With QUERY_ALL_PACKAGES declared in AndroidManifest, this enumerates 100% of real device apps.
+     * Every package is blocked until the user explicitly allows it.
+     * Sensitive categories remain blocked even if stale preferences contain
+     * their package names.
+     */
+    fun isAppExcluded(packageName: String): Boolean {
+        if (PrivacyAppHeuristics.isPrivacySensitiveApp("", packageName)) return true
+        val allowed = prefs.getStringSet(KEY_ALLOWED_PACKAGES, emptySet()).orEmpty()
+        return packageName !in allowed
+    }
+
+    fun toggleAppAccess(packageName: String) {
+        if (PrivacyAppHeuristics.isPrivacySensitiveApp("", packageName)) return
+
+        val current = prefs.getStringSet(KEY_ALLOWED_PACKAGES, emptySet())
+            .orEmpty()
+            .toMutableSet()
+
+        if (!current.add(packageName)) {
+            current.remove(packageName)
+        }
+
+        val committed = current.toSet()
+        prefs.edit().putStringSet(KEY_ALLOWED_PACKAGES, committed).apply()
+        refreshExcludedPackageSnapshot()
+    }
+
+    /**
+     * Only launchable applications are listed. This is sufficient for user
+     * selection and avoids broad installed-package inventory access.
      */
     suspend fun getInstalledApps(): List<InstalledAppItem> = withContext(Dispatchers.IO) {
-        val pm = context.packageManager
-        val appMap = mutableMapOf<String, InstalledAppItem>()
-        val currentExcluded = _excludedPackages.value
+        val packageManager = context.packageManager
+        val launcherIntent = Intent(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+        }
 
-        // Strategy 1: All launchable apps (Every user-facing app on the phone)
         try {
-            val launcherIntent = Intent(Intent.ACTION_MAIN, null).apply {
-                addCategory(Intent.CATEGORY_LAUNCHER)
-            }
-            val launcherApps = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                pm.queryIntentActivities(launcherIntent, PackageManager.ResolveInfoFlags.of(0))
+            val launchers = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                packageManager.queryIntentActivities(
+                    launcherIntent,
+                    PackageManager.ResolveInfoFlags.of(0)
+                )
             } else {
                 @Suppress("DEPRECATION")
-                pm.queryIntentActivities(launcherIntent, 0)
+                packageManager.queryIntentActivities(launcherIntent, 0)
             }
-            for (resolveInfo in launcherApps) {
-                val pkg = resolveInfo.activityInfo.packageName
-                if (pkg == context.packageName) continue // Skip ARGUS itself
-                val name = resolveInfo.loadLabel(pm).toString().trim().ifBlank { pkg }
-                val icon = try { resolveInfo.loadIcon(pm) } catch (_: Exception) { null }
-                val isExcluded = currentExcluded.contains(pkg) || isAppExcluded(pkg)
-                val isSys = (resolveInfo.activityInfo.applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-                appMap[pkg] = InstalledAppItem(
-                    appName = name,
-                    packageName = pkg,
+
+            val appsByPackage = linkedMapOf<String, InstalledAppItem>()
+            for (resolveInfo in launchers) {
+                val activityInfo = resolveInfo.activityInfo ?: continue
+                val packageName = activityInfo.packageName
+                if (packageName == context.packageName || appsByPackage.containsKey(packageName)) {
+                    continue
+                }
+
+                val appName = resolveInfo.loadLabel(packageManager)
+                    .toString()
+                    .trim()
+                    .ifBlank { packageName }
+                val icon = runCatching { resolveInfo.loadIcon(packageManager) }
+                    .getOrNull()
+                val isSystemApp = (activityInfo.applicationInfo.flags and
+                    android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+
+                appsByPackage[packageName] = InstalledAppItem(
+                    appName = appName,
+                    packageName = packageName,
                     icon = icon,
-                    isExcluded = isExcluded,
-                    isSystemApp = isSys
+                    isExcluded = isAppExcluded(packageName),
+                    isSystemApp = isSystemApp
                 )
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to query launcher activities: ${e.message}")
+
+            val result = appsByPackage.values.sortedWith(
+                compareByDescending<InstalledAppItem> { it.isExcluded }
+                    .thenBy { it.appName.lowercase() }
+            )
+            _excludedPackages.value = result
+                .asSequence()
+                .filter { it.isExcluded }
+                .map { it.packageName }
+                .toSet()
+            result
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to query launchable applications.", error)
+            emptyList()
         }
+    }
 
-        // Strategy 2: Query all installed applications via getInstalledApplications
-        try {
-            val allApps = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                pm.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
-            } else {
-                @Suppress("DEPRECATION")
-                pm.getInstalledApplications(0)
-            }
-            for (appInfo in allApps) {
-                val pkg = appInfo.packageName
-                if (pkg == context.packageName) continue // Skip ARGUS
-                if (!appMap.containsKey(pkg)) {
-                    val isSys = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-                    val launchIntent = pm.getLaunchIntentForPackage(pkg)
-                    // If not system app OR has a launch intent OR matches a known pattern, include it
-                    val name = try { pm.getApplicationLabel(appInfo).toString().trim().ifBlank { pkg } } catch (_: Exception) { pkg }
-                    val icon = try { pm.getApplicationIcon(appInfo) } catch (_: Exception) { null }
-                    val isExcluded = currentExcluded.contains(pkg) || isAppExcluded(pkg)
-
-                    appMap[pkg] = InstalledAppItem(
-                        appName = name,
-                        packageName = pkg,
-                        icon = icon,
-                        isExcluded = isExcluded,
-                        isSystemApp = isSys
-                    )
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to query installed applications: ${e.message}")
+    private fun refreshExcludedPackageSnapshot() {
+        _excludedPackages.value = _excludedPackages.value.toMutableSet().also { snapshot ->
+            val allowed = prefs.getStringSet(KEY_ALLOWED_PACKAGES, emptySet()).orEmpty()
+            snapshot.removeAll(allowed)
         }
-
-        // Strategy 3: Query getInstalledPackages as a comprehensive fallback
-        try {
-            val allPackages = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                pm.getInstalledPackages(PackageManager.PackageInfoFlags.of(0))
-            } else {
-                @Suppress("DEPRECATION")
-                pm.getInstalledPackages(0)
-            }
-            for (pkgInfo in allPackages) {
-                val pkg = pkgInfo.packageName
-                if (pkg == context.packageName) continue
-                if (!appMap.containsKey(pkg)) {
-                    val appInfo = pkgInfo.applicationInfo ?: continue
-                    val name = try { pm.getApplicationLabel(appInfo).toString().trim().ifBlank { pkg } } catch (_: Exception) { pkg }
-                    val icon = try { pm.getApplicationIcon(appInfo) } catch (_: Exception) { null }
-                    val isExcluded = currentExcluded.contains(pkg) || isAppExcluded(pkg)
-                    val isSys = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-
-                    appMap[pkg] = InstalledAppItem(
-                        appName = name,
-                        packageName = pkg,
-                        icon = icon,
-                        isExcluded = isExcluded,
-                        isSystemApp = isSys
-                    )
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to query installed packages: ${e.message}")
-        }
-
-        // Sort: Protected (isExcluded) first, then alphabetical by App Name
-        appMap.values.sortedWith(
-            compareByDescending<InstalledAppItem> { it.isExcluded }
-                .thenBy { it.appName.lowercase() }
-        )
     }
 }
