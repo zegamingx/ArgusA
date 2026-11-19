@@ -163,7 +163,7 @@ jobs:
             -no-audio \
             -no-boot-anim \
             -no-snapshot \
-            -gpu swiftshader \
+            -gpu swiftshader_indirect \
             -accel auto \
             > "$RUNNER_TEMP/argus-emulator.log" 2>&1 &
           echo "$!" > "$RUNNER_TEMP/argus-emulator.pid"

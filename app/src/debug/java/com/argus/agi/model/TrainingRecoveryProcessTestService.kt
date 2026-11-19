@@ -117,6 +117,7 @@ class TrainingRecoveryProcessTestService : Service() {
                 "The process-recovery baseline checkpoint could not be saved."
             }
 
+            var queuedItemId: String? = null
             val activeManager = TrainingManager(
                 context = isolated,
                 neuralEngine = engine,
@@ -134,7 +135,9 @@ class TrainingRecoveryProcessTestService : Service() {
                             .put("caseId", caseId)
                             .put("boundary", reachedBoundary.name)
                             .put("pid", Process.myPid())
-                            .put("itemId", queuedItem.id)
+                            .put("itemId", requireNotNull(queuedItemId) {
+                                "The generated queue item ID was not available at the crash boundary."
+                            })
                             .put(
                                 "baselineOptimizerStep",
                                 snapshot?.baselineOptimizerStep ?: engine.optimizerStep
@@ -185,6 +188,7 @@ class TrainingRecoveryProcessTestService : Service() {
                 }
                 activeManager.nextQueue.value.single { it.title == itemTitle }
             }
+            queuedItemId = queuedItem.id
             activeManager.triggerImmediateTrainingStep()
 
             // If the requested boundary is never observed, leave a durable failure
