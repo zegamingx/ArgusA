@@ -1593,6 +1593,11 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         loadInstalledApps()
     }
 
+    fun toggleAppTrainingAccess(packageName: String) {
+        excludedAppsManager.toggleAppTrainingAccess(packageName)
+        loadInstalledApps()
+    }
+
     fun clearChat() {
         stopGeneration()
         val resetMsg = ChatMessage(
