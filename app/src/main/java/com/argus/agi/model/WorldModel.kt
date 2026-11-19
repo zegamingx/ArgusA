@@ -154,15 +154,26 @@ class WorldModel(
         }
     }
 
+    /**
+     * Screen perception is transient context, not durable user memory.
+     * Screen-derived text must never be written into the persistent world-memory table.
+     */
     fun updateScreenContext(packageName: String, visibleTextSnippet: String) {
         val cleanSnippet = sanitizeSnippet(visibleTextSnippet)
-        storeEntities(
+        updateTransientEntities(
             WorldEntity("active_screen_app", packageName, "Accessibility Perception"),
             WorldEntity("last_screen_content", cleanSnippet, "Screen OCR/Text Parser")
         )
         val timeStr = TIME_FORMATTER.format(Instant.now().atZone(ZoneId.systemDefault()))
         _currentContextSummary.value =
             "App: $packageName | Detected: \"$cleanSnippet\" ($timeStr)"
+    }
+
+    fun clearScreenContext() {
+        entities.remove("active_screen_app")
+        entities.remove("last_screen_content")
+        publishSnapshot()
+        _currentContextSummary.value = "System ready."
     }
 
     private fun sanitizeSnippet(raw: String): String {
