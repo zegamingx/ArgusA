@@ -49,7 +49,25 @@ object PrivacyAppHeuristics {
         "health",
         "medical",
         "photos",
-        "gallery"
+        "gallery",
+        "paypal",
+        "venmo",
+        "cashapp",
+        "googlepay",
+        "applepay",
+        "payoneer",
+        "revolut",
+        "wise",
+        "zelle",
+        "linkaja",
+        "jenius",
+        "paytm",
+        "paysera",
+        "stripe",
+        "square",
+        "klarna",
+        "affirm",
+        "afterpay"
     )
 
     fun isPrivacySensitiveApp(appName: String, packageName: String): Boolean {
