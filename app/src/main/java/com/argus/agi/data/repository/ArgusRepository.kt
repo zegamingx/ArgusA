@@ -43,7 +43,8 @@ class ArgusRepository(
     private val corpusDao = db.corpusDao()
 
     private companion object {
-        const val SCREEN_SOURCE_PATTERN = "Screen (%"
+        const val SCREEN_SOURCE_PATTERN = "Screen%"
+        const val LEGACY_SCREEN_SOURCE_PATTERN = "Screen (%"
     }
 
     // =========================================================================
@@ -118,6 +119,12 @@ class ArgusRepository(
     suspend fun getScreenTrainingItemsSnapshot(): List<TrainingData> =
         withContext(Dispatchers.IO) {
             trainingQueueDao.getItemsBySourcePattern(SCREEN_SOURCE_PATTERN).map { it.toDomain() }
+        }
+
+    suspend fun getLegacyScreenTrainingItemsSnapshot(): List<TrainingData> =
+        withContext(Dispatchers.IO) {
+            trainingQueueDao.getItemsBySourcePattern(LEGACY_SCREEN_SOURCE_PATTERN)
+                .map { it.toDomain() }
         }
 
     suspend fun getOptimizerCommittedTrainingItemsSnapshot(): List<TrainingData> =
