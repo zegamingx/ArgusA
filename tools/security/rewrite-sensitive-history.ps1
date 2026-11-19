@@ -101,7 +101,7 @@ try {
             throw "The legacy signing-password identifier remains in Gradle history. Do not push."
         }
 
-        $changedRefsPath = Join-Path (Join-Path ".git" "filter-repo") "changed-refs"
+        $changedRefsPath = (& git rev-parse --git-path "filter-repo/changed-refs").Trim()
         $changedPullRefs = @()
         if (Test-Path -LiteralPath $changedRefsPath) {
             $changedPullRefs = @(
