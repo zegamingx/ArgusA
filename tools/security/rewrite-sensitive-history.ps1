@@ -109,7 +109,7 @@ try {
             throw "Signing material paths remain in rewritten history. Do not push."
         }
 
-        $passwordPattern = '(?i)(?:' + [regex]::Escape($legacyPasswordIdentifier) + '|(?:storePassword|keyPassword)\s*=\s*["''][^"'']+["''])'
+        $passwordPattern = [regex]::Escape($legacyPasswordIdentifier) + '|(storePassword|keyPassword)[[:space:]]*=[[:space:]]*["''][^"'']+["'']'
         $passwordMatches = & git log --all --format="%H" -G $passwordPattern -- "*.gradle" "*.gradle.kts"
         if ($LASTEXITCODE -ne 0) {
             throw "Could not verify historical Gradle signing configuration."
