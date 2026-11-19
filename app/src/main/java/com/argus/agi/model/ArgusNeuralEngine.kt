@@ -31,6 +31,11 @@ import kotlin.math.min
 import kotlin.math.sqrt
 import kotlin.random.Random
 
+internal data class GenerationTokenWindow(
+    val promptTokenLimit: Int,
+    val outputTokenLimit: Int
+)
+
 data class BenchmarkResult(
     val tokensPerSecond: Float,
     val latencyMsPerToken: Float,
@@ -623,6 +628,26 @@ class ArgusNeuralEngine private constructor(
         private const val CHECKPOINT_INTERVAL = 8
 
         /**
+         * Reserves output positions inside the fixed context window instead of letting
+         * a long prompt consume every position and silently truncate generation.
+         */
+        internal fun resolveGenerationTokenWindow(
+            maxSequenceLength: Int,
+            requestedNewTokens: Int
+        ): GenerationTokenWindow {
+            require(maxSequenceLength > 1) {
+                "Generation requires a context window of at least two tokens."
+            }
+
+            val outputTokenLimit = requestedNewTokens.coerceIn(0, maxSequenceLength - 1)
+            val promptTokenLimit = maxSequenceLength - maxOf(outputTokenLimit, 1)
+            return GenerationTokenWindow(
+                promptTokenLimit = promptTokenLimit,
+                outputTokenLimit = outputTokenLimit
+            )
+        }
+
+        /**
          * Builds the assistant prefix used for ordinary completion or reasoning generation.
          * Reasoning mode starts at the dedicated THINK token so the model is prompted with
          * the same serialized sequence used by reasoning training examples.
@@ -1084,7 +1109,8 @@ class ArgusNeuralEngine private constructor(
             if (rawTokens.isEmpty()) return@withContext "Input kosong."
 
             val currentVocab = tokenizer.vocabSize
-            val maxPromptLen = maxSeqLen - 1
+            val generationWindow = resolveGenerationTokenWindow(maxSeqLen, maxNewTokens)
+            val maxPromptLen = generationWindow.promptTokenLimit
             val effective = if (rawTokens.size > maxPromptLen) rawTokens.copyOfRange(rawTokens.size - maxPromptLen, rawTokens.size)
             else rawTokens
             val currentTokens = effective.toMutableList()
@@ -1180,7 +1206,7 @@ class ArgusNeuralEngine private constructor(
 
             // Decode loop
             var currentPos = initialLen - 1
-            for (step in 0 until maxNewTokens) {
+            for (step in 0 until generationWindow.outputTokenLimit) {
                 generationContext.ensureActive()
                 if (currentPos >= maxSeqLen - 1) break
 

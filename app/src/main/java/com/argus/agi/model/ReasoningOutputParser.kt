@@ -20,7 +20,31 @@ object ReasoningOutputParser {
 
         val reasoningStart = source.indexOf(Tokenizer.THINK_START)
         if (reasoningStart < 0) {
-            return ParsedReasoningOutput(answer = source, reasoning = null)
+            // In autoregressive reasoning mode, THINK_START is already part of the
+            // prompt and therefore is not repeated in the generated token stream.
+            // A generated THINK_END still closes that implicit reasoning prefix.
+            val implicitReasoningEnd = source.indexOf(Tokenizer.THINK_END)
+            if (implicitReasoningEnd < 0) {
+                return ParsedReasoningOutput(answer = source, reasoning = null)
+            }
+
+            val reasoningBody = source.substring(0, implicitReasoningEnd).trim()
+            val trailingText = source.substring(
+                implicitReasoningEnd + Tokenizer.THINK_END.length
+            ).trim()
+            val answer = trailingText
+                .removePrefix(Tokenizer.ASSISTANT_TOKEN)
+                .trim()
+                .removeSuffix(Tokenizer.EOS_TOKEN)
+                .trim()
+
+            if (answer.isBlank()) {
+                return ParsedReasoningOutput(answer = source, reasoning = null)
+            }
+            return ParsedReasoningOutput(
+                answer = answer,
+                reasoning = reasoningBody.takeIf(String::isNotBlank)
+            )
         }
 
         val reasoningContentStart = reasoningStart + Tokenizer.THINK_START.length
