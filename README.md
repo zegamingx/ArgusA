@@ -53,11 +53,15 @@ Build a debug APK:
 ./gradlew :app:assembleDebug
 ```
 
-Run release checks and build:
+Run release-variant checks and build an **unsigned** APK:
 
 ```bash
 ./gradlew :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
 ```
+
+This output is not an installable update for an existing signed Argus installation.
+Do not distribute it or use it for `adb install -r`; signed releases remain
+suspended until a verified Android signing-certificate lineage migration passes.
 
 Release APKs are intentionally unsigned in this branch. The previously distributed v1.0.13 signer was present in an unencrypted private-repository release asset and must be treated as compromised. Do not sign new APKs with that identity. A new release signing pipeline will be introduced only after an Android signing-certificate lineage has been generated with the old and replacement keys, and an in-place update has been tested on an existing v1.0.13 installation.
 
