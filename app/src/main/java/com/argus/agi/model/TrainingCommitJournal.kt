@@ -366,8 +366,8 @@ internal object TrainingCommitJournal {
         optimizerConfigFingerprint: String?,
         checkpointSha256Fingerprint: String? = null
     ) {
-        require((modelIdentityFingerprint == null) == (optimizerConfigFingerprint == null)) {
-            "Model identity and optimizer configuration fingerprints must be written together."
+        require(optimizerConfigFingerprint == null || modelIdentityFingerprint != null) {
+            "An optimizer configuration fingerprint requires a model identity fingerprint."
         }
         require(checkpointSha256Fingerprint == null || (
             state == STATE_COMMITTED && modelIdentityFingerprint != null && optimizerConfigFingerprint != null
