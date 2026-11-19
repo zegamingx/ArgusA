@@ -553,6 +553,8 @@ class ArgusAppRobolectricTest {
         assertTrue("Bitwarden must be excluded by keyword", manager.isAppExcluded("com.x8bit.bitwarden"))
         assertTrue("1Password must be excluded by keyword", manager.isAppExcluded("com.agilebits.onepassword"))
         assertTrue("Banking apps must be excluded by keyword", manager.isAppExcluded("com.bca.mobilebanking"))
+        assertTrue("PayPal must be excluded by keyword", manager.isAppExcluded("com.paypal.android.p2pmobile"))
+        assertTrue("Venmo must be excluded by keyword", manager.isAppExcluded("com.venmo"))
         assertTrue("Unapproved apps must be blocked by default", manager.isAppExcluded("com.example.calculator"))
     }
 
