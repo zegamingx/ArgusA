@@ -20,6 +20,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
+import java.security.MessageDigest
+import java.util.Locale
 import java.util.concurrent.Executors
 
 @RunWith(RobolectricTestRunner::class)
@@ -191,6 +193,10 @@ class TrainingManagerPersistenceTest {
                         assertTrue(committed.isCommitted)
                         assertFalse(committed.checkpointSha256Fingerprint.isNullOrBlank())
                         assertEquals(
+                            sha256Fingerprint(File(context.filesDir, CHECKPOINT_FILE_NAME)),
+                            committed.checkpointSha256Fingerprint
+                        )
+                        assertEquals(
                             item.id,
                             repository.getOptimizerCommittedTrainingItemsSnapshot().single().id
                         )
@@ -201,6 +207,10 @@ class TrainingManagerPersistenceTest {
                         }
                         assertTrue(committed.isCommitted)
                         assertEquals(
+                            sha256Fingerprint(File(context.filesDir, CHECKPOINT_FILE_NAME)),
+                            committed.checkpointSha256Fingerprint
+                        )
+                        assertEquals(
                             TrainingStatus.COMPLETED,
                             requireNotNull(repository.getTrainingItem(item.id)).status
                         )
@@ -208,6 +218,13 @@ class TrainingManagerPersistenceTest {
                     else -> throw AssertionError("Unexpected injected-boundary expectation: $expectedStatus")
                 }
             }
+        }
+    }
+
+    private fun sha256Fingerprint(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(file.readBytes())
+        return digest.joinToString(separator = "") { byte ->
+            "%02x".format(Locale.ROOT, byte.toInt() and 0xFF)
         }
     }
 
