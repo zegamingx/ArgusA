@@ -110,8 +110,9 @@ class TrainingRecoveryProcessTestService : Service() {
         var manager: TrainingManager? = null
         try {
             val isolated = isolatedContext(caseId)
-            database = openDatabase(isolated)
-            val repository = ArgusRepository(isolated, database)
+            val openedDatabase = openDatabase(isolated)
+            database = openedDatabase
+            val repository = ArgusRepository(isolated, openedDatabase)
             val engine = createEngine(isolated)
             check(engine.saveCheckpoint()) {
                 "The process-recovery baseline checkpoint could not be saved."
@@ -173,7 +174,6 @@ class TrainingRecoveryProcessTestService : Service() {
                 }
             )
             manager = activeManager
-            activeManager.pauseTraining()
             val itemTitle = "Cold-start recovery boundary " + boundaryName
             activeManager.enqueueData(
                 source = "process-death-recovery-test",
@@ -213,8 +213,9 @@ class TrainingRecoveryProcessTestService : Service() {
         try {
             val expectedStatus = TrainingStatus.valueOf(expectedStatusName)
             val isolated = isolatedContext(caseId)
-            database = openDatabase(isolated)
-            val repository = ArgusRepository(isolated, database)
+            val openedDatabase = openDatabase(isolated)
+            database = openedDatabase
+            val repository = ArgusRepository(isolated, openedDatabase)
             val engine = createEngine(isolated)
             val crashMarker = TrainingRecoveryProcessTestProtocol.crashMarker(
                 applicationContext,
@@ -231,10 +232,10 @@ class TrainingRecoveryProcessTestService : Service() {
                 neuralEngine = engine,
                 deviceGuard = DeviceGuard(isolated),
                 worldModel = WorldModel(isolated, repository),
-                repository = repository
+                repository = repository,
+                initiallyPaused = true
             )
             manager = activeManager
-            activeManager.pauseTraining()
 
             var recoveredItem: TrainingData? = null
             withTimeout(45_000L) {
@@ -296,7 +297,7 @@ class TrainingRecoveryProcessTestService : Service() {
 
             activeManager.close()
             manager = null
-            database.close()
+            openedDatabase.close()
             database = null
 
             writeJson(
