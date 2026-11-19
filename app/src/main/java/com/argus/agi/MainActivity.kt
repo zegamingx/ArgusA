@@ -236,7 +236,7 @@ fun MainScreen(viewModel: ArgusViewModel) {
 
     if (showScreenPrivacyDisclosure) {
         AlertDialog(
-            onDismissRequest = { showScreenPrivacyDisclosure = false },
+            onDismissRequest = { /* The disclosure is closed only by an explicit button choice. */ },
             title = {
                 Text(
                     text = "Optional screen access",
