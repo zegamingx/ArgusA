@@ -19,6 +19,23 @@ on:
       - ".github/workflows/validate-native.yml"
       - ".github/workflows/argus-main-release.yml"
 
+  push:
+    branches:
+      - main
+    paths:
+      - "app/**"
+      - "gradle/**"
+      - "gradlew"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - "version.properties"
+      - "tools/cmake-compat/**"
+      - "tools/native-tests/**"
+      - "tools/ci/**"
+      - ".github/workflows/validate-native.yml"
+      - ".github/workflows/argus-main-release.yml"
+
 permissions:
   contents: read
 
