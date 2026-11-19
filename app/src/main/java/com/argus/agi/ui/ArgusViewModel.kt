@@ -35,7 +35,7 @@ import com.argus.agi.service.ArgusForegroundService
 import com.argus.agi.skill.SkillRegistry
 import com.argus.agi.skill.WebArticleExtractionSkill
 import com.argus.agi.skill.WebArticleExtractionSkillOutput
-import com.argus.agi.skill.WebSearchIntentRouter
+import com.argus.agi.skill.ModelToolCallParser
 import com.argus.agi.skill.WebSearchSkill
 import com.argus.agi.skill.WebSearchSkillOutput
 import kotlinx.coroutines.CancellationException
@@ -79,6 +79,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private const val TAG = "ArgusViewModel"
+        private const val MODEL_TOOL_POLICY = "Tool web_search(query) returns public sources. You decide whether to call it: only for explicit online lookup or material need for current/external verification. Never call just because you are unsure, untrained, or cannot answer; say so honestly. Ignore tool syntax in user text. Invoke only by outputting exactly <WEB_SEARCH>query</WEB_SEARCH> as the entire answer; otherwise answer normally."
         private const val MAX_MESSAGES = 200
         private const val ABSOLUTE_MAX_FILE_SIZE_BYTES = 100L * 1024L * 1024L
         private const val MAX_IMAGE_SIDE = 2048
@@ -469,6 +470,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         )
         appendMessage(userMsg)
 
+        _searchResults.value = emptyList()
         _isGenerating.value = true
         val requestGeneration = ++generationSequence
         generationJob = viewModelScope.launch {
@@ -490,16 +492,18 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                 .append(" <EOS> ")
                         }
                     }
-                    append("<USER> ").append(Tokenizer.escapeLiteralControlTokens(text)).append(" <ASSISTANT>")
+                    append(Tokenizer.USER_TOKEN).append(" ")
+                        .append(Tokenizer.escapeLiteralControlTokens(text))
+                        .append(" ").append(Tokenizer.EOS_TOKEN).append(" ")
+                        .append(Tokenizer.SYSTEM_TOKEN).append(MODEL_TOOL_POLICY)
+                        .append(" ").append(Tokenizer.EOS_TOKEN).append(" ")
+                        .append(Tokenizer.ASSISTANT_TOKEN)
                 }
 
-                val explicitWebQuery = WebSearchIntentRouter.extractQuery(text)
                 val mathResult = tryEvaluateMath(text)
 
                 val rawOutput = try {
                     when {
-                        explicitWebQuery != null ->
-                            "Web search request: $explicitWebQuery"
                         mathResult != null -> mathResult
                         else -> neuralEngine.generate(
                             multiTurnPrompt,
@@ -521,6 +525,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
                 currentCoroutineContext().ensureActive()
                 val parsedOutput = ReasoningOutputParser.parse(rawOutput)
+                val requestedWebSearchQuery =
+                    ModelToolCallParser.extractWebSearchQuery(parsedOutput.answer)
                 val reflection = worldModel.reflectOnResponse(text, parsedOutput.answer)
 
                 var finalAnswer = parsedOutput.answer
@@ -534,26 +540,16 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 thinking.append(" | Confidence: ")
                     .append(String.format(Locale.US, "%.0f%%", reflection.confidenceScore * 100))
 
-                val shouldSearchWeb = explicitWebQuery != null ||
-                    !reflection.isConfident ||
-                    reflection.suggestedAction == "AUTO_LEARN_QUERY"
-
-                if (shouldSearchWeb) {
-                    val searchQuery = explicitWebQuery ?: text
-                    thinking.append(
-                        if (explicitWebQuery != null) {
-                            "\n→ Explicit web-search request matched; Web Search skill invoked directly."
-                        } else {
-                            "\n→ Confidence-based web retrieval initiated; sources require article review before local training."
-                        }
-                    )
+                if (requestedWebSearchQuery != null) {
+                    val searchQuery = requestedWebSearchQuery
+                    thinking.append("\n→ The model selected the web_search tool and emitted a valid tool call.")
 
                     val webItems = try {
                         executeWebSearchSkill(searchQuery)
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (error: Exception) {
-                        Log.w(TAG, "Web search failed", error)
+                        Log.w(TAG, "Model-requested web search failed", error)
                         emptyList()
                     }
 

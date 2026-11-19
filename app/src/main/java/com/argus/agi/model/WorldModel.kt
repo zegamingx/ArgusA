@@ -188,6 +188,9 @@ class WorldModel(
         )
     }
 
+    /**
+     * Provides diagnostic confidence only. This heuristic must never authorize external tools.
+     */
     fun reflectOnResponse(query: String, rawResponse: String): ReflectionEvaluation {
         val trimmed = rawResponse.trim()
 
@@ -212,8 +215,8 @@ class WorldModel(
             return ReflectionEvaluation(
                 isConfident = false,
                 confidenceScore = 0.25f,
-                reasoningNote = "The model expressed uncertainty. Further internal review may be needed.",
-                suggestedAction = "AUTO_LEARN_QUERY"
+                reasoningNote = "The model expressed uncertainty; confidence diagnostics do not select external actions.",
+                suggestedAction = null
             )
         }
 
@@ -250,7 +253,7 @@ class WorldModel(
                 append("Response length score %.2f.".format(lengthScore))
                 if (mentionsKnownEntity) append(" References a World Model entity.")
             },
-            suggestedAction = if (finalScore < 0.60f) "AUTO_LEARN_QUERY" else null
+            suggestedAction = null
         )
     }
 
