@@ -43,6 +43,7 @@ class VulkanDeviceProfileMapperTest {
               "subgroupSupportedStages": 32,
               "subgroupSupportedOperations": 20,
               "subgroupSizeControl": true,
+              "subgroupSizeControlEnabled": true,
               "shaderFloat16": true,
               "shaderFloat16FeatureSupported": true,
               "shaderFloat16FeatureEnabled": false,
