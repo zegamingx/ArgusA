@@ -156,6 +156,14 @@ class TrainingManagerProcessRecoveryTest {
             assertTrue(recovery.getInt("optimizerStep") >= 0)
             assertTrue(recovery.getString("checkpointSha256Fingerprint").isNotBlank())
 
+            if (!case.expectedCommittedCheckpoint || case.expectedStatus == "COMPLETED") {
+                assertEquals(
+                    "A rollback or already-finalized transaction must retain the exact checkpoint bytes.",
+                    crash.getString("checkpointSha256Fingerprint"),
+                    recovery.getString("checkpointSha256Fingerprint")
+                )
+            }
+
             if (case.expectedCommittedCheckpoint) {
                 val committedStep = crash.getInt("journalCommittedOptimizerStep")
                 assertTrue(
