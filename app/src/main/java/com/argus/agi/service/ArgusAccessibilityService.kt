@@ -149,6 +149,16 @@ class ArgusAccessibilityService : AccessibilityService() {
 
                         ArgusApp.worldModel.updateScreenContext(rootPackage, fullText)
 
+                        // The user may revoke screen consent while this coroutine is
+                        // dispatched. Recheck after the transient write and clear it
+                        // again if the access decision changed during that window.
+                        if (!excludedAppsManager.isScreenPerceptionEnabled() ||
+                            excludedAppsManager.isAppExcluded(rootPackage)
+                        ) {
+                            ArgusApp.worldModel.clearScreenContext()
+                            return@launch
+                        }
+
                         if (excludedAppsManager.isAppTrainingAllowed(rootPackage)) {
                             ArgusApp.trainingManager.enqueueScreenData(
                                 packageName = rootPackage,
