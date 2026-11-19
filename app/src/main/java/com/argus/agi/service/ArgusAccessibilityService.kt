@@ -67,7 +67,10 @@ class ArgusAccessibilityService : AccessibilityService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val isTraversing = AtomicBoolean(false)
 
-    private var lastScreenTextHash = 0
+    @Volatile
+    private var currentScreenPackage: String? = null
+
+    private var lastScreenTextHash: Int? = null
     private var lastPerceptionTime = 0L
 
     override fun onCreate() {
@@ -85,6 +88,7 @@ class ArgusAccessibilityService : AccessibilityService() {
         if (instance == this) {
             instance = null
         }
+        invalidateScreenContext()
         return super.onUnbind(intent)
     }
 
@@ -93,12 +97,20 @@ class ArgusAccessibilityService : AccessibilityService() {
         if (instance == this) {
             instance = null
         }
+        invalidateScreenContext()
         serviceScope.cancel()
         Log.i(TAG, "ArgusAccessibilityService destroyed.")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null || !excludedAppsManager.isScreenPerceptionEnabled()) return
+        if (event == null) {
+            invalidateScreenContext()
+            return
+        }
+        if (!excludedAppsManager.isScreenPerceptionEnabled()) {
+            invalidateScreenContext()
+            return
+        }
 
         val eventType = event.eventType
         if (eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
@@ -107,10 +119,19 @@ class ArgusAccessibilityService : AccessibilityService() {
             return
         }
 
-        val eventPackage = event.packageName?.toString() ?: return
+        val eventPackage = event.packageName?.toString()?.takeIf { it.isNotBlank() }
+        if (eventPackage == null) {
+            invalidateScreenContext()
+            return
+        }
+
+        if (currentScreenPackage != eventPackage) {
+            invalidateScreenContext(eventPackage)
+        }
         if (isInputMethodPackage(eventPackage) ||
             excludedAppsManager.isAppExcluded(eventPackage)
         ) {
+            invalidateScreenContext(eventPackage)
             return
         }
 
@@ -123,8 +144,13 @@ class ArgusAccessibilityService : AccessibilityService() {
         try {
             val rootNode = rootInActiveWindow ?: return
             try {
-                val rootPackage = rootNode.packageName?.toString() ?: eventPackage
-                if (excludedAppsManager.isAppExcluded(rootPackage)) return
+                val rootPackage = rootNode.packageName?.toString()
+                    ?.takeIf { it.isNotBlank() }
+                    ?: eventPackage
+                if (rootPackage != eventPackage || excludedAppsManager.isAppExcluded(rootPackage)) {
+                    invalidateScreenContext()
+                    return
+                }
 
                 val gatheredText = StringBuilder()
                 val visitedCount = IntArray(1)
@@ -138,28 +164,33 @@ class ArgusAccessibilityService : AccessibilityService() {
                 lastScreenTextHash = currentHash
 
                 serviceScope.launch {
+                    val worldModel = ArgusApp.worldModel
                     try {
-                        // Consent and app access are checked again at the persistence boundary
-                        // to avoid storing text after the user has revoked consent.
-                        if (!excludedAppsManager.isScreenPerceptionEnabled() ||
+                        // A delayed job from a previous app must not publish after the
+                        // active package changed or its screen-reading grant was revoked.
+                        if (currentScreenPackage != rootPackage ||
+                            !excludedAppsManager.isScreenPerceptionEnabled() ||
                             excludedAppsManager.isAppExcluded(rootPackage)
                         ) {
+                            worldModel.clearScreenContext(rootPackage)
                             return@launch
                         }
 
-                        ArgusApp.worldModel.updateScreenContext(rootPackage, fullText)
+                        worldModel.updateScreenContext(rootPackage, fullText)
 
-                        // The user may revoke screen consent while this coroutine is
-                        // dispatched. Recheck after the transient write and clear it
-                        // again if the access decision changed during that window.
-                        if (!excludedAppsManager.isScreenPerceptionEnabled() ||
+                        // Package transitions can race this asynchronous dispatch. Clear
+                        // only this package's context so a newer allowed app is untouched.
+                        if (currentScreenPackage != rootPackage ||
+                            !excludedAppsManager.isScreenPerceptionEnabled() ||
                             excludedAppsManager.isAppExcluded(rootPackage)
                         ) {
-                            ArgusApp.worldModel.clearScreenContext()
+                            worldModel.clearScreenContext(rootPackage)
                             return@launch
                         }
 
-                        if (excludedAppsManager.isAppTrainingAllowed(rootPackage)) {
+                        if (currentScreenPackage == rootPackage &&
+                            excludedAppsManager.isAppTrainingAllowed(rootPackage)
+                        ) {
                             ArgusApp.trainingManager.enqueueScreenData(
                                 packageName = rootPackage,
                                 title = "Layar: ${rootPackage.substringAfterLast('.')}",
@@ -167,6 +198,7 @@ class ArgusAccessibilityService : AccessibilityService() {
                             )
                         }
                     } catch (error: Exception) {
+                        worldModel.clearScreenContext(rootPackage)
                         Log.e(TAG, "Screen perception dispatch failed.", error)
                     }
                 }
@@ -180,7 +212,15 @@ class ArgusAccessibilityService : AccessibilityService() {
         }
     }
 
-    override fun onInterrupt() = Unit
+    override fun onInterrupt() {
+        invalidateScreenContext()
+    }
+
+    private fun invalidateScreenContext(nextPackage: String? = null) {
+        currentScreenPackage = nextPackage
+        lastScreenTextHash = null
+        ArgusApp.worldModel.clearScreenContext()
+    }
 
     private fun traverseNodes(
         node: AccessibilityNodeInfo?,

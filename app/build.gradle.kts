@@ -111,6 +111,18 @@ tasks.configureEach {
 // for new tests and gradual migration.
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
+    // Robolectric downloads instrumented Android SDK jars outside Gradle's
+    // repository resolver. Use Google's Maven Central mirror to avoid intermittent
+    // missing checksum/POM responses from repo1.maven.org on CI.
+    systemProperty(
+        "robolectric.dependency.repo.id",
+        "google-maven-central-mirror"
+    )
+    systemProperty(
+        "robolectric.dependency.repo.url",
+        "https://maven-central.storage-download.googleapis.com/maven2"
+    )
+
     // JEP 472 (JDK 24+): explicitly opt in for Conscrypt native calls in JVM tests.
     if (Runtime.version().feature() >= 24) {
         jvmArgs("--enable-native-access=ALL-UNNAMED")

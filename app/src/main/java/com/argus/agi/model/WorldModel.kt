@@ -209,12 +209,25 @@ class WorldModel(
         }
     }
 
-    fun clearScreenContext() {
+    /**
+     * Clears transient screen context. When [expectedPackage] is supplied, a delayed
+     * job may clear only the context still owned by that package; it must not erase
+     * a newer app's context after an application switch.
+     */
+    fun clearScreenContext(expectedPackage: String? = null) {
         synchronized(screenContextLock) {
+            val activePackage = entities["active_screen_app"]?.value
+            if (expectedPackage != null && activePackage != expectedPackage) return
+
             screenContextExpiryJob?.cancel()
             screenContextExpiryJob = null
-            entities.remove("active_screen_app")
-            entities.remove("last_screen_content")
+
+            val removedApp = entities.remove("active_screen_app") != null
+            val removedContent = entities.remove("last_screen_content") != null
+            if (!removedApp && !removedContent && !_currentContextSummary.value.startsWith("App: ")) {
+                return
+            }
+
             publishSnapshot()
             _currentContextSummary.value = "System ready."
         }
