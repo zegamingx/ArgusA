@@ -280,7 +280,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                 fontWeight = FontWeight.SemiBold
                             )
                             Text(
-                                text = "Independent opt-in. Requires screen perception and an allowed app.",
+                                text = "Global opt-in. Each app also needs its own Train permission in the allowlist.",
                                 style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                 color = ArgusTextMuted
                             )
@@ -535,14 +535,11 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                                 .fillMaxWidth()
                                                 .clip(RoundedCornerShape(10.dp))
                                                 .background(ArgusSurfaceVariant)
-                                                .clickable(enabled = !protectedApp) {
-                                                    viewModel.toggleAppAccess(app.packageName)
-                                                }
                                                 .padding(horizontal = 10.dp, vertical = 7.dp),
                                             horizontalArrangement = Arrangement.SpaceBetween,
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                            Column(modifier = Modifier.weight(1f).padding(end = 6.dp)) {
                                                 Text(
                                                     text = app.appName,
                                                     style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp),
@@ -551,9 +548,9 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                                 )
                                                 Text(
                                                     text = when {
-                                                        protectedApp -> "Protected by default"
-                                                        app.isExcluded -> "Blocked • tap to allow"
-                                                        else -> "Allowed for on-device perception"
+                                                        protectedApp -> "Protected by best-effort matching"
+                                                        app.isExcluded -> "Blocked by default"
+                                                        else -> "Allowed for local screen reading"
                                                     },
                                                     style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                                     color = if (protectedApp) ArgusWarning else if (!app.isExcluded) ArgusCyanGlow else ArgusTextMuted
@@ -564,16 +561,42 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                                     color = ArgusTextMuted
                                                 )
                                             }
-                                            Checkbox(
-                                                checked = !app.isExcluded && !protectedApp,
-                                                enabled = !protectedApp,
-                                                onCheckedChange = { viewModel.toggleAppAccess(app.packageName) },
-                                                colors = CheckboxDefaults.colors(
-                                                    checkedColor = ArgusCyanPrimary,
-                                                    uncheckedColor = ArgusCardBorder,
-                                                    checkmarkColor = ArgusDarkBg
-                                                )
-                                            )
+                                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Text(
+                                                        text = "Read",
+                                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                                                        color = ArgusTextSecondary
+                                                    )
+                                                    Checkbox(
+                                                        checked = !app.isExcluded && !protectedApp,
+                                                        enabled = !protectedApp,
+                                                        onCheckedChange = { viewModel.toggleAppAccess(app.packageName) },
+                                                        colors = CheckboxDefaults.colors(
+                                                            checkedColor = ArgusCyanPrimary,
+                                                            uncheckedColor = ArgusCardBorder,
+                                                            checkmarkColor = ArgusDarkBg
+                                                        )
+                                                    )
+                                                }
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Text(
+                                                        text = "Train",
+                                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                                                        color = ArgusTextSecondary
+                                                    )
+                                                    Checkbox(
+                                                        checked = app.isTrainingAllowed && !app.isExcluded && !protectedApp,
+                                                        enabled = !protectedApp && !app.isExcluded && screenTrainingEnabled,
+                                                        onCheckedChange = { viewModel.toggleAppTrainingAccess(app.packageName) },
+                                                        colors = CheckboxDefaults.colors(
+                                                            checkedColor = ArgusCyanPrimary,
+                                                            uncheckedColor = ArgusCardBorder,
+                                                            checkmarkColor = ArgusDarkBg
+                                                        )
+                                                    )
+                                                }
+                                            }
                                         }
                                     }
                                 }
