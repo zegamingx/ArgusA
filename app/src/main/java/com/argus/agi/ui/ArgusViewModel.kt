@@ -152,6 +152,12 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     val screenTrainingEnabled: StateFlow<Boolean> = excludedAppsManager.screenTrainingEnabled
     val accessibilityActionsEnabled: StateFlow<Boolean> = excludedAppsManager.accessibilityActionsEnabled
 
+    private val _isClearingScreenData = MutableStateFlow(false)
+    val isClearingScreenData: StateFlow<Boolean> = _isClearingScreenData.asStateFlow()
+
+    private val _screenDataClearMessage = MutableStateFlow<String?>(null)
+    val screenDataClearMessage: StateFlow<String?> = _screenDataClearMessage.asStateFlow()
+
     private val _cameraLuminance = MutableStateFlow(0f)
     val cameraLuminance: StateFlow<Float> = _cameraLuminance.asStateFlow()
 
@@ -1543,6 +1549,43 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setAccessibilityActionsEnabled(enabled: Boolean) {
         excludedAppsManager.setAccessibilityActionsEnabled(enabled)
+    }
+
+    fun clearScreenDerivedData() {
+        if (!_isClearingScreenData.compareAndSet(false, true)) return
+
+        // Revoke both collection permissions before waiting for training to reach
+        // a safe deletion boundary. A failed deletion never silently re-enables them.
+        excludedAppsManager.setScreenPerceptionEnabled(false)
+        excludedAppsManager.setScreenTrainingEnabled(false)
+        _screenDataClearMessage.value = "Screen access disabled. Removing stored screen-derived records..."
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result = trainingManager.clearScreenDerivedData()
+                withContext(Dispatchers.Main) {
+                    _screenDataClearMessage.value =
+                        "Removed ${result.totalRecordsDeleted} local screen-derived records " +
+                            "(${result.trainingItemsDeleted} training items, " +
+                            "${result.corpusDocumentsDeleted} corpus documents, " +
+                            "${result.screenMemoriesDeleted} screen memories). " +
+                            "Previous optimizer updates are not selectively reversed."
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.e(TAG, "Could not clear screen-derived local data.", error)
+                withContext(Dispatchers.Main) {
+                    _screenDataClearMessage.value =
+                        "Screen access remains disabled. Data cleanup was not completed: " +
+                            (error.message ?: error.javaClass.simpleName)
+                }
+            } finally {
+                withContext(Dispatchers.Main) {
+                    _isClearingScreenData.value = false
+                }
+            }
+        }
     }
 
     fun toggleAppAccess(packageName: String) {
