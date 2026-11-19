@@ -136,6 +136,9 @@ try {
             "--path-glob", "*.lineage",
             "--path-glob", ".env",
             "--path-glob", ".env.*",
+            "--path-glob", "key.properties",
+            "--path-glob", "keystore.properties",
+            "--path-glob", "signing.properties",
             "--path-glob", "signing/**",
             "--replace-text", $rulesPath
         )
@@ -145,7 +148,7 @@ try {
             throw "Could not enumerate rewritten Git objects."
         }
 
-        $sensitivePathPattern = '(?i)(^|/)([^/]+[.](jks|keystore|jceks|bks|p12|pfx|pem|pk8|key|cer|crt|der|mobileprovision|idsig|lineage)|[.]env([.][^/]*)?)$|(^|/)signing/'
+        $sensitivePathPattern = '(?i)(^|/)([^/]+[.](jks|keystore|jceks|bks|p12|pfx|pem|pk8|key|cer|crt|der|mobileprovision|idsig|lineage)|[.]env([.][^/]*)?|key[.]properties|keystore[.]properties|signing[.]properties)$|(^|/)signing/'
         $sensitivePaths = @(
             $objectPaths | ForEach-Object {
                 $entry = [string]$_
