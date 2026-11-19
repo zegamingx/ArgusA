@@ -2048,8 +2048,60 @@ class TrainingManager internal constructor(
             return false
         }
         requireJournalCompatibility(snapshot, "live committed-batch recovery")
-        check(neuralEngine.saveCheckpoint()) {
-            "The optimizer committed the batch, but its checkpoint could not be secured."
+
+        val modelIdentityFingerprint = requireNotNull(snapshot.modelIdentityFingerprint) {
+            "A live committed training journal must contain a model identity fingerprint."
+        }
+        val optimizerConfigFingerprint = requireNotNull(snapshot.optimizerConfigFingerprint) {
+            "A live committed training journal must contain an optimizer configuration fingerprint."
+        }
+
+        val checkpointFingerprint = snapshot.checkpointSha256Fingerprint?.let { expectedFingerprint ->
+            val activeFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
+            check(activeFingerprint == expectedFingerprint) {
+                "The live committed journal does not match the active checkpoint file."
+            }
+            activeFingerprint
+        } ?: run {
+            check(neuralEngine.saveCheckpoint()) {
+                "The optimizer committed the batch, but its checkpoint could not be secured."
+            }
+
+            val savedCheckpointFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
+            TrainingCommitJournal.writeCommitted(
+                file = trainingCommitJournalFile,
+                baselineOptimizerStep = snapshot.baselineOptimizerStep,
+                committedOptimizerStep = requireNotNull(snapshot.committedOptimizerStep),
+                entries = snapshot.entries,
+                modelIdentityFingerprint = modelIdentityFingerprint,
+                optimizerConfigFingerprint = optimizerConfigFingerprint,
+                checkpointSha256Fingerprint = savedCheckpointFingerprint
+            )
+
+            val checkpointBoundJournal = requireNotNull(
+                TrainingCommitJournal.read(trainingCommitJournalFile)
+            ) {
+                "The recovered checkpoint-bound training journal could not be read back."
+            }
+            check(
+                checkpointBoundJournal.checkpointSha256Fingerprint == savedCheckpointFingerprint
+            ) {
+                "The recovered checkpoint SHA-256 was not persisted in the training journal."
+            }
+            requireJournalCompatibility(
+                checkpointBoundJournal,
+                "live committed-batch recovery after checkpoint binding"
+            )
+            check(
+                neuralEngine.checkpointFileSha256Fingerprint() == savedCheckpointFingerprint
+            ) {
+                "The active checkpoint changed while its recovered journal binding was being verified."
+            }
+            savedCheckpointFingerprint
+        }
+
+        check(checkpointFingerprint.isNotBlank()) {
+            "A live committed batch cannot be finalized without a checkpoint fingerprint."
         }
 
         val repository = requireNotNull(repo) {
