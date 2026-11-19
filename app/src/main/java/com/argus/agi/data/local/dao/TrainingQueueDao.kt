@@ -67,6 +67,12 @@ interface TrainingQueueDao {
     @Query("SELECT * FROM training_items WHERE id = :id LIMIT 1")
     suspend fun getItem(id: String): TrainingItemEntity?
 
+    @Query("SELECT * FROM training_items WHERE source LIKE :sourcePattern ORDER BY timestamp ASC")
+    suspend fun getItemsBySourcePattern(sourcePattern: String): List<TrainingItemEntity>
+
+    @Query("DELETE FROM training_items WHERE source LIKE :sourcePattern")
+    suspend fun deleteItemsBySourcePattern(sourcePattern: String): Int
+
     @Query("UPDATE training_items SET status = 'TRAINING' WHERE id = :id AND status = 'QUEUED'")
     suspend fun markTrainingStarted(id: String): Int
 
