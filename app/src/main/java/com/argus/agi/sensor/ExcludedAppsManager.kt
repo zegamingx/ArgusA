@@ -122,6 +122,18 @@ class ExcludedAppsManager(private val context: Context) {
     }
 
     /**
+     * Revokes all screen-reading and screen-training app grants.
+     * The independent accessibility-action consent is intentionally preserved.
+     */
+    fun clearScreenAppAllowlist() {
+        prefs.edit()
+            .putStringSet(KEY_ALLOWED_PACKAGES, emptySet())
+            .putStringSet(KEY_TRAINING_ALLOWED_PACKAGES, emptySet())
+            .apply()
+        _excludedPackages.value = emptySet()
+    }
+
+    /**
      * Every package is blocked until the user explicitly allows it.
      * Sensitive categories remain blocked even if stale preferences contain
      * their package names.
