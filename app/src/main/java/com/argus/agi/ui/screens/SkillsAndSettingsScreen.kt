@@ -96,6 +96,8 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
     val screenPerceptionEnabled by viewModel.screenPerceptionEnabled.collectAsState()
     val screenTrainingEnabled by viewModel.screenTrainingEnabled.collectAsState()
     val accessibilityActionsEnabled by viewModel.accessibilityActionsEnabled.collectAsState()
+    val isClearingScreenData by viewModel.isClearingScreenData.collectAsState()
+    val screenDataClearMessage by viewModel.screenDataClearMessage.collectAsState()
 
     var isBatteryExpanded by remember { mutableStateOf(true) }
     var isSkillsExpanded by remember { mutableStateOf(false) }
@@ -236,7 +238,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "When enabled, ARGUS reads visible text and content descriptions from the active window of apps you explicitly allow below. Captured text is processed and stored only in ARGUS local data. It is not sent to a remote training service. Password and sensitive input fields are filtered, but ordinary screen text can still contain private information.",
+                        text = "When enabled, ARGUS reads visible text and content descriptions from the active window of apps you explicitly allow below. Screen context remains local and temporary. If you separately allow screen training, snippets enter a local training queue but not the replayable document corpus. Password and sensitive input fields are filtered, but ordinary screen text can still contain private information.",
                         style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
                         color = ArgusTextSecondary,
                         lineHeight = 16.sp
@@ -310,6 +312,40 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                         Checkbox(
                             checked = accessibilityActionsEnabled,
                             onCheckedChange = viewModel::setAccessibilityActionsEnabled
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Clearing removes screen memories, queued/completed screen samples, and legacy screen-only corpus records. It cannot selectively reverse model-weight updates from screen text that was trained previously.",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                        color = ArgusTextMuted,
+                        lineHeight = 15.sp
+                    )
+                    Button(
+                        onClick = viewModel::clearScreenDerivedData,
+                        enabled = !isClearingScreenData,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = ArgusWarning.copy(alpha = 0.16f),
+                            contentColor = ArgusWarning,
+                            disabledContainerColor = ArgusSurfaceVariant,
+                            disabledContentColor = ArgusTextMuted
+                        ),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text(
+                            text = if (isClearingScreenData) "Clearing screen data…" else "Disable & clear screen data",
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp
+                        )
+                    }
+                    screenDataClearMessage?.let { message ->
+                        Text(
+                            text = message,
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = ArgusTextSecondary,
+                            lineHeight = 16.sp
                         )
                     }
                 }
