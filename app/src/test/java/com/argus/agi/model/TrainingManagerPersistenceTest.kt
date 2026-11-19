@@ -55,6 +55,8 @@ class TrainingManagerPersistenceTest {
 
             privacyPreferences.edit()
                 .putBoolean("screen_training_enabled", true)
+                .putStringSet("allowed_screen_packages", setOf("com.example.reader"))
+                .putStringSet("allowed_screen_training_packages", setOf("com.example.reader"))
                 .commit()
             manager.enqueueScreenData(
                 packageName = "com.example.reader",
