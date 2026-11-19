@@ -187,7 +187,8 @@ class TrainingManager internal constructor(
         const val MAX_STREAMED_DOCUMENT_CHARACTERS = 2 * 1024 * 1024
         const val MAX_STREAMED_DOCUMENT_CHUNKS = 8_192
         private const val IDLE_POLL_MS = 500L
-        private const val SCREEN_SOURCE_PREFIX = "Screen ("
+        private const val SCREEN_SOURCE_PREFIX = "ScreenTrainingV2 ("
+        private const val LEGACY_SCREEN_SOURCE_PREFIX = "Screen ("
         private const val SCREEN_PRIVACY_PREFERENCES = "argus_excluded_apps"
         private const val SCREEN_TRAINING_CONSENT_KEY = "screen_training_enabled"
         private const val SCREEN_PERCEPTION_CONSENT_KEY = "screen_perception_enabled"
@@ -1808,8 +1809,21 @@ class TrainingManager internal constructor(
         }
     }
 
+    private fun String.isLegacyScreenTrainingSource(): Boolean =
+        startsWith(LEGACY_SCREEN_SOURCE_PREFIX)
+
     private fun String.isScreenTrainingSource(): Boolean =
-        startsWith(SCREEN_SOURCE_PREFIX)
+        startsWith(SCREEN_SOURCE_PREFIX) || isLegacyScreenTrainingSource()
+
+    private fun String.screenTrainingPackageName(): String? {
+        val prefix = when {
+            startsWith(SCREEN_SOURCE_PREFIX) -> SCREEN_SOURCE_PREFIX
+            isLegacyScreenTrainingSource() -> LEGACY_SCREEN_SOURCE_PREFIX
+            else -> return null
+        }
+        if (!endsWith(")")) return null
+        return removePrefix(prefix).removeSuffix(")").takeIf(String::isNotBlank)
+    }
 
     private fun isScreenTrainingConsentEnabled(packageName: String): Boolean {
         if (!trainingPreferences.getBoolean(SCREEN_PERCEPTION_CONSENT_KEY, false) ||
@@ -1832,11 +1846,6 @@ class TrainingManager internal constructor(
         return packageName in allowedForReading &&
             packageName in allowedForTraining &&
             packageName !in protectedPackages
-    }
-
-    private fun String.screenTrainingPackageName(): String? {
-        if (!startsWith(SCREEN_SOURCE_PREFIX) || !endsWith(")")) return null
-        return removePrefix(SCREEN_SOURCE_PREFIX).removeSuffix(")").takeIf(String::isNotBlank)
     }
 
     fun enqueueData(source: String, title: String, content: String) {
@@ -2531,6 +2540,26 @@ class TrainingManager internal constructor(
                 run {
                     reconcilePersistedTrainingCommit(repository)
                     repository.recoverInterruptedTrainingItems()
+
+                    // Old releases queued screen text automatically with no per-app
+                    // Train consent. Remove every legacy row that has not already
+                    // changed model weights. Optimizer-committed rows are finalized
+                    // below from their durable journal without applying another update.
+                    val legacyScreenItems = repository.getLegacyScreenTrainingItemsSnapshot()
+                    legacyScreenItems
+                        .filterNot { it.status == TrainingStatus.OPTIMIZER_COMMITTED }
+                        .forEach { legacyItem ->
+                            repository.deleteTrainingItem(legacyItem.id)
+                        }
+                    synchronized(queueLock) {
+                        _nextQueue.value = _nextQueue.value.filterNot {
+                            it.source.isLegacyScreenTrainingSource()
+                        }
+                        _completedQueue.value = _completedQueue.value.filterNot {
+                            it.source.isLegacyScreenTrainingSource()
+                        }
+                    }
+
                     val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
                     val pending = repository.getPendingQueueSnapshot()
                     val databaseIds = (committed + pending).mapTo(HashSet()) { it.id }
@@ -3355,7 +3384,14 @@ class TrainingManager internal constructor(
         failed.documentId?.let { documentId ->
             repository.markCorpusDocumentPartial(documentId)
         }
-        pushCompleted(failed)
+        if (item.source.isLegacyScreenTrainingSource()) {
+            repository.deleteTrainingItem(item.id)
+            synchronized(queueLock) {
+                _completedQueue.value = _completedQueue.value.filterNot { it.id == item.id }
+            }
+        } else {
+            pushCompleted(failed)
+        }
         if (!reason.isNullOrBlank()) {
             Log.w(TAG, "Training item '${item.title}' failed: $reason")
         }
@@ -3490,7 +3526,16 @@ class TrainingManager internal constructor(
             }
         }
 
-        pushCompleted(finished)
+        if (finished.source.isLegacyScreenTrainingSource()) {
+            // The legacy optimizer transaction has now been finalized. Its screen
+            // sample is removed instead of being retained as replayable history.
+            repository.deleteTrainingItem(finished.id)
+            synchronized(queueLock) {
+                _completedQueue.value = _completedQueue.value.filterNot { it.id == finished.id }
+            }
+        } else {
+            pushCompleted(finished)
+        }
         if (
             finished.documentId != null &&
             finished.chunkIndex >= finished.totalChunks
