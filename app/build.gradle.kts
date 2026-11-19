@@ -186,6 +186,7 @@ dependencies {
     testImplementation(libs.androidx.core)
     testImplementation(libs.androidx.junit)
     testImplementation(libs.junit4)
+    testImplementation(libs.org.json)
     testImplementation(libs.junit.jupiter)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.robolectric)
