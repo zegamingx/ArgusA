@@ -138,6 +138,8 @@ class TrainingManager internal constructor(
         context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
     private val validationFilesDirectory = context.applicationContext.filesDir
     private val ingestionStagingDirectory = context.applicationContext.cacheDir
+    private val trainingPreferences =
+        context.applicationContext.getSharedPreferences(SCREEN_PRIVACY_PREFERENCES, Context.MODE_PRIVATE)
     private val trainingCommitJournalFile =
         File(validationFilesDirectory, TrainingCommitJournal.FILE_NAME)
     private val conversationalValidationPersistence =
@@ -162,6 +164,10 @@ class TrainingManager internal constructor(
         data class Barrier(
             val completion: CompletableDeferred<Unit>
         ) : QueuePersistenceOperation
+
+        data class DeleteItem(
+            val itemId: String
+        ) : QueuePersistenceOperation
     }
 
     companion object {
@@ -180,6 +186,8 @@ class TrainingManager internal constructor(
         const val MAX_STREAMED_DOCUMENT_CHUNKS = 8_192
         private const val IDLE_POLL_MS = 500L
         private const val SCREEN_SOURCE_PREFIX = "Screen ("
+        private const val SCREEN_PRIVACY_PREFERENCES = "argus_excluded_apps"
+        private const val SCREEN_TRAINING_CONSENT_KEY = "screen_training_enabled"
         private const val SCREEN_DATA_CLEAR_POLL_MS = 100L
         private const val SCREEN_DATA_CLEAR_TIMEOUT_MS = 120_000L
         private val REASONING_BLOCK_PATTERN = Regex(
@@ -1801,6 +1809,9 @@ class TrainingManager internal constructor(
     private fun String.isScreenTrainingSource(): Boolean =
         startsWith(SCREEN_SOURCE_PREFIX)
 
+    private fun isScreenTrainingConsentEnabled(): Boolean =
+        trainingPreferences.getBoolean(SCREEN_TRAINING_CONSENT_KEY, false)
+
     fun enqueueData(source: String, title: String, content: String) {
         if (content.isBlank() || closed) return
 
@@ -2820,6 +2831,7 @@ class TrainingManager internal constructor(
                 operation.completion.completeExceptionally(error)
             }
             is QueuePersistenceOperation.Clear,
+            is QueuePersistenceOperation.DeleteItem,
             is QueuePersistenceOperation.Save -> Unit
         }
     }
@@ -2862,6 +2874,18 @@ class TrainingManager internal constructor(
 
             is QueuePersistenceOperation.Barrier -> {
                 operation.completion.complete(Unit)
+            }
+
+            is QueuePersistenceOperation.DeleteItem -> {
+                runSuspendCatching {
+                    val repository = repo ?: throw IllegalStateException(
+                        "Training queue persistence is unavailable.",
+                        repositoryInitialization.exceptionOrNull()
+                    )
+                    repository.deleteTrainingItem(operation.itemId)
+                }.onFailure { error ->
+                    Log.e(TAG, "Failed to delete a revoked screen-training item.", error)
+                }
             }
 
             is QueuePersistenceOperation.Save -> {
@@ -2940,6 +2964,22 @@ class TrainingManager internal constructor(
             if (screenTrainingPurgePending) return@synchronized null
             val first = list.firstOrNull() ?: return@synchronized null
             if (expectedStatus != null && first.status != expectedStatus) {
+                return@synchronized null
+            }
+
+            if (
+                first.status == TrainingStatus.QUEUED &&
+                first.source.isScreenTrainingSource() &&
+                !isScreenTrainingConsentEnabled()
+            ) {
+                val deletion = persistenceOperations.trySend(
+                    QueuePersistenceOperation.DeleteItem(first.id)
+                )
+                if (deletion.isFailure) {
+                    Log.e(TAG, "Could not queue deletion of screen data after training consent was revoked.")
+                    return@synchronized null
+                }
+                _nextQueue.value = list.drop(1)
                 return@synchronized null
             }
 
