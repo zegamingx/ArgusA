@@ -24,6 +24,9 @@ internal interface ComputeBackend {
 
     fun initializeAfterModelReady(): Boolean
 
+    /** Reset failed native state before an explicit initialization retry. */
+    fun resetForRetry()
+
     fun synchronizeAuthoritativeState(): Boolean
 
     fun releaseDeviceResourcesForMemoryPressure(): Boolean
