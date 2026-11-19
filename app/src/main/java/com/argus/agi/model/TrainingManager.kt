@@ -3170,10 +3170,31 @@ class TrainingManager internal constructor(
         items: MutableList<TrainingData>,
         runtimeContextLength: Int
     ): Boolean {
-        require(items.isNotEmpty()) { "A training micro-batch cannot be empty." }
         val repository = requireNotNull(repo) {
             "Durable training storage is required before optimizer updates can begin."
         }
+
+        // A user can revoke per-app consent after popNext reserves a row but before
+        // this micro-batch reaches the optimizer. Drop those screen samples while
+        // the model is still at its durable pre-batch checkpoint.
+        val revokedScreenItems = items.filter { item ->
+            item.source.isScreenTrainingSource() &&
+                item.source.screenTrainingPackageName()?.let(::isScreenTrainingConsentEnabled) != true
+        }
+        if (revokedScreenItems.isNotEmpty()) {
+            revokedScreenItems.forEach { item ->
+                repository.deleteTrainingItem(item.id)
+            }
+            val revokedIds = revokedScreenItems.mapTo(HashSet(), TrainingData::id)
+            items.removeAll { it.id in revokedIds }
+        }
+
+        if (items.isEmpty()) {
+            _currentTrainingItem.value = null
+            _activeDocument.value = null
+            return true
+        }
+
         items.mapNotNull(TrainingData::documentId)
             .forEach(validationRunDocumentIds::add)
 
