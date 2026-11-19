@@ -131,19 +131,33 @@ try {
             $pushExitCode = $LASTEXITCODE
             $pushOutput | ForEach-Object { Write-Host $_ }
 
-            $nonPullRefRejections = @(
-                $pushOutput | Where-Object {
-                    $_ -match 'rejected|failed' -and $_ -notmatch 'refs/pull/'
+            $pushLines = @($pushOutput | ForEach-Object { [string]$_ })
+            $pullRefRejections = @(
+                $pushLines | Where-Object {
+                    $_ -match '(?i)(rejected|failed)' -and $_ -match 'refs/pull/'
                 }
             )
-            if ($nonPullRefRejections.Count -gt 0) {
-                throw "One or more non-PR refs failed to update. Inspect the push output; do not repeat blindly."
-            }
-            if ($pushExitCode -ne 0 -and $nonPullRefRejections.Count -gt 0) {
-                throw "Mirror push failed for refs other than GitHub-managed pull-request refs."
+            $unexpectedPushErrors = @(
+                $pushLines | Where-Object {
+                    $_ -match '(?i)(fatal:|error:|remote error:|unable to|could not|timed out|hang up|rejected|failed)' -and
+                    $_ -notmatch 'refs/pull/'
+                }
+            )
+
+            if ($pushExitCode -ne 0) {
+                if ($pullRefRejections.Count -gt 0 -and $unexpectedPushErrors.Count -eq 0) {
+                    Write-Warning "GitHub rejected only GitHub-managed refs/pull entries. Branch/tag updates still require independent verification."
+                }
+                else {
+                    throw "Mirror push returned exit code $pushExitCode. Do not proceed; inspect the complete output and verify every remote ref."
+                }
             }
 
-            Write-Host "Mirror push finished. Contact GitHub Support with the changed-ref and first-changed-commit details."
+            if ($unexpectedPushErrors.Count -gt 0) {
+                throw "One or more non-PR refs failed to update. Do not proceed."
+            }
+
+            Write-Host "Mirror push command completed. Verify every remote branch/tag and contact GitHub Support with changed-ref details."
         }
         else {
             Write-Host "No remote refs were changed. Run again with -PushCleanedHistory and the explicit confirmation only after review."
