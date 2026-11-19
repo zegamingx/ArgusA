@@ -2422,7 +2422,7 @@ class TrainingManager(
                         val safetySnapshot = deviceGuard.safetyState.value
                         val memorySnapshot = captureTrainingMemorySnapshot()
                         val runtimeConfiguration = RuntimeConfigurationPlanner.create(
-                            backend = VulkanTrainingBackend,
+                            backend = neuralEngine.runtimeComputeBackend,
                             resources = RuntimeResourceSnapshot(
                                 availableAppHeapBytes = memorySnapshot.availableHeapBytes,
                                 maximumAppHeapBytes = memorySnapshot.maximumHeapBytes,
