@@ -179,6 +179,9 @@ class TrainingManager internal constructor(
         const val MAX_STREAMED_DOCUMENT_CHARACTERS = 2 * 1024 * 1024
         const val MAX_STREAMED_DOCUMENT_CHUNKS = 8_192
         private const val IDLE_POLL_MS = 500L
+        private const val SCREEN_SOURCE_PREFIX = "Screen ("
+        private const val SCREEN_DATA_CLEAR_POLL_MS = 100L
+        private const val SCREEN_DATA_CLEAR_TIMEOUT_MS = 120_000L
         private val REASONING_BLOCK_PATTERN = Regex(
             "<THINK>(.*?)</THINK>",
             RegexOption.DOT_MATCHES_ALL
@@ -192,6 +195,8 @@ class TrainingManager internal constructor(
     // StateFlow<List<TrainingData>> sebagai satu-satunya sumber kebenaran untuk queue.
     // Channel hanya berfungsi sebagai wakeup signal, bukan storage.
     private val queueLock = Any()
+    @Volatile
+    private var screenTrainingPurgePending = false
     private val corpusSchedulingMutex = Mutex()
     private val seedSchedulingMutex = Mutex()
     private var lastScheduledTimestamp: Long = System.currentTimeMillis()
@@ -1684,6 +1689,118 @@ class TrainingManager internal constructor(
         )
     }
 
+    /**
+     * Queues explicitly approved screen text without retaining it in the durable
+     * document corpus. Screen perception and screen-derived training are separate
+     * opt-ins; this method is called only after the service rechecks both.
+     */
+    fun enqueueScreenData(packageName: String, title: String, content: String) {
+        if (content.isBlank() || closed || screenTrainingPurgePending) return
+
+        val source = "$SCREEN_SOURCE_PREFIX$packageName)"
+        val processed = TextModalityProcessor.process(
+            rawText = content,
+            documentTitle = title,
+            chunkSize = 160,
+            overlap = 0,
+            tokenizer = neuralEngine.tokenizer
+        )
+        if (processed.isEmpty()) return
+
+        val newItems = processed.map { chunk ->
+            TrainingData(
+                source = source,
+                title = if (processed.size > 1) chunk.segmentTitle else title.ifBlank { "Approved screen text" },
+                content = chunk.content,
+                status = TrainingStatus.QUEUED
+            )
+        }
+
+        synchronized(queueLock) {
+            if (closed || screenTrainingPurgePending) return
+            val current = _nextQueue.value
+            val nonDuplicates = newItems.filter { item ->
+                current.none {
+                    it.source == item.source &&
+                        it.content == item.content &&
+                        it.documentTitle == null
+                }
+            }
+            if (nonDuplicates.isNotEmpty()) appendPersistingQueueItems(nonDuplicates)
+        }
+    }
+
+    /**
+     * Deletes stored screen-derived text without touching unrelated training data.
+     *
+     * Active screen samples are allowed to finish before deletion. An optimizer-
+     * committed item that cannot be finalized is a hard stop: deleting its journal
+     * row would break checkpoint/queue recovery invariants.
+     */
+    suspend fun clearScreenDerivedData(): com.argus.agi.data.repository.ScreenDataDeletionResult {
+        val wasPaused = _isTrainingPaused.value
+        synchronized(queueLock) {
+            screenTrainingPurgePending = true
+            _isTrainingPaused.value = true
+        }
+
+        try {
+            awaitQueuePersistenceIdle()
+            var screenItems = requireNotNull(repo) {
+                "Durable training storage is unavailable; screen data was not deleted."
+            }.getScreenTrainingItemsSnapshot()
+
+            if (wasPaused && screenItems.any { item ->
+                    item.status == TrainingStatus.TRAINING ||
+                        item.status == TrainingStatus.OPTIMIZER_COMMITTED
+                }
+            ) {
+                throw IllegalStateException(
+                    "Screen-derived training has an active or optimizer-committed item. " +
+                        "Resume and finalize training before clearing its stored records."
+                )
+            }
+
+            val deadline = System.currentTimeMillis() + SCREEN_DATA_CLEAR_TIMEOUT_MS
+            while (screenItems.any { item ->
+                    item.status == TrainingStatus.TRAINING ||
+                        item.status == TrainingStatus.OPTIMIZER_COMMITTED
+                }
+            ) {
+                if (System.currentTimeMillis() >= deadline) {
+                    throw IllegalStateException(
+                        "Screen-derived training did not reach a safe deletion state. " +
+                            "No screen records were deleted."
+                    )
+                }
+                delay(SCREEN_DATA_CLEAR_POLL_MS)
+                awaitQueuePersistenceIdle()
+                screenItems = requireNotNull(repo).getScreenTrainingItemsSnapshot()
+            }
+
+            awaitQueuePersistenceIdle()
+            val repository = requireNotNull(repo)
+            val deletionResult = repository.clearScreenDerivedData()
+
+            synchronized(queueLock) {
+                _nextQueue.value = _nextQueue.value.filterNot { it.source.isScreenTrainingSource() }
+                _completedQueue.value =
+                    _completedQueue.value.filterNot { it.source.isScreenTrainingSource() }
+            }
+            worldModel.clearScreenContext()
+            return deletionResult
+        } finally {
+            synchronized(queueLock) {
+                screenTrainingPurgePending = false
+                _isTrainingPaused.value = wasPaused
+            }
+            wakeupSignal.trySend(Unit)
+        }
+    }
+
+    private fun String.isScreenTrainingSource(): Boolean =
+        startsWith(SCREEN_SOURCE_PREFIX)
+
     fun enqueueData(source: String, title: String, content: String) {
         if (content.isBlank() || closed) return
 
@@ -2646,6 +2763,7 @@ class TrainingManager internal constructor(
                     }
                 } finally {
                     resetForceOverrideIfSet()
+                    _currentTrainingItem.value = null
                 }
 
                 val currentSafety = deviceGuard.safetyState.value
@@ -2820,6 +2938,9 @@ class TrainingManager internal constructor(
         val reservation = synchronized(queueLock) {
             val list = _nextQueue.value
             val first = list.firstOrNull() ?: return@synchronized null
+            if (screenTrainingPurgePending && first.source.isScreenTrainingSource()) {
+                return@synchronized null
+            }
             if (expectedStatus != null && first.status != expectedStatus) {
                 return@synchronized null
             }
