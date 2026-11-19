@@ -1831,7 +1831,12 @@ internal object VulkanTrainingBackend : ComputeBackend {
         return true
     }
 
-    /** Reset failed native state before the user explicitly retries Vulkan initialization. */
+    /** Reset failed native state before an explicit backend initialization retry. */
+    override fun resetForRetry() {
+        resetRuntimeForRetry()
+    }
+
+    /** Retained Vulkan-specific entry point for internal recovery orchestration. */
     @Synchronized
     fun resetRuntimeForRetry() {
         if (nativeReady && !synchronizeTrainingStateMirrors()) {
