@@ -14,6 +14,7 @@ import com.argus.agi.runtime.RuntimeModelConstraints
 import com.argus.agi.runtime.RuntimeResourceSnapshot
 import com.argus.agi.sensor.DeviceGuard
 import com.argus.agi.sensor.PrivacyAppHeuristics
+import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -3076,6 +3077,26 @@ class TrainingManager internal constructor(
             )
             return null
         }
+
+        // Consent may be revoked while the durable QUEUED -> TRAINING transition
+        // is being persisted. Recheck at the final boundary before the worker can
+        // construct a batch or call the optimizer.
+        if (
+            item.source.isScreenTrainingSource() &&
+            item.source.screenTrainingPackageName()?.let(::isScreenTrainingConsentEnabled) != true
+        ) {
+            try {
+                persistenceOperations.send(QueuePersistenceOperation.DeleteItem(item.id))
+            } catch (closedChannel: ClosedSendChannelException) {
+                Log.e(
+                    TAG,
+                    "Could not queue deletion of screen item '${item.id}' after consent was revoked.",
+                    closedChannel
+                )
+            }
+            return null
+        }
+
         return item
     }
 
