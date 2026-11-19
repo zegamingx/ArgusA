@@ -31,8 +31,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $repositoryUrl = "https://github.com/zegamingx/ArgusA.git"
-$mirrorPath = Join-Path $WorkingRoot "ArgusA-clean-history.git"
-$rulesPath = Join-Path $WorkingRoot "argusa-history-redactions.txt"
 
 function Invoke-Git {
     param(
@@ -64,6 +62,9 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 if (-not (Test-Path -LiteralPath $WorkingRoot -PathType Container)) {
     throw "WorkingRoot must be an existing folder on encrypted storage."
 }
+$resolvedWorkingRoot = (Resolve-Path -LiteralPath $WorkingRoot).Path
+$mirrorPath = Join-Path $resolvedWorkingRoot "ArgusA-clean-history.git"
+$rulesPath = Join-Path $resolvedWorkingRoot "argusa-history-redactions.txt"
 if (Test-Path -LiteralPath $mirrorPath) {
     throw "The destination already exists. Move it aside or securely remove it before retrying."
 }
