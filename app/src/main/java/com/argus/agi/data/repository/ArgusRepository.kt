@@ -521,6 +521,51 @@ class ArgusRepository(
         }
 
     /**
+     * Removes corpus documents imported by the legacy automatic Accessibility
+     * pipeline. The caller must first finalize every optimizer-committed screen
+     * queue item so this operation cannot invalidate an active replay journal.
+     *
+     * Deduplicated documents are preserved when any non-screen source remains.
+     */
+    suspend fun deleteLegacyScreenCorpusDocuments(): Int =
+        withContext(Dispatchers.IO) {
+            db.withTransaction {
+                val documentIds = corpusDao
+                    .getDocumentIdsBySourcePattern(LEGACY_SCREEN_SOURCE_PATTERN)
+                    .distinct()
+                var deletedDocuments = 0
+
+                for (documentId in documentIds) {
+                    corpusDao.deleteSourcesBySourcePattern(
+                        documentId = documentId,
+                        sourcePattern = LEGACY_SCREEN_SOURCE_PATTERN
+                    )
+
+                    val remainingSources = corpusDao.getSources(documentId)
+                    if (remainingSources.isEmpty()) {
+                        deletedDocuments += corpusDao.deleteDocument(documentId)
+                    } else {
+                        val retainedSource = remainingSources.first()
+                        check(
+                            corpusDao.updateDocumentPrimarySource(
+                                documentId = documentId,
+                                source = retainedSource.source,
+                                canonicalUrl = retainedSource.canonicalUrl,
+                                language = retainedSource.language
+                            ) == 1
+                        ) {
+                            "Could not restore retained corpus provenance for document $documentId."
+                        }
+                        check(corpusDao.refreshDocumentRightsStatus(documentId) == 1) {
+                            "Could not refresh corpus rights for document $documentId."
+                        }
+                    }
+                }
+                deletedDocuments
+            }
+        }
+
+    /**
      * Deletes records originating only from Accessibility screen capture.
      *
      * The caller must pause training and ensure there are no screen-derived
