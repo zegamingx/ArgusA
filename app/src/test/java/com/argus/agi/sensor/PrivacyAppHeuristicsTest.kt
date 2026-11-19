@@ -44,6 +44,24 @@ class PrivacyAppHeuristicsTest {
                 packageName = "com.example.records"
             )
         )
+        assertTrue(
+            PrivacyAppHeuristics.isPrivacySensitiveApp(
+                appName = "PayPal",
+                packageName = "com.paypal.android.p2pmobile"
+            )
+        )
+        assertTrue(
+            PrivacyAppHeuristics.isPrivacySensitiveApp(
+                appName = "Venmo",
+                packageName = "com.venmo"
+            )
+        )
+        assertTrue(
+            PrivacyAppHeuristics.isPrivacySensitiveApp(
+                appName = "Cash App",
+                packageName = "com.squareup.cash"
+            )
+        )
     }
 
     @Test
