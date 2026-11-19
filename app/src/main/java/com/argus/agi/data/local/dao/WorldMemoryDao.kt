@@ -27,6 +27,12 @@ interface WorldMemoryDao {
     @Query("DELETE FROM world_memories WHERE timestamp < :threshold")
     suspend fun deleteExpired(threshold: Long)
 
+    @Query(
+        "DELETE FROM world_memories WHERE `key` IN ('active_screen_app', 'last_screen_content') " +
+            "OR source IN ('Accessibility Perception', 'Screen OCR/Text Parser')"
+    )
+    suspend fun deleteScreenContextMemories(): Int
+
     @Query("DELETE FROM world_memories")
     suspend fun clearAll()
 }
