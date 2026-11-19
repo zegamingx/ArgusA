@@ -78,6 +78,26 @@ interface CorpusDao {
     @Query("SELECT * FROM corpus_sources WHERE documentId = :documentId ORDER BY importedAtEpochMs ASC")
     suspend fun getSources(documentId: String): List<CorpusSourceEntity>
 
+    @Query("SELECT DISTINCT documentId FROM corpus_sources WHERE source LIKE :sourcePattern")
+    suspend fun getDocumentIdsBySourcePattern(sourcePattern: String): List<String>
+
+    @Query("DELETE FROM corpus_sources WHERE documentId = :documentId AND source LIKE :sourcePattern")
+    suspend fun deleteSourcesBySourcePattern(
+        documentId: String,
+        sourcePattern: String
+    ): Int
+
+    @Query(
+        "UPDATE corpus_documents SET source = :source, canonicalUrl = :canonicalUrl, " +
+            "language = :language WHERE id = :documentId"
+    )
+    suspend fun updateDocumentPrimarySource(
+        documentId: String,
+        source: String,
+        canonicalUrl: String?,
+        language: String?
+    ): Int
+
     @Query("SELECT * FROM corpus_documents WHERE id = :documentId LIMIT 1")
     suspend fun getDocument(documentId: String): CorpusDocumentEntity?
 
