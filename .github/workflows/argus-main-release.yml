@@ -1,44 +1,32 @@
-name: Argus Main Release
+name: Argus Signed Release
 
-# Every matching main push builds, signs, and publishes the verified APK automatically.
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "app/**"
-      - "gradle/**"
-      - "gradlew"
-      - "build.gradle.kts"
-      - "settings.gradle.kts"
-      - "gradle.properties"
-      - "version.properties"
-      - "tools/cmake-compat/**"
-      - "tools/native-tests/**"
-      - "tools/ci/**"
-      - "README.md"
-      - ".github/workflows/argus-main-release.yml"
-      - ".github/workflows/validate-native.yml"
+  workflow_dispatch:
+
 permissions:
   contents: read
 
 concurrency:
-  group: argus-main-release
+  group: argus-signed-release
   cancel-in-progress: false
 
 jobs:
   build-release:
-    permissions:
-      contents: write
-    name: Lint, test, sign and package APK
+    if: github.ref == 'refs/heads/main'
+    name: Verify, sign and publish Argus APK
     runs-on: ubuntu-26.04
     timeout-minutes: 60
+    environment:
+      name: release-signing
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout main source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          ref: main
+          fetch-depth: 0
 
       - name: Set up JDK 25
         uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
@@ -54,28 +42,19 @@ jobs:
           sdk_root="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
           echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
-
           test -s "${sdk_root}/platforms/android-37.0/android.jar"
           test -x "${sdk_root}/platform-tools/adb"
-
-          sdk_platform="${sdk_root}/platforms/android-37.0"
-          if [[ ! -s "${sdk_platform}/android.jar" ]]; then
-            echo "::error::Android SDK platform android-37.0 is not installed."
-            exit 1
-          fi
-          echo "Android SDK platform ready: minSdk 34, compileSdk 37, targetSdk 37."
+          echo "Android SDK API 37.0 is ready."
 
       - name: Install Android NDK r30 and CMake 4.5.0
         shell: bash
         run: |
           set -euo pipefail
-
           sdkmanager_path="$(command -v sdkmanager || true)"
           if [[ -z "${sdkmanager_path}" ]]; then
             sdkmanager_path="$(find "${ANDROID_HOME}/cmdline-tools" -type f -name sdkmanager -print -quit)"
           fi
           test -n "${sdkmanager_path}"
-
           set +o pipefail
           yes | "${sdkmanager_path}" --licenses >/dev/null
           set -o pipefail
@@ -86,7 +65,6 @@ jobs:
           cmake_archive="cmake-${cmake_version}-linux-x86_64.tar.gz"
           cmake_archive_path="${RUNNER_TEMP}/${cmake_archive}"
           cmake_root="${RUNNER_TEMP}/cmake-${cmake_version}"
-          # Fetch the official Kitware release asset; the pinned SHA-256 below remains mandatory.
           curl --fail --location --retry 3 --silent --show-error \
             "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/${cmake_archive}" \
             --output "${cmake_archive_path}"
@@ -99,7 +77,6 @@ jobs:
           glslc_path="$(find "${ANDROID_HOME}/ndk/30.0.16248370/shader-tools" -type f -name glslc -print -quit)"
           test -n "${glslc_path}"
           test -x "${glslc_path}"
-          echo "NDK r30, CMake ${cmake_version}, and NDK glslc are ready."
 
       - name: Resolve application version
         shell: bash
@@ -109,69 +86,71 @@ jobs:
           minor="$(awk -F= '$1 == "VERSION_MINOR" { print $2 }' version.properties)"
           patch="$(awk -F= '$1 == "VERSION_PATCH" { print $2 }' version.properties)"
           build="$(awk -F= '$1 == "VERSION_BUILD" { print $2 }' version.properties)"
-
-          version_name="${major}.${minor}.${patch}"
           if [[ ! "${build}" =~ ^[0-9]+$ || "${build}" -le 0 ]]; then
             echo "::error::Invalid VERSION_BUILD in version.properties."
             exit 1
           fi
-
-          echo "VERSION_NAME=${version_name}" >> "${GITHUB_ENV}"
+          echo "VERSION_NAME=${major}.${minor}.${patch}" >> "${GITHUB_ENV}"
           echo "VERSION_BUILD=${build}" >> "${GITHUB_ENV}"
-          echo "Building Argus ${version_name} (${build}) from $(git rev-parse HEAD)."
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
 
-      - name: Restore persistent Argus signing identity
+      - name: Build, sign and verify with protected signing secrets
         env:
-          GH_TOKEN: ${{ github.token }}
+          ARGUS_SIGNING_KEY_BASE64: ${{ secrets.ARGUS_SIGNING_KEY_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ARGUS_SIGNING_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ARGUS_SIGNING_KEY_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p signing
-          gh release download argus-signing-key --repo "${GITHUB_REPOSITORY}" --pattern "ARGUS-RELEASE-KEY.p12" --dir signing
+          set +x
+          : "${ARGUS_SIGNING_KEY_BASE64:?Missing environment secret ARGUS_SIGNING_KEY_BASE64.}"
+          : "${STORE_PASSWORD:?Missing environment secret ARGUS_SIGNING_STORE_PASSWORD.}"
+          : "${KEY_PASSWORD:?Missing environment secret ARGUS_SIGNING_KEY_PASSWORD.}"
 
-          mv "signing/ARGUS-RELEASE-KEY.p12" "signing/argus-release.p12"
-          test -s "signing/argus-release.p12"
-          keytool -list -storetype PKCS12 -keystore "signing/argus-release.p12" -storepass "" -alias upload >/dev/null
+          umask 077
+          keystore_path="${RUNNER_TEMP}/argus-release.p12"
+          trap 'rm -f -- "${keystore_path}"' EXIT
+          printf '%s' "${ARGUS_SIGNING_KEY_BASE64}" | base64 --decode > "${keystore_path}"
+          unset ARGUS_SIGNING_KEY_BASE64
+          test -s "${keystore_path}"
+          chmod 600 "${keystore_path}"
 
-          echo "KEYSTORE_PATH=${GITHUB_WORKSPACE}/signing/argus-release.p12" >> "${GITHUB_ENV}"
-          echo "STORE_PASSWORD=" >> "${GITHUB_ENV}"
-          echo "KEY_PASSWORD=" >> "${GITHUB_ENV}"
-          echo "Persistent Argus signing identity restored."
+          keytool -list -storetype PKCS12 \
+            -keystore "${keystore_path}" \
+            -storepass "${STORE_PASSWORD}" \
+            -alias upload >/dev/null
 
-      - name: Verify Gradle Wrapper
-        run: |
+          expected_fingerprint="950f815c01b819c07a9cdbc21bd150936d8623871c28c211a974e8263ab34cf6"
+          actual_fingerprint="$(
+            keytool -exportcert -storetype PKCS12 \
+              -keystore "${keystore_path}" \
+              -storepass "${STORE_PASSWORD}" \
+              -alias upload |
+              sha256sum | awk '{print tolower($1)}'
+          )"
+          if [[ "${actual_fingerprint}" != "${expected_fingerprint}" ]]; then
+            echo "::error::Signing certificate mismatch. Expected the current v1.0.13 signer; refusing to publish."
+            exit 1
+          fi
+
           chmod +x gradlew
-          ./gradlew --version
+          env -u ANDROID_SDK_ROOT \
+            KEYSTORE_PATH="${keystore_path}" \
+            KEY_ALIAS=upload \
+            STORE_PASSWORD="${STORE_PASSWORD}" \
+            KEY_PASSWORD="${KEY_PASSWORD}" \
+            ./gradlew --no-daemon --no-configuration-cache --stacktrace \
+              clean :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
 
-      - name: Run release lint, unit tests and APK build
-        run: |
-          chmod +x gradlew
-          env -u ANDROID_SDK_ROOT ./gradlew --no-daemon --no-configuration-cache --stacktrace clean :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
-
-      - name: Verify APK signature and prepare checksums
-        shell: bash
-        run: |
-          set -euo pipefail
           apk_path="app/build/outputs/apk/release/app-release.apk"
           test -s "${apk_path}"
-
           for abi in arm64-v8a armeabi-v7a x86_64; do
             unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
           done
 
-          "${ANDROID_HOME}/build-tools/37.0.0/apksigner" verify --verbose --print-certs "${apk_path}" | tee /tmp/apksigner-report.txt
-
-          expected_fingerprint="$(
-            keytool -exportcert \
-              -storetype PKCS12 \
-              -keystore "${KEYSTORE_PATH}" \
-              -storepass "" \
-              -alias upload |
-              sha256sum |
-              awk '{print $1}' |
-              tr '[:upper:]' '[:lower:]'
-          )"
-          actual_fingerprint="$(
+          "${ANDROID_HOME}/build-tools/37.0.0/apksigner" \
+            verify --verbose --print-certs "${apk_path}" > "${RUNNER_TEMP}/apksigner-report.txt"
+          apk_fingerprint="$(
             awk '
               tolower($0) ~ /certificate sha-256 digest:/ {
                 line = $0
@@ -180,79 +159,49 @@ jobs:
                 print tolower(line)
                 exit
               }
-            ' /tmp/apksigner-report.txt
+            ' "${RUNNER_TEMP}/apksigner-report.txt"
           )"
-
-          echo "Expected upload certificate SHA-256: ${expected_fingerprint}"
-          echo "Actual APK signer SHA-256: ${actual_fingerprint}"
-
-          if [[ ! "${expected_fingerprint}" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::Could not extract the persistent upload certificate fingerprint."
+          if [[ "${apk_fingerprint}" != "${expected_fingerprint}" ]]; then
+            echo "::error::Built APK signer does not match the approved certificate."
             exit 1
           fi
 
-          if [[ ! "${actual_fingerprint}" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::Could not extract the APK signer certificate fingerprint."
-            exit 1
-          fi
+          mkdir -p "${RUNNER_TEMP}/argus-dist"
+          release_apk="ARGUS-v${VERSION_NAME}.apk"
+          cp "${apk_path}" "${RUNNER_TEMP}/argus-dist/${release_apk}"
+          cp "${apk_path}" "${RUNNER_TEMP}/argus-dist/ARGUS.apk"
+          (cd "${RUNNER_TEMP}/argus-dist" && sha256sum "${release_apk}" > "${release_apk}.sha256")
+          (cd "${RUNNER_TEMP}/argus-dist" && sha256sum ARGUS.apk > ARGUS.apk.sha256)
 
-          if [[ "${expected_fingerprint}" != "${actual_fingerprint}" ]]; then
-            echo "::error::APK certificate does not match the persistent Argus signing identity."
-            exit 1
-          fi
-
-          mkdir -p dist
-          cp "${apk_path}" "dist/ARGUS-v${VERSION_NAME}.apk"
-          cp "${apk_path}" "dist/ARGUS.apk"
-          (cd dist && sha256sum "ARGUS-v${VERSION_NAME}.apk" > "ARGUS-v${VERSION_NAME}.apk.sha256")
-          (cd dist && sha256sum "ARGUS.apk" > "ARGUS.apk.sha256")
-          echo "APK signature verified against the persistent Argus upload certificate."
-
-      - name: Remove signing key from workspace
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The keystore was downloaded only to sign this APK; do not leave it
-          # in the workspace for later steps.
-          if [[ -n "${KEYSTORE_PATH:-}" ]]; then
-            rm -f -- "${KEYSTORE_PATH}"
-          fi
-          rmdir signing 2>/dev/null || true
-
-      - name: Publish latest signed APK to GitHub Release tag
+      - name: Publish verified APK and checksums
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          apk_path="app/build/outputs/apk/release/app-release.apk"
           release_apk="ARGUS-v${VERSION_NAME}.apk"
-          cp "${apk_path}" "${release_apk}"
-          cp "${apk_path}" "ARGUS.apk"
-          sha256sum "${release_apk}" > "${release_apk}.sha256"
-          sha256sum "ARGUS.apk" > "ARGUS.apk.sha256"
+          cd "${RUNNER_TEMP}/argus-dist"
 
-          release_notes="$(printf "Latest verified Argus main build.\nVersion: v%s\nBuild: %s\nSource commit: %s\n" "${VERSION_NAME}" "${VERSION_BUILD}" "${GITHUB_SHA}")"
-          if gh release view "Release" >/dev/null 2>&1; then
-            gh release edit "Release" --title "Argus Latest Release" --notes "${release_notes}"
-            gh release upload "Release" "${release_apk}" "${release_apk}.sha256" "ARGUS.apk" "ARGUS.apk.sha256" --clobber
+          release_notes="$(printf "Latest manually approved Argus release.\nVersion: v%s\nBuild: %s\nSource commit: %s\nSigner SHA-256: %s\n" "${VERSION_NAME}" "${VERSION_BUILD}" "${SOURCE_SHA}" "950f815c01b819c07a9cdbc21bd150936d8623871c28c211a974e8263ab34cf6")"
+          if gh release view Release >/dev/null 2>&1; then
+            gh release edit Release --title "Argus Latest Release" --notes "${release_notes}"
+            gh release upload Release "${release_apk}" "${release_apk}.sha256" ARGUS.apk ARGUS.apk.sha256 --clobber
           else
-            gh release create "Release" "${release_apk}" "${release_apk}.sha256" "ARGUS.apk" "ARGUS.apk.sha256" \
-              --target "${GITHUB_SHA}" \
+            gh release create Release "${release_apk}" "${release_apk}.sha256" ARGUS.apk ARGUS.apk.sha256 \
+              --target "${SOURCE_SHA}" \
               --title "Argus Latest Release" \
               --notes "${release_notes}"
           fi
 
-          # Keep the rolling Release tag attached to the exact commit that produced these assets.
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/Release" \
-            --raw-field "sha=${GITHUB_SHA}" --field "force=true" >/dev/null
+            --raw-field "sha=${SOURCE_SHA}" --field "force=true" >/dev/null
 
-          stale_assets="$(gh release view "Release" --json assets --jq '.assets[].name' |
+          stale_assets="$(gh release view Release --json assets --jq '.assets[].name' |
             grep -E '^ARGUS-v[0-9]+\.[0-9]+\.[0-9]+\.apk(\.sha256)?$' || true)"
           while IFS= read -r stale_asset; do
             [[ -z "${stale_asset}" || "${stale_asset}" == "${release_apk}" || "${stale_asset}" == "${release_apk}.sha256" ]] && continue
-            gh release delete-asset "Release" "${stale_asset}" --yes
-            echo "Removed superseded release asset: ${stale_asset}"
+            gh release delete-asset Release "${stale_asset}" --yes
+            echo "Removed superseded APK asset: ${stale_asset}"
           done <<< "${stale_assets}"
 
-          echo "Published signed Argus APK and SHA-256 checksums to https://github.com/${GITHUB_REPOSITORY}/releases/tag/Release"
+          echo "Published verified Argus APK assets to the rolling Release tag."
