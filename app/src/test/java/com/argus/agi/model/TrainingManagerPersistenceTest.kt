@@ -87,7 +87,7 @@ class TrainingManagerPersistenceTest {
 
             val queuedItems = repository.getPendingQueueSnapshot()
             assertEquals(1, queuedItems.size)
-            assertTrue(queuedItems.single().source.startsWith("Screen (com.example.reader)"))
+            assertTrue(queuedItems.single().source.startsWith("ScreenTrainingV2 (com.example.reader)"))
             assertEquals(0, repository.getCorpusDocumentCount())
 
             privacyPreferences.edit()
@@ -99,7 +99,7 @@ class TrainingManagerPersistenceTest {
             assertEquals(0, deletion.corpusDocumentsDeleted)
             assertEquals(0, deletion.screenMemoriesDeleted)
             assertTrue(repository.getPendingQueueSnapshot().isEmpty())
-            assertTrue(manager.nextQueue.value.none { it.source.startsWith("Screen (") })
+            assertTrue(manager.nextQueue.value.none { it.source.startsWith("ScreenTrainingV2 (") })
         }
     }
 
