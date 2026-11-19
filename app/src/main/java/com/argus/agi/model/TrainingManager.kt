@@ -127,7 +127,8 @@ class TrainingManager internal constructor(
     private val worldModel: WorldModel,
     private val trainingDispatcher: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1),
     private val repository: com.argus.agi.data.repository.ArgusRepository? = null,
-    private val onCommitBoundary: (TrainingCommitBoundary) -> Unit = {}
+    private val onCommitBoundary: (TrainingCommitBoundary) -> Unit = {},
+    private val initiallyPaused: Boolean = false
 ) : Closeable {
 
     private val repositoryInitialization =
@@ -217,7 +218,7 @@ class TrainingManager internal constructor(
     private val _lossHistory = MutableStateFlow<List<Float>>(emptyList())
     val lossHistory: StateFlow<List<Float>> = _lossHistory.asStateFlow()
 
-    private val _isTrainingPaused = MutableStateFlow(false)
+    private val _isTrainingPaused = MutableStateFlow(initiallyPaused)
     val isTrainingPaused: StateFlow<Boolean> = _isTrainingPaused.asStateFlow()
 
     private val _totalStepsExecuted = MutableStateFlow(0)
