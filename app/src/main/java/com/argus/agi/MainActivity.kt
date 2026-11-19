@@ -28,7 +28,9 @@ import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.systemBars
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -205,6 +207,16 @@ fun MainScreen(viewModel: ArgusViewModel) {
     var currentScreen by rememberSaveable { mutableStateOf(ArgusScreen.CHAT) }
     var hasRequestedNotificationPermission by rememberSaveable { mutableStateOf(false) }
 
+    var showScreenPrivacyDisclosure by rememberSaveable { mutableStateOf(false) }
+    val screenPrivacyPreferences = remember(context) {
+        context.getSharedPreferences("argus_screen_privacy", Context.MODE_PRIVATE)
+    }
+    LaunchedEffect(screenPrivacyPreferences) {
+        if (!screenPrivacyPreferences.getBoolean("first_run_disclosure_acknowledged", false)) {
+            showScreenPrivacyDisclosure = true
+        }
+    }
+
     if (showGenesisBoot) {
         GenesisBootScreen(
             viewModel = viewModel,
@@ -220,6 +232,47 @@ fun MainScreen(viewModel: ArgusViewModel) {
             subtitle = "RESTORING THE NEURAL CORE & CHAT HISTORY..."
         )
         return
+    }
+
+    if (showScreenPrivacyDisclosure) {
+        AlertDialog(
+            onDismissRequest = { showScreenPrivacyDisclosure = false },
+            title = {
+                Text(
+                    text = "Optional screen access",
+                    fontWeight = FontWeight.SemiBold
+                )
+            },
+            text = {
+                Text(
+                    text = "ARGUS can optionally read visible text and content descriptions from the active app window through Android Accessibility. Screen reading is off by default, and every app starts blocked until you allow it. If enabled, captured text is processed in local ARGUS memory; a separate opt-in is required before screen text can enter local model training. Password fields are filtered, but ordinary screen text can still contain private information. Financial, credential, private-messaging, email, health, and personal-media apps remain blocked. Accessibility clicks have a separate opt-in. This notice does not enable any of these features."
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        screenPrivacyPreferences.edit()
+                            .putBoolean("first_run_disclosure_acknowledged", true)
+                            .apply()
+                        showScreenPrivacyDisclosure = false
+                    }
+                ) {
+                    Text("Understood")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        screenPrivacyPreferences.edit()
+                            .putBoolean("first_run_disclosure_acknowledged", true)
+                            .apply()
+                        showScreenPrivacyDisclosure = false
+                    }
+                ) {
+                    Text("Not now")
+                }
+            }
+        )
     }
 
     // Resilient notification permission launcher with result piped into ViewModel
