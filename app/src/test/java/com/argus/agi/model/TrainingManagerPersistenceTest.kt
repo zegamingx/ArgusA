@@ -144,7 +144,7 @@ class TrainingManagerPersistenceTest {
     }
 
     @Test
-    fun injectedFailuresAtEveryDurableCommitBoundaryPreserveTheCorrectState() = runBlocking {
+    fun injectedFailuresAtEveryTrainingTransactionBoundaryPreserveTheCorrectState() = runBlocking {
         val cases = listOf(
             TrainingCommitBoundary.PREPARED_JOURNAL_DURABLE to TrainingStatus.FAILED,
             TrainingCommitBoundary.OPTIMIZER_UPDATE_APPLIED to TrainingStatus.FAILED,
@@ -189,7 +189,7 @@ class TrainingManagerPersistenceTest {
                             "A durable optimizer commit must retain its recovery journal."
                         }
                         assertTrue(committed.isCommitted)
-                        assertTrue(!committed.checkpointSha256Fingerprint.isNullOrBlank())
+                        assertFalse(committed.checkpointSha256Fingerprint.isNullOrBlank())
                         assertEquals(
                             item.id,
                             repository.getOptimizerCommittedTrainingItemsSnapshot().single().id
@@ -255,6 +255,10 @@ class TrainingManagerPersistenceTest {
 
         try {
             checkpoint.delete()
+            check(!journalFile.exists() || journalFile.delete()) {
+                "The previous training transaction journal could not be cleared for the test."
+            }
+            File(context.filesDir, "${TrainingCommitJournal.FILE_NAME}.tmp").delete()
             val engine = ArgusNeuralEngine.createBlocking(
                 context,
                 EngineConfig(

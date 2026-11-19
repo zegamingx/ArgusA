@@ -1,10 +1,10 @@
 package com.argus.agi.model
 
 /**
- * Durable boundaries of the TrainingManager batch transaction.
+ * Transaction boundaries in the TrainingManager batch commit/finalization path.
  *
- * The observer is a no-op in production and can be used by persistence tests to
- * inject failures immediately after each durable transition.
+ * The observer is a no-op in production and lets persistence tests inject failures
+ * immediately after a mutation or durable transition.
  */
 internal enum class TrainingCommitBoundary {
     PREPARED_JOURNAL_DURABLE,
