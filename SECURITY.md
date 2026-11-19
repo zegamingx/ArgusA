@@ -16,7 +16,8 @@ private signing material, or unredacted device logs in a report.
 
 Release signing material must remain outside Git history, repository files,
 release assets, workflow artifacts, and caches. CI signing is restricted to
-the manually dispatched release workflow and the protected
-`release-signing` environment. Treat any signing key that has appeared in Git
+the manually dispatched release workflow and the dedicated
+`release-signing` environment, which must have required reviewers configured.
+Treat any signing key that has appeared in Git
 history or a downloadable repository asset as compromised until its
 replacement or migration has been verified.
