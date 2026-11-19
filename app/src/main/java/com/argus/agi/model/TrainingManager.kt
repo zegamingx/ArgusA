@@ -1758,17 +1758,6 @@ class TrainingManager internal constructor(
                 "Durable training storage is unavailable; screen data was not deleted."
             }.getScreenTrainingItemsSnapshot()
 
-            if (wasPaused && screenItems.any { item ->
-                    item.status == TrainingStatus.TRAINING ||
-                        item.status == TrainingStatus.OPTIMIZER_COMMITTED
-                }
-            ) {
-                throw IllegalStateException(
-                    "Screen-derived training has an active or optimizer-committed item. " +
-                        "Resume and finalize training before clearing its stored records."
-                )
-            }
-
             val deadline = System.currentTimeMillis() + SCREEN_DATA_CLEAR_TIMEOUT_MS
             while (screenItems.any { item ->
                     item.status == TrainingStatus.TRAINING ||
@@ -2553,7 +2542,11 @@ class TrainingManager internal constructor(
 
             while (isActive && !closed) {
                 if (_isTrainingPaused.value) {
-                    _isTrainingPaused.first { !it || closed }
+                    combine(_isTrainingPaused, _nextQueue) { paused, queue ->
+                        !paused || queue.any {
+                            it.status == TrainingStatus.OPTIMIZER_COMMITTED
+                        }
+                    }.first { canFinalizeCommitted -> canFinalizeCommitted || closed }
                     if (closed) break
                 }
 
@@ -2591,8 +2584,8 @@ class TrainingManager internal constructor(
 
                 val firstItem = popNext()
                 if (firstItem == null) {
+                    _currentTrainingItem.value = null
                     if (_nextQueue.value.isEmpty()) {
-                        _currentTrainingItem.value = null
                         _activeDocument.value = null
                         if (validationRunActive) {
                             completeConversationalTrainingRun(validationRunHadFailures)
@@ -2961,7 +2954,16 @@ class TrainingManager internal constructor(
         val startCompletion = CompletableDeferred<Result<Unit>>()
         val reservation = synchronized(queueLock) {
             val list = _nextQueue.value
-            if (screenTrainingPurgePending) return@synchronized null
+            if (screenTrainingPurgePending) {
+                // A committed optimizer transaction has already changed weights.
+                // Finalize it (without another optimizer update), but do not claim
+                // any new queued work while deletion is in progress.
+                val committed = list.firstOrNull {
+                    it.status == TrainingStatus.OPTIMIZER_COMMITTED
+                } ?: return@synchronized null
+                _nextQueue.value = list.filterNot { it.id == committed.id }
+                return@synchronized Triple(committed, null, queueGeneration)
+            }
             val first = list.firstOrNull() ?: return@synchronized null
             if (expectedStatus != null && first.status != expectedStatus) {
                 return@synchronized null
