@@ -148,6 +148,10 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     private val _installedApps = MutableStateFlow<List<InstalledAppItem>>(emptyList())
     val installedApps: StateFlow<List<InstalledAppItem>> = _installedApps.asStateFlow()
 
+    val screenPerceptionEnabled: StateFlow<Boolean> = excludedAppsManager.screenPerceptionEnabled
+    val screenTrainingEnabled: StateFlow<Boolean> = excludedAppsManager.screenTrainingEnabled
+    val accessibilityActionsEnabled: StateFlow<Boolean> = excludedAppsManager.accessibilityActionsEnabled
+
     private val _cameraLuminance = MutableStateFlow(0f)
     val cameraLuminance: StateFlow<Float> = _cameraLuminance.asStateFlow()
 
@@ -1529,8 +1533,20 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         runCatching { ArgusAccessibilityService.performClickAction(targetText) }
             .getOrDefault(false)
 
-    fun toggleAppExclusion(packageName: String) {
-        excludedAppsManager.toggleAppExclusion(packageName)
+    fun setScreenPerceptionEnabled(enabled: Boolean) {
+        excludedAppsManager.setScreenPerceptionEnabled(enabled)
+    }
+
+    fun setScreenTrainingEnabled(enabled: Boolean) {
+        excludedAppsManager.setScreenTrainingEnabled(enabled)
+    }
+
+    fun setAccessibilityActionsEnabled(enabled: Boolean) {
+        excludedAppsManager.setAccessibilityActionsEnabled(enabled)
+    }
+
+    fun toggleAppAccess(packageName: String) {
+        excludedAppsManager.toggleAppAccess(packageName)
         loadInstalledApps()
     }
 
