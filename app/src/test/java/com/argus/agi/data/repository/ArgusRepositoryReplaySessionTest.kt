@@ -11,7 +11,9 @@ import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingStatus
 import com.argus.agi.model.WorldEntity
 import com.argus.agi.model.WorldModel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
