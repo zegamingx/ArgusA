@@ -1,4 +1,4 @@
-# Require the repository owner to review changes to application and automation code.
+# Code ownership. Enable branch protection with required code-owner reviews for enforcement.
 * @zegamingx
 /.github/ @zegamingx
 /app/ @zegamingx
