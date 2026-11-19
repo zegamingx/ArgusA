@@ -245,7 +245,7 @@ fun MainScreen(viewModel: ArgusViewModel) {
             },
             text = {
                 Text(
-                    text = "ARGUS can optionally read visible text and content descriptions from the active app window through Android Accessibility. Screen reading is off by default, and every app starts blocked until you allow it. If enabled, captured text is processed in local ARGUS memory; a separate opt-in is required before screen text can enter local model training. Password fields are filtered, but ordinary screen text can still contain private information. Financial, credential, private-messaging, email, health, and personal-media apps remain blocked. Accessibility clicks have a separate opt-in. This notice does not enable any of these features."
+                    text = "ARGUS can optionally read visible text and content descriptions from the active app window through Android Accessibility. Screen reading is off by default, and every app starts blocked until you allow it. If enabled, captured text is processed in local ARGUS memory; a separate opt-in is required before screen text can enter local model training. Password fields are filtered, but ordinary screen text can still contain private information. Known financial, credential, private-messaging, email, health, and personal-media app categories are blocked by best-effort matching, which cannot identify every sensitive app. Accessibility clicks have a separate opt-in. This notice does not enable any of these features."
                 )
             },
             confirmButton = {
