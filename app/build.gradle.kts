@@ -15,13 +15,9 @@ plugins {
 // runs outside the Android DSL block.
 val releaseStorePassword = providers.environmentVariable("STORE_PASSWORD")
 val releaseKeyPassword = providers.environmentVariable("KEY_PASSWORD")
-val jksFile = rootProject.file("my-upload-key.jks")
-val p12File = rootProject.file("signing/argus-release.p12")
-val defaultKeystore = when {
-    jksFile.isFile -> jksFile
-    p12File.isFile -> p12File
-    else -> jksFile
-}
+// Local release signing material is ignored by Git. CI supplies an encrypted
+// PKCS#12 file through KEYSTORE_PATH from the protected release environment.
+val defaultKeystore = rootProject.file("signing/argus-release.p12")
 val releaseKeystorePath = providers.environmentVariable("KEYSTORE_PATH")
     .orElse(defaultKeystore.absolutePath)
     .get()
@@ -67,8 +63,8 @@ android {
     }
 
     // A release must never silently fall back to the Android debug identity.
-    // The upload-key path is only a location default; its passwords remain required
-    // environment inputs and are validated by validateSigningRelease.
+    // The ignored local PKCS#12 path is only a location default; passwords remain
+    // required environment inputs and are validated by validateSigningRelease.
     val releaseKeyAlias = providers.environmentVariable("KEY_ALIAS")
         .orElse("upload")
         .get()
