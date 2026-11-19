@@ -44,6 +44,13 @@ object TrainingRecoveryProcessTestProtocol {
 
     fun itemId(caseId: String): String = "training-recovery-" + caseId
 
+    fun databaseName(caseId: String): String {
+        require(caseId.matches(Regex("[a-z0-9_-]{1,48}"))) {
+            "The process-recovery database case identifier is invalid."
+        }
+        return DATABASE_NAME.removeSuffix(".db") + "_" + caseId + ".db"
+    }
+
     fun crashMarker(context: Context, caseId: String): File =
         File(controlDirectory(context), caseId + ".crashed.json")
 
@@ -110,7 +117,17 @@ class TrainingRecoveryProcessTestService : Service() {
         var manager: TrainingManager? = null
         try {
             val isolated = isolatedContext(caseId)
-            val openedDatabase = openDatabase(isolated)
+            val databaseName = TrainingRecoveryProcessTestProtocol.databaseName(caseId)
+
+            // Room's framework helper calls Context.openOrCreateDatabase(), which
+            // ContextWrapper delegates to its base context. Give every boundary
+            // case a unique real database name and remove leftovers from prior runs.
+            applicationContext.deleteDatabase(databaseName)
+            check(!applicationContext.getDatabasePath(databaseName).exists()) {
+                "A stale per-case Room database could not be removed before setup."
+            }
+
+            val openedDatabase = openDatabase(isolated, caseId)
             database = openedDatabase
             val repository = ArgusRepository(isolated, openedDatabase)
             val engine = createEngine(isolated)
@@ -134,6 +151,7 @@ class TrainingRecoveryProcessTestService : Service() {
                         val snapshot = TrainingCommitJournal.read(journalFile)
                         val marker = JSONObject()
                             .put("caseId", caseId)
+                            .put("databaseName", databaseName)
                             .put("boundary", reachedBoundary.name)
                             .put("pid", Process.myPid())
                             .put("itemId", requireNotNull(queuedItemId) {
@@ -214,7 +232,8 @@ class TrainingRecoveryProcessTestService : Service() {
         try {
             val expectedStatus = TrainingStatus.valueOf(expectedStatusName)
             val isolated = isolatedContext(caseId)
-            val openedDatabase = openDatabase(isolated)
+            val databaseName = TrainingRecoveryProcessTestProtocol.databaseName(caseId)
+            val openedDatabase = openDatabase(isolated, caseId)
             database = openedDatabase
             val repository = ArgusRepository(isolated, openedDatabase)
             val engine = createEngine(isolated)
@@ -280,6 +299,7 @@ class TrainingRecoveryProcessTestService : Service() {
             }
             val probe = JSONObject()
                 .put("caseId", caseId)
+                .put("databaseName", databaseName)
                 .put("pid", Process.myPid())
                 .put("itemStatus", finalItem.status.name)
                 .put("optimizerStep", engine.optimizerStep)
@@ -300,6 +320,9 @@ class TrainingRecoveryProcessTestService : Service() {
             manager = null
             openedDatabase.close()
             database = null
+            check(applicationContext.deleteDatabase(databaseName)) {
+                "The per-case Room database could not be cleaned after recovery."
+            }
 
             writeJson(
                 TrainingRecoveryProcessTestProtocol.recoveryMarker(
@@ -328,11 +351,11 @@ class TrainingRecoveryProcessTestService : Service() {
         return TrainingRecoveryIsolatedContext(applicationContext, caseId)
     }
 
-    private fun openDatabase(context: Context): ArgusDatabase =
+    private fun openDatabase(context: Context, caseId: String): ArgusDatabase =
         Room.databaseBuilder(
             context,
             ArgusDatabase::class.java,
-            TrainingRecoveryProcessTestProtocol.DATABASE_NAME
+            TrainingRecoveryProcessTestProtocol.databaseName(caseId)
         )
             .addMigrations(
                 ArgusDatabase.MIGRATION_1_2,
@@ -408,9 +431,6 @@ class TrainingRecoveryProcessTestService : Service() {
         override fun getFilesDir(): File = ensureDirectory("files")
 
         override fun getCacheDir(): File = ensureDirectory("cache")
-
-        override fun getDatabasePath(name: String): File =
-            File(ensureDirectory("databases"), name)
 
         private fun ensureDirectory(name: String): File {
             val directory = File(rootDirectory, name)
