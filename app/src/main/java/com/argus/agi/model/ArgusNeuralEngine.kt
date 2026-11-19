@@ -1,6 +1,8 @@
 package com.argus.agi.model
 
 import android.content.Context
+import com.argus.agi.backend.ComputeBackend
+import com.argus.agi.backend.ComputeBackendKind
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.StateFlow
@@ -323,7 +325,8 @@ internal data class GradientCheckResult(
  */
 class ArgusNeuralEngine private constructor(
     private val context: Context,
-    val config: EngineConfig = EngineConfig()
+    val config: EngineConfig = EngineConfig(),
+    private val computeBackend: ComputeBackend = VulkanTrainingBackend
 ) {
 
     val tokenizer = Tokenizer(config.tokenizerConfig)
@@ -418,10 +421,14 @@ class ArgusNeuralEngine private constructor(
         )
     }
 
+    /** The backend contract used by training planning and state lifecycle operations. */
+    internal val runtimeComputeBackend: ComputeBackend
+        get() = computeBackend
+
     val optimizerBackend: String
         get() = VulkanTrainingBackend.currentBackend
     val isVulkanRuntimeReady: Boolean
-        get() = VulkanTrainingBackend.isRuntimeAvailable
+        get() = computeBackend.kind == ComputeBackendKind.VULKAN && computeBackend.isReady
     val computeBackendStatus: StateFlow<String>
         get() = VulkanTrainingBackend.runtimeStatus
     val vulkanInitializationProgress: StateFlow<VulkanInitializationProgress>
@@ -434,21 +441,24 @@ class ArgusNeuralEngine private constructor(
         get() = VulkanTrainingBackend.modelTensorResidencyReady
 
     fun initializeOptionalVulkanRuntime(): Boolean {
-        val runtimeReady = VulkanTrainingBackend.initializeAfterModelReady()
+        if (computeBackend.kind != ComputeBackendKind.VULKAN) return false
+        val runtimeReady = computeBackend.initializeAfterModelReady()
         if (!runtimeReady) return false
-        synchronizeVulkanModelTensorResidency("model initialization")
+        if (computeBackend === VulkanTrainingBackend) {
+            synchronizeVulkanModelTensorResidency("model initialization")
+        }
         return true
     }
 
     fun releaseVulkanTensorResidencyForMemoryPressure(): Boolean =
-        VulkanTrainingBackend.releaseModelTensorResidencyForMemoryPressure()
+        computeBackend.releaseDeviceResourcesForMemoryPressure()
 
     fun resumeVulkanTensorResidencyAfterForeground() {
-        VulkanTrainingBackend.resumeModelTensorResidencyAfterForeground()
+        computeBackend.resumeDeviceResourcesAfterForeground()
     }
 
     fun resetOptionalVulkanRuntimeForRetry() {
-        VulkanTrainingBackend.resetRuntimeForRetry()
+        computeBackend.resetForRetry()
     }
 
     private fun synchronizeVulkanModelTensorResidency(reason: String) {
@@ -866,9 +876,20 @@ class ArgusNeuralEngine private constructor(
         }
         @JvmStatic
         fun createBlocking(context: Context, config: EngineConfig = EngineConfig()): ArgusNeuralEngine =
-            ArgusNeuralEngine(context.applicationContext, config).also { engine ->
-                engine.loadCheckpointIfExists()
-            }
+            createBlockingWithBackend(context, config, VulkanTrainingBackend)
+
+        /** Internal injection seam for lifecycle tests and future backend implementations. */
+        internal fun createBlockingWithBackend(
+            context: Context,
+            config: EngineConfig,
+            computeBackend: ComputeBackend
+        ): ArgusNeuralEngine = ArgusNeuralEngine(
+            context.applicationContext,
+            config,
+            computeBackend
+        ).also { engine ->
+            engine.loadCheckpointIfExists()
+        }
 
         suspend fun create(context: Context, config: EngineConfig = EngineConfig()): ArgusNeuralEngine =
             withContext(Dispatchers.IO) {
@@ -1001,8 +1022,8 @@ class ArgusNeuralEngine private constructor(
 
     private fun resizeVocabCapacityTo(targetCap: Int) {
         if (targetCap <= 0 || targetCap == vocabCap) return
-        check(VulkanTrainingBackend.synchronizeTrainingStateMirrors()) {
-            "GPU model weights and optimizer moments must be recovered before vocabulary capacity changes."
+        check(computeBackend.synchronizeAuthoritativeState()) {
+            "Model weights and optimizer moments must be recovered before vocabulary capacity changes."
         }
         requireSafeVocabularyCapacity(targetCap)
         val targetElements = Math.multiplyExact(targetCap, dModel)
@@ -3882,8 +3903,8 @@ class ArgusNeuralEngine private constructor(
                 check(!checkpointRestoreBlocked) {
                     "An existing checkpoint could not be restored; refusing to overwrite it without explicit recovery."
                 }
-                check(VulkanTrainingBackend.synchronizeTrainingStateMirrors()) {
-                    "GPU model or optimizer state could not be recovered before checkpoint serialization."
+                check(computeBackend.synchronizeAuthoritativeState()) {
+                    "Model or optimizer state could not be recovered before checkpoint serialization."
                 }
                 writeArg6Checkpoint()
             }
