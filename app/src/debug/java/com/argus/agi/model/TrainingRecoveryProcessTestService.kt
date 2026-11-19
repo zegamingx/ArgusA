@@ -134,6 +134,7 @@ class TrainingRecoveryProcessTestService : Service() {
                             .put("caseId", caseId)
                             .put("boundary", reachedBoundary.name)
                             .put("pid", Process.myPid())
+                            .put("itemId", queuedItem.id)
                             .put(
                                 "baselineOptimizerStep",
                                 snapshot?.baselineOptimizerStep ?: engine.optimizerStep
@@ -170,18 +171,19 @@ class TrainingRecoveryProcessTestService : Service() {
             )
             manager = activeManager
             activeManager.pauseTraining()
+            val itemTitle = "Cold-start recovery boundary " + boundaryName
             activeManager.enqueueData(
                 source = "process-death-recovery-test",
-                title = "Cold-start recovery boundary " + boundaryName,
+                title = itemTitle,
                 content = "The recovery test must preserve exactly one durable optimizer transaction after process death."
             )
             activeManager.awaitQueuePersistenceIdle()
 
-            val itemId = TrainingRecoveryProcessTestProtocol.itemId(caseId)
-            withTimeout(20_000L) {
-                while (activeManager.nextQueue.value.none { it.id == itemId }) {
+            val queuedItem = withTimeout(20_000L) {
+                while (activeManager.nextQueue.value.none { it.title == itemTitle }) {
                     delay(25L)
                 }
+                activeManager.nextQueue.value.single { it.title == itemTitle }
             }
             activeManager.triggerImmediateTrainingStep()
 
@@ -210,7 +212,14 @@ class TrainingRecoveryProcessTestService : Service() {
             database = openDatabase(isolated)
             val repository = ArgusRepository(isolated, database)
             val engine = createEngine(isolated)
-            val itemId = TrainingRecoveryProcessTestProtocol.itemId(caseId)
+            val crashMarker = TrainingRecoveryProcessTestProtocol.crashMarker(
+                applicationContext,
+                caseId
+            )
+            check(crashMarker.isFile) {
+                "The preceding process did not leave its durable crash marker."
+            }
+            val itemId = JSONObject(crashMarker.readText()).getString("itemId")
             val journalFile = File(isolated.filesDir, TrainingCommitJournal.FILE_NAME)
 
             val activeManager = TrainingManager(
