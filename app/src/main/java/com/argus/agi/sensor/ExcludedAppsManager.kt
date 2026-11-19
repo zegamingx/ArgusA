@@ -33,6 +33,7 @@ class ExcludedAppsManager(private val context: Context) {
         private const val TAG = "ExcludedAppsManager"
         private const val PREFS_NAME = "argus_excluded_apps"
         private const val KEY_ALLOWED_PACKAGES = "allowed_screen_packages"
+        private const val KEY_PROTECTED_PACKAGES = "protected_screen_packages"
         private const val KEY_SCREEN_PERCEPTION = "screen_perception_enabled"
         private const val KEY_SCREEN_TRAINING = "screen_training_enabled"
         private const val KEY_ACCESSIBILITY_ACTIONS = "accessibility_actions_enabled"
@@ -100,25 +101,32 @@ class ExcludedAppsManager(private val context: Context) {
      * their package names.
      */
     fun isAppExcluded(packageName: String): Boolean {
-        if (PrivacyAppHeuristics.isPrivacySensitiveApp("", packageName)) return true
+        val protected = prefs.getStringSet(KEY_PROTECTED_PACKAGES, emptySet()).orEmpty()
+        if (packageName in protected ||
+            PrivacyAppHeuristics.isPrivacySensitiveApp("", packageName)
+        ) {
+            return true
+        }
         val allowed = prefs.getStringSet(KEY_ALLOWED_PACKAGES, emptySet()).orEmpty()
         return packageName !in allowed
     }
 
     fun toggleAppAccess(packageName: String) {
-        if (PrivacyAppHeuristics.isPrivacySensitiveApp("", packageName)) return
+        val protected = prefs.getStringSet(KEY_PROTECTED_PACKAGES, emptySet()).orEmpty()
+        if (packageName in protected ||
+            PrivacyAppHeuristics.isPrivacySensitiveApp("", packageName)
+        ) {
+            return
+        }
 
         val current = prefs.getStringSet(KEY_ALLOWED_PACKAGES, emptySet())
             .orEmpty()
             .toMutableSet()
+        val isNowAllowed = current.add(packageName)
+        if (!isNowAllowed) current.remove(packageName)
 
-        if (!current.add(packageName)) {
-            current.remove(packageName)
-        }
-
-        val committed = current.toSet()
-        prefs.edit().putStringSet(KEY_ALLOWED_PACKAGES, committed).apply()
-        refreshExcludedPackageSnapshot()
+        prefs.edit().putStringSet(KEY_ALLOWED_PACKAGES, current.toSet()).apply()
+        updateExcludedPackageSnapshot(packageName, isExcluded = !isNowAllowed)
     }
 
     /**
@@ -142,6 +150,18 @@ class ExcludedAppsManager(private val context: Context) {
                 packageManager.queryIntentActivities(launcherIntent, 0)
             }
 
+            val protectedPackages = launchers.mapNotNull { resolveInfo ->
+                val activityInfo = resolveInfo.activityInfo ?: return@mapNotNull null
+                val packageName = activityInfo.packageName
+                val appName = resolveInfo.loadLabel(packageManager).toString()
+                packageName.takeIf {
+                    PrivacyAppHeuristics.isPrivacySensitiveApp(appName, packageName)
+                }
+            }.toSet()
+            prefs.edit()
+                .putStringSet(KEY_PROTECTED_PACKAGES, protectedPackages)
+                .apply()
+
             val appsByPackage = linkedMapOf<String, InstalledAppItem>()
             for (resolveInfo in launchers) {
                 val activityInfo = resolveInfo.activityInfo ?: continue
@@ -163,7 +183,7 @@ class ExcludedAppsManager(private val context: Context) {
                     appName = appName,
                     packageName = packageName,
                     icon = icon,
-                    isExcluded = isAppExcluded(packageName),
+                    isExcluded = packageName in protectedPackages || isAppExcluded(packageName),
                     isSystemApp = isSystemApp
                 )
             }
@@ -184,10 +204,16 @@ class ExcludedAppsManager(private val context: Context) {
         }
     }
 
-    private fun refreshExcludedPackageSnapshot() {
+    private fun updateExcludedPackageSnapshot(
+        packageName: String,
+        isExcluded: Boolean
+    ) {
         _excludedPackages.value = _excludedPackages.value.toMutableSet().also { snapshot ->
-            val allowed = prefs.getStringSet(KEY_ALLOWED_PACKAGES, emptySet()).orEmpty()
-            snapshot.removeAll(allowed)
+            if (isExcluded) {
+                snapshot.add(packageName)
+            } else {
+                snapshot.remove(packageName)
+            }
         }
     }
 }
