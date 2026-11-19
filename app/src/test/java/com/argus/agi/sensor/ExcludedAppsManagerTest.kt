@@ -41,10 +41,18 @@ class ExcludedAppsManagerTest {
 
         manager.setScreenTrainingEnabled(true)
         assertTrue(manager.isScreenTrainingEnabled())
+        assertFalse(manager.isAppTrainingAllowed("com.example.notes"))
+
+        manager.toggleAppAccess("com.example.notes")
+        assertFalse(manager.isAppTrainingAllowed("com.example.notes"))
+
+        manager.toggleAppTrainingAccess("com.example.notes")
+        assertTrue(manager.isAppTrainingAllowed("com.example.notes"))
 
         manager.setScreenPerceptionEnabled(false)
         assertFalse(manager.isScreenPerceptionEnabled())
         assertFalse(manager.isScreenTrainingEnabled())
+        assertFalse(manager.isAppTrainingAllowed("com.example.notes"))
     }
 
     @Test
@@ -84,11 +92,13 @@ class ExcludedAppsManagerTest {
         manager.setScreenTrainingEnabled(true)
         manager.setAccessibilityActionsEnabled(true)
         manager.toggleAppAccess("com.example.notes")
+        manager.toggleAppTrainingAccess("com.example.notes")
 
         val restored = ExcludedAppsManager(context)
         assertTrue(restored.isScreenPerceptionEnabled())
         assertTrue(restored.isScreenTrainingEnabled())
         assertTrue(restored.isAccessibilityActionsEnabled())
         assertFalse(restored.isAppExcluded("com.example.notes"))
+        assertTrue(restored.isAppTrainingAllowed("com.example.notes"))
     }
 }
