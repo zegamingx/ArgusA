@@ -63,10 +63,33 @@ A release build requires the Argus release signing key at `signing/argus-release
 
 ## GitHub releases
 
-Every push to `main` runs release lint, JUnit/Robolectric unit tests, a signed release build, and APK signature/native-ABI verification. It does not run an Android emulator smoke test. Publishing the signed APK to the `Release` tag is a separate, explicit `workflow_dispatch` operation with `publish_release=true`; ordinary pushes only validate and build.
+Pushes to `main` are validated by the native-validation workflow. They do not
+sign or publish an APK.
 
-The private repository keeps the CI signing-key backup in the private GitHub Release named `argus-signing-key`. Repository access therefore also grants access to the app-signing identity. Keep this repository private and restrict collaborator access. Never redistribute the signing-key asset. The asset-pruning step only targets old `ARGUS-v*.apk` files in the `Release` tag and does not touch this signing-key backup.
+A signed APK is produced only by manually dispatching
+`Argus Signed Release` from the `main` branch. The job uses the protected
+GitHub Environment named `release-signing`. Configure that environment with
+required reviewers and these environment secrets:
 
+- `ARGUS_SIGNING_KEY_BASE64`: Base64-encoded encrypted PKCS#12 keystore.
+- `ARGUS_SIGNING_STORE_PASSWORD`: PKCS#12 store password.
+- `ARGUS_SIGNING_KEY_PASSWORD`: private-key password.
+
+The signing certificate is pinned in the workflow to the SHA-256 fingerprint
+of the currently distributed Argus v1.0.13 APK. A different certificate causes
+the release job to fail closed. Update that pin only as part of a tested Android
+app-signing key-rotation and migration plan.
+
+The encrypted keystore is decoded only into the runner's temporary directory,
+used for the signed build, and deleted when the signing step exits. The
+keystore is not committed, uploaded as a release asset, or retained in the
+workspace. Do not add signing material to GitHub Releases, workflow artifacts,
+job outputs, caches, or repository files.
+
+The workflow publishes the verified APK and SHA-256 checksums to the rolling
+`Release` GitHub Release. Repository pushes and pull-request validation never
+receive signing secrets.
+ 
 ## Runtime crash diagnostics
 
 On startup, Argus reads Android's historical process-exit record and keeps a bounded
