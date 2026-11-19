@@ -92,7 +92,7 @@ class RuntimeConfigurationPlannerTest {
         val configuration = RuntimeConfigurationPlanner.create(
             backend = FakeComputeBackend(deviceProfile(), isReady = true, isFp16ComputeReady = false),
             resources = healthyResources().copy(
-                availableAppHeapBytes = 1024L * MEBIBYTE,
+                availableAppHeapBytes = 2L * MEBIBYTE,
                 availableSystemMemoryBytes = 128L * MEBIBYTE
             ),
             model = modelConstraints()
