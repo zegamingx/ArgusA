@@ -55,7 +55,27 @@ class TrainingManagerPersistenceTest {
 
             privacyPreferences.edit()
                 .putBoolean("screen_training_enabled", true)
+                .commit()
+            manager.enqueueScreenData(
+                packageName = "com.example.reader",
+                title = "Screen capture",
+                content = "A screen sample without any per-app Read or Train grant."
+            )
+            awaitPersistence(manager)
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+
+            privacyPreferences.edit()
                 .putStringSet("allowed_screen_packages", setOf("com.example.reader"))
+                .commit()
+            manager.enqueueScreenData(
+                packageName = "com.example.reader",
+                title = "Screen capture",
+                content = "A screen sample with Read permission but no Train permission."
+            )
+            awaitPersistence(manager)
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+
+            privacyPreferences.edit()
                 .putStringSet("allowed_screen_training_packages", setOf("com.example.reader"))
                 .commit()
             manager.enqueueScreenData(
