@@ -144,7 +144,12 @@ try {
 
         $sensitivePathPattern = '(?i)(^|/)([^/]+\.(jks|keystore|jceks|bks|p12|pfx|pem|pk8|key|cer|crt|der|mobileprovision|idsig|lineage)|\.env(?:\.[^/]*)?)$|(^|/)signing/'
         $sensitivePaths = @(
-            $objectPaths | Where-Object { $_ -match $sensitivePathPattern }
+            $objectPaths | ForEach-Object {
+                $objectEntry = ([string]$_) -split '\s+', 2
+                if ($objectEntry.Count -eq 2 -and $objectEntry[1] -match $sensitivePathPattern) {
+                    $objectEntry[1]
+                }
+            }
         )
         if ($sensitivePaths.Count -gt 0) {
             throw "Signing material paths remain in rewritten history. Do not push."
