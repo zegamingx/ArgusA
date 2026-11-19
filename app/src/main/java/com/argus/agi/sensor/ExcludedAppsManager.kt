@@ -70,6 +70,16 @@ class ExcludedAppsManager(private val context: Context) {
     fun isAccessibilityActionsEnabled(): Boolean =
         prefs.getBoolean(KEY_ACCESSIBILITY_ACTIONS, false)
 
+    /**
+     * Accessibility actions require independent global consent and an explicitly
+     * allowed target package. Unknown package identities always fail closed.
+     */
+    fun isAccessibilityActionAllowed(packageName: String?): Boolean {
+        if (!isAccessibilityActionsEnabled()) return false
+        val normalizedPackage = packageName?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+        return !isAppExcluded(normalizedPackage)
+    }
+
     fun isAppTrainingAllowed(packageName: String): Boolean {
         if (!isScreenTrainingEnabled() || isAppExcluded(packageName)) return false
         val trainingAllowed = prefs.getStringSet(KEY_TRAINING_ALLOWED_PACKAGES, emptySet()).orEmpty()

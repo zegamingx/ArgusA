@@ -259,12 +259,11 @@ class ArgusAccessibilityService : AccessibilityService() {
     }
 
     private fun internalPerformClick(query: String): Boolean {
-        if (!excludedAppsManager.isAccessibilityActionsEnabled()) return false
-
         val root = rootInActiveWindow ?: return false
         try {
-            val activePackage = root.packageName?.toString()
-            if (activePackage != null && excludedAppsManager.isAppExcluded(activePackage)) {
+            // A missing active package is not an allowed target. The manager checks
+            // independent action consent, the explicit app allowlist, and protected apps.
+            if (!excludedAppsManager.isAccessibilityActionAllowed(root.packageName?.toString())) {
                 return false
             }
 

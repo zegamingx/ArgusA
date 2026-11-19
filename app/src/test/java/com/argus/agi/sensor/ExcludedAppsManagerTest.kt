@@ -67,6 +67,24 @@ class ExcludedAppsManagerTest {
     }
 
     @Test
+    fun accessibilityActionsFailClosedForUnknownOrUnapprovedPackages() {
+        assertFalse(manager.isAccessibilityActionAllowed(null))
+        assertFalse(manager.isAccessibilityActionAllowed(""))
+        assertFalse(manager.isAccessibilityActionAllowed("   "))
+
+        manager.setAccessibilityActionsEnabled(true)
+        assertFalse(manager.isAccessibilityActionAllowed("com.example.reader"))
+
+        manager.toggleAppAccess("com.example.reader")
+        assertTrue(manager.isAccessibilityActionAllowed("com.example.reader"))
+
+        assertFalse(manager.isAccessibilityActionAllowed("com.whatsapp"))
+
+        manager.setAccessibilityActionsEnabled(false)
+        assertFalse(manager.isAccessibilityActionAllowed("com.example.reader"))
+    }
+
+    @Test
     fun appAccessIsDefaultDenyAndSensitiveAppsStayBlocked() {
         assertTrue(manager.isAppExcluded("com.example.notes"))
 
