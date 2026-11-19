@@ -236,7 +236,7 @@ try {
     $lineageReport = Get-LineageReport -LineagePath $lineagePath
     $lineageMatches = [regex]::Matches(
         $lineageReport,
-        '(?i)SHA-256 digest:\\s*([0-9a-f:]{64,95})'
+        '(?i)SHA-256 digest:\s*([0-9a-f:]{64,95})'
     )
     $lineageFingerprints = @(
         foreach ($match in $lineageMatches) {
