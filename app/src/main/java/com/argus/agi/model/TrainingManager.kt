@@ -2987,9 +2987,16 @@ class TrainingManager internal constructor(
         val reservation = synchronized(queueLock) {
             val list = _nextQueue.value
             if (screenTrainingPurgePending) {
-                // A committed optimizer transaction has already changed weights.
-                // Finalize it (without another optimizer update), but do not claim
-                // any new queued work while deletion is in progress.
+                // Batch collectors explicitly request QUEUED rows. Never return a
+                // committed row to that path: its optimizer transaction already
+                // changed weights and it must be finalized only by the single-item
+                // recovery path, without another optimizer update.
+                if (
+                    expectedStatus != null &&
+                    expectedStatus != TrainingStatus.OPTIMIZER_COMMITTED
+                ) {
+                    return@synchronized null
+                }
                 val committed = list.firstOrNull {
                     it.status == TrainingStatus.OPTIMIZER_COMMITTED
                 } ?: return@synchronized null
