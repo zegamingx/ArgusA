@@ -87,6 +87,33 @@ class ExcludedAppsManagerTest {
     }
 
     @Test
+    fun clearingScreenAppAllowlistRevokesReadAndTrainingForEveryApp() {
+        manager.setScreenPerceptionEnabled(true)
+        manager.setScreenTrainingEnabled(true)
+        manager.toggleAppAccess("com.example.reader")
+        manager.toggleAppTrainingAccess("com.example.reader")
+        assertFalse(manager.isAppExcluded("com.example.reader"))
+        assertTrue(manager.isAppTrainingAllowed("com.example.reader"))
+
+        manager.clearScreenAppAllowlist()
+
+        assertTrue(manager.isAppExcluded("com.example.reader"))
+        assertFalse(manager.isAppTrainingAllowed("com.example.reader"))
+        assertTrue(
+            context.getSharedPreferences("argus_excluded_apps", Context.MODE_PRIVATE)
+                .getStringSet("allowed_screen_packages", emptySet())
+                .orEmpty()
+                .isEmpty()
+        )
+        assertTrue(
+            context.getSharedPreferences("argus_excluded_apps", Context.MODE_PRIVATE)
+                .getStringSet("allowed_screen_training_packages", emptySet())
+                .orEmpty()
+                .isEmpty()
+        )
+    }
+
+    @Test
     fun allowlistAndConsentsPersistAcrossManagerInstances() {
         manager.setScreenPerceptionEnabled(true)
         manager.setScreenTrainingEnabled(true)
