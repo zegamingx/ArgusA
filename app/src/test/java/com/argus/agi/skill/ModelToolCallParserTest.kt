@@ -31,6 +31,20 @@ class ModelToolCallParserTest {
     }
 
     @Test
+    fun parsesToolCallWhenThinkStartWasAlreadyInTheGenerationPrompt() {
+        val parsed = ReasoningOutputParser.parse(
+            "External verification is needed.</THINK>" +
+                "<WEB_SEARCH>Android 37 release notes</WEB_SEARCH>"
+        )
+
+        assertEquals("External verification is needed.", parsed.reasoning)
+        assertEquals(
+            "Android 37 release notes",
+            ModelToolCallParser.extractWebSearchQuery(parsed.answer)
+        )
+    }
+
+    @Test
     fun doesNotSearchWhenModelOnlyExpressesUncertainty() {
         assertNull(
             ModelToolCallParser.extractWebSearchQuery(

@@ -1,10 +1,5 @@
 package com.argus.agi.model
 
-internal data class GenerationTokenWindow(
-    val promptTokenLimit: Int,
-    val outputTokenLimit: Int
-)
-
 import android.content.Context
 import com.argus.agi.backend.ComputeBackend
 import com.argus.agi.backend.ComputeBackendKind
@@ -35,6 +30,11 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 import kotlin.random.Random
+
+internal data class GenerationTokenWindow(
+    val promptTokenLimit: Int,
+    val outputTokenLimit: Int
+)
 
 data class BenchmarkResult(
     val tokensPerSecond: Float,
