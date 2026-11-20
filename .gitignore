@@ -25,13 +25,21 @@ debug.keystore
 signing/
 *.jks
 *.keystore
+*.jceks
+*.bks
 *.p12
 *.pfx
 *.p7b
 *.pem
+*.pk8
 *.key
 *.der
+*.cer
+*.crt
+*.mobileprovision
+key.properties
 keystore.properties
+signing.properties
 
 # Generated CMake compatibility launcher and local CMake path metadata.
 /tools/cmake-compat/runtime/

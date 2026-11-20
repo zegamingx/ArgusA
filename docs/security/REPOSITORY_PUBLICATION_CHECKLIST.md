@@ -1,6 +1,6 @@
 # ArgusA repository security and public-release checklist
 
-Keep repository visibility private until historical signing material has been removed from all refs and the remaining controls below have been verified.
+> **Current visibility (2026-11-20): PUBLIC.** The repository was made public before this incident checklist was completed. Switching it back to private does not reverse exposure of Git history, release assets, forks, cached pages, or downloaded copies. Treat this document as ongoing public-exposure remediation; do not publish another signed release until the Go/no-go items below are complete.
 
 ## Signing incident and current release state
 
@@ -39,7 +39,7 @@ The PowerShell helper `tools/security/rewrite-sensitive-history.ps1`:
 
 Before rewriting remote refs, finish or close active pull requests, freeze pushes, tell collaborators not to push old clones, inspect `.git/filter-repo/changed-refs`, and review the rewritten refs. GitHub-managed `refs/pull/*` refs are not force-pushable. After rewriting branches and tags, contact GitHub Support to request removal of cached views and affected PR references. Re-clone the sanitized repository; do not reuse an old clone.
 
-## Repository controls required before public visibility
+## Repository controls required while public
 
 - Protect `main`: require pull requests, passing validation checks, code-owner review, conversation resolution, stale approval dismissal, and prohibit force-push and deletion.
 - Enable secret scanning and push protection. Run a full-history credential scan after the rewrite.
@@ -52,11 +52,11 @@ Before rewriting remote refs, finish or close active pull requests, freeze pushe
 
 Screen perception, screen-derived training, and accessibility clicks are separate opt-ins and disabled by default in this branch. App access is default-deny; sensitive app categories remain protected. The broad `QUERY_ALL_PACKAGES` permission has been removed; the app list uses a launcher-intent query.
 
-The normal app flow displays a disclosure. Settings explains what is read and stored locally and exposes separate controls. This implementation still needs a complete Android build, lint, unit tests, and emulator validation. Re-review it against current Google Play User Data, Accessibility API, and package-visibility policies before Play distribution.
+The normal app flow displays a disclosure. Settings explains what is read and stored locally and exposes separate controls. Normal PR native build, lint, unit tests, and ABI packaging passed on commit `0747477`; the separate seven-case Android process-death recovery matrix still requires its dedicated emulator run. Re-review the implementation against current Google Play User Data, Accessibility API, and package-visibility policies before Play distribution.
 
 ## Go/no-go
 
-Keep repository visibility private until:
+Do not publish another release or describe this repository as security-ready until:
 
 - each signing identity has been mapped to APKs users actually installed;
 - the v1.0.13 signer is rotated through a tested lineage, or a separate package migration is chosen;

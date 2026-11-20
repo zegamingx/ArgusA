@@ -263,7 +263,7 @@ try {
         "--ks-pass", "env:ARGUS_NEW_STORE_PASSWORD",
         "--key-pass", "env:ARGUS_NEW_KEY_PASSWORD",
         "--lineage", $lineagePath,
-        "--rotation-min-sdk-version", "33",
+        "--rotation-min-sdk-version", "34",
         "--out", $migrationApkPath,
         $tempUnsignedCopy
     )
