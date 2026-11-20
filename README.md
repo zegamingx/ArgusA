@@ -171,7 +171,7 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 - PDF extraction supports selectable text. Scanned/image-only PDFs are rejected; OCR is not included.
 - DOCX reads the Word document XML body. EPUB follows its package spine order.
 - Archive entry counts, per-entry expansion, total expansion, source file size, and extracted text length are bounded.
-- Import budgets are reduced using the device's live app-heap headroom and a bounded queue-capacity estimate.
+- Reader-based imports are bounded by live app-heap headroom and a 2 Mi UTF-16-code-unit hard cap per document. Actual tokenized chunk count is validated before Room persistence; raw character count is not used as a proxy for language-dependent token density.
 - `Reader` ingestion stages UTF-16BE code units in a temporary cache file using fixed-size buffers. The file is removed after success, rejection, or coroutine cancellation.
 - JSONL is validated and processed one complete object per line, with per-record size and total generated-record limits. JSONL records are persisted only after the entire source has passed validation, so a malformed tail cannot leave a partially imported document.
 - Single-object ChatML/ShareGPT, reasoning, and legacy plain-text inputs retain document-level parsing semantics. Their in-memory parser path is still bounded by the live-heap limit; this is not a constant-memory parser for every format.
