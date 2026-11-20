@@ -249,11 +249,11 @@ class CorpusPersistenceTest {
             neuralEngine = ArgusNeuralEngine.createBlocking(context),
             deviceGuard = DeviceGuard(context),
             worldModel = WorldModel(context),
-            repository = repository
+            repository = repository,
+            initiallyPaused = true
         )
 
         try {
-            manager.pauseTraining()
             val documents = listOf(
                 "Research document alpha preserves its own source sequence. ".repeat(24),
                 "Research document beta contributes another ordered token stream. ".repeat(19),
