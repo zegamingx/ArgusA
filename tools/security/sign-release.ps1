@@ -180,7 +180,7 @@ try {
 
     $fingerprintMatch = [regex]::Match(
         $verificationText,
-        '(?im)Signer #1 certificate SHA-256 digest:[\s]*([0-9a-f:]{64,95})'
+        '(?im)certificate SHA-256 digest:[\s]*([0-9a-f:]{64,95})'
     )
     if (-not $fingerprintMatch.Success) {
         throw "The verified APK did not report a signer SHA-256 fingerprint."

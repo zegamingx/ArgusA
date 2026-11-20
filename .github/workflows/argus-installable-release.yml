@@ -174,7 +174,7 @@ jobs:
 
           "$build_tools/apksigner" verify --verbose --print-certs "$signed_apk" > "$verify_log" 2>&1
           cat "$verify_log"
-          fingerprint="$(awk -F': ' '/Signer #1 certificate SHA-256 digest:/ { print $2; exit }' "$verify_log" | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          fingerprint="$(awk -F': ' '/certificate SHA-256 digest:/ { print $NF; exit }' "$verify_log" | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
           test "${#fingerprint}" -eq 64
 
           package_line="$("$build_tools/aapt" dump badging "$signed_apk" | grep -m1 '^package:')"
@@ -196,7 +196,7 @@ jobs:
             echo "Package metadata: $package_line"
             echo "APK SHA-256: $(awk '{print $1}' "$signed_apk.sha256")"
             echo "Signing certificate SHA-256: $fingerprint"
-            echo "Signature: apksigner verified; v1/v2/v3 enabled"
+            echo "Signature: apksigner verified; v3 scheme valid for minSdk 34"
             echo "ZIP alignment: verified for 16 KiB native-library pages"
             echo "Native ABIs: arm64-v8a, armeabi-v7a, x86_64"
             echo "Signing scope: temporary CI-only identity; not the persistent Argus release signer"
@@ -268,7 +268,7 @@ jobs:
             echo "APK SHA-256: $(awk '{print $1}' "${apk}.sha256")"
             echo "Package metadata: ${metadata}"
             echo "Native ABI packaging: arm64-v8a, armeabi-v7a, x86_64"
-            echo "Signature: apksigner verified; v1/v2/v3 enabled"
+            echo "Signature: apksigner verified; v3 scheme valid for minSdk 34"
             echo "ZIP alignment: verified for 16 KiB native-library pages"
           } > "dist/BUILD-MANIFEST.txt"
           cat "dist/BUILD-MANIFEST.txt"

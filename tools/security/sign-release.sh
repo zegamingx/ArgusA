@@ -98,7 +98,7 @@ echo "Verifying APK signature and pinned certificate fingerprint..."
     fail "apksigner rejected the produced APK."
   }
 
-fingerprint_line="$(grep -m1 'Signer #1 certificate SHA-256 digest:' "$verification_log" || true)"
+fingerprint_line="$(grep -m1 'certificate SHA-256 digest:' "$verification_log" || true)"
 [[ -n "$fingerprint_line" ]] || {
   cat "$verification_log" >&2
   fail "No signer SHA-256 fingerprint was reported by apksigner."
