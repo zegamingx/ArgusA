@@ -219,7 +219,9 @@ class ArgusAccessibilityService : AccessibilityService() {
     private fun invalidateScreenContext(nextPackage: String? = null) {
         currentScreenPackage = nextPackage
         lastScreenTextHash = null
-        ArgusApp.worldModel.clearScreenContext()
+        if (ArgusApp.isWorldModelInitialized()) {
+            ArgusApp.worldModel.clearScreenContext()
+        }
     }
 
     private fun traverseNodes(

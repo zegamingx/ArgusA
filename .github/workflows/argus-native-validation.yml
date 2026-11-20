@@ -36,7 +36,7 @@ jobs:
   validate:
     name: Compile Vulkan NDK, lint, test and package debug APK
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout validated source
@@ -169,7 +169,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          emulator -accel-check
+          accel_mode=auto
+          device_timeout=180
+          boot_timeout=240
+          if emulator -accel-check; then
+            echo "KVM acceleration is available; using automatic VM acceleration."
+          else
+            echo "::warning::KVM acceleration is unavailable. Trying the supported software CPU-emulation fallback; this can be significantly slower."
+            export ANDROID_I_WANT_MY_TCG=yes
+            accel_mode=off
+            device_timeout=600
+            boot_timeout=900
+          fi
           emulator \
             -avd argus-process-recovery \
             -no-window \
@@ -177,19 +188,23 @@ jobs:
             -no-boot-anim \
             -no-snapshot \
             -gpu software \
-            -accel auto \
+            -accel "$accel_mode" \
             > "$RUNNER_TEMP/argus-emulator.log" 2>&1 &
           echo "$!" > "$RUNNER_TEMP/argus-emulator.pid"
-          if ! timeout 180s adb wait-for-device; then
-            echo "::error::Android emulator did not expose an ADB device within 180 seconds."
+          if ! timeout "${device_timeout}s" adb wait-for-device; then
+            echo "::error::Android emulator did not expose an ADB device within ${device_timeout} seconds."
             cat "$RUNNER_TEMP/argus-emulator.log" || true
             exit 1
           fi
-          timeout 240s bash -c '
+          if ! timeout "${boot_timeout}s" bash -c '
             until [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" == "1" ]]; do
               sleep 2
             done
-          '
+          '; then
+            echo "::error::Android emulator did not finish booting within ${boot_timeout} seconds."
+            cat "$RUNNER_TEMP/argus-emulator.log" || true
+            exit 1
+          fi
           adb shell settings put global window_animation_scale 0
           adb shell settings put global transition_animation_scale 0
           adb shell settings put global animator_duration_scale 0

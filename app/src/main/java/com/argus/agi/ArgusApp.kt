@@ -130,6 +130,9 @@ class ArgusApp : Application() {
         }
         val repository: com.argus.agi.data.repository.ArgusRepository get() = _repository.value
 
+        /** For lifecycle cleanup without triggering lazy singleton construction. */
+        fun isWorldModelInitialized(): Boolean = _worldModel.isInitialized()
+
         /** Untuk test / shutdown: cek apakah singleton sudah diinisialisasi. */
         fun isTrainingManagerInitialized(): Boolean = _trainingManager.isInitialized()
     }
