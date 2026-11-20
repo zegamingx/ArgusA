@@ -218,6 +218,7 @@ jobs:
           compression-level: 0
 
       - name: Check protected release signing secrets
+        id: release-secrets
         shell: bash
         env:
           ARGUS_RELEASE_KEYSTORE_BASE64: ${{ secrets.ARGUS_RELEASE_KEYSTORE_BASE64 }}
@@ -225,22 +226,26 @@ jobs:
           ARGUS_RELEASE_KEY_PASSWORD: ${{ secrets.ARGUS_RELEASE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          missing=0
+          missing=()
           for name in \
             ARGUS_RELEASE_KEYSTORE_BASE64 \
             ARGUS_RELEASE_STORE_PASSWORD \
             ARGUS_RELEASE_KEY_PASSWORD; do
             if [[ -z "${!name:-}" ]]; then
-              echo "::error::Missing Environment secret ${name} in Settings > Environments > argus-release."
-              missing=1
+              missing+=("$name")
             fi
           done
-          if [[ "$missing" -ne 0 ]]; then
-            echo "::error::Add the existing Argus 2026 PKCS#12 keystore (base64) and its two passwords once. Do not upload or commit the keystore."
-            exit 1
+
+          if (( ${#missing[@]} > 0 )); then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Persistent release signing is not configured. Missing Environment secrets: ${missing[*]}. The verified CI-signed APK artifact remains available; no production release will be published."
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Persistent release signing secrets are configured."
           fi
 
       - name: Sign and cryptographically verify release APK
+        if: ${{ steps.release-secrets.outputs.ready == 'true' }}
         shell: bash
         env:
           ARGUS_RELEASE_KEYSTORE_BASE64: ${{ secrets.ARGUS_RELEASE_KEYSTORE_BASE64 }}
@@ -255,6 +260,7 @@ jobs:
             "dist/ARGUS.apk"
 
       - name: Write verified build manifest
+        if: ${{ steps.release-secrets.outputs.ready == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -274,6 +280,7 @@ jobs:
           cat "dist/BUILD-MANIFEST.txt"
 
       - name: Upload installable Argus APK
+        if: ${{ steps.release-secrets.outputs.ready == 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v4
         with:
           name: argus-installable-apk
