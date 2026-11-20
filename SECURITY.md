@@ -16,30 +16,42 @@ private signing material, or unredacted device logs in a report.
 
 The previously distributed v1.0.13 signing identity appeared in an unencrypted
 GitHub Release asset and must be treated as compromised, even after asset
-deletion. Do not use that identity for new installations or releases.
+deletion. Never use that identity for new installations or releases.
 
-A separate offline Argus 2026 signing identity is used for clean installs and
-future releases signed with the same key:
+The replacement offline Argus 2026 identity is pinned for clean installations
+and future updates signed with the same key:
 
 - Alias: `argus-release-2026`
 - Certificate SHA-256: `40969E172BC0F8CB18ED2DDF274CAF3D3DB1456EDAEAF03939C0C0511797E64E`
-- The new key is not a signing-certificate lineage successor to the exposed
-  v1.0.13 identity. Existing installations signed by the old identity cannot
-  be updated with this key; they require a separate migration or package plan.
-- Keep the PKCS#12 keystore and its passwords offline. Never commit the
-  keystore, passwords, or private key to Git, releases, Actions artifacts,
-  caches, or public issues.
+- It is not a signing-certificate lineage successor to the exposed v1.0.13
+  identity. Existing installations signed by the old certificate cannot be
+  updated with this signer. Back up local app data before changing identity.
 
-Use `tools/security/sign-release.ps1` with the official Android SDK
-`zipalign` and `apksigner` tools to align and sign release APKs locally. The
-helper requires the expected certificate fingerprint and verifies the final
-APK before writing its output. It enables v1, v2, and v3 signing and aligns
-uncompressed native libraries for 16 KiB pages.
+Keep the PKCS#12 keystore and both passwords offline. For automated release
+builds, store them only as protected GitHub Environment secrets in the
+`argus-release` Environment:
 
-A protected GitHub Environment is an additional access-control layer, not a
-remedy for a compromised signing identity. Do not enable automated CI signing
-until the offline key backup and repository secret-handling process have been
-reviewed.
+- `ARGUS_RELEASE_KEYSTORE_BASE64`
+- `ARGUS_RELEASE_STORE_PASSWORD`
+- `ARGUS_RELEASE_KEY_PASSWORD`
+
+Restrict the Environment to the `main` branch and apply required reviewers
+where appropriate. The private key must never enter Git, pull-request jobs,
+Actions artifacts, caches, logs, or public issues. The workflow checks out only
+trusted `main` source for signing; PR validation has no access to release
+signing secrets.
+
+The `tools/security/sign-release.sh` helper decodes the protected PKCS#12
+secret into a short-lived permission-restricted temporary directory, aligns
+native libraries for 16 KiB pages, signs with v1/v2/v3 schemes, verifies the
+APK with `apksigner`, checks the pinned certificate fingerprint, and confirms
+the expected package ID before writing the final APK. Temporary key material is
+removed on exit.
+
+For local Windows signing, use `tools/security/sign-release.ps1` with the
+official Android SDK `zipalign` and `apksigner` tools. The helper also checks
+the expected certificate fingerprint and verifies the final APK before
+publishing it. Never store the PKCS#12 keystore or passwords in the repository.
 
 ## Screen privacy
 

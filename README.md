@@ -53,42 +53,74 @@ Build a debug APK:
 ./gradlew :app:assembleDebug
 ```
 
-Run release-variant checks and build an **unsigned** APK:
+For a direct local export, use:
+
+```bash
+./gradlew :app:exportDebugApk
+```
+
+This writes `ARGUS.apk` in the repository root. It is signed automatically with
+the machine-local Android Debug Keystore and is intended for local development.
+Keep that debug keystore stable on the development machine if the APK must
+update an earlier debug installation. A debug-signed APK cannot update an
+Argus 2026 release-signed installation.
+
+Run release-variant checks and build the unsigned intermediate APK:
 
 ```bash
 ./gradlew :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
 ```
 
-This output is not an installable update for an existing signed Argus installation.
-Do not distribute it or use it for `adb install -r`; signed releases remain
-suspended until a verified Android signing-certificate lineage migration passes.
+The unsigned intermediate is not an installable app and is not published as a
+download artifact. `./gradlew :app:exportReleaseApk` intentionally writes
+`ARGUS-unsigned.apk`, never `ARGUS.apk`.
 
-Release APKs are intentionally unsigned in this branch. The previously distributed v1.0.13 signer was present in an unencrypted private-repository release asset and must be treated as compromised. Do not sign new APKs with that identity. A new release signing pipeline will be introduced only after an Android signing-certificate lineage has been generated with the old and replacement keys, and an in-place update has been tested on an existing v1.0.13 installation.
+Installable release artifacts are produced by the protected
+`Argus Installable Release` workflow after changes reach `main`. The workflow
+signs with the Argus 2026 PKCS#12 identity, checks the pinned certificate
+fingerprint, validates 16 KiB ZIP alignment, and uploads only the final
+`ARGUS.apk` plus its checksum and manifest.
 
-## GitHub releases
-
-Signed release publication is temporarily suspended.
+## GitHub releases and installable builds
 
 The signing identity used by the distributed Argus v1.0.13 APK was previously
-stored as an unencrypted PKCS#12 GitHub Release asset. Removing that asset does
-not undo prior exposure. Treat the old private key as compromised and do not
-use it for new releases.
+stored in an unencrypted GitHub Release asset. Treat that historical private
+key as compromised and do not use it for new APKs.
 
-Before signed releases resume, create an Android signing-certificate lineage
-from the old signer to a new offline-generated signer, using the official
-`apksigner rotate` and rotated-signing workflow. The migration APK must be
-built and installed over an existing v1.0.13 installation with `adb install -r`;
-verify that app data remains intact and that subsequent updates signed by the
-new identity are accepted. Keep the old key only for the controlled migration
-operation, then remove it from CI and retain it only in encrypted offline
-recovery storage for as long as required.
+The replacement Argus 2026 identity is used for clean installs and all future
+updates signed with that same key:
 
-The certificate fingerprint from v1.0.13 is recorded in the private migration
-notes, not used as an approval pin for future release signing. A new workflow
-will be added after the replacement certificate, lineage, and update path have
-been verified. Until then, `:app:assembleRelease` produces an unsigned APK.
+- Alias: `argus-release-2026`
+- Certificate SHA-256: `40969E172BC0F8CB18ED2DDF274CAF3D3DB1456EDAEAF03939C0C0511797E64E`
+- It is not a signing-certificate lineage successor to the exposed v1.0.13
+  identity. An APK signed with this key cannot update an older installation
+  signed by the exposed certificate. Back up app data before changing signing
+  identity or package installation.
 
-Repository validation and debug builds do not receive signing keys.
+The private PKCS#12 keystore and passwords must remain offline or in protected
+GitHub Environment secrets. Never commit them or upload them as build
+artifacts. Configure these one-time Environment secrets under
+**Settings → Environments → argus-release**:
+
+- `ARGUS_RELEASE_KEYSTORE_BASE64`: base64 encoding of the existing Argus 2026
+  PKCS#12 keystore.
+- `ARGUS_RELEASE_STORE_PASSWORD`: keystore password.
+- `ARGUS_RELEASE_KEY_PASSWORD`: private-key password.
+
+The alias is pinned to `argus-release-2026` in the workflow. Restrict the
+Environment deployment branch to `main`; add required reviewers if the
+repository's release policy requires approval.
+
+The `Argus Installable Release` workflow runs after relevant changes reach
+`main`. It performs release lint and unit tests, builds the native release
+variant, aligns native libraries for 16 KiB pages, signs the APK, verifies the
+signature and pinned certificate fingerprint, and uploads the installable
+`ARGUS.apk` artifact. The PR validation workflow never receives signing
+secrets and does not publish unsigned APKs.
+
+Use `tools/security/sign-release.ps1` for local Windows signing or
+`tools/security/sign-release.sh` for Linux/CI signing. Both helpers verify the
+expected Argus 2026 certificate before publishing their output.
 
 ## Runtime crash diagnostics
 
@@ -143,8 +175,9 @@ runtime is currently integrated.
 The native-validation workflow builds the native library and verifies that the
 APK contains the configured ABI libraries on pull requests and relevant
 main-branch pushes. GitHub Automatic Dependency Submission also validates the
-Gradle dependency graph. No release-signing workflow is active while the
-previous signing identity is being migrated. Native validation runs on JDK 25;
+Gradle dependency graph. Installable release signing runs only through the
+protected `argus-release` GitHub Environment after changes reach `main`.
+Native validation runs on JDK 25;
 the Android app's Java source and bytecode compatibility target remains Java 21.
 Native builds install the checksum-pinned CMake 4.5.0 distribution and NDK r30.
 

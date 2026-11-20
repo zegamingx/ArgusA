@@ -1660,7 +1660,15 @@ class TrainingManager internal constructor(
         }
 
         val memoryConflicts = synchronized(queueLock) {
+            // clearQueue() keeps optimizer-committed rows in memory until their
+            // finalization completes, even after their persisted queue rows have
+            // been cleared. Those rows no longer represent pending work for the
+            // duplicate-replay guard. The current item remains protected below,
+            // and the repository check above still blocks committed rows that
+            // have not actually been cleared from persistent storage.
             val memoryActiveDocumentIds = _nextQueue.value
+                .asSequence()
+                .filter { it.status != TrainingStatus.OPTIMIZER_COMMITTED }
                 .mapNotNull { it.documentId }
                 .toMutableSet()
             _currentTrainingItem.value?.documentId?.let { memoryActiveDocumentIds.add(it) }
