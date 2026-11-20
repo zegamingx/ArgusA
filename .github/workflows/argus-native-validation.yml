@@ -144,6 +144,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          set -euo pipefail
           sdk_root="$ANDROID_HOME"
           sdkmanager_path="$(command -v sdkmanager || true)"
           if [[ -z "$sdkmanager_path" ]]; then
@@ -152,23 +153,52 @@ jobs:
           avdmanager_path="$(find "$sdk_root/cmdline-tools" -type f -name avdmanager -print -quit)"
           test -n "$sdkmanager_path"
           test -n "$avdmanager_path"
+
+          # Keep AVD creation and emulator startup on one explicit, persisted path.
+          # Without this, avdmanager may create under ANDROID_SDK_HOME/avd while
+          # emulator resolves HOME/.android/avd and reports "Unknown AVD name".
+          avd_home="$HOME/.android/avd"
+          mkdir -p "$avd_home"
+          export ANDROID_AVD_HOME="$avd_home"
+          export ANDROID_USER_HOME="$HOME/.android"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_USER_HOME=$ANDROID_USER_HOME" >> "$GITHUB_ENV"
+
           set +o pipefail
           yes | "$sdkmanager_path" --licenses >/dev/null
           set -o pipefail
           "$sdkmanager_path" --install "emulator" "system-images;android-35;google_apis;x86_64"
           echo "$sdk_root/emulator" >> "$GITHUB_PATH"
           echo "$(dirname "$avdmanager_path")" >> "$GITHUB_PATH"
-          echo "no" | "$avdmanager_path" create avd \
+
+          printf 'no\n' | "$avdmanager_path" create avd \
             --name argus-process-recovery \
             --package "system-images;android-35;google_apis;x86_64" \
             --device pixel_2 \
             --force
+
+          echo "Created Android Virtual Device definitions:"
+          "$avdmanager_path" list avd
+          test -s "$ANDROID_AVD_HOME/argus-process-recovery.ini"
+          test -d "$ANDROID_AVD_HOME/argus-process-recovery.avd"
+          echo "Verified AVD metadata: $ANDROID_AVD_HOME/argus-process-recovery.ini"
 
       - name: Start Android emulator
         if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery')) }}
         shell: bash
         run: |
           set -euo pipefail
+          avd_home="${ANDROID_AVD_HOME:-$HOME/.android/avd}"
+          export ANDROID_AVD_HOME="$avd_home"
+          export ANDROID_USER_HOME="${ANDROID_USER_HOME:-$HOME/.android}"
+          avd_ini="$ANDROID_AVD_HOME/argus-process-recovery.ini"
+          if [[ ! -s "$avd_ini" || ! -d "$ANDROID_AVD_HOME/argus-process-recovery.avd" ]]; then
+            echo "::error::The process-recovery AVD was not created in the configured AVD home: $ANDROID_AVD_HOME"
+            find "$HOME/.android" -maxdepth 3 -type f -name 'argus-process-recovery.ini' -print || true
+            exit 1
+          fi
+          echo "Using verified AVD: $avd_ini"
+
           accel_mode=auto
           device_timeout=180
           boot_timeout=240
