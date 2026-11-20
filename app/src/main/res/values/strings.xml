@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">A.R.G.U.S</string>
-    <string name="accessibility_service_description">A.R.G.U.S Screen Text Perception is off by default. When explicitly enabled in ARGUS, it reads accessible text only from apps you allow. Screen-derived local training and user-requested accessibility clicks require separate opt-ins. Sensitive app categories stay blocked.</string>
+    <string name="accessibility_service_description">A.R.G.U.S screen text perception is off by default. When enabled, it reads accessible text and content descriptions only from the active app window and only from apps you explicitly allow. Screen-derived local training and user-requested accessibility clicks require separate opt-ins. Known sensitive app categories are blocked using best-effort matching; detection is not exhaustive.</string>
 </resources>
