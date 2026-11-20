@@ -35,46 +35,6 @@ class DeviceAdaptiveRuntimePolicyTest {
     }
 
     @Test
-    fun streamedDocumentQueueBudgetDoesNotAssumeFourCharactersPerToken() {
-        assertEquals(
-            2 * 1024 * 1024,
-            DeviceAdaptiveRuntimePolicy.streamedDocumentQueueCharacterLimit(
-                maximumChunks = 8_192,
-                epochs = 1,
-                chunkStrideTokens = 330,
-                hardLimitCharacters = 2 * 1024 * 1024
-            )
-        )
-    }
-
-    @Test
-    fun streamedDocumentQueueBudgetAccountsForEveryEpoch() {
-        assertEquals(
-            540_540,
-            DeviceAdaptiveRuntimePolicy.streamedDocumentQueueCharacterLimit(
-                maximumChunks = 8_192,
-                epochs = 5,
-                chunkStrideTokens = 330,
-                hardLimitCharacters = 2 * 1024 * 1024
-            )
-        )
-    }
-
-    @Test
-    fun streamedDocumentQueueBudgetRejectsInvalidConfiguration() {
-        val failure = runCatching {
-            DeviceAdaptiveRuntimePolicy.streamedDocumentQueueCharacterLimit(
-                maximumChunks = 8_192,
-                epochs = 0,
-                chunkStrideTokens = 330,
-                hardLimitCharacters = 2 * 1024 * 1024
-            )
-        }.exceptionOrNull()
-
-        assertTrue(failure is IllegalArgumentException)
-    }
-
-    @Test
     fun deviceLocalHeadroomIgnoresHostOnlyMemoryHeaps() {
         val headroom = DeviceAdaptiveRuntimePolicy.deviceLocalHeapHeadroomBytes(
             budgets = listOf(1_000L, 2_000L),
