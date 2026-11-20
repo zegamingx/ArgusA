@@ -257,7 +257,7 @@ val exportReleaseApk = tasks.register<CopyApkTask>("exportReleaseApk") {
     group = "distribution"
     description = "Builds and exports an unsigned release APK; signing is suspended pending verified key rotation."
     dependsOn("assembleRelease")
-    apk.from(layout.buildDirectory.file("outputs/apk/release/app-release.apk"))
+    apk.from(layout.buildDirectory.file("outputs/apk/release/app-release-unsigned.apk"))
     target.set(layout.projectDirectory.file("../ARGUS.apk"))
     outputs.upToDateWhen { false }
 }
