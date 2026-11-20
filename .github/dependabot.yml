@@ -9,10 +9,6 @@ updates:
       time: "02:00"
       timezone: Asia/Jakarta
     open-pull-requests-limit: 5
-    labels:
-      - dependencies
-      - android
-
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -21,6 +17,3 @@ updates:
       time: "02:30"
       timezone: Asia/Jakarta
     open-pull-requests-limit: 5
-    labels:
-      - dependencies
-      - ci
