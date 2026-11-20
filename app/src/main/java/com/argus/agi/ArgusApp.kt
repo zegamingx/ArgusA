@@ -168,6 +168,19 @@ class ArgusApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+
+        // The process-death instrumentation service runs in its own Android process.
+        // It constructs an isolated engine/repository for each crash scenario and must
+        // not initialize a second application-wide model, Vulkan runtime, or worker.
+        val processName = Application.getProcessName()
+        if (processName != packageName) {
+            Log.i(
+                TAG,
+                "Skipping main-process core initialization in secondary process '$processName'."
+            )
+            return
+        }
+
         _instance = this
         capturePreviousProcessExit()
         installUncaughtExceptionHandler()
