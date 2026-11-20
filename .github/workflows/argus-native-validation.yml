@@ -141,7 +141,6 @@ jobs:
           done
 
       - name: Prepare unsigned release APK and checksum
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.number == 45 }}
         shell: bash
         run: |
           set -euo pipefail
@@ -167,7 +166,6 @@ jobs:
           cat "${RUNNER_TEMP}/argus-release/ARGUS-v1.0.13-release-unsigned.apk.sha256"
 
       - name: Upload unsigned release APK for retrieval
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.number == 45 && success() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: argus-v1.0.13-release-unsigned
