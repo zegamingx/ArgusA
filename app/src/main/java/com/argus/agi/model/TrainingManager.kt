@@ -685,17 +685,12 @@ class TrainingManager internal constructor(
         if (closed) return Pair(0, 0L)
 
         val availableHeapBytes = captureTrainingMemorySnapshot().availableHeapBytes
-        val effectiveChunkStride = (chunkSize - overlap).coerceAtLeast(1)
-        val queueBoundedCharacterLimit =
-            DeviceAdaptiveRuntimePolicy.streamedDocumentQueueCharacterLimit(
-                maximumChunks = MAX_STREAMED_DOCUMENT_CHUNKS,
-                epochs = epochs,
-                chunkStrideTokens = effectiveChunkStride,
-                hardLimitCharacters = MAX_STREAMED_DOCUMENT_CHARACTERS
-            )
+        // Do not infer token-queue capacity from character count: UTF-8 byte-level
+        // token density varies substantially by script. Enforce the live heap budget
+        // while reading, then validate the actual generated chunk count after parsing.
         val streamCharacterLimit = DeviceAdaptiveRuntimePolicy.streamedDocumentCharacterLimit(
             availableHeapBytes = availableHeapBytes,
-            hardLimitCharacters = queueBoundedCharacterLimit
+            hardLimitCharacters = MAX_STREAMED_DOCUMENT_CHARACTERS
         )
         require(streamCharacterLimit > 0) {
             "There is not enough available app-heap headroom for a streamed document import."
