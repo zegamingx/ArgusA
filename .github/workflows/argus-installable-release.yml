@@ -37,28 +37,6 @@ jobs:
       name: argus-release
 
     steps:
-      - name: Check protected release signing secrets
-        shell: bash
-        env:
-          ARGUS_RELEASE_KEYSTORE_BASE64: ${{ secrets.ARGUS_RELEASE_KEYSTORE_BASE64 }}
-          ARGUS_RELEASE_STORE_PASSWORD: ${{ secrets.ARGUS_RELEASE_STORE_PASSWORD }}
-          ARGUS_RELEASE_KEY_PASSWORD: ${{ secrets.ARGUS_RELEASE_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          missing=0
-          for name in \
-            ARGUS_RELEASE_KEYSTORE_BASE64 \
-            ARGUS_RELEASE_STORE_PASSWORD \
-            ARGUS_RELEASE_KEY_PASSWORD; do
-            if [[ -z "${!name:-}" ]]; then
-              echo "::error::Missing Environment secret ${name} in Settings > Environments > argus-release."
-              missing=1
-            fi
-          done
-          if [[ "$missing" -ne 0 ]]; then
-            echo "::error::Add the existing Argus 2026 PKCS#12 keystore (base64) and its two passwords once. Do not upload or commit the keystore."
-            exit 1
-          fi
 
       - name: Checkout trusted main source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -261,7 +239,6 @@ jobs:
             echo "::error::Add the existing Argus 2026 PKCS#12 keystore (base64) and its two passwords once. Do not upload or commit the keystore."
             exit 1
           fi
-
 
       - name: Sign and cryptographically verify release APK
         shell: bash
