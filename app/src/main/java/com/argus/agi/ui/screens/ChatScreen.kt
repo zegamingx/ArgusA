@@ -559,7 +559,7 @@ fun ChatMessageItem(
     var isTrainingSubmitted by remember(msg.id) { mutableStateOf(false) }
 
     val isLongMessage = msg.text.length > 450
-    val displayText = if (isLongMessage && !isLongTextExpanded) msg.text.take(380) + "..." else msg.text
+    val displayText = if (isLongMessage && !isLongTextExpanded) msg.text.take(512) + "..." else msg.text
 
     Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = if (msg.isUser) Alignment.End else Alignment.Start) {
         Text(

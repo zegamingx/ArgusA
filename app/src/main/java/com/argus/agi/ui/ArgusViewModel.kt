@@ -416,7 +416,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     source = "user_approved_conversation",
                     title = "Approved conversation ${System.currentTimeMillis()}",
                     fullText = trainingSample,
-                    chunkSize = 380,
+                    chunkSize = 512,
                     overlap = 0,
                     epochs = 1,
                     rightsStatus = "USER_DECLARED",

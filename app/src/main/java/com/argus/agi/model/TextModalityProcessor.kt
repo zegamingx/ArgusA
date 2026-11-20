@@ -674,7 +674,7 @@ object TextModalityProcessor {
     fun process(
         rawText: String,
         documentTitle: String = "Dokumen",
-        chunkSize: Int = 380,
+        chunkSize: Int = 512,
         overlap: Int = 50,
         tokenizer: Tokenizer = defaultChunkTokenizer
     ): List<ProcessedChunk> {

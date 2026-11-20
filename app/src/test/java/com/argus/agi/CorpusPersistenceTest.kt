@@ -517,7 +517,7 @@ class CorpusPersistenceTest {
                     source = "JSONL record-budget regression",
                     title = "Must not partially persist",
                     reader = StringReader(records),
-                    chunkSize = 380,
+                    chunkSize = 512,
                     overlap = 0
                 )
             }.exceptionOrNull()
@@ -572,7 +572,7 @@ class CorpusPersistenceTest {
                     source = "JSONL field-size regression",
                     title = "Oversized JSONL record",
                     reader = StringReader(oversizedRecord),
-                    chunkSize = 380,
+                    chunkSize = 512,
                     overlap = 0
                 )
             }.exceptionOrNull()
@@ -623,7 +623,7 @@ class CorpusPersistenceTest {
                     source = "Explicit JSONL malformed-record regression",
                     title = "Must be rejected atomically",
                     reader = StringReader("$validRecord\n$malformedRecord"),
-                    chunkSize = 380,
+                    chunkSize = 512,
                     overlap = 0,
                     strictJsonLines = true
                 )

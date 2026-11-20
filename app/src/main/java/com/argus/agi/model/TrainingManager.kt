@@ -472,7 +472,7 @@ class TrainingManager internal constructor(
         source: String,
         title: String,
         fullText: String,
-        chunkSize: Int = 380,
+        chunkSize: Int = 512,
         overlap: Int = 50,
         epochs: Int = 1,
         language: String? = null,
@@ -597,7 +597,7 @@ class TrainingManager internal constructor(
         source: String,
         title: String,
         fullText: String,
-        chunkSize: Int = 380,
+        chunkSize: Int = 512,
         overlap: Int = 50,
         epochs: Int = 1
     ): Int {
@@ -657,7 +657,7 @@ class TrainingManager internal constructor(
         source: String,
         title: String,
         reader: Reader,
-        chunkSize: Int = 380,
+        chunkSize: Int = 512,
         overlap: Int = 50,
         epochs: Int = 1,
         language: String? = null,
@@ -1858,7 +1858,7 @@ class TrainingManager internal constructor(
     fun enqueueData(source: String, title: String, content: String) {
         if (content.isBlank() || closed) return
 
-        if (neuralEngine.tokenizer.encodeToIds(content, autoRegister = false).size > 380) {
+        if (neuralEngine.tokenizer.encodeToIds(content, autoRegister = false).size > 512) {
             scope.launch {
                 runSuspendCatching { enqueueDocument(source, title, content) }
                     .onFailure { error ->
@@ -1871,7 +1871,7 @@ class TrainingManager internal constructor(
         val processed = TextModalityProcessor.process(
             rawText = content,
             documentTitle = title,
-            chunkSize = 380,
+            chunkSize = 512,
             overlap = 40,
             tokenizer = neuralEngine.tokenizer
         )
