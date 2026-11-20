@@ -21,6 +21,15 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
+data class ScreenDataDeletionResult(
+    val trainingItemsDeleted: Int,
+    val corpusDocumentsDeleted: Int,
+    val screenMemoriesDeleted: Int
+) {
+    val totalRecordsDeleted: Int
+        get() = trainingItemsDeleted + corpusDocumentsDeleted + screenMemoriesDeleted
+}
+
 class ArgusRepository(
     context: Context,
     database: ArgusDatabase = ArgusDatabase.getInstance(context)
@@ -32,6 +41,11 @@ class ArgusRepository(
     private val trainingQueueDao = db.trainingQueueDao()
     private val trainingReplaySessionDao = db.trainingReplaySessionDao()
     private val corpusDao = db.corpusDao()
+
+    private companion object {
+        const val SCREEN_SOURCE_PATTERN = "Screen%"
+        const val LEGACY_SCREEN_SOURCE_PATTERN = "Screen (%"
+    }
 
     // =========================================================================
     // Chat Messages
@@ -81,6 +95,10 @@ class ArgusRepository(
         worldMemoryDao.deleteMemory(key)
     }
 
+    suspend fun deleteScreenContextMemories(): Int = withContext(Dispatchers.IO) {
+        worldMemoryDao.deleteScreenContextMemories()
+    }
+
     suspend fun pruneExpiredMemories(ttlMs: Long) = withContext(Dispatchers.IO) {
         val threshold = System.currentTimeMillis() - ttlMs
         worldMemoryDao.deleteExpired(threshold)
@@ -97,6 +115,17 @@ class ArgusRepository(
     suspend fun getPendingQueueSnapshot(): List<TrainingData> = withContext(Dispatchers.IO) {
         trainingQueueDao.getPendingQueueSnapshot().map { it.toDomain() }
     }
+
+    suspend fun getScreenTrainingItemsSnapshot(): List<TrainingData> =
+        withContext(Dispatchers.IO) {
+            trainingQueueDao.getItemsBySourcePattern(SCREEN_SOURCE_PATTERN).map { it.toDomain() }
+        }
+
+    suspend fun getLegacyScreenTrainingItemsSnapshot(): List<TrainingData> =
+        withContext(Dispatchers.IO) {
+            trainingQueueDao.getItemsBySourcePattern(LEGACY_SCREEN_SOURCE_PATTERN)
+                .map { it.toDomain() }
+        }
 
     suspend fun getOptimizerCommittedTrainingItemsSnapshot(): List<TrainingData> =
         withContext(Dispatchers.IO) {
@@ -235,6 +264,10 @@ class ArgusRepository(
 
     suspend fun getTrainingItem(id: String): TrainingData? = withContext(Dispatchers.IO) {
         trainingQueueDao.getItem(id)?.toDomain()
+    }
+
+    suspend fun deleteTrainingItem(id: String) = withContext(Dispatchers.IO) {
+        trainingQueueDao.deleteItem(id)
     }
 
     suspend fun recoverInterruptedTrainingItems(): Int = withContext(Dispatchers.IO) {
@@ -485,6 +518,114 @@ class ArgusRepository(
     suspend fun deleteCorpusDocument(documentId: String): Boolean =
         withContext(Dispatchers.IO) {
             corpusDao.deleteDocument(documentId) > 0
+        }
+
+    /**
+     * Removes corpus documents imported by the legacy automatic Accessibility
+     * pipeline. The caller must first finalize every optimizer-committed screen
+     * queue item so this operation cannot invalidate an active replay journal.
+     *
+     * Deduplicated documents are preserved when any non-screen source remains.
+     */
+    suspend fun deleteLegacyScreenCorpusDocuments(): Int =
+        withContext(Dispatchers.IO) {
+            db.withTransaction {
+                val documentIds = corpusDao
+                    .getDocumentIdsBySourcePattern(LEGACY_SCREEN_SOURCE_PATTERN)
+                    .distinct()
+                var deletedDocuments = 0
+
+                for (documentId in documentIds) {
+                    corpusDao.deleteSourcesBySourcePattern(
+                        documentId = documentId,
+                        sourcePattern = LEGACY_SCREEN_SOURCE_PATTERN
+                    )
+
+                    val remainingSources = corpusDao.getSources(documentId)
+                    if (remainingSources.isEmpty()) {
+                        deletedDocuments += corpusDao.deleteDocument(documentId)
+                    } else {
+                        val retainedSource = remainingSources.first()
+                        check(
+                            corpusDao.updateDocumentPrimarySource(
+                                documentId = documentId,
+                                source = retainedSource.source,
+                                canonicalUrl = retainedSource.canonicalUrl,
+                                language = retainedSource.language
+                            ) == 1
+                        ) {
+                            "Could not restore retained corpus provenance for document $documentId."
+                        }
+                        check(corpusDao.refreshDocumentRightsStatus(documentId) == 1) {
+                            "Could not refresh corpus rights for document $documentId."
+                        }
+                    }
+                }
+                deletedDocuments
+            }
+        }
+
+    /**
+     * Deletes records originating only from Accessibility screen capture.
+     *
+     * The caller must pause training and ensure there are no screen-derived
+     * optimizer-committed or active rows. The database transaction preserves
+     * deduplicated corpus documents that still have non-screen source provenance.
+     */
+    suspend fun clearScreenDerivedData(): ScreenDataDeletionResult =
+        withContext(Dispatchers.IO) {
+            db.withTransaction {
+                val screenItems = trainingQueueDao.getItemsBySourcePattern(SCREEN_SOURCE_PATTERN)
+                val unsafeItems = screenItems.filter { item ->
+                    item.status == TrainingStatus.TRAINING.name ||
+                        item.status == TrainingStatus.OPTIMIZER_COMMITTED.name
+                }
+                check(unsafeItems.isEmpty()) {
+                    "Screen-derived training has an active or optimizer-committed item. " +
+                        "Resume/finalize training before deleting screen-derived records."
+                }
+
+                val screenDocumentIds =
+                    corpusDao.getDocumentIdsBySourcePattern(SCREEN_SOURCE_PATTERN).distinct()
+                var deletedCorpusDocuments = 0
+
+                for (documentId in screenDocumentIds) {
+                    corpusDao.deleteSourcesBySourcePattern(
+                        documentId = documentId,
+                        sourcePattern = SCREEN_SOURCE_PATTERN
+                    )
+
+                    val remainingSources = corpusDao.getSources(documentId)
+                    if (remainingSources.isEmpty()) {
+                        deletedCorpusDocuments += corpusDao.deleteDocument(documentId)
+                    } else {
+                        val retainedSource = remainingSources.first()
+                        check(
+                            corpusDao.updateDocumentPrimarySource(
+                                documentId = documentId,
+                                source = retainedSource.source,
+                                canonicalUrl = retainedSource.canonicalUrl,
+                                language = retainedSource.language
+                            ) == 1
+                        ) {
+                            "Could not restore retained corpus provenance for document $documentId."
+                        }
+                        check(corpusDao.refreshDocumentRightsStatus(documentId) == 1) {
+                            "Could not refresh corpus rights for document $documentId."
+                        }
+                    }
+                }
+
+                val deletedTrainingItems =
+                    trainingQueueDao.deleteItemsBySourcePattern(SCREEN_SOURCE_PATTERN)
+                val deletedScreenMemories = worldMemoryDao.deleteScreenContextMemories()
+
+                ScreenDataDeletionResult(
+                    trainingItemsDeleted = deletedTrainingItems,
+                    corpusDocumentsDeleted = deletedCorpusDocuments,
+                    screenMemoriesDeleted = deletedScreenMemories
+                )
+            }
         }
 
     private fun sha256Utf16Be(value: String): String {

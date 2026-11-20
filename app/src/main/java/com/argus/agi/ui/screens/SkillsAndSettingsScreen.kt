@@ -93,6 +93,12 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
     val isQueueingArticle by viewModel.isQueueingArticle.collectAsState()
     val articleQueueStatus by viewModel.articleQueueStatus.collectAsState()
 
+    val screenPerceptionEnabled by viewModel.screenPerceptionEnabled.collectAsState()
+    val screenTrainingEnabled by viewModel.screenTrainingEnabled.collectAsState()
+    val accessibilityActionsEnabled by viewModel.accessibilityActionsEnabled.collectAsState()
+    val isClearingScreenData by viewModel.isClearingScreenData.collectAsState()
+    val screenDataClearMessage by viewModel.screenDataClearMessage.collectAsState()
+
     var isBatteryExpanded by remember { mutableStateOf(true) }
     var isSkillsExpanded by remember { mutableStateOf(false) }
     var isTesterExpanded by remember { mutableStateOf(false) }
@@ -123,7 +129,8 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    val excludedCount = installedApps.count { it.isExcluded }
+    val blockedCount = installedApps.count { it.isExcluded }
+    val allowedCount = installedApps.count { !it.isExcluded }
     val privacySuggestedCount = remember(installedApps) {
         installedApps.count { app ->
             PrivacyAppHeuristics.isPrivacySensitiveApp(app.appName, app.packageName)
@@ -136,7 +143,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                 app.appName.contains(query, ignoreCase = true) ||
                 app.packageName.contains(query, ignoreCase = true)
             val matchesTab = when (appFilterTab) {
-                1 -> app.isExcluded
+                1 -> !app.isExcluded
                 2 -> PrivacyAppHeuristics.isPrivacySensitiveApp(app.appName, app.packageName)
                 else -> true
             }
@@ -159,11 +166,11 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                     }
                 }
                 Spacer(modifier = Modifier.height(4.dp))
-                Text(text = "Configure what ARGUS can read, act on, and learn. Model execution and stored memory stay on-device; web retrieval and some speech services may use network providers.", style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp), color = ArgusTextMuted, lineHeight = 17.sp)
+                Text(text = "Screen reading, screen-derived training, and accessibility clicks are separate opt-ins. Screen content stays on this device. All apps are blocked until you explicitly allow them.", style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp), color = ArgusTextMuted, lineHeight = 17.sp)
                 Spacer(modifier = Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     MiniStat(label = "CAPABILITIES", value = "7 built-in", modifier = Modifier.weight(1f))
-                    MiniStat(label = "EXCLUDED", value = "$excludedCount apps", modifier = Modifier.weight(1f))
+                    MiniStat(label = "APP ACCESS", value = "$allowedCount allowed", modifier = Modifier.weight(1f))
                     MiniStat(label = "MEMORY", value = "${worldEntities.size} facts", modifier = Modifier.weight(1f))
                 }
             }
@@ -214,7 +221,138 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
             }
         }
 
-        // 2. SKILLS
+        // 2. EXPLICIT SCREEN PRIVACY CONSENT
+        item {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = ArgusSurface,
+                border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(
+                        text = "Screen access & privacy",
+                        style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp),
+                        color = ArgusTextPrimary,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "When enabled, ARGUS reads visible text and content descriptions from the active window of apps you explicitly allow below. Screen context remains local and temporary. If you separately allow screen training, snippets enter a local training queue but not the replayable document corpus. Password and sensitive input fields are filtered, but ordinary screen text can still contain private information.",
+                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                        color = ArgusTextSecondary,
+                        lineHeight = 16.sp
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                text = "Allow screen text perception",
+                                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp),
+                                color = ArgusTextPrimary,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Separate opt-in. Off until explicitly enabled.",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                color = ArgusTextMuted
+                            )
+                        }
+                        Checkbox(
+                            checked = screenPerceptionEnabled,
+                            onCheckedChange = viewModel::setScreenPerceptionEnabled
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                text = "Allow screen text in local training",
+                                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp),
+                                color = ArgusTextPrimary,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Global opt-in. Each app also needs its own Train permission in the allowlist.",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                color = ArgusTextMuted
+                            )
+                        }
+                        Checkbox(
+                            checked = screenTrainingEnabled,
+                            enabled = screenPerceptionEnabled,
+                            onCheckedChange = viewModel::setScreenTrainingEnabled
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                text = "Allow user-requested accessibility clicks",
+                                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp),
+                                color = ArgusTextPrimary,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Independent opt-in. Screen-reading consent does not enable clicks.",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                color = ArgusTextMuted
+                            )
+                        }
+                        Checkbox(
+                            checked = accessibilityActionsEnabled,
+                            onCheckedChange = viewModel::setAccessibilityActionsEnabled
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Clearing disables screen reading, screen training and accessibility clicks, revokes every per-app Read/Train grant, and removes screen memories, queued/completed samples and legacy screen-only corpus records. Previously applied model-weight updates cannot be selectively reversed.",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                        color = ArgusTextMuted,
+                        lineHeight = 15.sp
+                    )
+                    Button(
+                        onClick = viewModel::clearScreenDerivedData,
+                        enabled = !isClearingScreenData,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = ArgusWarning.copy(alpha = 0.16f),
+                            contentColor = ArgusWarning,
+                            disabledContainerColor = ArgusSurfaceVariant,
+                            disabledContentColor = ArgusTextMuted
+                        ),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text(
+                            text = if (isClearingScreenData) "Clearing screen data…" else "Disable all screen access & clear data",
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp
+                        )
+                    }
+                    screenDataClearMessage?.let { message ->
+                        Text(
+                            text = message,
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = ArgusTextSecondary,
+                            lineHeight = 16.sp
+                        )
+                    }
+                }
+            }
+        }
+
+        // 3. SKILLS
         item {
             Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
@@ -237,8 +375,8 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                             Spacer(modifier = Modifier.height(8.dp))
                             SkillRow(number = "01", title = "General Web Search", desc = "Searches web sources and returns source links for review.")
                             SkillRow(number = "02", title = "Article Extraction", desc = "Extracts a selected article and presents a preview for review.")
-                            SkillRow(number = "03", title = "Screen Text Perception", desc = "Reads visible text from the active app; excluded apps are skipped.")
-                            SkillRow(number = "04", title = "Accessibility Actions", desc = "Attempts supported actions on visible accessibility nodes.")
+                            SkillRow(number = "03", title = "Screen Text Perception", desc = "Off by default. Reads visible text only after separate consent and an explicit per-app allowlist.")
+                            SkillRow(number = "04", title = "Accessibility Actions", desc = "Off by default. Performs clicks only after separate action consent and on an allowed app.")
                             SkillRow(number = "05", title = "Deterministic Arithmetic", desc = "Evaluates supported arithmetic expressions deterministically.")
                             SkillRow(number = "06", title = "World Model Memory", desc = "Stores local key-value facts with source and app context.")
                             SkillRow(number = "07", title = "Local Model Training", desc = "Trains the on-device model using the local document queue.")
@@ -338,7 +476,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
             }
         }
 
-        // 3. EXCLUDED APPS - FIX TABS + ROW
+        // 4. DEFAULT-DENY APP ALLOWLIST
         item {
             Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
@@ -349,13 +487,13 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                             }
                             Spacer(modifier = Modifier.width(9.dp))
                             Column {
-                                Text(text = "Excluded Apps", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
-                                Text(text = "$excludedCount apps excluded from screen reading", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
+                                Text(text = "App Allowlist", style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp), color = ArgusTextPrimary, fontWeight = FontWeight.Bold)
+                                Text(text = "$allowedCount allowed • $blockedCount blocked by default", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextMuted)
                             }
                         }
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(ArgusCyanPrimary.copy(alpha = 0.15f)).padding(horizontal = 8.dp, vertical = 4.dp)) {
-                                Text(text = "$excludedCount excluded", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = ArgusCyanPrimary, fontWeight = FontWeight.Bold)
+                                Text(text = "$allowedCount allowed", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = ArgusCyanPrimary, fontWeight = FontWeight.Bold)
                             }
                             Icon(painter = if (isExcludeAppsExpanded) painterResource(R.drawable.ic_symbol_keyboard_arrow_up) else painterResource(R.drawable.ic_symbol_keyboard_arrow_down), contentDescription = "Toggle", tint = ArgusCyanPrimary, modifier = Modifier.size(20.dp))
                         }
@@ -363,13 +501,13 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                     AnimatedVisibility(visible = isExcludeAppsExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
                             Spacer(modifier = Modifier.height(8.dp))
-                            Text(text = "ARGUS skips screen text from excluded apps. This reduces exposure but does not replace Android permissions or the app's own privacy controls.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextSecondary, lineHeight = 16.sp)
+                            Text(text = "All apps start blocked. Read grants local screen perception; Train separately grants local model training. Both the global switches above and the corresponding per-app choices must be enabled. Known financial, credential, private-messaging, email, health, and personal-media apps are blocked by best-effort matching, which is not exhaustive.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextSecondary, lineHeight = 16.sp)
                             Spacer(modifier = Modifier.height(10.dp))
                             OutlinedTextField(value = appFilterText, onValueChange = { appFilterText = it }, placeholder = { Text("Cari app...", color = ArgusTextMuted, fontSize = 12.sp) }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = ArgusCyanPrimary, unfocusedBorderColor = ArgusCardBorder, focusedTextColor = ArgusTextPrimary, unfocusedTextColor = ArgusTextPrimary, focusedContainerColor = ArgusSurfaceVariant, unfocusedContainerColor = ArgusSurfaceVariant), singleLine = true)
                             Spacer(modifier = Modifier.height(8.dp))
                             // FIX: LazyRow biar tab gak kepotong
                             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                val tabs = listOf("All (${installedApps.size})", "Excluded ($excludedCount)", "Privacy suggestions ($privacySuggestedCount)")
+                                val tabs = listOf("All (${installedApps.size})", "Allowed ($allowedCount)", "Protected ($privacySuggestedCount)")
                                 items(tabs.indices.toList()) { idx ->
                                     val label = tabs[idx]
                                     val isSelected = appFilterTab == idx
@@ -379,7 +517,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                 }
                             }
                             Spacer(modifier = Modifier.height(10.dp))
-                            Text(text = "Showing ${filteredApps.size} apps • scroll di dalam kotak", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = ArgusCyanGlow, fontFamily = FontFamily.Monospace)
+                            Text(text = "Showing ${filteredApps.size} launchable apps • only allowed apps can be read", style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = ArgusCyanGlow, fontFamily = FontFamily.Monospace)
                             Spacer(modifier = Modifier.height(6.dp))
                             Column(modifier = Modifier.fillMaxWidth().heightIn(max = 340.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                 if (filteredApps.isEmpty()) {
@@ -388,12 +526,77 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                                     }
                                 } else {
                                     filteredApps.forEach { app ->
-                                        Row(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(ArgusSurfaceVariant).clickable { viewModel.toggleAppExclusion(app.packageName) }.padding(horizontal = 10.dp, vertical = 7.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
-                                                Text(text = app.appName, style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp), color = ArgusTextPrimary, fontWeight = if (app.isExcluded) FontWeight.Bold else FontWeight.Normal)
-                                                Text(text = app.packageName, style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp), color = if (app.isExcluded) ArgusCyanGlow else ArgusTextMuted)
+                                        val protectedApp = PrivacyAppHeuristics.isPrivacySensitiveApp(
+                                            app.appName,
+                                            app.packageName
+                                        )
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(10.dp))
+                                                .background(ArgusSurfaceVariant)
+                                                .padding(horizontal = 10.dp, vertical = 7.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f).padding(end = 6.dp)) {
+                                                Text(
+                                                    text = app.appName,
+                                                    style = MaterialTheme.typography.titleMedium.copy(fontSize = 12.sp),
+                                                    color = ArgusTextPrimary,
+                                                    fontWeight = if (!app.isExcluded) FontWeight.Bold else FontWeight.Normal
+                                                )
+                                                Text(
+                                                    text = when {
+                                                        protectedApp -> "Protected by best-effort matching"
+                                                        app.isExcluded -> "Blocked by default"
+                                                        else -> "Allowed for local screen reading"
+                                                    },
+                                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                                    color = if (protectedApp) ArgusWarning else if (!app.isExcluded) ArgusCyanGlow else ArgusTextMuted
+                                                )
+                                                Text(
+                                                    text = app.packageName,
+                                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                                                    color = ArgusTextMuted
+                                                )
                                             }
-                                            Checkbox(checked = app.isExcluded, onCheckedChange = { viewModel.toggleAppExclusion(app.packageName) }, colors = CheckboxDefaults.colors(checkedColor = ArgusCyanPrimary, uncheckedColor = ArgusCardBorder, checkmarkColor = ArgusDarkBg))
+                                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Text(
+                                                        text = "Read",
+                                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                                                        color = ArgusTextSecondary
+                                                    )
+                                                    Checkbox(
+                                                        checked = !app.isExcluded && !protectedApp,
+                                                        enabled = !protectedApp,
+                                                        onCheckedChange = { viewModel.toggleAppAccess(app.packageName) },
+                                                        colors = CheckboxDefaults.colors(
+                                                            checkedColor = ArgusCyanPrimary,
+                                                            uncheckedColor = ArgusCardBorder,
+                                                            checkmarkColor = ArgusDarkBg
+                                                        )
+                                                    )
+                                                }
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Text(
+                                                        text = "Train",
+                                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                                                        color = ArgusTextSecondary
+                                                    )
+                                                    Checkbox(
+                                                        checked = app.isTrainingAllowed && !app.isExcluded && !protectedApp,
+                                                        enabled = !protectedApp && !app.isExcluded && screenTrainingEnabled,
+                                                        onCheckedChange = { viewModel.toggleAppTrainingAccess(app.packageName) },
+                                                        colors = CheckboxDefaults.colors(
+                                                            checkedColor = ArgusCyanPrimary,
+                                                            uncheckedColor = ArgusCardBorder,
+                                                            checkmarkColor = ArgusDarkBg
+                                                        )
+                                                    )
+                                                }
+                                            }
                                         }
                                     }
                                 }

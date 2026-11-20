@@ -13,6 +13,8 @@ import com.argus.agi.runtime.RuntimeDeferReason
 import com.argus.agi.runtime.RuntimeModelConstraints
 import com.argus.agi.runtime.RuntimeResourceSnapshot
 import com.argus.agi.sensor.DeviceGuard
+import com.argus.agi.sensor.PrivacyAppHeuristics
+import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -138,6 +140,8 @@ class TrainingManager internal constructor(
         context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
     private val validationFilesDirectory = context.applicationContext.filesDir
     private val ingestionStagingDirectory = context.applicationContext.cacheDir
+    private val trainingPreferences =
+        context.applicationContext.getSharedPreferences(SCREEN_PRIVACY_PREFERENCES, Context.MODE_PRIVATE)
     private val trainingCommitJournalFile =
         File(validationFilesDirectory, TrainingCommitJournal.FILE_NAME)
     private val conversationalValidationPersistence =
@@ -162,6 +166,10 @@ class TrainingManager internal constructor(
         data class Barrier(
             val completion: CompletableDeferred<Unit>
         ) : QueuePersistenceOperation
+
+        data class DeleteItem(
+            val itemId: String
+        ) : QueuePersistenceOperation
     }
 
     companion object {
@@ -179,6 +187,16 @@ class TrainingManager internal constructor(
         const val MAX_STREAMED_DOCUMENT_CHARACTERS = 2 * 1024 * 1024
         const val MAX_STREAMED_DOCUMENT_CHUNKS = 8_192
         private const val IDLE_POLL_MS = 500L
+        private const val SCREEN_SOURCE_PREFIX = "ScreenTrainingV2 ("
+        private const val LEGACY_SCREEN_SOURCE_PREFIX = "Screen ("
+        private const val SCREEN_PRIVACY_PREFERENCES = "argus_excluded_apps"
+        private const val SCREEN_TRAINING_CONSENT_KEY = "screen_training_enabled"
+        private const val SCREEN_PERCEPTION_CONSENT_KEY = "screen_perception_enabled"
+        private const val SCREEN_ALLOWED_PACKAGES_KEY = "allowed_screen_packages"
+        private const val SCREEN_TRAINING_ALLOWED_PACKAGES_KEY = "allowed_screen_training_packages"
+        private const val SCREEN_PROTECTED_PACKAGES_KEY = "protected_screen_packages"
+        private const val SCREEN_DATA_CLEAR_POLL_MS = 100L
+        private const val SCREEN_DATA_CLEAR_TIMEOUT_MS = 120_000L
         private val REASONING_BLOCK_PATTERN = Regex(
             "<THINK>(.*?)</THINK>",
             RegexOption.DOT_MATCHES_ALL
@@ -192,6 +210,8 @@ class TrainingManager internal constructor(
     // StateFlow<List<TrainingData>> sebagai satu-satunya sumber kebenaran untuk queue.
     // Channel hanya berfungsi sebagai wakeup signal, bukan storage.
     private val queueLock = Any()
+    @Volatile
+    private var screenTrainingPurgePending = false
     private val corpusSchedulingMutex = Mutex()
     private val seedSchedulingMutex = Mutex()
     private var lastScheduledTimestamp: Long = System.currentTimeMillis()
@@ -1684,6 +1704,159 @@ class TrainingManager internal constructor(
         )
     }
 
+    /**
+     * Queues explicitly approved screen text without retaining it in the durable
+     * document corpus. Screen perception and screen-derived training are separate
+     * opt-ins; this method is called only after the service rechecks both.
+     */
+    fun enqueueScreenData(packageName: String, title: String, content: String) {
+        if (
+            content.isBlank() ||
+            closed ||
+            screenTrainingPurgePending ||
+            !isScreenTrainingConsentEnabled(packageName)
+        ) {
+            return
+        }
+
+        val source = "$SCREEN_SOURCE_PREFIX$packageName)"
+        val processed = TextModalityProcessor.process(
+            rawText = content,
+            documentTitle = title,
+            chunkSize = 160,
+            overlap = 0,
+            tokenizer = neuralEngine.tokenizer
+        )
+        if (processed.isEmpty()) return
+
+        val newItems = processed.map { chunk ->
+            TrainingData(
+                source = source,
+                title = if (processed.size > 1) chunk.segmentTitle else title.ifBlank { "Approved screen text" },
+                content = chunk.content,
+                status = TrainingStatus.QUEUED
+            )
+        }
+
+        synchronized(queueLock) {
+            if (closed || screenTrainingPurgePending || !isScreenTrainingConsentEnabled(packageName)) return
+            val current = _nextQueue.value
+            val nonDuplicates = newItems.filter { item ->
+                current.none {
+                    it.source == item.source &&
+                        it.content == item.content &&
+                        it.documentTitle == null
+                }
+            }
+            if (nonDuplicates.isNotEmpty()) appendPersistingQueueItems(nonDuplicates)
+        }
+    }
+
+    /**
+     * Deletes stored screen-derived text without touching unrelated training data.
+     *
+     * Active screen samples are allowed to finish before deletion. An optimizer-
+     * committed item that cannot be finalized is a hard stop: deleting its journal
+     * row would break checkpoint/queue recovery invariants.
+     */
+    suspend fun clearScreenDerivedData(): com.argus.agi.data.repository.ScreenDataDeletionResult {
+        val wasPaused = _isTrainingPaused.value
+        synchronized(queueLock) {
+            screenTrainingPurgePending = true
+            _isTrainingPaused.value = true
+        }
+
+        try {
+            awaitQueuePersistenceIdle()
+            var screenItems = requireNotNull(repo) {
+                "Durable training storage is unavailable; screen data was not deleted."
+            }.getScreenTrainingItemsSnapshot()
+
+            val deadline = System.currentTimeMillis() + SCREEN_DATA_CLEAR_TIMEOUT_MS
+            while (screenItems.any { item ->
+                    item.status == TrainingStatus.TRAINING ||
+                        item.status == TrainingStatus.OPTIMIZER_COMMITTED
+                }
+            ) {
+                if (System.currentTimeMillis() >= deadline) {
+                    throw IllegalStateException(
+                        "Screen-derived training did not reach a safe deletion state. " +
+                            "No screen records were deleted."
+                    )
+                }
+                delay(SCREEN_DATA_CLEAR_POLL_MS)
+                awaitQueuePersistenceIdle()
+                screenItems = requireNotNull(repo).getScreenTrainingItemsSnapshot()
+            }
+
+            awaitQueuePersistenceIdle()
+            val repository = requireNotNull(repo)
+            val deletionResult = repository.clearScreenDerivedData()
+
+            synchronized(queueLock) {
+                _nextQueue.value = _nextQueue.value.filterNot { it.source.isScreenTrainingSource() }
+                _completedQueue.value =
+                    _completedQueue.value.filterNot { it.source.isScreenTrainingSource() }
+            }
+            worldModel.clearScreenContext()
+            return deletionResult
+        } finally {
+            synchronized(queueLock) {
+                screenTrainingPurgePending = false
+                _isTrainingPaused.value = wasPaused
+            }
+            wakeupSignal.trySend(Unit)
+        }
+    }
+
+    private fun String.isLegacyScreenTrainingSource(): Boolean =
+        startsWith(LEGACY_SCREEN_SOURCE_PREFIX)
+
+    private fun String.isScreenTrainingSource(): Boolean =
+        startsWith(SCREEN_SOURCE_PREFIX) || isLegacyScreenTrainingSource()
+
+    private fun String.screenTrainingPackageName(): String? {
+        val prefix = when {
+            startsWith(SCREEN_SOURCE_PREFIX) -> SCREEN_SOURCE_PREFIX
+            isLegacyScreenTrainingSource() -> LEGACY_SCREEN_SOURCE_PREFIX
+            else -> return null
+        }
+        if (!endsWith(")")) return null
+        return removePrefix(prefix).removeSuffix(")").takeIf(String::isNotBlank)
+    }
+
+    private suspend fun purgeLegacyScreenCorpusIfResolved(
+        repository: com.argus.agi.data.repository.ArgusRepository
+    ) {
+        // Never remove source documents while any legacy queue row may still be
+        // referenced by a committed optimizer journal or interrupted worker.
+        if (repository.getLegacyScreenTrainingItemsSnapshot().isNotEmpty()) return
+        repository.deleteLegacyScreenCorpusDocuments()
+    }
+
+    private fun isScreenTrainingConsentEnabled(packageName: String): Boolean {
+        if (!trainingPreferences.getBoolean(SCREEN_PERCEPTION_CONSENT_KEY, false) ||
+            !trainingPreferences.getBoolean(SCREEN_TRAINING_CONSENT_KEY, false)
+        ) {
+            return false
+        }
+        if (PrivacyAppHeuristics.isPrivacySensitiveApp("", packageName)) return false
+
+        val allowedForReading = trainingPreferences
+            .getStringSet(SCREEN_ALLOWED_PACKAGES_KEY, emptySet())
+            .orEmpty()
+        val allowedForTraining = trainingPreferences
+            .getStringSet(SCREEN_TRAINING_ALLOWED_PACKAGES_KEY, emptySet())
+            .orEmpty()
+        val protectedPackages = trainingPreferences
+            .getStringSet(SCREEN_PROTECTED_PACKAGES_KEY, emptySet())
+            .orEmpty()
+
+        return packageName in allowedForReading &&
+            packageName in allowedForTraining &&
+            packageName !in protectedPackages
+    }
+
     fun enqueueData(source: String, title: String, content: String) {
         if (content.isBlank() || closed) return
 
@@ -2324,6 +2497,9 @@ class TrainingManager internal constructor(
         val duration = journalEntry?.stepDurationMs ?: item.stepDurationMs
         val completed = processItem(item, result, duration)
         deleteTrainingCommitJournalWhenResolved()
+        if (item.source.isLegacyScreenTrainingSource()) {
+            purgeLegacyScreenCorpusIfResolved(requireNotNull(repo))
+        }
         synchronized(queueLock) {
             oomRecoveryItemIds.remove(item.id)
             oomRetryCounts.remove(item.id)
@@ -2376,6 +2552,27 @@ class TrainingManager internal constructor(
                 run {
                     reconcilePersistedTrainingCommit(repository)
                     repository.recoverInterruptedTrainingItems()
+
+                    // Old releases queued screen text automatically with no per-app
+                    // Train consent. Remove every legacy row that has not already
+                    // changed model weights. Optimizer-committed rows are finalized
+                    // below from their durable journal without applying another update.
+                    val legacyScreenItems = repository.getLegacyScreenTrainingItemsSnapshot()
+                    legacyScreenItems
+                        .filterNot { it.status == TrainingStatus.OPTIMIZER_COMMITTED }
+                        .forEach { legacyItem ->
+                            repository.deleteTrainingItem(legacyItem.id)
+                        }
+                    purgeLegacyScreenCorpusIfResolved(repository)
+                    synchronized(queueLock) {
+                        _nextQueue.value = _nextQueue.value.filterNot {
+                            it.source.isLegacyScreenTrainingSource()
+                        }
+                        _completedQueue.value = _completedQueue.value.filterNot {
+                            it.source.isLegacyScreenTrainingSource()
+                        }
+                    }
+
                     val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
                     val pending = repository.getPendingQueueSnapshot()
                     val databaseIds = (committed + pending).mapTo(HashSet()) { it.id }
@@ -2425,7 +2622,11 @@ class TrainingManager internal constructor(
 
             while (isActive && !closed) {
                 if (_isTrainingPaused.value) {
-                    _isTrainingPaused.first { !it || closed }
+                    combine(_isTrainingPaused, _nextQueue) { paused, queue ->
+                        !paused || queue.any {
+                            it.status == TrainingStatus.OPTIMIZER_COMMITTED
+                        }
+                    }.first { canFinalizeCommitted -> canFinalizeCommitted || closed }
                     if (closed) break
                 }
 
@@ -2463,8 +2664,8 @@ class TrainingManager internal constructor(
 
                 val firstItem = popNext()
                 if (firstItem == null) {
+                    _currentTrainingItem.value = null
                     if (_nextQueue.value.isEmpty()) {
-                        _currentTrainingItem.value = null
                         _activeDocument.value = null
                         if (validationRunActive) {
                             completeConversationalTrainingRun(validationRunHadFailures)
@@ -2646,6 +2847,7 @@ class TrainingManager internal constructor(
                     }
                 } finally {
                     resetForceOverrideIfSet()
+                    _currentTrainingItem.value = null
                 }
 
                 val currentSafety = deviceGuard.safetyState.value
@@ -2702,6 +2904,7 @@ class TrainingManager internal constructor(
                 operation.completion.completeExceptionally(error)
             }
             is QueuePersistenceOperation.Clear,
+            is QueuePersistenceOperation.DeleteItem,
             is QueuePersistenceOperation.Save -> Unit
         }
     }
@@ -2744,6 +2947,18 @@ class TrainingManager internal constructor(
 
             is QueuePersistenceOperation.Barrier -> {
                 operation.completion.complete(Unit)
+            }
+
+            is QueuePersistenceOperation.DeleteItem -> {
+                runSuspendCatching {
+                    val repository = repo ?: throw IllegalStateException(
+                        "Training queue persistence is unavailable.",
+                        repositoryInitialization.exceptionOrNull()
+                    )
+                    repository.deleteTrainingItem(operation.itemId)
+                }.onFailure { error ->
+                    Log.e(TAG, "Failed to delete a revoked screen-training item.", error)
+                }
             }
 
             is QueuePersistenceOperation.Save -> {
@@ -2819,8 +3034,41 @@ class TrainingManager internal constructor(
         val startCompletion = CompletableDeferred<Result<Unit>>()
         val reservation = synchronized(queueLock) {
             val list = _nextQueue.value
+            if (screenTrainingPurgePending) {
+                // Batch collectors explicitly request QUEUED rows. Never return a
+                // committed row to that path: its optimizer transaction already
+                // changed weights and it must be finalized only by the single-item
+                // recovery path, without another optimizer update.
+                if (
+                    expectedStatus != null &&
+                    expectedStatus != TrainingStatus.OPTIMIZER_COMMITTED
+                ) {
+                    return@synchronized null
+                }
+                val committed = list.firstOrNull {
+                    it.status == TrainingStatus.OPTIMIZER_COMMITTED
+                } ?: return@synchronized null
+                _nextQueue.value = list.filterNot { it.id == committed.id }
+                return@synchronized Triple(committed, null, queueGeneration)
+            }
             val first = list.firstOrNull() ?: return@synchronized null
             if (expectedStatus != null && first.status != expectedStatus) {
+                return@synchronized null
+            }
+
+            if (
+                first.status == TrainingStatus.QUEUED &&
+                first.source.isScreenTrainingSource() &&
+                first.source.screenTrainingPackageName()?.let(::isScreenTrainingConsentEnabled) != true
+            ) {
+                val deletion = persistenceOperations.trySend(
+                    QueuePersistenceOperation.DeleteItem(first.id)
+                )
+                if (deletion.isFailure) {
+                    Log.e(TAG, "Could not queue deletion of screen data after training consent was revoked.")
+                    return@synchronized null
+                }
+                _nextQueue.value = list.drop(1)
                 return@synchronized null
             }
 
@@ -2871,6 +3119,26 @@ class TrainingManager internal constructor(
             )
             return null
         }
+
+        // Consent may be revoked while the durable QUEUED -> TRAINING transition
+        // is being persisted. Recheck at the final boundary before the worker can
+        // construct a batch or call the optimizer.
+        if (
+            item.source.isScreenTrainingSource() &&
+            item.source.screenTrainingPackageName()?.let(::isScreenTrainingConsentEnabled) != true
+        ) {
+            try {
+                persistenceOperations.send(QueuePersistenceOperation.DeleteItem(item.id))
+            } catch (closedChannel: ClosedSendChannelException) {
+                Log.e(
+                    TAG,
+                    "Could not queue deletion of screen item '${item.id}' after consent was revoked.",
+                    closedChannel
+                )
+            }
+            return null
+        }
+
         return item
     }
 
@@ -2944,10 +3212,31 @@ class TrainingManager internal constructor(
         items: MutableList<TrainingData>,
         runtimeContextLength: Int
     ): Boolean {
-        require(items.isNotEmpty()) { "A training micro-batch cannot be empty." }
         val repository = requireNotNull(repo) {
             "Durable training storage is required before optimizer updates can begin."
         }
+
+        // A user can revoke per-app consent after popNext reserves a row but before
+        // this micro-batch reaches the optimizer. Drop those screen samples while
+        // the model is still at its durable pre-batch checkpoint.
+        val revokedScreenItems = items.filter { item ->
+            item.source.isScreenTrainingSource() &&
+                item.source.screenTrainingPackageName()?.let(::isScreenTrainingConsentEnabled) != true
+        }
+        if (revokedScreenItems.isNotEmpty()) {
+            revokedScreenItems.forEach { item ->
+                repository.deleteTrainingItem(item.id)
+            }
+            val revokedIds = revokedScreenItems.mapTo(HashSet(), TrainingData::id)
+            items.removeAll { it.id in revokedIds }
+        }
+
+        if (items.isEmpty()) {
+            _currentTrainingItem.value = null
+            _activeDocument.value = null
+            return true
+        }
+
         items.mapNotNull(TrainingData::documentId)
             .forEach(validationRunDocumentIds::add)
 
@@ -3108,7 +3397,17 @@ class TrainingManager internal constructor(
         failed.documentId?.let { documentId ->
             repository.markCorpusDocumentPartial(documentId)
         }
-        pushCompleted(failed)
+        if (item.source.isLegacyScreenTrainingSource()) {
+            repository.deleteTrainingItem(item.id)
+            synchronized(queueLock) {
+                _completedQueue.value = _completedQueue.value.filterNot { it.id == item.id }
+            }
+        } else {
+            pushCompleted(failed)
+        }
+        if (item.source.isLegacyScreenTrainingSource()) {
+            purgeLegacyScreenCorpusIfResolved(repository)
+        }
         if (!reason.isNullOrBlank()) {
             Log.w(TAG, "Training item '${item.title}' failed: $reason")
         }
@@ -3243,7 +3542,17 @@ class TrainingManager internal constructor(
             }
         }
 
-        pushCompleted(finished)
+        if (finished.source.isLegacyScreenTrainingSource()) {
+            // The legacy optimizer transaction has now been finalized. Its screen
+            // sample is removed instead of being retained as replayable history.
+            repository.deleteTrainingItem(finished.id)
+            synchronized(queueLock) {
+                _completedQueue.value = _completedQueue.value.filterNot { it.id == finished.id }
+            }
+            purgeLegacyScreenCorpusIfResolved(repository)
+        } else {
+            pushCompleted(finished)
+        }
         if (
             finished.documentId != null &&
             finished.chunkIndex >= finished.totalChunks

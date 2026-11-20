@@ -7,25 +7,21 @@ import org.junit.Test
 class PrivacyAppHeuristicsTest {
 
     @Test
-    fun detectsSensitiveAppsFromPackageNames() {
-        assertTrue(
-            PrivacyAppHeuristics.isPrivacySensitiveApp(
-                appName = "Livin' by Mandiri",
-                packageName = "com.bankmandiri",
-            ),
+    fun detectsFinancialCredentialAndPrivateCommunicationApps() {
+        val protectedApps = listOf(
+            "Livin' by Mandiri" to "com.bankmandiri",
+            "Authenticator" to "com.example.secure",
+            "WhatsApp" to "com.whatsapp",
+            "Gmail" to "com.google.android.gm",
+            "Private Messenger" to "com.example.messenger"
         )
-        assertTrue(
-            PrivacyAppHeuristics.isPrivacySensitiveApp(
-                appName = "Authenticator",
-                packageName = "com.example.secure",
-            ),
-        )
-        assertTrue(
-            PrivacyAppHeuristics.isPrivacySensitiveApp(
-                appName = "WhatsApp",
-                packageName = "com.whatsapp",
-            ),
-        )
+
+        protectedApps.forEach { (appName, packageName) ->
+            assertTrue(
+                "$appName should be protected",
+                PrivacyAppHeuristics.isPrivacySensitiveApp(appName, packageName)
+            )
+        }
     }
 
     @Test
@@ -33,14 +29,38 @@ class PrivacyAppHeuristicsTest {
         assertTrue(
             PrivacyAppHeuristics.isPrivacySensitiveApp(
                 appName = "DANA",
-                packageName = "com.example.payment",
-            ),
+                packageName = "com.example.payment"
+            )
         )
         assertTrue(
             PrivacyAppHeuristics.isPrivacySensitiveApp(
                 appName = "Secure Wallet",
-                packageName = "com.example.finance",
-            ),
+                packageName = "com.example.finance"
+            )
+        )
+        assertTrue(
+            PrivacyAppHeuristics.isPrivacySensitiveApp(
+                appName = "Personal Health",
+                packageName = "com.example.records"
+            )
+        )
+        assertTrue(
+            PrivacyAppHeuristics.isPrivacySensitiveApp(
+                appName = "PayPal",
+                packageName = "com.paypal.android.p2pmobile"
+            )
+        )
+        assertTrue(
+            PrivacyAppHeuristics.isPrivacySensitiveApp(
+                appName = "Venmo",
+                packageName = "com.venmo"
+            )
+        )
+        assertTrue(
+            PrivacyAppHeuristics.isPrivacySensitiveApp(
+                appName = "Cash App",
+                packageName = "com.squareup.cash"
+            )
         )
     }
 
@@ -49,8 +69,14 @@ class PrivacyAppHeuristicsTest {
         assertFalse(
             PrivacyAppHeuristics.isPrivacySensitiveApp(
                 appName = "Calculator",
-                packageName = "com.example.calculator",
-            ),
+                packageName = "com.example.calculator"
+            )
+        )
+        assertFalse(
+            PrivacyAppHeuristics.isPrivacySensitiveApp(
+                appName = "Offline Notes",
+                packageName = "com.example.notes"
+            )
         )
     }
 }

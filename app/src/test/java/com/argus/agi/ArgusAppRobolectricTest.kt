@@ -548,12 +548,18 @@ class ArgusAppRobolectricTest {
 
     @Test
     fun testExcludedAppsManagerSensitivityHeuristic() {
+        context.getSharedPreferences("argus_excluded_apps", Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .commit()
         val manager = com.argus.agi.sensor.ExcludedAppsManager(context)
         assertTrue("Authenticator must be excluded", manager.isAppExcluded("com.google.android.apps.authenticator2"))
         assertTrue("Bitwarden must be excluded by keyword", manager.isAppExcluded("com.x8bit.bitwarden"))
         assertTrue("1Password must be excluded by keyword", manager.isAppExcluded("com.agilebits.onepassword"))
         assertTrue("Banking apps must be excluded by keyword", manager.isAppExcluded("com.bca.mobilebanking"))
-        assertFalse("General non-sensitive apps should not be excluded", manager.isAppExcluded("com.example.calculator"))
+        assertTrue("PayPal must be excluded by keyword", manager.isAppExcluded("com.paypal.android.p2pmobile"))
+        assertTrue("Venmo must be excluded by keyword", manager.isAppExcluded("com.venmo"))
+        assertTrue("Unapproved apps must be blocked by default", manager.isAppExcluded("com.example.calculator"))
     }
 
     @Test

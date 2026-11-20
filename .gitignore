@@ -6,7 +6,7 @@
 /.idea/libraries
 /.idea/modules.xml
 /.idea/workspace.xml
-/.idea/navEditor.xml
+/.idea/navEditorSettings.xml
 /.idea/assetWizardSettings.xml
 .DS_Store
 /build
@@ -14,13 +14,36 @@
 .externalNativeBuild
 .cxx
 local.properties
-.env
 debug.keystore
 
-# Generated release signing material; never commit signing keys.
-/signing/
+# Environment files may contain credentials. Keep only an explicitly safe template.
+.env
+.env.*
+!.env.example
+
+# Local signing material and signing configuration must never enter Git.
+signing/
 *.jks
+*.keystore
+*.jceks
+*.bks
 *.p12
+*.pfx
+*.p7b
+*.pem
+*.pk8
+*.key
+*.der
+*.cer
+*.crt
+*.mobileprovision
+key.properties
+keystore.properties
+signing.properties
 
 # Generated CMake compatibility launcher and local CMake path metadata.
 /tools/cmake-compat/runtime/
+
+# Local Android signing lineage and signature sidecars.
+*.lineage
+*.idsig

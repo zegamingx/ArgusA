@@ -53,19 +53,42 @@ Build a debug APK:
 ./gradlew :app:assembleDebug
 ```
 
-Run release checks and build:
+Run release-variant checks and build an **unsigned** APK:
 
 ```bash
 ./gradlew :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
 ```
 
-A release build requires the Argus release signing key at `signing/argus-release.p12`, or a different path supplied through `KEYSTORE_PATH`. The alias is `upload`; the keystore format is PKCS#12.
+This output is not an installable update for an existing signed Argus installation.
+Do not distribute it or use it for `adb install -r`; signed releases remain
+suspended until a verified Android signing-certificate lineage migration passes.
+
+Release APKs are intentionally unsigned in this branch. The previously distributed v1.0.13 signer was present in an unencrypted private-repository release asset and must be treated as compromised. Do not sign new APKs with that identity. A new release signing pipeline will be introduced only after an Android signing-certificate lineage has been generated with the old and replacement keys, and an in-place update has been tested on an existing v1.0.13 installation.
 
 ## GitHub releases
 
-Every push to `main` runs release lint, JUnit/Robolectric unit tests, a signed release build, and APK signature/native-ABI verification. It does not run an Android emulator smoke test. Publishing the signed APK to the `Release` tag is a separate, explicit `workflow_dispatch` operation with `publish_release=true`; ordinary pushes only validate and build.
+Signed release publication is temporarily suspended.
 
-The private repository keeps the CI signing-key backup in the private GitHub Release named `argus-signing-key`. Repository access therefore also grants access to the app-signing identity. Keep this repository private and restrict collaborator access. Never redistribute the signing-key asset. The asset-pruning step only targets old `ARGUS-v*.apk` files in the `Release` tag and does not touch this signing-key backup.
+The signing identity used by the distributed Argus v1.0.13 APK was previously
+stored as an unencrypted PKCS#12 GitHub Release asset. Removing that asset does
+not undo prior exposure. Treat the old private key as compromised and do not
+use it for new releases.
+
+Before signed releases resume, create an Android signing-certificate lineage
+from the old signer to a new offline-generated signer, using the official
+`apksigner rotate` and rotated-signing workflow. The migration APK must be
+built and installed over an existing v1.0.13 installation with `adb install -r`;
+verify that app data remains intact and that subsequent updates signed by the
+new identity are accepted. Keep the old key only for the controlled migration
+operation, then remove it from CI and retain it only in encrypted offline
+recovery storage for as long as required.
+
+The certificate fingerprint from v1.0.13 is recorded in the private migration
+notes, not used as an approval pin for future release signing. A new workflow
+will be added after the replacement certificate, lineage, and update path have
+been verified. Until then, `:app:assembleRelease` produces an unsigned APK.
+
+Repository validation and debug builds do not receive signing keys.
 
 ## Runtime crash diagnostics
 
@@ -117,11 +140,13 @@ optimizer. Runtime verification failures also preserve the CPU fallback.
 NPU/APU detection is informational only; no vendor-specific NPU training
 runtime is currently integrated.
 
-The CI pull-request workflow builds the native library and verifies that the
-APK contains the configured ABI libraries. Main, pull-request, and release
-workflows execute Gradle on JDK 25; the Android app's Java source and bytecode
-compatibility target remains Java 21. All workflows install the checksum-pinned
-CMake 4.5.0 distribution and NDK r30 for native builds.
+The native-validation workflow builds the native library and verifies that the
+APK contains the configured ABI libraries on pull requests and relevant
+main-branch pushes. GitHub Automatic Dependency Submission also validates the
+Gradle dependency graph. No release-signing workflow is active while the
+previous signing identity is being migrated. Native validation runs on JDK 25;
+the Android app's Java source and bytecode compatibility target remains Java 21.
+Native builds install the checksum-pinned CMake 4.5.0 distribution and NDK r30.
 
 ## Background training service
 

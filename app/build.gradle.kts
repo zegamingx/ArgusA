@@ -11,20 +11,8 @@ plugins {
     alias(libs.plugins.google.devtools.ksp)
 }
 
-// Signing inputs are declared at script scope because the release validation task
-// runs outside the Android DSL block.
-val releaseStorePassword = providers.environmentVariable("STORE_PASSWORD")
-val releaseKeyPassword = providers.environmentVariable("KEY_PASSWORD")
-val jksFile = rootProject.file("my-upload-key.jks")
-val p12File = rootProject.file("signing/argus-release.p12")
-val defaultKeystore = when {
-    jksFile.isFile -> jksFile
-    p12File.isFile -> p12File
-    else -> jksFile
-}
-val releaseKeystorePath = providers.environmentVariable("KEYSTORE_PATH")
-    .orElse(defaultKeystore.absolutePath)
-    .get()
+// Release APKs remain unsigned until the exposed historical signing identity
+// has been migrated through a verified Android signing-certificate lineage.
 
 android {
     namespace = "com.argus.agi"
@@ -66,22 +54,6 @@ android {
 
     }
 
-    // A release must never silently fall back to the Android debug identity.
-    // The upload-key path is only a location default; its passwords remain required
-    // environment inputs and are validated by validateSigningRelease.
-    val releaseKeyAlias = providers.environmentVariable("KEY_ALIAS")
-        .orElse("upload")
-        .get()
-
-    signingConfigs {
-        create("release") {
-            storeFile = file(releaseKeystorePath)
-            storePassword = releaseStorePassword.orNull
-            keyAlias = releaseKeyAlias
-            keyPassword = releaseKeyPassword.orNull
-        }
-    }
-
     buildTypes {
         release {
             isCrunchPngs = false
@@ -90,7 +62,6 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("release")
         }
         debug {
             // Debug builds use AGP's machine-local debug signer.
@@ -140,6 +111,18 @@ tasks.configureEach {
 // for new tests and gradual migration.
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
+    // Robolectric downloads instrumented Android SDK jars outside Gradle's
+    // repository resolver. Use Google's Maven Central mirror to avoid intermittent
+    // missing checksum/POM responses from repo1.maven.org on CI.
+    systemProperty(
+        "robolectric.dependency.repo.id",
+        "google-maven-central-mirror"
+    )
+    systemProperty(
+        "robolectric.dependency.repo.url",
+        "https://maven-central.storage-download.googleapis.com/maven2"
+    )
+
     // JEP 472 (JDK 24+): explicitly opt in for Conscrypt native calls in JVM tests.
     if (Runtime.version().feature() >= 24) {
         jvmArgs("--enable-native-access=ALL-UNNAMED")
@@ -272,7 +255,7 @@ abstract class BumpVersionTask : DefaultTask() {
 
 val exportReleaseApk = tasks.register<CopyApkTask>("exportReleaseApk") {
     group = "distribution"
-    description = "Builds and exports the signed release APK to the repository root."
+    description = "Builds and exports an unsigned release APK; signing is suspended pending verified key rotation."
     dependsOn("assembleRelease")
     apk.from(layout.buildDirectory.file("outputs/apk/release/app-release.apk"))
     target.set(layout.projectDirectory.file("../ARGUS.apk"))
@@ -295,16 +278,3 @@ tasks.register<BumpVersionTask>("bumpVersion") {
     outputs.upToDateWhen { false }
 }
 
-tasks.matching { it.name == "validateSigningRelease" }.configureEach {
-    doFirst {
-        check(releaseStorePassword.isPresent) {
-            "STORE_PASSWORD must be provided to build a signed release APK."
-        }
-        check(releaseKeyPassword.isPresent) {
-            "KEY_PASSWORD must be provided to build a signed release APK."
-        }
-        check(file(releaseKeystorePath).isFile) {
-            "Release keystore not found: $releaseKeystorePath"
-        }
-    }
-}

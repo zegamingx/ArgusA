@@ -32,6 +32,78 @@ class TrainingManagerPersistenceTest {
         get() = ApplicationProvider.getApplicationContext()
 
     @Test
+    fun screenTrainingRequiresConsentAndCanBeClearedWithoutCreatingReplayCorpus() = runBlocking {
+        withTrainingManager { database, repository, manager ->
+            manager.pauseTraining()
+            val privacyPreferences = context.getSharedPreferences(
+                "argus_excluded_apps",
+                Context.MODE_PRIVATE
+            )
+            privacyPreferences.edit()
+                .putBoolean("screen_perception_enabled", true)
+                .putBoolean("screen_training_enabled", false)
+                .commit()
+
+            manager.enqueueScreenData(
+                packageName = "com.example.reader",
+                title = "Screen capture",
+                content = "A sufficiently long screen sample that must never enter the document replay corpus."
+            )
+            awaitPersistence(manager)
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            assertEquals(0, repository.getCorpusDocumentCount())
+
+            privacyPreferences.edit()
+                .putBoolean("screen_training_enabled", true)
+                .commit()
+            manager.enqueueScreenData(
+                packageName = "com.example.reader",
+                title = "Screen capture",
+                content = "A screen sample without any per-app Read or Train grant."
+            )
+            awaitPersistence(manager)
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+
+            privacyPreferences.edit()
+                .putStringSet("allowed_screen_packages", setOf("com.example.reader"))
+                .commit()
+            manager.enqueueScreenData(
+                packageName = "com.example.reader",
+                title = "Screen capture",
+                content = "A screen sample with Read permission but no Train permission."
+            )
+            awaitPersistence(manager)
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+
+            privacyPreferences.edit()
+                .putStringSet("allowed_screen_training_packages", setOf("com.example.reader"))
+                .commit()
+            manager.enqueueScreenData(
+                packageName = "com.example.reader",
+                title = "Screen capture",
+                content = "A sufficiently long screen sample that requires separate training consent."
+            )
+            awaitPersistence(manager)
+
+            val queuedItems = repository.getPendingQueueSnapshot()
+            assertEquals(1, queuedItems.size)
+            assertTrue(queuedItems.single().source.startsWith("ScreenTrainingV2 (com.example.reader)"))
+            assertEquals(0, repository.getCorpusDocumentCount())
+
+            privacyPreferences.edit()
+                .putBoolean("screen_training_enabled", false)
+                .commit()
+            val deletion = manager.clearScreenDerivedData()
+
+            assertEquals(1, deletion.trainingItemsDeleted)
+            assertEquals(0, deletion.corpusDocumentsDeleted)
+            assertEquals(0, deletion.screenMemoriesDeleted)
+            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            assertTrue(manager.nextQueue.value.none { it.source.startsWith("ScreenTrainingV2 (") })
+        }
+    }
+
+    @Test
     fun failedStartPersistenceRestoresItemWithoutTraining() = runBlocking {
         withTrainingManager { database, repository, manager ->
             manager.pauseTraining()

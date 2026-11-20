@@ -39,8 +39,8 @@ class ArgusAccessibilityService : AccessibilityService() {
         private val mainHandler = Handler(Looper.getMainLooper())
 
         /**
-         * Safely performs a click on a visible, enabled node matching the target query.
-         * Dispatches safely to the main thread and properly recycles nodes on API < 33.
+         * Performs a user-requested click only when the user separately enabled
+         * accessibility actions. Screen-reading consent does not imply action consent.
          */
         fun performClickAction(query: String): Boolean {
             val service = instance ?: return false
@@ -67,7 +67,10 @@ class ArgusAccessibilityService : AccessibilityService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val isTraversing = AtomicBoolean(false)
 
-    private var lastScreenTextHash = 0
+    @Volatile
+    private var currentScreenPackage: String? = null
+
+    private var lastScreenTextHash: Int? = null
     private var lastPerceptionTime = 0L
 
     override fun onCreate() {
@@ -78,13 +81,14 @@ class ArgusAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        Log.i(TAG, "ArgusAccessibilityService connected and ready.")
+        Log.i(TAG, "ArgusAccessibilityService connected. Screen reading remains opt-in and default-off.")
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
         if (instance == this) {
             instance = null
         }
+        invalidateScreenContext()
         return super.onUnbind(intent)
     }
 
@@ -93,16 +97,21 @@ class ArgusAccessibilityService : AccessibilityService() {
         if (instance == this) {
             instance = null
         }
+        invalidateScreenContext()
         serviceScope.cancel()
         Log.i(TAG, "ArgusAccessibilityService destroyed.")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
+        if (event == null) {
+            invalidateScreenContext()
+            return
+        }
+        if (!excludedAppsManager.isScreenPerceptionEnabled()) {
+            invalidateScreenContext()
+            return
+        }
 
-        // 1. EVENT TYPE GATING:
-        // Strictly ignore keystroke events (TYPE_VIEW_TEXT_CHANGED) to prevent keylogging.
-        // Only process high-level window state or significant content changes.
         val eventType = event.eventType
         if (eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
@@ -110,69 +119,90 @@ class ArgusAccessibilityService : AccessibilityService() {
             return
         }
 
-        val eventPkg = event.packageName?.toString() ?: return
-
-        // 2. PRIVACY & EXCLUSION CHECK (Event Package):
-        // Reject excluded apps and keyboard / IME packages from triggering window captures.
-        if (isInputMethodPackage(eventPkg) || excludedAppsManager.isAppExcluded(eventPkg)) {
+        val eventPackage = event.packageName?.toString()?.takeIf { it.isNotBlank() }
+        if (eventPackage == null) {
+            invalidateScreenContext()
             return
         }
 
-        // 3. SEPARATED THROTTLE:
-        // Update throttle timestamp immediately to avoid redundant full-tree walks on static screens.
+        if (currentScreenPackage != eventPackage) {
+            invalidateScreenContext(eventPackage)
+        }
+        if (isInputMethodPackage(eventPackage) ||
+            excludedAppsManager.isAppExcluded(eventPackage)
+        ) {
+            invalidateScreenContext(eventPackage)
+            return
+        }
+
         val now = SystemClock.elapsedRealtime()
-        if (now - lastPerceptionTime < THROTTLE_MS) {
-            return
-        }
+        if (now - lastPerceptionTime < THROTTLE_MS) return
         lastPerceptionTime = now
 
-        // 4. REENTRANCY GUARD:
-        if (!isTraversing.compareAndSet(false, true)) {
-            return
-        }
+        if (!isTraversing.compareAndSet(false, true)) return
 
         try {
-            // Retrieve root node of the active window
             val rootNode = rootInActiveWindow ?: return
-
             try {
-                // 5. PRIVACY & EXCLUSION CHECK (Root Active Window Package):
-                // Guarantees that system UI or overlay events cannot leak content from an excluded background app.
-                val rootPkg = rootNode.packageName?.toString()
-                if (rootPkg != null && excludedAppsManager.isAppExcluded(rootPkg)) {
-                    Log.d(TAG, "Skipping perception: Active root window '$rootPkg' is excluded.")
+                val rootPackage = rootNode.packageName?.toString()
+                    ?.takeIf { it.isNotBlank() }
+                    ?: eventPackage
+                if (rootPackage != eventPackage || excludedAppsManager.isAppExcluded(rootPackage)) {
+                    invalidateScreenContext()
                     return
                 }
 
-                // 6. TRAVERSE ACCESSIBILITY TREE WITH DEPTH CAP & SENSITIVE FIELD FILTERING
                 val gatheredText = StringBuilder()
-                val visitedCount = IntArray(1) { 0 }
+                val visitedCount = IntArray(1)
                 traverseNodes(rootNode, gatheredText, visitedCount, depth = 0)
 
                 val fullText = gatheredText.toString().trim()
-                if (fullText.length >= MIN_TEXT_LENGTH) {
-                    val currentHash = fullText.hashCode()
-                    if (currentHash != lastScreenTextHash) {
-                        lastScreenTextHash = currentHash
-                        val targetPkg = rootPkg ?: eventPkg
+                if (fullText.length < MIN_TEXT_LENGTH) return
 
-                        // Offload model dispatch & training ingestion to background coroutine
-                        serviceScope.launch {
-                            try {
-                                ArgusApp.worldModel.updateScreenContext(targetPkg, fullText)
-                                ArgusApp.trainingManager.enqueueData(
-                                    source = "Screen ($targetPkg)",
-                                    title = "Layar: ${targetPkg.substringAfterLast('.')}",
-                                    content = fullText.take(500)
-                                )
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Error passing perception to WorldModel/TrainingManager: ${e.message}", e)
-                            }
+                val currentHash = fullText.hashCode()
+                if (currentHash == lastScreenTextHash) return
+                lastScreenTextHash = currentHash
+
+                serviceScope.launch {
+                    val worldModel = ArgusApp.worldModel
+                    try {
+                        // A delayed job from a previous app must not publish after the
+                        // active package changed or its screen-reading grant was revoked.
+                        if (currentScreenPackage != rootPackage ||
+                            !excludedAppsManager.isScreenPerceptionEnabled() ||
+                            excludedAppsManager.isAppExcluded(rootPackage)
+                        ) {
+                            worldModel.clearScreenContext(rootPackage)
+                            return@launch
                         }
+
+                        worldModel.updateScreenContext(rootPackage, fullText)
+
+                        // Package transitions can race this asynchronous dispatch. Clear
+                        // only this package's context so a newer allowed app is untouched.
+                        if (currentScreenPackage != rootPackage ||
+                            !excludedAppsManager.isScreenPerceptionEnabled() ||
+                            excludedAppsManager.isAppExcluded(rootPackage)
+                        ) {
+                            worldModel.clearScreenContext(rootPackage)
+                            return@launch
+                        }
+
+                        if (currentScreenPackage == rootPackage &&
+                            excludedAppsManager.isAppTrainingAllowed(rootPackage)
+                        ) {
+                            ArgusApp.trainingManager.enqueueScreenData(
+                                packageName = rootPackage,
+                                title = "Layar: ${rootPackage.substringAfterLast('.')}",
+                                content = fullText.take(500)
+                            )
+                        }
+                    } catch (error: Exception) {
+                        worldModel.clearScreenContext(rootPackage)
+                        Log.e(TAG, "Screen perception dispatch failed.", error)
                     }
                 }
             } finally {
-                // Prevent native memory leak on API < 33
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
                     rootNode.recycle()
                 }
@@ -182,22 +212,27 @@ class ArgusAccessibilityService : AccessibilityService() {
         }
     }
 
-    override fun onInterrupt() {}
+    override fun onInterrupt() {
+        invalidateScreenContext()
+    }
 
-    /**
-     * Recursively traverses nodes while:
-     * 1. Skipping password fields, OTPs, and sensitive input fields.
-     * 2. Enforcing a maximum node cap (MAX_TRAVERSAL_NODES) to avoid ANRs.
-     * 3. Enforcing a maximum depth cap (MAX_TRAVERSAL_DEPTH).
-     * 4. Recycling all intermediate AccessibilityNodeInfo objects on API < 33.
-     */
+    private fun invalidateScreenContext(nextPackage: String? = null) {
+        currentScreenPackage = nextPackage
+        lastScreenTextHash = null
+        if (ArgusApp.isWorldModelInitialized()) {
+            ArgusApp.worldModel.clearScreenContext()
+        }
+    }
+
     private fun traverseNodes(
         node: AccessibilityNodeInfo?,
-        sb: StringBuilder,
+        output: StringBuilder,
         visitedCount: IntArray,
         depth: Int
     ) {
-        if (node == null || depth > MAX_TRAVERSAL_DEPTH || visitedCount[0] >= MAX_TRAVERSAL_NODES) {
+        if (node == null || depth > MAX_TRAVERSAL_DEPTH ||
+            visitedCount[0] >= MAX_TRAVERSAL_NODES
+        ) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
                 node?.recycle()
             }
@@ -206,26 +241,19 @@ class ArgusAccessibilityService : AccessibilityService() {
 
         try {
             visitedCount[0]++
-
-            // SENSITIVE INPUT FILTER: Never ingest passwords, PINs, or secret credentials
-            if (isSensitiveNode(node)) {
-                return
-            }
+            if (isSensitiveNode(node)) return
 
             val text = node.text?.toString()?.trim()
-            val desc = node.contentDescription?.toString()?.trim()
-
+            val description = node.contentDescription?.toString()?.trim()
             if (!text.isNullOrBlank()) {
-                sb.append(text).append(" ")
-            } else if (!desc.isNullOrBlank()) {
-                sb.append(desc).append(" ")
+                output.append(text).append(' ')
+            } else if (!description.isNullOrBlank()) {
+                output.append(description).append(' ')
             }
 
-            val childCount = node.childCount
-            for (i in 0 until childCount) {
+            for (index in 0 until node.childCount) {
                 if (visitedCount[0] >= MAX_TRAVERSAL_NODES) break
-                val child = node.getChild(i)
-                traverseNodes(child, sb, visitedCount, depth + 1)
+                traverseNodes(node.getChild(index), output, visitedCount, depth + 1)
             }
         } finally {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
@@ -234,81 +262,86 @@ class ArgusAccessibilityService : AccessibilityService() {
         }
     }
 
-    /**
-     * Detects if an AccessibilityNode represents password, PIN, OTP, or sensitive inputs.
-     */
     private fun isSensitiveNode(node: AccessibilityNodeInfo): Boolean {
         if (node.isPassword) return true
 
         val inputType = node.inputType
-        val isPasswordVariation = (inputType and InputType.TYPE_TEXT_VARIATION_PASSWORD) != 0 ||
+        val passwordVariation =
+            (inputType and InputType.TYPE_TEXT_VARIATION_PASSWORD) != 0 ||
                 (inputType and InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD) != 0 ||
                 (inputType and InputType.TYPE_NUMBER_VARIATION_PASSWORD) != 0 ||
                 (inputType and InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD) != 0
+        if (passwordVariation) return true
 
-        if (isPasswordVariation) return true
-
-        val text = node.text?.toString()?.lowercase() ?: ""
-        val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+        val text = node.text?.toString()?.lowercase().orEmpty()
+        val description = node.contentDescription?.toString()?.lowercase().orEmpty()
         val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            node.hintText?.toString()?.lowercase() ?: ""
-        } else ""
+            node.hintText?.toString()?.lowercase().orEmpty()
+        } else {
+            ""
+        }
 
         val sensitiveKeywords = listOf(
             "password", "kata sandi", "passcode", "pin ", "otp", "cvv",
             "kode verifikasi", "security code", "token rahasia"
         )
-
-        if (node.isEditable && sensitiveKeywords.any { text.contains(it) || hint.contains(it) || desc.contains(it) }) {
-            return true
-        }
-
-        return false
+        return node.isEditable &&
+            sensitiveKeywords.any { keyword ->
+                text.contains(keyword) || hint.contains(keyword) || description.contains(keyword)
+            }
     }
 
-    private fun isInputMethodPackage(pkg: String): Boolean {
-        val lower = pkg.lowercase()
+    private fun isInputMethodPackage(packageName: String): Boolean {
+        val lower = packageName.lowercase()
         return lower.contains("inputmethod") ||
-                lower.contains("keyboard") ||
-                lower.contains("ime") ||
-                lower == "com.google.android.inputmethod.latin" ||
-                lower == "com.touchtype.swiftkey"
+            lower.contains("keyboard") ||
+            lower.contains("ime") ||
+            lower == "com.google.android.inputmethod.latin" ||
+            lower == "com.touchtype.swiftkey"
     }
 
     private fun internalPerformClick(query: String): Boolean {
         val root = rootInActiveWindow ?: return false
         try {
+            // A missing active package is not an allowed target. The manager checks
+            // independent action consent, the explicit app allowlist, and protected apps.
+            if (!excludedAppsManager.isAccessibilityActionAllowed(root.packageName?.toString())) {
+                return false
+            }
+
             val nodes = root.findAccessibilityNodeInfosByText(query) ?: return false
             try {
                 for (node in nodes) {
-                    val textMatch = node.text?.toString()?.trim()?.equals(query.trim(), ignoreCase = true) == true ||
-                            node.contentDescription?.toString()?.trim()?.equals(query.trim(), ignoreCase = true) == true
+                    val exactMatch =
+                        node.text?.toString()?.trim()?.equals(query.trim(), ignoreCase = true) == true ||
+                            node.contentDescription?.toString()?.trim()
+                                ?.equals(query.trim(), ignoreCase = true) == true
 
-                    if (textMatch && node.isVisibleToUser && node.isEnabled) {
-                        if (node.isClickable) {
-                            return node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                        }
-                        var parent: AccessibilityNodeInfo? = node.parent
-                        while (parent != null) {
-                            try {
-                                if (parent.isClickable && parent.isEnabled) {
-                                    return parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                                }
-                                val nextParent = parent.parent
-                                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                                    parent.recycle()
-                                }
-                                parent = nextParent
-                            } catch (_: Exception) {
-                                break
+                    if (!exactMatch || !node.isVisibleToUser || !node.isEnabled) continue
+                    if (node.isClickable) {
+                        return node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    }
+
+                    var parent: AccessibilityNodeInfo? = node.parent
+                    while (parent != null) {
+                        try {
+                            if (parent.isClickable && parent.isEnabled) {
+                                return parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                             }
+                            val nextParent = parent.parent
+                            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                                parent.recycle()
+                            }
+                            parent = nextParent
+                        } catch (_: Exception) {
+                            break
                         }
                     }
                 }
             } finally {
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                    for (n in nodes) {
-                        try { n.recycle() } catch (_: Exception) {}
+                    nodes.forEach { node ->
+                        runCatching { node.recycle() }
                     }
                 }
             }
