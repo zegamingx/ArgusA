@@ -175,8 +175,9 @@ runtime is currently integrated.
 The native-validation workflow builds the native library and verifies that the
 APK contains the configured ABI libraries on pull requests and relevant
 main-branch pushes. GitHub Automatic Dependency Submission also validates the
-Gradle dependency graph. No release-signing workflow is active while the
-previous signing identity is being migrated. Native validation runs on JDK 25;
+Gradle dependency graph. Installable release signing runs only through the
+protected `argus-release` GitHub Environment after changes reach `main`.
+Native validation runs on JDK 25;
 the Android app's Java source and bytecode compatibility target remains Java 21.
 Native builds install the checksum-pinned CMake 4.5.0 distribution and NDK r30.
 
