@@ -127,7 +127,8 @@ jobs:
             clean \
             :app:lintRelease \
             :app:testReleaseUnitTest \
-            :app:assembleDebug
+            :app:assembleDebug \
+            :app:assembleRelease
 
       - name: Verify packaged native ABI libraries
         shell: bash
@@ -138,6 +139,42 @@ jobs:
           for abi in arm64-v8a armeabi-v7a x86_64; do
             unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
           done
+
+      - name: Prepare unsigned release APK and checksum
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.number == 45 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_path="app/build/outputs/apk/release/app-release-unsigned.apk"
+          test -s "${apk_path}"
+          mkdir -p "${RUNNER_TEMP}/argus-release"
+          cp "${apk_path}" "${RUNNER_TEMP}/argus-release/ARGUS-v1.0.13-release-unsigned.apk"
+          (
+            cd "${RUNNER_TEMP}/argus-release"
+            sha256sum ARGUS-v1.0.13-release-unsigned.apk > ARGUS-v1.0.13-release-unsigned.apk.sha256
+          )
+          {
+            echo "Application: com.argus.agi"
+            echo "Version: 1.0.13 (build 10013)"
+            echo "Source commit: ${GITHUB_SHA}"
+            echo "Signing: UNSIGNED"
+            echo "Compatibility: Not installable as an update to any signed Argus installation."
+            echo "Next gate: Offline Android signing-certificate lineage migration and in-place update verification."
+          } > "${RUNNER_TEMP}/argus-release/BUILD-MANIFEST.txt"
+          test -s "${RUNNER_TEMP}/argus-release/ARGUS-v1.0.13-release-unsigned.apk"
+          test -s "${RUNNER_TEMP}/argus-release/ARGUS-v1.0.13-release-unsigned.apk.sha256"
+          cat "${RUNNER_TEMP}/argus-release/BUILD-MANIFEST.txt"
+          cat "${RUNNER_TEMP}/argus-release/ARGUS-v1.0.13-release-unsigned.apk.sha256"
+
+      - name: Upload unsigned release APK for retrieval
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.number == 45 && success() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: argus-v1.0.13-release-unsigned
+          path: ${{ runner.temp }}/argus-release/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
 
       - name: Install Android emulator and API 35 test image
         if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery')) }}
