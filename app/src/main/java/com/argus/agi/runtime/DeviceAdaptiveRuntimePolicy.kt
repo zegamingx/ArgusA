@@ -43,6 +43,30 @@ internal object DeviceAdaptiveRuntimePolicy {
         return minOf(hardLimitCharacters.toLong(), heapBoundCharacters).toInt()
     }
 
+    /**
+     * Converts the per-document queue ceiling into a conservative UTF-16 character
+     * ceiling. A byte-level tokenizer can emit up to one token per UTF-16 code unit
+     * for ordinary BMP input, so the queue budget must not assume four characters
+     * per token. The caller still applies the live-heap and absolute document caps.
+     */
+    fun streamedDocumentQueueCharacterLimit(
+        maximumChunks: Int,
+        epochs: Int,
+        chunkStrideTokens: Int,
+        hardLimitCharacters: Int
+    ): Int {
+        require(maximumChunks > 0) { "The maximum streamed chunk count must be positive." }
+        require(epochs > 0) { "The streamed document epoch count must be positive." }
+        require(chunkStrideTokens > 0) { "The streamed chunk stride must be positive." }
+        require(hardLimitCharacters > 0) { "The hard streamed character limit must be positive." }
+
+        val maximumRawChunks = maximumChunks.toLong() / epochs.toLong()
+        val queueCharacterLimit = maximumRawChunks * chunkStrideTokens.toLong()
+        return minOf(queueCharacterLimit, hardLimitCharacters.toLong())
+            .coerceAtLeast(1L)
+            .toInt()
+    }
+
     fun deviceLocalHeapHeadroomBytes(
         budgets: List<Long>,
         usages: List<Long>,
