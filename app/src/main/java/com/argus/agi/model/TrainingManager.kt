@@ -685,11 +685,14 @@ class TrainingManager internal constructor(
         if (closed) return Pair(0, 0L)
 
         val availableHeapBytes = captureTrainingMemorySnapshot().availableHeapBytes
-        val maximumRawChunks = MAX_STREAMED_DOCUMENT_CHUNKS / epochs
         val effectiveChunkStride = (chunkSize - overlap).coerceAtLeast(1)
-        val queueBoundedCharacterLimit = (
-            maximumRawChunks.toLong() * effectiveChunkStride.toLong() / 4L
-        ).coerceIn(1L, MAX_STREAMED_DOCUMENT_CHARACTERS.toLong()).toInt()
+        val queueBoundedCharacterLimit =
+            DeviceAdaptiveRuntimePolicy.streamedDocumentQueueCharacterLimit(
+                maximumChunks = MAX_STREAMED_DOCUMENT_CHUNKS,
+                epochs = epochs,
+                chunkStrideTokens = effectiveChunkStride,
+                hardLimitCharacters = MAX_STREAMED_DOCUMENT_CHARACTERS
+            )
         val streamCharacterLimit = DeviceAdaptiveRuntimePolicy.streamedDocumentCharacterLimit(
             availableHeapBytes = availableHeapBytes,
             hardLimitCharacters = queueBoundedCharacterLimit
