@@ -11,8 +11,9 @@ plugins {
     alias(libs.plugins.google.devtools.ksp)
 }
 
-// Release APKs remain unsigned until the exposed historical signing identity
-// has been migrated through a verified Android signing-certificate lineage.
+// Release variants are assembled unsigned during validation. The protected
+// main-branch distribution workflow applies the stable Argus 2026 signer only
+// after 16 KiB ZIP alignment and certificate verification.
 
 android {
     namespace = "com.argus.agi"
@@ -255,16 +256,16 @@ abstract class BumpVersionTask : DefaultTask() {
 
 val exportReleaseApk = tasks.register<CopyApkTask>("exportReleaseApk") {
     group = "distribution"
-    description = "Builds and exports an unsigned release APK; signing is suspended pending verified key rotation."
+    description = "Builds and exports an unsigned release APK for inspection; it is not installable."
     dependsOn("assembleRelease")
     apk.from(layout.buildDirectory.file("outputs/apk/release/app-release-unsigned.apk"))
-    target.set(layout.projectDirectory.file("../ARGUS.apk"))
+    target.set(layout.projectDirectory.file("../ARGUS-unsigned.apk"))
     outputs.upToDateWhen { false }
 }
 
 val exportDebugApk = tasks.register<CopyApkTask>("exportDebugApk") {
     group = "distribution"
-    description = "Builds and exports the debug APK to the repository root."
+    description = "Builds and exports the automatically debug-signed APK as ARGUS.apk."
     dependsOn("assembleDebug")
     apk.from(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk"))
     target.set(layout.projectDirectory.file("../ARGUS.apk"))
