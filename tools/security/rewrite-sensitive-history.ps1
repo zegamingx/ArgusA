@@ -51,222 +51,51 @@ function Get-RefMap {
         [System.StringComparer]::Ordinal
     )
     foreach ($line in $Lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+
+        # for-each-ref separates fields with spaces; ls-remote uses tabs.
+        # Git ref names cannot contain whitespace, so one expression safely handles both.
         $match = [regex]::Match(
             $line,
-            '^\s*([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\s+([^\s].*?)\s*
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    throw "Git is required. Install Git for Windows first."
-}
-if (-not (Test-Path -LiteralPath $WorkingRoot -PathType Container)) {
-    throw "WorkingRoot must be an existing folder on encrypted storage."
-}
-$resolvedWorkingRoot = (Resolve-Path -LiteralPath $WorkingRoot).Path
-$mirrorPath = Join-Path $resolvedWorkingRoot "ArgusA-clean-history.git"
-$rulesPath = Join-Path $resolvedWorkingRoot "argusa-history-redactions.txt"
-if (Test-Path -LiteralPath $mirrorPath) {
-    throw "The destination already exists. Move it aside or securely remove it before retrying."
-}
-if (Test-Path -LiteralPath $rulesPath) {
-    throw "A previous redaction rules file exists at the selected working root. Inspect and remove it before retrying."
-}
-
-# git-filter-repo --version prints a script hash, not a reliable semantic version.
-# Feature-probe the minimum options required by this sensitive-data rewrite.
-$filterRepoHelp = (& git filter-repo -h 2>&1 | Out-String)
-$filterRepoExitCode = $LASTEXITCODE
-if ($filterRepoExitCode -ne 0 -or
-    -not $filterRepoHelp.Contains("--sensitive-data-removal") -or
-    -not $filterRepoHelp.Contains("--path-glob")) {
-    throw "git-filter-repo with --sensitive-data-removal and --path-glob is required (v2.47.0 or newer)."
-}
-
-# Split the known legacy identifier so the scrubber source itself does not
-# contain a complete copy of the historical variable name.
-$legacyPasswordIdentifier = "default" + "Pass"
-$redactionRules = @(
-    ('regex:(?im)^.*' + [regex]::Escape($legacyPasswordIdentifier) + '.*$==>REDACTED_BY_HISTORY_CLEANUP'),
-    'regex:(?im)^.*(?:storePassword|keyPassword)[ \t]*=[ \t]*["''][^"'']+["''].*$==>REDACTED_BY_HISTORY_CLEANUP'
-)
-[System.IO.File]::WriteAllLines(
-    $rulesPath,
-    $redactionRules,
-    [System.Text.UTF8Encoding]::new($false)
-)
-
-try {
-    Write-Host "Cloning all advertised refs into encrypted working storage..."
-    Invoke-Git -Arguments @("clone", "--mirror", $repositoryUrl, $mirrorPath)
-
-    Push-Location $mirrorPath
-    try {
-        # GitHub pull-request refs may not be copied by every mirror transport.
-        # Fetch them explicitly so the sanitized mirror can report all affected PR refs.
-        Invoke-Git -Arguments @(
-            "fetch",
-            "--force",
-            "origin",
-            "+refs/pull/*:refs/pull/*"
+            '^\s*([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\s+(refs/\S+)\s*$'
         )
-
-        Write-Host "Rewriting signing files and credential assignments..."
-        Invoke-Git -Arguments @(
-            "filter-repo",
-            "--sensitive-data-removal",
-            "--force",
-            "--invert-paths",
-            "--path-glob", "*.jks",
-            "--path-glob", "*.keystore",
-            "--path-glob", "*.jceks",
-            "--path-glob", "*.bks",
-            "--path-glob", "*.p12",
-            "--path-glob", "*.pfx",
-            "--path-glob", "*.pem",
-            "--path-glob", "*.pk8",
-            "--path-glob", "*.key",
-            "--path-glob", "*.cer",
-            "--path-glob", "*.crt",
-            "--path-glob", "*.der",
-            "--path-glob", "*.mobileprovision",
-            "--path-glob", "*.idsig",
-            "--path-glob", "*.lineage",
-            "--path-glob", ".env",
-            "--path-glob", ".env.*",
-            "--path-glob", "key.properties",
-            "--path-glob", "keystore.properties",
-            "--path-glob", "signing.properties",
-            "--path-glob", "signing/**",
-            "--replace-text", $rulesPath
-        )
-
-        $objectPaths = & git rev-list --objects --all
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not enumerate rewritten Git objects."
+        if (-not $match.Success) {
+            throw "Could not parse Git ref line: $line"
         }
 
-        $sensitivePathPattern = '(?i)(^|/)([^/]+[.](jks|keystore|jceks|bks|p12|pfx|pem|pk8|key|cer|crt|der|mobileprovision|idsig|lineage)|[.]env([.][^/]*)?|key[.]properties|keystore[.]properties|signing[.]properties)$|(^|/)signing/'
-        $sensitivePaths = @(
-            $objectPaths | ForEach-Object {
-                $entry = [string]$_
-                $separator = $entry.IndexOf(' ')
-                if ($separator -gt 0) {
-                    $objectPath = $entry.Substring($separator + 1)
-                    if ($objectPath -match $sensitivePathPattern) { $objectPath }
-                }
-            }
-        )
-        if ($sensitivePaths.Count -gt 0) {
-            throw "Signing material paths remain in rewritten history. Do not push."
+        $objectId = $match.Groups[1].Value.ToLowerInvariant()
+        $refName = $match.Groups[2].Value
+        if ($map.ContainsKey($refName) -and $map[$refName] -cne $objectId) {
+            throw "Conflicting object IDs were reported for Git ref '$refName'."
         }
-
-        $credentialPattern = [regex]::Escape($legacyPasswordIdentifier) +
-            '|(storePassword|keyPassword)[[:space:]]*=[[:space:]]*["''][^"'']+["'']'
-        $credentialMatches = & git log --all --format="%H" -G $credentialPattern --
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not scan rewritten commit contents for credential assignments."
-        }
-        if ($credentialMatches) {
-            throw "A legacy credential assignment remains in rewritten history. Do not push."
-        }
-
-        $changedRefsPath = (& git rev-parse --git-path "filter-repo/changed-refs").Trim()
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $changedRefsPath -PathType Leaf)) {
-            throw "git-filter-repo did not produce changed-refs metadata. Do not push."
-        }
-
-        $changedRefs = @(Get-Content -LiteralPath $changedRefsPath)
-        $changedPullRefs = @(
-            $changedRefs | Where-Object { $_.StartsWith('refs/pull/') -and ($_.EndsWith('/head') -or $_.EndsWith('/merge')) }
-        )
-
-        Write-Host ""
-        Write-Host "History rewrite verification passed."
-        Write-Host "Changed refs recorded: $($changedRefs.Count)"
-        Write-Host "GitHub-managed pull-request refs listed by filter-repo: $($changedPullRefs.Count)"
-        Write-Host "Review .git/filter-repo/changed-refs and first-changed-commits before any push."
-
-        if (-not $PushCleanedHistory) {
-            Write-Host "No remote refs were changed. Re-run with -PushCleanedHistory and explicit confirmation only after manual review."
-            return
-        }
-
-        if ($Confirmation -cne "PUSH CLEANED HISTORY") {
-            throw 'Remote rewrite blocked. Supply -Confirmation "PUSH CLEANED HISTORY" only after reviewing the sanitized mirror and freezing repository writes.'
-        }
-
-        # git-filter-repo removes the origin remote by design; add it back explicitly.
-        & git remote add origin $repositoryUrl
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not restore the origin remote after history rewrite."
-        }
-
-        Write-Host "Pushing only branches and tags. GitHub-managed refs/pull/* are intentionally excluded."
-        & git push --force --prune origin "+refs/heads/*:refs/heads/*" "+refs/tags/*:refs/tags/*"
-        if ($LASTEXITCODE -ne 0) {
-            throw "Branch/tag push failed. Inspect all remote refs before any retry."
-        }
-
-        Write-Host "Verifying remote branch and tag refs..."
-        $localRefLines = & git for-each-ref --format="%(objectname) %(refname)" refs/heads refs/tags
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not enumerate local rewritten branches and tags."
-        }
-        $remoteRefLines = & git ls-remote --heads --tags origin
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not enumerate remote branches and tags after push."
-        }
-
-        $localRefs = Get-RefMap -Lines @($localRefLines)
-        $remoteRefs = Get-RefMap -Lines @(
-            $remoteRefLines | Where-Object { -not $_.EndsWith('^{}') }
-        )
-
-        $refMismatches = @()
-        foreach ($refName in $localRefs.Keys) {
-            if (-not $remoteRefs.ContainsKey($refName) -or
-                $remoteRefs[$refName] -ne $localRefs[$refName]) {
-                $refMismatches += $refName
-            }
-        }
-        foreach ($refName in $remoteRefs.Keys) {
-            if (-not $localRefs.ContainsKey($refName)) {
-                $refMismatches += $refName
-            }
-        }
-        if ($refMismatches.Count -gt 0) {
-            throw "Remote branch/tag refs do not exactly match the sanitized mirror: $($refMismatches -join ', ')"
-        }
-
-        Write-Host "All remote branches and tags match the sanitized mirror."
-        Write-Host "Contact GitHub Support to request removal of cached sensitive-data views and affected PR refs."
-        Write-Host "Re-clone the repository after the rewrite. Do not reuse old working clones."
+        $map[$refName] = $objectId
     }
-    finally {
-        Pop-Location
-    }
-}
-finally {
-    Remove-Item -LiteralPath $rulesPath -Force -ErrorAction SilentlyContinue
-}
 
-        )
-        if ($match.Success) {
-            $objectId = $match.Groups[1].Value.ToLowerInvariant()
-            $refName = $match.Groups[2].Value
-            $map[$refName] = $objectId
-        }
-    }
     return $map
 }
 
 # Exercise both Git output formats before any destructive rewrite can begin.
 $refMapSelfTest = Get-RefMap -Lines @(
-    ('0123456789abcdef0123456789abcdef01234567 refs/heads/main'),
-    ("89abcdef0123456789abcdef0123456789abcdef`trefs/tags/v1.0.0")
+    '0123456789abcdef0123456789abcdef01234567 refs/heads/main',
+    ('89abcdef0123456789abcdef0123456789abcdef' + [char]9 + 'refs/tags/v1.0.0')
 )
 if ($refMapSelfTest.Count -ne 2 -or
     $refMapSelfTest['refs/heads/main'] -ne '0123456789abcdef0123456789abcdef01234567' -or
     $refMapSelfTest['refs/tags/v1.0.0'] -ne '89abcdef0123456789abcdef0123456789abcdef') {
     throw "Get-RefMap self-test failed for space/tab-delimited Git ref output. Do not rewrite history."
+}
+
+$malformedRefRejected = $false
+try {
+    $null = Get-RefMap -Lines @('not-a-git-ref')
+}
+catch {
+    $malformedRefRejected = $true
+}
+if (-not $malformedRefRejected) {
+    throw "Get-RefMap accepted malformed input. Do not rewrite history."
 }
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
