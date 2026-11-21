@@ -84,8 +84,8 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         private const val ABSOLUTE_MAX_FILE_SIZE_BYTES = 100L * 1024L * 1024L
         private const val MAX_IMAGE_SIDE = 2048
         private const val MAX_ZIP_ENTRIES = 1_000
-        private const val ABSOLUTE_MAX_ZIP_ENTRY_EXPANDED_BYTES = 20L * 1024L * 1024L
-        private const val ABSOLUTE_MAX_ZIP_EXPANDED_TOTAL_BYTES = 40L * 1024L * 1024L
+        private const val ZIP_DISK_RESERVE_BYTES = 256L * 1024L * 1024L
+        private const val MINIMUM_ZIP_IMPORT_BUDGET_BYTES = 1L * 1024L * 1024L
     }
 
     private val neuralEngine = ArgusApp.neuralEngine
@@ -615,22 +615,6 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     cr.openFileDescriptor(uri, "r")?.use { it.statSize }
                 }.getOrNull()
 
-                val maxFileSizeBytes = maxImportFileSizeBytes()
-                if (sizeBytes != null && sizeBytes > maxFileSizeBytes) {
-                    withContext(Dispatchers.Main) {
-                        appendMessage(
-                            ChatMessage(
-                                isUser = false,
-                                text = "File is too large (${sizeBytes / 1024 / 1024} MB). " +
-                                    "The current device-memory-based import limit is " +
-                                    "${maxFileSizeBytes / 1024 / 1024} MB.",
-                                thinkReasoning = "Device-memory-aware import size guard triggered."
-                            )
-                        )
-                    }
-                    return@launch
-                }
-
                 val docDisplayName = runCatching {
                     var name: String? = null
                     cr.query(uri, null, null, null, null)?.use { cursor ->
@@ -754,11 +738,10 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 // Streaming chunk ingestion: membaca langsung secara buffered (4KB)
                 // tanpa pernah memuat seluruh file ke dalam sebuah String raksasa di heap RAM.
                 val (chunkCount, charsRead) = cr.openInputStream(uri)?.use { stream ->
-                    val boundedReader = BoundedReader(
+                    val reader = BufferedReader(
                         openImportReader(stream, strictUtf8 = isJsonLines),
-                        maxImportTextCharacters()
+                        16_384
                     )
-                    val reader = BufferedReader(boundedReader, 16_384)
                     trainingManager.enqueueDocumentStream(
                         source = "text_file|name=${encodeProvenanceField(docDisplayName)}",
                         title = docDisplayName,
@@ -806,7 +789,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             isUser = false,
                             text = "Document '$docDisplayName' ($sizeDisplay) was read incrementally.\n\n" +
                                     "The text was split into $chunkCount chunks and scheduled for local training. " +
-                                    "Queued chunks are currently held in application memory, so large imports require sufficient available RAM.\n\n" +
+                                    "The corpus and compact training queue were stored locally in bounded batches.\n\n" +
                                     "Track progress in the Neural Core tab.",
                             thinkReasoning = "Buffered document ingestion: $charsRead characters → $chunkCount queued blocks."
                         )
@@ -868,17 +851,20 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     private fun maxImportTextCharacters(): Long =
         maxQueuedTextMemoryBudgetBytes() / 4L
 
-    private fun maxZipEntryExpandedBytes(): Long =
-        minOf(
-            ABSOLUTE_MAX_ZIP_ENTRY_EXPANDED_BYTES,
-            maxQueuedTextMemoryBudgetBytes()
-        )
+    /**
+     * ZIP expansion is constrained by available cache storage, not by the app heap.
+     * The reserve accounts for Room/WAL files, the second staging pass and unrelated
+     * application cache use. Actual I/O failures still abort and roll back the import.
+     */
+    private fun availableZipImportDiskBudgetBytes(): Long {
+        val availableBytes = getApplication<Application>().cacheDir.usableSpace.coerceAtLeast(0L)
+        val afterReserve = (availableBytes - ZIP_DISK_RESERVE_BYTES).coerceAtLeast(0L)
+        return maxOf(MINIMUM_ZIP_IMPORT_BUDGET_BYTES, afterReserve / 4L)
+    }
 
-    private fun maxZipExpandedTotalBytes(): Long =
-        minOf(
-            ABSOLUTE_MAX_ZIP_EXPANDED_TOTAL_BYTES,
-            maxQueuedTextMemoryBudgetBytes()
-        )
+    private fun maxZipEntryExpandedBytes(): Long = availableZipImportDiskBudgetBytes()
+
+    private fun maxZipExpandedTotalBytes(): Long = availableZipImportDiskBudgetBytes()
 
     private suspend fun enqueueExtractedDocument(
         extracted: ExtractedDocument,
@@ -1136,12 +1122,9 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                         else -> {
                                             val strictJsonLines = extension in setOf("jsonl", "ndjson")
                                             val reader = BufferedReader(
-                                                BoundedReader(
-                                                    openImportReader(
-                                                        boundedEntry,
-                                                        strictUtf8 = strictJsonLines
-                                                    ),
-                                                    maxTextCharacters
+                                                openImportReader(
+                                                    boundedEntry,
+                                                    strictUtf8 = strictJsonLines
                                                 ),
                                                 8_192
                                             )
