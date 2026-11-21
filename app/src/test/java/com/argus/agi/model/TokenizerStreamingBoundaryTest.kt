@@ -45,10 +45,10 @@ class TokenizerStreamingBoundaryTest {
             "Multilingual: 日本語 한국어 العربية हिन्दी emoji 😀🧑🏽‍🚀",
             "<SYSTEM>policy<USER>question<ASSISTANT>answer<EOS>",
             Tokenizer.escapeLiteralControlTokens(
-                "Literal \${Tokenizer.USER_TOKEN}, \${Tokenizer.EOS_TOKEN}, and \${Tokenizer.IMAGE_TOKEN}"
+                "Literal ${Tokenizer.USER_TOKEN}, ${Tokenizer.EOS_TOKEN}, and ${Tokenizer.IMAGE_TOKEN}"
             ),
             (1..5).joinToString("|") { count ->
-                "prefix\${marker.toString().repeat(count)}\${Tokenizer.USER_TOKEN}suffix"
+                "prefix${marker.toString().repeat(count)}${Tokenizer.USER_TOKEN}suffix"
             },
             "combining e\u0301 and malformed \uD800 surrogate \uDC00"
         )
