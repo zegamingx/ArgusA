@@ -1,5 +1,21 @@
 package com.argus.agi.ui
 
+
+/**
+ * Reserves local cache capacity before assigning a bounded expansion budget to ZIP imports.
+ * The importer may use at most one quarter of the storage remaining after the reserve.
+ */
+internal fun calculateZipImportBudgetBytes(
+    availableBytes: Long,
+    reservedBytes: Long
+): Long {
+    require(availableBytes >= 0L) { "Available storage must not be negative." }
+    require(reservedBytes >= 0L) { "Reserved storage must not be negative." }
+
+    val bytesAfterReserve = (availableBytes - reservedBytes).coerceAtLeast(0L)
+    return bytesAfterReserve / 4L
+}
+
 import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -86,6 +102,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         private const val MAX_ZIP_ENTRIES = 1_000
         private const val ZIP_DISK_RESERVE_BYTES = 256L * 1024L * 1024L
         private const val MINIMUM_ZIP_IMPORT_BUDGET_BYTES = 1L * 1024L * 1024L
+        private const val ZIP_IMPORT_BUDGET_DIVISOR = 4L
     }
 
     private val neuralEngine = ArgusApp.neuralEngine
@@ -858,13 +875,11 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun availableZipImportDiskBudgetBytes(): Long {
         val availableBytes = getApplication<Application>().cacheDir.usableSpace.coerceAtLeast(0L)
-        val afterReserve = (availableBytes - ZIP_DISK_RESERVE_BYTES).coerceAtLeast(0L)
-        return maxOf(MINIMUM_ZIP_IMPORT_BUDGET_BYTES, afterReserve / 4L)
+        return calculateZipImportBudgetBytes(
+            availableBytes = availableBytes,
+            reservedBytes = ZIP_DISK_RESERVE_BYTES
+        )
     }
-
-    private fun maxZipEntryExpandedBytes(): Long = availableZipImportDiskBudgetBytes()
-
-    private fun maxZipExpandedTotalBytes(): Long = availableZipImportDiskBudgetBytes()
 
     private suspend fun enqueueExtractedDocument(
         extracted: ExtractedDocument,
@@ -1030,8 +1045,20 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 var totalCharsExtracted = 0L
                 var totalExpandedBytes = 0L
                 var entryCount = 0
-                val maxZipEntryBytes = maxZipEntryExpandedBytes()
-                val maxZipTotalBytes = maxZipExpandedTotalBytes()
+                val maxZipImportBytes = availableZipImportDiskBudgetBytes()
+                if (maxZipImportBytes < MINIMUM_ZIP_IMPORT_BUDGET_BYTES) {
+                    val minimumRequiredBytes =
+                        ZIP_DISK_RESERVE_BYTES +
+                            MINIMUM_ZIP_IMPORT_BUDGET_BYTES * ZIP_IMPORT_BUDGET_DIVISOR
+                    throw IOException(
+                        "ZIP import requires at least " +
+                            (minimumRequiredBytes / 1024L / 1024L) +
+                            " MB of free cache storage to preserve the safety reserve. " +
+                            "Free up local storage and retry."
+                    )
+                }
+                val maxZipEntryBytes = maxZipImportBytes
+                val maxZipTotalBytes = maxZipImportBytes
                 val maxTextCharacters = maxImportTextCharacters()
 
                 val plainTextExtensions = setOf(
