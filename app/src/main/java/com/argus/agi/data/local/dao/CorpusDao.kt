@@ -104,6 +104,13 @@ interface CorpusDao {
     @Query("SELECT * FROM corpus_documents WHERE id = :documentId LIMIT 1")
     suspend fun getDocument(documentId: String): CorpusDocumentEntity?
 
+    @Query("UPDATE corpus_documents SET status = 'READY' WHERE id = :documentId AND status = 'IMPORTING'")
+    suspend fun completeStreamedImport(documentId: String): Int
+
+    @Query("SELECT * FROM corpus_chunks WHERE documentId = :documentId AND chunkIndex = :chunkIndex LIMIT 1")
+    suspend fun getChunk(documentId: String, chunkIndex: Int): CorpusChunkEntity?
+
+
     @Query("SELECT * FROM corpus_documents WHERE contentFingerprint = :fingerprint LIMIT 1")
     suspend fun getDocumentByFingerprint(fingerprint: String): CorpusDocumentEntity?
 

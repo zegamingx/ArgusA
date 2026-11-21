@@ -12,8 +12,17 @@ interface TrainingQueueDao {
     @Query("SELECT * FROM training_items WHERE status = 'QUEUED' ORDER BY timestamp ASC")
     fun getPendingQueue(): Flow<List<TrainingItemEntity>>
 
-    @Query("SELECT * FROM training_items WHERE status = 'QUEUED' ORDER BY timestamp ASC")
-    suspend fun getPendingQueueSnapshot(): List<TrainingItemEntity>
+    @Query("SELECT * FROM training_items WHERE status = 'QUEUED' ORDER BY timestamp ASC LIMIT :limit")
+    suspend fun getPendingQueueSnapshot(limit: Int): List<TrainingItemEntity>
+
+    @Query(
+        "UPDATE training_items SET status = 'QUEUED' " +
+            "WHERE documentId = :documentId AND status = 'PERSISTING'"
+    )
+    suspend fun activateStreamedDocumentQueue(documentId: String): Int
+
+    @Query("DELETE FROM training_items WHERE documentId = :documentId AND status = 'PERSISTING'")
+    suspend fun deleteUncommittedStreamedDocumentQueue(documentId: String): Int
 
     @Query(
         "SELECT * FROM training_items WHERE status = 'OPTIMIZER_COMMITTED' ORDER BY timestamp ASC"
