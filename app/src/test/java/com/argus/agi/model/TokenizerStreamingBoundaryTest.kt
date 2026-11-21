@@ -111,6 +111,25 @@ class TokenizerStreamingBoundaryTest {
     }
 
     @Test
+    fun literalControlModeEscapesReservedSpellingsInsteadOfEmittingControlIds() {
+        val tokenizer = tokenizer()
+        val sample = "ordinary prose with ${Tokenizer.USER_TOKEN} and ${Tokenizer.EOS_TOKEN} markers"
+        val escaped = Tokenizer.escapeLiteralControlTokens(sample)
+        val chunks = ArrayList<TokenizerTextChunk>()
+
+        tokenizer.forEachSafeTextChunk(
+            reader = FragmentingReader(sample, 2),
+            maxTokensPerChunk = 12,
+            literalControlTokens = true,
+            action = chunks::add
+        )
+
+        assertEquals(escaped, chunks.joinToString(separator = "") { it.text })
+        assertArrayEquals(tokenizer.encodeToIds(escaped), flatten(chunks))
+        assertTrue(flatten(chunks).none { it == Tokenizer.USER_ID || it == Tokenizer.EOS_ID })
+    }
+
+    @Test
     fun safeChunksNeverSplitAnIndivisiblePreToken() {
         val tokenizer = tokenizer()
         val sample = "thisisoneverylongpretokenwithoutanysafeinnerboundary"
