@@ -1106,6 +1106,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         reader: Reader,
         maxTokensPerChunk: Int,
         overlapTokens: Int = 0,
+        literalControlTokens: Boolean = false,
         action: (TokenizerTextChunk) -> Unit
     ) {
         require(maxTokensPerChunk > 0) { "maxTokensPerChunk must be positive." }
@@ -1261,8 +1262,22 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 '<' -> {
                     val special = readSpecialAfterOpenAngle()
                     if (special != null) {
-                        flushPlainText()
-                        appendSafeUnit(special)
+                        if (literalControlTokens) {
+                            // Match TextModalityProcessor's payload escaping while keeping
+                            // the original control spelling as ordinary byte-level text.
+                            flushWord()
+                            val escapedLiteral = buildString {
+                                append(pendingWhitespace)
+                                append(LITERAL_CONTROL_ESCAPE_MARKER)
+                                append(LITERAL_CONTROL_ESCAPE_MARKER)
+                                append(special)
+                            }
+                            pendingWhitespace.setLength(0)
+                            appendSafeUnit(escapedLiteral)
+                        } else {
+                            flushPlainText()
+                            appendSafeUnit(special)
+                        }
                     } else {
                         acceptPlainCodePoint('<'.code, "<")
                     }
