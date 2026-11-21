@@ -182,6 +182,8 @@ class TrainingManager internal constructor(
         const val MAX_CORPUS_REPLAY_CHUNKS = 50_000
         private const val MAX_TOKENIZER_SAMPLE_CHUNKS = 256
         private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
+        private const val QUEUE_PREFETCH_LIMIT = 64
+        private const val CORPUS_WRITE_BATCH_SIZE = 128
         private const val MAX_STREAMED_JSON_VALUE_CHARACTERS = 256 * 1024
         // Import remains bounded even when the supplied Reader is unbounded.
         const val MAX_STREAMED_DOCUMENT_CHARACTERS = 2 * 1024 * 1024
@@ -214,6 +216,7 @@ class TrainingManager internal constructor(
     private var screenTrainingPurgePending = false
     private val corpusSchedulingMutex = Mutex()
     private val seedSchedulingMutex = Mutex()
+    private val queueRefillMutex = Mutex()
     private var lastScheduledTimestamp: Long = System.currentTimeMillis()
     private var queueGeneration: Long = 0L
     private val persistenceOperations =
@@ -2580,7 +2583,7 @@ class TrainingManager internal constructor(
                     }
 
                     val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
-                    val pending = repository.getPendingQueueSnapshot()
+                    val pending = repository.getPendingQueueSnapshot(QUEUE_PREFETCH_LIMIT)
                     val databaseIds = (committed + pending).mapTo(HashSet()) { it.id }
                     val inMemoryItems = synchronized(queueLock) {
                         _nextQueue.value.filterNot { item -> item.id in databaseIds }
@@ -2627,6 +2630,7 @@ class TrainingManager internal constructor(
             }
 
             while (isActive && !closed) {
+                refillPendingQueueFromDatabase()
                 if (_isTrainingPaused.value) {
                     combine(_isTrainingPaused, _nextQueue) { paused, queue ->
                         !paused || queue.any {
@@ -3148,6 +3152,74 @@ class TrainingManager internal constructor(
         return item
     }
 
+    /**
+     * Loads only a bounded queue page. PERSISTING/committed items remain governed by
+     * the persistence journal; QUEUED rows are fetched in timestamp order as pages drain.
+     */
+    private suspend fun refillPendingQueueFromDatabase() {
+        if (_nextQueue.value.isNotEmpty()) return
+        val repository = repo ?: return
+        queueRefillMutex.lock()
+        try {
+            if (_nextQueue.value.isNotEmpty() || closed) return
+            awaitQueuePersistenceIdle()
+            val page = repository.getPendingQueueSnapshot(QUEUE_PREFETCH_LIMIT)
+            if (page.isEmpty()) return
+
+            synchronized(queueLock) {
+                val existingIds = _nextQueue.value.mapTo(HashSet()) { item -> item.id }
+                val additions = page.filterNot { item -> item.id in existingIds }
+                if (additions.isNotEmpty()) {
+                    _nextQueue.value = (_nextQueue.value + additions)
+                        .sortedBy(TrainingData::timestamp)
+                    additions.maxOfOrNull(TrainingData::timestamp)?.let { latest ->
+                        lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
+                    }
+                }
+            }
+        } finally {
+            queueRefillMutex.unlock()
+        }
+    }
+
+    /**
+     * Streamed imports persist queue descriptors with empty inline content. Hydrate only
+     * the active micro-batch from retained corpus chunks immediately before tokenization.
+     */
+    private suspend fun hydrateCorpusQueueItems(
+        items: MutableList<TrainingData>,
+        repository: com.argus.agi.data.repository.ArgusRepository
+    ) {
+        val documentCache = HashMap<String, CorpusDocumentEntity>()
+        for (index in items.indices) {
+            val item = items[index]
+            val documentId = item.documentId ?: continue
+            if (item.content.isNotEmpty()) continue
+
+            val document = documentCache[documentId] ?: run {
+                val loaded = repository.getCorpusDocument(documentId)
+                    ?: throw IllegalStateException(
+                        "Training queue references missing corpus document $documentId."
+                    )
+                documentCache[documentId] = loaded
+                loaded
+            }
+            require(document.chunkCount > 0) {
+                "Corpus document $documentId has no retained training chunks."
+            }
+            val corpusChunkIndex = ((item.chunkIndex - 1) % document.chunkCount) + 1
+            val chunk = repository.getCorpusChunk(documentId, corpusChunkIndex)
+                ?: throw IllegalStateException(
+                    "Corpus document $documentId is missing chunk $corpusChunkIndex."
+                )
+            items[index] = item.copy(content = chunk.content)
+        }
+        items.firstOrNull()?.let { first ->
+            _currentTrainingItem.value = first
+            updateActiveDocumentEntering(first)
+        }
+    }
+
     private fun updateActiveDocumentEntering(item: TrainingData) {
         if (item.documentTitle == null) return
         _activeDocument.update { current ->
@@ -3242,6 +3314,8 @@ class TrainingManager internal constructor(
             _activeDocument.value = null
             return true
         }
+
+        hydrateCorpusQueueItems(items, repository)
 
         items.mapNotNull(TrainingData::documentId)
             .forEach(validationRunDocumentIds::add)
