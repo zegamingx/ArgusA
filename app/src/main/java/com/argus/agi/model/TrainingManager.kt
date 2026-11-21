@@ -317,6 +317,7 @@ class TrainingManager internal constructor(
         Log.e(TAG, "Unhandled exception in training scope", t)
     }
     private val scope = CoroutineScope(SupervisorJob() + trainingDispatcher + exceptionHandler)
+    private val streamedImportStartup = CompletableDeferred<Unit>()
     private var workerJob: Job? = null
     private var persistenceJob: Job? = null
 
@@ -669,6 +670,8 @@ class TrainingManager internal constructor(
         sourceProvenance: CorpusSourceProvenance = CorpusSourceProvenance(),
         strictJsonLines: Boolean = false
     ): Pair<Int, Long> {
+        if (closed) return Pair(0, 0L)
+        streamedImportStartup.await()
         require(chunkSize > 0) { "chunkSize must be positive." }
         require(overlap >= 0 && overlap < chunkSize) {
             "overlap must be between zero and chunkSize - 1."
@@ -766,7 +769,7 @@ class TrainingManager internal constructor(
                             var lineNumber = 0
                             while (true) {
                                 currentCoroutineContext().ensureActive()
-                                val line = stagedReader.readLine() ?: break
+                                val line = readBoundedJsonLine(stagedReader, MAX_STREAMED_JSON_VALUE_CHARACTERS) ?: break
                                 lineNumber++
                                 val record = line.removePrefix("\uFEFF").trim()
                                 if (record.isEmpty()) continue
@@ -1033,8 +1036,6 @@ class TrainingManager internal constructor(
         } else {
             TextModalityProcessor.detectModality(String(sample, 0, sampleCount))
         }
-        val literalControlTokens = modality != TextModality.CONVERSATION &&
-            modality != TextModality.REASONING
         var emittedChunks = 0
         InputStreamReader(
             FileInputStream(file),
@@ -1044,11 +1045,13 @@ class TrainingManager internal constructor(
                 reader = sourceReader,
                 maxTokensPerChunk = chunkSize,
                 overlapTokens = overlap,
-                literalControlTokens = literalControlTokens
+                literalControlTokens = false,
+                allowSpecialTokens = false
             ) { chunk ->
-                if (chunk.text.isNotEmpty()) {
-                    output.writeInt(chunk.text.length)
-                    for (character in chunk.text) output.writeChar(character.code)
+                val trainingText = Tokenizer.escapeLiteralControlTokens(chunk.text)
+                if (trainingText.isNotEmpty()) {
+                    output.writeInt(trainingText.length)
+                    for (character in trainingText) output.writeChar(character.code)
                     emittedChunks = Math.addExact(emittedChunks, 1)
                 }
             }
@@ -1058,101 +1061,38 @@ class TrainingManager internal constructor(
     }
 
 
-    /**
-     * Processes JSONL one complete object per line. In automatic mode a non-JSONL source
-     * returns null so the caller can use the document-level parser. Explicit JSONL imports
-     * fail closed: malformed, mixed-format, or empty streams are rejected before persistence.
-     *
-     * The returned list is bounded by MAX_STREAMED_DOCUMENT_CHUNKS. Each JSONObject is
-     * parsed and released before the next source line is read; conversation objects stay
-     * atomic because TextModalityProcessor receives the full JSON object for each line.
-     */
-    private suspend fun processStagedJsonLinesIfValid(
-        file: File,
-        documentTitle: String,
-        chunkSize: Int,
-        overlap: Int,
-        strictJsonLines: Boolean
-    ): List<ProcessedChunk>? {
-        val processed = ArrayList<ProcessedChunk>()
-        var foundRecord = false
-        var lineNumber = 0
+    private fun readBoundedJsonLine(
+        reader: BufferedReader,
+        maximumCharacters: Int
+    ): String? {
+        require(maximumCharacters > 0) { "maximumCharacters must be positive." }
+        val line = StringBuilder(minOf(maximumCharacters, 4_096))
+        var hasContent = false
 
-        BufferedReader(
-            InputStreamReader(
-                FileInputStream(file),
-                StandardCharsets.UTF_16BE
-            )
-        ).use { reader ->
-            while (true) {
-                currentCoroutineContext().ensureActive()
-                val line = reader.readLine() ?: break
-                lineNumber++
-                val record = line.removePrefix("\uFEFF").trim()
-                if (record.isEmpty()) continue
-                if (!record.startsWith('{')) {
-                    if (strictJsonLines) {
+        while (true) {
+            val next = reader.read()
+            if (next < 0) return if (hasContent) line.toString() else null
+
+            when (next.toChar()) {
+                '\n' -> return line.toString()
+                '\r' -> {
+                    reader.mark(1)
+                    val following = reader.read()
+                    if (following >= 0 && following.toChar() != '\n') reader.reset()
+                    return line.toString()
+                }
+                else -> {
+                    if (line.length >= maximumCharacters) {
                         throw IllegalArgumentException(
-                            "Invalid JSONL record at line $lineNumber: expected a JSON object."
+                            "A streamed JSONL record exceeds $maximumCharacters UTF-16 characters. " +
+                                "Split the record at a complete JSON object boundary."
                         )
                     }
-                    return null
+                    line.append(next.toChar())
+                    hasContent = true
                 }
-                require(record.length <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
-                    "A streamed JSONL record exceeds " +
-                        "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
-                        "Split the record before importing it."
-                }
-
-                validateStreamedJsonValueSizes(record)
-                val isJsonObject = runCatching {
-                    org.json.JSONObject(record)
-                }.isSuccess
-                if (!isJsonObject) {
-                    if (strictJsonLines) {
-                        throw IllegalArgumentException(
-                            "Malformed JSONL record at line $lineNumber: expected one complete JSON object."
-                        )
-                    }
-                    return null
-                }
-                require(processed.size < MAX_STREAMED_DOCUMENT_CHUNKS) {
-                    "JSONL document exceeds the safe limit of " +
-                        "$MAX_STREAMED_DOCUMENT_CHUNKS processed records."
-                }
-
-                foundRecord = true
-                val nextChunks = TextModalityProcessor.process(
-                    rawText = record,
-                    documentTitle = documentTitle,
-                    chunkSize = chunkSize,
-                    overlap = overlap,
-                    tokenizer = neuralEngine.tokenizer
-                )
-                if (nextChunks.isEmpty()) {
-                    if (strictJsonLines) {
-                        throw IllegalArgumentException(
-                            "JSONL record at line $lineNumber did not produce a trainable sample."
-                        )
-                    }
-                    return null
-                }
-                val nextSize = Math.addExact(processed.size, nextChunks.size)
-                require(nextSize <= MAX_STREAMED_DOCUMENT_CHUNKS) {
-                    "JSONL document exceeds the safe limit of " +
-                        "$MAX_STREAMED_DOCUMENT_CHUNKS processed records."
-                }
-                processed.addAll(nextChunks)
             }
         }
-
-        val completedRecords = processed.takeIf { foundRecord }
-        if (strictJsonLines) {
-            require(completedRecords != null) {
-                "The JSONL file contains no non-empty JSON object records."
-            }
-        }
-        return completedRecords
     }
 
     /**
@@ -1163,7 +1103,7 @@ class TrainingManager internal constructor(
         file: File,
         expectedCharacterCount: Int
     ): String {
-        require(expectedCharacterCount in 1..MAX_STREAMED_DOCUMENT_CHARACTERS)
+        require(expectedCharacterCount in 1..MAX_STREAMED_JSON_VALUE_CHARACTERS)
         val result = StringBuilder(expectedCharacterCount)
         val byteBuffer = ByteArray(8 * 1024)
         val charBuffer = CharArray(byteBuffer.size / 2)
@@ -1209,52 +1149,6 @@ class TrainingManager internal constructor(
             "Temporary streamed-ingestion character count does not match the source stream."
         }
         return result.toString()
-    }
-
-    private fun validateStreamedJsonValueSizes(text: String) {
-        fun skipWhitespace(start: Int): Int {
-            var index = start
-            while (index < text.length && text[index].isWhitespace()) index++
-            return index
-        }
-
-        var cursor = skipWhitespace(0)
-        if (cursor >= text.length) return
-
-        if (text[cursor] == '[') {
-            val end = TextModalityProcessor.findCompleteJsonValueEnd(text, cursor)
-                ?: throw IllegalArgumentException(
-                    "The streamed JSON array is incomplete. Check its closing brackets."
-                )
-            require(end - cursor <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
-                "A streamed JSON training array exceeds " +
-                    "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
-                    "Use JSONL with one training record per line."
-            }
-            require(skipWhitespace(end) == text.length) {
-                "Unexpected content follows the streamed JSON array."
-            }
-            return
-        }
-
-        if (text[cursor] != '{') return
-
-        while (cursor < text.length) {
-            cursor = skipWhitespace(cursor)
-            if (cursor >= text.length || text[cursor] != '{') return
-
-            val end = TextModalityProcessor.findCompleteJsonValueEnd(text, cursor)
-                ?: throw IllegalArgumentException(
-                    "A streamed JSON training record is incomplete. " +
-                        "Check the final JSONL record or closing JSON braces."
-                )
-            require(end - cursor <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
-                "A streamed JSON training record exceeds " +
-                    "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
-                    "Use smaller JSONL records."
-            }
-            cursor = end
-        }
     }
 
     /**
@@ -2713,6 +2607,20 @@ class TrainingManager internal constructor(
         }
     }
 
+    private fun removeInterruptedStreamedIngestionFiles() {
+        val abandonedFiles = ingestionStagingDirectory.listFiles().orEmpty().filter { file ->
+            file.isFile && (
+                (file.name.startsWith("argus-ingest-") && file.name.endsWith(".utf16be")) ||
+                    (file.name.startsWith("argus-chunks-") && file.name.endsWith(".bin"))
+                )
+        }
+        for (file in abandonedFiles) {
+            if (!file.delete() && file.exists()) {
+                Log.w(TAG, "Could not remove abandoned streamed-ingestion spool: ${file.name}")
+            }
+        }
+    }
+
     private fun startTrainingWorker() {
         workerJob = scope.launch {
             var validationRunActive = false
@@ -2722,6 +2630,11 @@ class TrainingManager internal constructor(
                 awaitQueuePersistenceIdle()
                 val repository = requireNotNull(repo) {
                     "Training cannot start without durable local queue storage."
+                }
+                removeInterruptedStreamedIngestionFiles()
+                val recoveredImports = repository.recoverIncompleteStreamedCorpusImports()
+                if (recoveredImports > 0) {
+                    Log.w(TAG, "Removed $recoveredImports incomplete streamed corpus imports after process restart.")
                 }
                 val persistedCommitted = repository.getOptimizerCommittedTrainingItemsSnapshot()
                 val interruptedCandidateRun =
@@ -2802,8 +2715,10 @@ class TrainingManager internal constructor(
                 }
                 wakeupSignal.trySend(Unit)
             } catch (cancelled: CancellationException) {
+                streamedImportStartup.completeExceptionally(cancelled)
                 throw cancelled
             } catch (error: Throwable) {
+                streamedImportStartup.completeExceptionally(error)
                 Log.e(TAG, "Training startup recovery failed.", error)
                 _isTrainingPaused.value = true
                 setConversationalValidationStatus(
@@ -2813,6 +2728,7 @@ class TrainingManager internal constructor(
                 return@launch
             }
 
+            streamedImportStartup.complete(Unit)
             while (isActive && !closed) {
                 refillPendingQueueFromDatabase()
                 if (_isTrainingPaused.value) {

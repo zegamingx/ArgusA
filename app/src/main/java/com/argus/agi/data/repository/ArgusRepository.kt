@@ -112,9 +112,9 @@ class ArgusRepository(
         entities.map { it.toDomain() }
     }
 
-    suspend fun getPendingQueueSnapshot(limit: Int = Int.MAX_VALUE): List<TrainingData> =
+    suspend fun getPendingQueueSnapshot(limit: Int = 64): List<TrainingData> =
         withContext(Dispatchers.IO) {
-            require(limit > 0) { "Queue page size must be positive." }
+            require(limit in 1..128) { "Queue page size must be in 1..128." }
             trainingQueueDao.getPendingQueueSnapshot(limit).map { it.toDomain() }
         }
 
@@ -291,20 +291,7 @@ class ArgusRepository(
     suspend fun clearPendingQueueAndMarkInterruptedCorpusDocumentsPartial(): Set<String> =
         withContext(Dispatchers.IO) {
             db.withTransaction {
-                val activeItems = trainingQueueDao.getActiveCorpusTrainingItems()
-                val itemsByDocument = activeItems
-                    .filter { it.documentId != null }
-                    .groupBy { requireNotNull(it.documentId) }
-
-                val partialDocumentIds = itemsByDocument
-                    .filterValues { documentItems ->
-                        val canFinishDocument = documentItems.size == 1 &&
-                            documentItems.single().status in setOf("TRAINING", "OPTIMIZER_COMMITTED") &&
-                            documentItems.single().chunkIndex >= documentItems.single().totalChunks
-                        !canFinishDocument
-                    }
-                    .keys
-                    .toSet()
+                val partialDocumentIds = trainingQueueDao.getInterruptedCorpusDocumentIds().toSet()
 
                 trainingQueueDao.clearPendingQueue()
                 partialDocumentIds.forEach { documentId ->
@@ -448,6 +435,24 @@ class ArgusRepository(
                 }
             }
         }
+
+    /**
+     * Removes streamed imports that were interrupted before their READY/QUEUED activation
+     * transaction. Their PERSISTING queue rows are never replayable and their retained chunks
+     * are deleted through the corpus-document foreign-key cascade.
+     */
+    suspend fun recoverIncompleteStreamedCorpusImports(): Int = withContext(Dispatchers.IO) {
+        db.withTransaction {
+            val incompleteDocumentIds = corpusDao.getImportingDocumentIds()
+            incompleteDocumentIds.forEach { documentId ->
+                trainingQueueDao.deleteUncommittedStreamedDocumentQueue(documentId)
+                check(corpusDao.deleteDocument(documentId) == 1) {
+                    "The incomplete streamed corpus document could not be removed: $documentId"
+                }
+            }
+            incompleteDocumentIds.size
+        }
+    }
 
     suspend fun storeCorpusDocument(
         document: CorpusDocumentEntity,

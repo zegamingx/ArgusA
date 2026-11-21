@@ -1107,6 +1107,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         maxTokensPerChunk: Int,
         overlapTokens: Int = 0,
         literalControlTokens: Boolean = false,
+        allowSpecialTokens: Boolean = true,
         action: (TokenizerTextChunk) -> Unit
     ) {
         require(maxTokensPerChunk > 0) { "maxTokensPerChunk must be positive." }
@@ -1143,9 +1144,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             currentTokenCount = 0
         }
 
-        fun appendSafeUnit(sourceText: String) {
+        fun appendSafeUnit(sourceText: String, encodingText: String = sourceText) {
             if (sourceText.isEmpty()) return
-            val encoded = encodeTextWithState(sourceText, current)
+            val encoded = encodeTextWithState(encodingText, current)
             if (encoded.isEmpty()) return
 
             if (
@@ -1262,10 +1263,14 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 '<' -> {
                     val special = readSpecialAfterOpenAngle()
                     if (special != null) {
-                        if (literalControlTokens) {
-                            // Match TextModalityProcessor's payload escaping while keeping
-                            // the original control spelling as ordinary byte-level text.
+                        if (literalControlTokens || !allowSpecialTokens) {
+                            // Keep the imported spelling byte-for-byte in the chunk text;
+                            // escape it only in the tokenization view to block control injection.
                             flushWord()
+                            val sourceLiteral = buildString {
+                                append(pendingWhitespace)
+                                append(special)
+                            }
                             val escapedLiteral = buildString {
                                 append(pendingWhitespace)
                                 append(LITERAL_CONTROL_ESCAPE_MARKER)
@@ -1273,7 +1278,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                                 append(special)
                             }
                             pendingWhitespace.setLength(0)
-                            appendSafeUnit(escapedLiteral)
+                            appendSafeUnit(sourceLiteral, escapedLiteral)
                         } else {
                             flushPlainText()
                             appendSafeUnit(special)

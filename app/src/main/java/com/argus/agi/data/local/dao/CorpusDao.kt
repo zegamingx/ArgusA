@@ -104,6 +104,9 @@ interface CorpusDao {
     @Query("SELECT * FROM corpus_documents WHERE id = :documentId LIMIT 1")
     suspend fun getDocument(documentId: String): CorpusDocumentEntity?
 
+    @Query("SELECT id FROM corpus_documents WHERE status = 'IMPORTING' ORDER BY createdAtEpochMs ASC")
+    suspend fun getImportingDocumentIds(): List<String>
+
     @Query("UPDATE corpus_documents SET status = 'READY' WHERE id = :documentId AND status = 'IMPORTING'")
     suspend fun completeStreamedImport(documentId: String): Int
 

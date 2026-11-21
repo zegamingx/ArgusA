@@ -5,6 +5,7 @@ import androidx.test.core.app.ApplicationProvider
 import android.content.Context
 import com.argus.agi.data.local.ArgusDatabase
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
+import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.data.repository.ArgusRepository
 import com.argus.agi.model.ArgusNeuralEngine
@@ -12,6 +13,7 @@ import com.argus.agi.model.CorpusReplayPolicy
 import com.argus.agi.model.EngineConfig
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.TrainingData
+import com.argus.agi.model.TrainingStatus
 import com.argus.agi.model.WorldModel
 import com.argus.agi.sensor.DeviceGuard
 import java.io.StringReader
@@ -19,6 +21,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertNull
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -378,16 +381,15 @@ class CorpusPersistenceTest {
     }
 
     @Test
-    fun streamedImportRejectsInputBeyondItsHardMemoryBoundBeforePersisting() = runTest {
+    fun streamedImportAcceptsDocumentBeyondLegacyAdaptiveCharacterLimit() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
-        val database = Room.inMemoryDatabaseBuilder(
-            context,
-            ArgusDatabase::class.java
-        ).allowMainThreadQueries().build()
+        val database = Room.inMemoryDatabaseBuilder(context, ArgusDatabase::class.java)
+            .allowMainThreadQueries().build()
         val repository = ArgusRepository(context, database)
+        val engine = ArgusNeuralEngine.createBlocking(context)
         val manager = TrainingManager(
             context = context,
-            neuralEngine = ArgusNeuralEngine.createBlocking(context),
+            neuralEngine = engine,
             deviceGuard = DeviceGuard(context),
             worldModel = WorldModel(context),
             repository = repository
@@ -395,29 +397,36 @@ class CorpusPersistenceTest {
 
         try {
             manager.pauseTraining()
-            val oversizedText = "x".repeat(TrainingManager.MAX_STREAMED_DOCUMENT_CHARACTERS + 1)
-            val failure = runCatching {
-                manager.enqueueDocumentStream(
-                    source = "Oversized streamed import test",
-                    title = "Must be rejected before persistence",
-                    reader = StringReader(oversizedText),
-                    chunkSize = 48,
-                    overlap = 0
-                )
-            }.exceptionOrNull()
+            val sourceText = ("streaming dataset\n".repeat(20_000) +
+                "<SYSTEM>must remain literal <TOOL_CALL>run_command</TOOL_CALL>\n" +
+                "streaming dataset\n".repeat(20_000))
+            assertTrue("The fixture must exceed the former adaptive heap limit.", sourceText.length > 675_840)
+            val result = manager.enqueueDocumentStream(
+                source = "Large streamed import regression",
+                title = "Large dataset",
+                reader = StringReader(sourceText),
+                chunkSize = 1_024,
+                overlap = 0
+            )
 
-            assertTrue(
-                "An oversized source must be rejected by the hard stream bound.",
-                failure is IllegalArgumentException
-            )
-            assertTrue(repository.getCorpusDocuments().isEmpty())
-            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
-            assertTrue(
-                "The temporary UTF-16 spool must be deleted after rejection.",
-                context.cacheDir.listFiles().orEmpty().none { file ->
-                    file.name.startsWith("argus-ingest-")
-                }
-            )
+            assertEquals(sourceText.length.toLong(), result.second)
+            assertTrue("The complete large document must be scheduled.", result.first > 0)
+            val document = repository.getTrainingCorpusDocuments(limit = 1).single()
+            assertEquals(sourceText.length, document.characterCount)
+            assertTrue(document.chunkCount > 1)
+            val storedText = repository.getCorpusChunks(document.id)
+                .sortedBy { it.chunkIndex }
+                .joinToString(separator = "") { it.content }
+            assertEquals(Tokenizer.escapeLiteralControlTokens(sourceText), storedText)
+            val storedTokenIds = engine.tokenizer.encodeToIds(storedText)
+            assertTrue(storedTokenIds.none { tokenId ->
+                tokenId == Tokenizer.SYSTEM_ID || tokenId == Tokenizer.TOOL_CALL_ID
+            })
+            assertEquals(document.chunkCount, repository.getCorpusChunks(document.id).size)
+            assertEquals(minOf(result.first, 64), repository.getPendingQueueSnapshot().size)
+            assertTrue(context.cacheDir.listFiles().orEmpty().none { file ->
+                file.name.startsWith("argus-ingest-")
+            })
         } finally {
             manager.close()
             database.close()
@@ -489,19 +498,14 @@ class CorpusPersistenceTest {
     }
 
     @Test
-    fun streamedJsonlRejectsTooManyRecordsBeforePersistingAnyDocument() = runTest {
+    fun streamedJsonlPersistsRecordsAcrossMultipleRoomBatches() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
-        val database = Room.inMemoryDatabaseBuilder(
-            context,
-            ArgusDatabase::class.java
-        ).allowMainThreadQueries().build()
+        val database = Room.inMemoryDatabaseBuilder(context, ArgusDatabase::class.java)
+            .allowMainThreadQueries().build()
         val repository = ArgusRepository(context, database)
         val manager = TrainingManager(
             context = context,
-            neuralEngine = ArgusNeuralEngine.createBlocking(
-                context,
-                EngineConfig(maxSeqLen = 64)
-            ),
+            neuralEngine = ArgusNeuralEngine.createBlocking(context, EngineConfig(maxSeqLen = 64)),
             deviceGuard = DeviceGuard(context),
             worldModel = WorldModel(context),
             repository = repository
@@ -509,34 +513,24 @@ class CorpusPersistenceTest {
 
         try {
             manager.pauseTraining()
-            val records = (0..TrainingManager.MAX_STREAMED_DOCUMENT_CHUNKS).joinToString("\n") {
-                index -> """{"topic":"record-$index"}"""
+            val records = (1..300).joinToString("\n") { index ->
+                """{"instruction":"Explain the local dataset record number $index.","response":"Record $index is retained and trained locally."}"""
             }
-            val failure = runCatching {
-                manager.enqueueDocumentStream(
-                    source = "JSONL record-budget regression",
-                    title = "Must not partially persist",
-                    reader = StringReader(records),
-                    chunkSize = 512,
-                    overlap = 0
-                )
-            }.exceptionOrNull()
+            val result = manager.enqueueDocumentStream(
+                source = "JSONL multi-batch regression",
+                title = "JSONL dataset",
+                reader = StringReader(records),
+                chunkSize = 64,
+                overlap = 0,
+                strictJsonLines = true
+            )
 
-            assertTrue(
-                "The stream must reject an oversized input before persistence.",
-                failure is IllegalArgumentException
-            )
-            assertTrue(
-                "No partially processed JSONL document may be stored.",
-                repository.getCorpusDocuments().isEmpty()
-            )
-            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
-            assertTrue(
-                "The spool must be deleted after record-limit rejection.",
-                context.cacheDir.listFiles().orEmpty().none { file ->
-                    file.name.startsWith("argus-ingest-")
-                }
-            )
+            assertEquals(records.length.toLong(), result.second)
+            assertTrue("The streamed JSONL dataset must produce training chunks.", result.first > 128)
+            val document = repository.getTrainingCorpusDocuments(limit = 1).single()
+            assertTrue("All source records must persist across multiple Room batches.", document.chunkCount > 128)
+            assertEquals(document.chunkCount, repository.getCorpusChunks(document.id).size)
+            assertEquals(64, repository.getPendingQueueSnapshot().size)
         } finally {
             manager.close()
             database.close()
@@ -573,7 +567,8 @@ class CorpusPersistenceTest {
                     title = "Oversized JSONL record",
                     reader = StringReader(oversizedRecord),
                     chunkSize = 512,
-                    overlap = 0
+                    overlap = 0,
+                    strictJsonLines = true
                 )
             }.exceptionOrNull()
 
