@@ -14,6 +14,7 @@ import com.argus.agi.model.EngineConfig
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingStatus
+import com.argus.agi.model.Tokenizer
 import com.argus.agi.model.WorldModel
 import com.argus.agi.sensor.DeviceGuard
 import java.io.StringReader

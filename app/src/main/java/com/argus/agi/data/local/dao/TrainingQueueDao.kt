@@ -13,7 +13,7 @@ interface TrainingQueueDao {
     fun getPendingQueue(): Flow<List<TrainingItemEntity>>
 
     @Query("SELECT * FROM training_items WHERE status = 'QUEUED' ORDER BY timestamp ASC LIMIT :limit")
-    suspend fun getPendingQueueSnapshot(limit: Int): List<TrainingItemEntity>
+    suspend fun getPendingQueueSnapshot(limit: Int = 64): List<TrainingItemEntity>
 
     @Query(
         "UPDATE training_items SET status = 'QUEUED' " +
