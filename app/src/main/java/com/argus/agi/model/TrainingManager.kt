@@ -674,7 +674,7 @@ class TrainingManager internal constructor(
             "overlap must be between zero and chunkSize - 1."
         }
         require(overlap <= chunkSize / 3) {
-            "overlap must be <= one third of chunkSize (\${chunkSize / 3})."
+            "overlap must be <= one third of chunkSize (${chunkSize / 3})."
         }
         require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
             "epochs must be in 1..$MAX_DOCUMENT_EPOCHS."
@@ -695,11 +695,11 @@ class TrainingManager internal constructor(
 
         val stagingFile = File(
             ingestionStagingDirectory,
-            "argus-ingest-\${UUID.randomUUID()}.utf16be"
+            "argus-ingest-${UUID.randomUUID()}.utf16be"
         )
         val chunkStagingFile = File(
             ingestionStagingDirectory,
-            "argus-chunks-\${UUID.randomUUID()}.bin"
+            "argus-chunks-${UUID.randomUUID()}.bin"
         )
         val inputBuffer = CharArray(4_096)
         val encodedBuffer = ByteArray(inputBuffer.size * 2)
@@ -927,7 +927,7 @@ class TrainingManager internal constructor(
                     val chunkTitle = if (epochs == 1) {
                         "$title [Block $chunkIndex/$chunkCount]"
                     } else {
-                        "$title [Block $chunkIndex/$chunkCount] [Epoch \${epochIndex + 1}/$epochs]"
+                        "$title [Block $chunkIndex/$chunkCount] [Epoch ${epochIndex + 1}/$epochs]"
                     }
                     queueBatch += TrainingData(
                         source = source,
@@ -1000,7 +1000,7 @@ class TrainingManager internal constructor(
         } finally {
             for (file in listOf(stagingFile, chunkStagingFile)) {
                 if (file.exists() && !file.delete()) {
-                    Log.w(TAG, "Could not remove streamed ingestion staging file: \${file.name}")
+                    Log.w(TAG, "Could not remove streamed ingestion staging file: ${file.name}")
                 }
             }
         }
