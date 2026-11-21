@@ -112,9 +112,11 @@ class ArgusRepository(
         entities.map { it.toDomain() }
     }
 
-    suspend fun getPendingQueueSnapshot(): List<TrainingData> = withContext(Dispatchers.IO) {
-        trainingQueueDao.getPendingQueueSnapshot().map { it.toDomain() }
-    }
+    suspend fun getPendingQueueSnapshot(limit: Int = Int.MAX_VALUE): List<TrainingData> =
+        withContext(Dispatchers.IO) {
+            require(limit > 0) { "Queue page size must be positive." }
+            trainingQueueDao.getPendingQueueSnapshot(limit).map { it.toDomain() }
+        }
 
     suspend fun getScreenTrainingItemsSnapshot(): List<TrainingData> =
         withContext(Dispatchers.IO) {
@@ -324,6 +326,129 @@ class ArgusRepository(
     val corpusDocuments: Flow<List<CorpusDocumentEntity>> =
         corpusDao.observeDocuments(limit = 500)
 
+    /**
+     * Starts a disk-backed corpus import. The IMPORTING state is deliberately excluded
+     * from replay until every chunk and queue row has been committed.
+     */
+    suspend fun beginStreamedCorpusDocument(
+        document: CorpusDocumentEntity,
+        sourceProvenance: CorpusSourceProvenance = CorpusSourceProvenance()
+    ): Boolean = withContext(Dispatchers.IO) {
+        sourceProvenance.validateFor(document.rightsStatus)
+        val isWebContent = document.source.startsWith("web_article", ignoreCase = true) ||
+            document.canonicalUrl != null
+        require(!isWebContent || document.rightsStatus != "UNVERIFIED") {
+            "Web article content must be reviewed and explicitly declared before it can be stored."
+        }
+        require(document.datasetSplit == "TRAIN") {
+            "Streamed training imports must use the TRAIN corpus split."
+        }
+        require(document.status == "IMPORTING" && document.chunkCount > 0) {
+            "A streamed corpus document must begin in IMPORTING state with a positive chunk count."
+        }
+
+        db.withTransaction {
+            val insertedRowId = corpusDao.insertDocument(document)
+            if (insertedRowId == -1L) {
+                val existing = corpusDao.getDocumentByFingerprint(document.contentFingerprint)
+                    ?: error("Corpus fingerprint conflict has no matching document.")
+                require(existing.datasetSplit == document.datasetSplit) {
+                    "Identical content already belongs to the ${existing.datasetSplit} corpus; cross-split reuse is blocked."
+                }
+                return@withTransaction false
+            }
+
+            val sourceIdentity = document.canonicalUrl ?: document.source
+            val sourceId = sha256Utf16Be("${document.id}\u0000$sourceIdentity")
+            val insertedSourceId = corpusDao.insertSource(
+                CorpusSourceEntity(
+                    id = sourceId,
+                    documentId = document.id,
+                    source = document.source,
+                    canonicalUrl = document.canonicalUrl,
+                    language = document.language,
+                    rightsStatus = document.rightsStatus,
+                    importedAtEpochMs = document.createdAtEpochMs,
+                    licenseIdentifier = sourceProvenance.licenseIdentifier,
+                    licenseName = sourceProvenance.licenseName,
+                    licenseUrl = sourceProvenance.licenseUrl,
+                    attributionText = sourceProvenance.attributionText,
+                    rightsEvidenceUrl = sourceProvenance.rightsEvidenceUrl,
+                    userDeclarationText = sourceProvenance.userDeclarationText,
+                    userDeclaredAtEpochMs = sourceProvenance.userDeclaredAtEpochMs,
+                    reviewedAtEpochMs = sourceProvenance.reviewedAtEpochMs
+                )
+            )
+            check(insertedSourceId != -1L) {
+                "The streamed corpus source provenance could not be inserted."
+            }
+            check(corpusDao.refreshDocumentRightsStatus(document.id) == 1) {
+                "The streamed corpus rights status could not be synchronized."
+            }
+            true
+        }
+    }
+
+    suspend fun appendStreamedCorpusChunks(
+        documentId: String,
+        chunks: List<CorpusChunkEntity>
+    ) = withContext(Dispatchers.IO) {
+        require(chunks.isNotEmpty() && chunks.size <= 128) {
+            "A streamed corpus write must contain between one and 128 chunks."
+        }
+        require(chunks.all { it.documentId == documentId }) {
+            "Every streamed chunk must reference the active document."
+        }
+        db.withTransaction {
+            val document = corpusDao.getDocument(documentId)
+                ?: throw IllegalArgumentException("Unknown streamed corpus document: $documentId")
+            check(document.status == "IMPORTING") {
+                "Corpus chunks can only be appended while a document is IMPORTING."
+            }
+            corpusDao.insertChunks(chunks)
+        }
+    }
+
+    /**
+     * Atomically exposes the imported corpus and its staged queue rows to the trainer.
+     * A crash before this transaction leaves the document non-replayable.
+     */
+    suspend fun completeStreamedCorpusDocument(
+        documentId: String,
+        expectedQueueItems: Int
+    ): Int = withContext(Dispatchers.IO) {
+        require(expectedQueueItems > 0) { "A streamed document must schedule training work." }
+        db.withTransaction {
+            val document = corpusDao.getDocument(documentId)
+                ?: throw IllegalArgumentException("Unknown streamed corpus document: $documentId")
+            check(document.status == "IMPORTING") {
+                "Only an IMPORTING corpus document can be activated for training."
+            }
+            check(corpusDao.completeStreamedImport(documentId) == 1) {
+                "The streamed corpus document could not be finalized."
+            }
+            val activated = trainingQueueDao.activateStreamedDocumentQueue(documentId)
+            check(activated == expectedQueueItems) {
+                "Expected to activate $expectedQueueItems queue rows but activated $activated."
+            }
+            activated
+        }
+    }
+
+    suspend fun rollbackStreamedCorpusDocument(documentId: String) =
+        withContext(Dispatchers.IO) {
+            db.withTransaction {
+                val document = corpusDao.getDocument(documentId) ?: return@withTransaction
+                check(document.status == "IMPORTING") {
+                    "Only an incomplete streamed import can be rolled back."
+                }
+                trainingQueueDao.deleteUncommittedStreamedDocumentQueue(documentId)
+                check(corpusDao.deleteDocument(documentId) == 1) {
+                    "The incomplete streamed corpus document could not be removed."
+                }
+            }
+        }
+
     suspend fun storeCorpusDocument(
         document: CorpusDocumentEntity,
         chunks: List<CorpusChunkEntity>,
@@ -451,6 +576,13 @@ class ArgusRepository(
         withContext(Dispatchers.IO) {
             corpusDao.getChunks(documentId)
         }
+
+    suspend fun getCorpusChunk(documentId: String, chunkIndex: Int): CorpusChunkEntity? =
+        withContext(Dispatchers.IO) {
+            require(chunkIndex > 0) { "Corpus chunk index must be positive." }
+            corpusDao.getChunk(documentId, chunkIndex)
+        }
+
 
     suspend fun getTokenizerCorpusSample(documentId: String, limit: Int): List<String> =
         withContext(Dispatchers.IO) {
