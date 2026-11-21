@@ -1,7 +1,7 @@
 package com.argus.agi.ui
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ZipImportBudgetTest {
@@ -54,22 +54,26 @@ class ZipImportBudgetTest {
         )
 
         assertEquals((availableBytes - reserveBytes) / 4L, budget)
-        assertEquals(true, budget <= availableBytes / 4L)
+        assertTrue(budget <= availableBytes / 4L)
     }
 
     @Test
     fun rejectsNegativeStorageValues() {
-        assertThrows(IllegalArgumentException::class.java) {
-            calculateZipImportBudgetBytes(
-                availableBytes = -1L,
-                reservedBytes = reserveBytes
-            )
-        }
-        assertThrows(IllegalArgumentException::class.java) {
-            calculateZipImportBudgetBytes(
-                availableBytes = reserveBytes,
-                reservedBytes = -1L
-            )
-        }
+        assertTrue(
+            runCatching {
+                calculateZipImportBudgetBytes(
+                    availableBytes = -1L,
+                    reservedBytes = reserveBytes
+                )
+            }.exceptionOrNull() is IllegalArgumentException
+        )
+        assertTrue(
+            runCatching {
+                calculateZipImportBudgetBytes(
+                    availableBytes = reserveBytes,
+                    reservedBytes = -1L
+                )
+            }.exceptionOrNull() is IllegalArgumentException
+        )
     }
 }

@@ -1,21 +1,6 @@
 package com.argus.agi.ui
 
 
-/**
- * Reserves local cache capacity before assigning a bounded expansion budget to ZIP imports.
- * The importer may use at most one quarter of the storage remaining after the reserve.
- */
-internal fun calculateZipImportBudgetBytes(
-    availableBytes: Long,
-    reservedBytes: Long
-): Long {
-    require(availableBytes >= 0L) { "Available storage must not be negative." }
-    require(reservedBytes >= 0L) { "Reserved storage must not be negative." }
-
-    val bytesAfterReserve = (availableBytes - reservedBytes).coerceAtLeast(0L)
-    return bytesAfterReserve / 4L
-}
-
 import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -80,6 +65,21 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipInputStream
+
+/**
+ * Reserves local cache capacity before assigning a bounded expansion budget to ZIP imports.
+ * The importer may use at most one quarter of the storage remaining after the reserve.
+ */
+internal fun calculateZipImportBudgetBytes(
+    availableBytes: Long,
+    reservedBytes: Long
+): Long {
+    require(availableBytes >= 0L) { "Available storage must not be negative." }
+    require(reservedBytes >= 0L) { "Reserved storage must not be negative." }
+
+    val bytesAfterReserve = (availableBytes - reservedBytes).coerceAtLeast(0L)
+    return bytesAfterReserve / 4L
+}
 
 data class ChatMessage(
     val id: String = UUID.randomUUID().toString(),
