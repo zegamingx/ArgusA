@@ -73,6 +73,44 @@ class TokenizerStreamingBoundaryTest {
     }
 
     @Test
+    fun streamingEncodingMatchesWholeDocumentAfterLearnedBpeMerges() {
+        val tokenizer = tokenizer()
+        tokenizer.trainBpe(
+            corpus = List(80) {
+                "Bahasa Indonesia tokenizer learns repeated byte level BPE patterns. " +
+                    "Dataset streaming harus tetap menghasilkan token ID yang konsisten."
+            },
+            targetVocabSize = 512,
+            maxNewMerges = 96
+        )
+
+        val sample = buildString {
+            repeat(12) {
+                append("Bahasa Indonesia tokenizer learns repeated patterns — ")
+                append("multilingual 😀 العربية 日本語 ")
+                append(Tokenizer.escapeLiteralControlTokens("literal ${Tokenizer.USER_TOKEN}"))
+                append("\n")
+            }
+        }
+        val expected = tokenizer.encodeToIds(sample)
+
+        for (fragmentSize in listOf(1, 2, 5, 13, 64, 257)) {
+            val chunks = ArrayList<TokenizerTextChunk>()
+            tokenizer.forEachSafeTextChunk(
+                reader = FragmentingReader(sample, fragmentSize),
+                maxTokensPerChunk = 37,
+                overlapTokens = 0,
+                action = chunks::add
+            )
+            assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+            assertArrayEquals(expected, flatten(chunks))
+            for (chunk in chunks) {
+                assertArrayEquals(tokenizer.encodeToIds(chunk.text), chunk.tokenIds)
+            }
+        }
+    }
+
+    @Test
     fun safeChunksNeverSplitAnIndivisiblePreToken() {
         val tokenizer = tokenizer()
         val sample = "thisisoneverylongpretokenwithoutanysafeinnerboundary"
