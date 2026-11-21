@@ -1112,11 +1112,12 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             "overlapTokens must be between zero and maxTokensPerChunk - 1."
         }
 
+        // Keep the tokenizer identity fixed for the complete streaming document.
         val current = state
         val maximumSpecialLength = SPECIAL_TOKENS.maxOfOrNull(String::length) ?: 1
         val input = PushbackReader(BufferedReader(reader, 8_192), maximumSpecialLength + 2)
 
-        data class SafeUnit(val text: String, val tokenIds: IntArray)
+        data class SafeUnit(val sourceText: String, val tokenIds: IntArray)
 
         val currentUnits = ArrayList<SafeUnit>()
         var currentTokenCount = 0
@@ -1125,13 +1126,13 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
         fun emitCurrentChunk() {
             if (currentUnits.isEmpty()) return
-            val textLength = currentUnits.sumOf { unit -> unit.text.length }
+            val textLength = currentUnits.sumOf { unit -> unit.sourceText.length }
             val tokenCount = currentUnits.sumOf { unit -> unit.tokenIds.size }
             val chunkText = StringBuilder(textLength)
             val chunkTokenIds = IntArray(tokenCount)
             var tokenOffset = 0
             for (unit in currentUnits) {
-                chunkText.append(unit.text)
+                chunkText.append(unit.sourceText)
                 unit.tokenIds.copyInto(chunkTokenIds, tokenOffset)
                 tokenOffset += unit.tokenIds.size
             }
@@ -1140,9 +1141,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             currentTokenCount = 0
         }
 
-        fun appendSafeUnit(text: String) {
-            if (text.isEmpty()) return
-            val encoded = encodeTextWithState(text, current)
+        fun appendSafeUnit(sourceText: String) {
+            if (sourceText.isEmpty()) return
+            val encoded = encodeTextWithState(sourceText, current)
             if (encoded.isEmpty()) return
 
             if (
@@ -1166,7 +1167,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 }
             }
 
-            currentUnits += SafeUnit(text, encoded)
+            currentUnits += SafeUnit(sourceText, encoded)
             currentTokenCount = Math.addExact(currentTokenCount, encoded.size)
         }
 
@@ -1185,17 +1186,17 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             }
         }
 
-        fun acceptPlainCodePoint(codePoint: Int, rawText: String) {
+        fun acceptPlainCodePoint(codePoint: Int, sourceText: String) {
             when {
                 isUnicodeWhiteSpace(codePoint) -> {
                     flushWord()
-                    pendingWhitespace.append(rawText)
+                    pendingWhitespace.append(sourceText)
                 }
                 isAsciiDigit(codePoint) || isPunctuation(codePoint) -> {
                     flushWord()
-                    val isolated = StringBuilder(pendingWhitespace.length + rawText.length)
+                    val isolated = StringBuilder(pendingWhitespace.length + sourceText.length)
                         .append(pendingWhitespace)
-                        .append(rawText)
+                        .append(sourceText)
                     pendingWhitespace.setLength(0)
                     appendSafeUnit(isolated.toString())
                 }
@@ -1204,7 +1205,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                         currentWord.append(pendingWhitespace)
                         pendingWhitespace.setLength(0)
                     }
-                    currentWord.append(rawText)
+                    currentWord.append(sourceText)
                 }
             }
         }
@@ -1238,7 +1239,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             val candidate = "<$lookahead"
             val special = SPECIAL_TOKENS.firstOrNull { token -> candidate.startsWith(token) }
             if (special == null) {
-                for (index in lookahead.length - 1 downTo 0) input.unread(lookahead[index].code)
+                for (index in lookahead.length - 1 downTo 0) {
+                    input.unread(lookahead[index].code)
+                }
                 return null
             }
 
@@ -1247,6 +1250,18 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 input.unread(lookahead[index].code)
             }
             return special
+        }
+
+        fun acceptEscapedLiteralSpecial(special: String, escapePrefix: String) {
+            for (index in special.indices) {
+                val character = special[index]
+                val sourceText = if (index == 0) {
+                    escapePrefix + character
+                } else {
+                    character.toString()
+                }
+                acceptPlainCodePoint(character.code, sourceText)
+            }
         }
 
         while (true) {
@@ -1280,40 +1295,42 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                     if (markerCount >= 2 && following == '<'.code) {
                         val special = readSpecialAfterOpenAngle()
                         if (special != null) {
-                            if (pendingWhitespace.isNotEmpty()) {
-                                currentWord.append(pendingWhitespace)
-                                pendingWhitespace.setLength(0)
+                            // Mirror scanSpecialAwareText exactly: the final two markers
+                            // escape the control spelling; earlier markers in a longer run
+                            // remain ordinary payload characters.
+                            repeat(markerCount - 2) {
+                                acceptPlainCodePoint(
+                                    LITERAL_CONTROL_ESCAPE_MARKER.code,
+                                    LITERAL_CONTROL_ESCAPE_MARKER.toString()
+                                )
                             }
-                            repeat(markerCount) {
-                                currentWord.append(LITERAL_CONTROL_ESCAPE_MARKER)
-                            }
-                            currentWord.append(special)
-                            flushWord()
+                            acceptEscapedLiteralSpecial(
+                                special = special,
+                                escapePrefix = LITERAL_CONTROL_ESCAPE_MARKER.toString().repeat(2)
+                            )
                         } else {
                             input.unread('<'.code)
-                            if (currentWord.isEmpty() && pendingWhitespace.isNotEmpty()) {
-                                currentWord.append(pendingWhitespace)
-                                pendingWhitespace.setLength(0)
-                            }
                             repeat(markerCount) {
-                                currentWord.append(LITERAL_CONTROL_ESCAPE_MARKER)
+                                acceptPlainCodePoint(
+                                    LITERAL_CONTROL_ESCAPE_MARKER.code,
+                                    LITERAL_CONTROL_ESCAPE_MARKER.toString()
+                                )
                             }
                         }
                     } else {
                         if (following >= 0) input.unread(following)
-                        if (currentWord.isEmpty() && pendingWhitespace.isNotEmpty()) {
-                            currentWord.append(pendingWhitespace)
-                            pendingWhitespace.setLength(0)
-                        }
                         repeat(markerCount) {
-                            currentWord.append(LITERAL_CONTROL_ESCAPE_MARKER)
+                            acceptPlainCodePoint(
+                                LITERAL_CONTROL_ESCAPE_MARKER.code,
+                                LITERAL_CONTROL_ESCAPE_MARKER.toString()
+                            )
                         }
                     }
                 }
 
                 else -> {
-                    val (codePoint, rawText) = readCodePoint(next)
-                    acceptPlainCodePoint(codePoint, rawText)
+                    val (codePoint, sourceText) = readCodePoint(next)
+                    acceptPlainCodePoint(codePoint, sourceText)
                 }
             }
         }
