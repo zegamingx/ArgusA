@@ -789,7 +789,7 @@ class CorpusPersistenceTest {
             val storedChunks = repository.getCorpusChunks(document.id)
             assertEquals(document.chunkCount, storedChunks.size)
             assertEquals(1, repository.getCorpusSources(document.id).size)
-            assertEquals(queuedCount, repository.getPendingQueueSnapshot().size)
+            assertEquals(queuedCount, repository.getPendingQueueSnapshot(limit = 128).size)
 
             val duplicateCount = manager.enqueueDocument(
                 source = "Second import source",
@@ -1022,7 +1022,7 @@ class CorpusPersistenceTest {
             assertEquals(document.chunkCount * 2, replayedCount)
             manager.awaitQueuePersistenceIdle()
 
-            val replayedItems = repository.getPendingQueueSnapshot()
+            val replayedItems = repository.getPendingQueueSnapshot(limit = 128)
             assertEquals(replayedCount, replayedItems.size)
             assertTrue(replayedItems.all { it.documentId == document.id })
             assertEquals(

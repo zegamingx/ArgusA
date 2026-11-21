@@ -15,6 +15,9 @@ interface TrainingQueueDao {
     @Query("SELECT * FROM training_items WHERE status = 'QUEUED' ORDER BY timestamp ASC LIMIT :limit")
     suspend fun getPendingQueueSnapshot(limit: Int = 64): List<TrainingItemEntity>
 
+    @Query("SELECT COUNT(*) FROM training_items WHERE status = 'QUEUED'")
+    suspend fun countPendingQueueItems(): Int
+
     @Query(
         "UPDATE training_items SET status = 'QUEUED' " +
             "WHERE documentId = :documentId AND status = 'PERSISTING'"

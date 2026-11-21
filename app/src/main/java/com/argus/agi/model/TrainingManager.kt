@@ -187,6 +187,7 @@ class TrainingManager internal constructor(
         private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
         private const val MAX_STREAMED_JSON_VALUE_CHARACTERS = 256 * 1024
         private const val QUEUE_PREFETCH_LIMIT = 64
+        private const val MAX_IN_MEMORY_QUEUE_ITEMS = 128
         private const val CORPUS_WRITE_BATCH_SIZE = 128
         private const val IDLE_POLL_MS = 500L
         private const val SCREEN_SOURCE_PREFIX = "ScreenTrainingV2 ("
@@ -978,6 +979,7 @@ class TrainingManager internal constructor(
                     )
                 }
             }
+            appendPendingQueuePageFromDatabase()
             wakeupSignal.trySend(Unit)
             return Pair(totalScheduledChunks, totalCharsRead)
         } catch (cancelled: CancellationException) {
@@ -1036,6 +1038,36 @@ class TrainingManager internal constructor(
         } else {
             TextModalityProcessor.detectModality(String(sample, 0, sampleCount))
         }
+        if (modality == TextModality.CONVERSATION || modality == TextModality.REASONING) {
+            val characterCount = file.length() / 2L
+            require(characterCount in 1..MAX_STREAMED_JSON_VALUE_CHARACTERS.toLong()) {
+                "A single streamed conversation or reasoning sample exceeds " +
+                    "$MAX_STREAMED_JSON_VALUE_CHARACTERS UTF-16 code units. " +
+                    "Split long datasets into complete JSONL records."
+            }
+            val transcript = readUtf16BeStagingFile(
+                file = file,
+                expectedCharacterCount = characterCount.toInt()
+            )
+            val processed = TextModalityProcessor.process(
+                rawText = transcript,
+                documentTitle = title,
+                chunkSize = chunkSize,
+                overlap = overlap,
+                tokenizer = neuralEngine.tokenizer
+            )
+            for (chunk in processed) {
+                output.writeInt(chunk.content.length)
+                for (character in chunk.content) output.writeChar(character.code)
+            }
+            addCount(processed.size)
+            Log.d(
+                TAG,
+                "Streamed ${processed.size} atomic ${modality.displayName} sample(s) for '$title'."
+            )
+            return
+        }
+
         var emittedChunks = 0
         InputStreamReader(
             FileInputStream(file),
@@ -3250,6 +3282,49 @@ class TrainingManager internal constructor(
         }
 
         return item
+    }
+
+    /**
+     * Appends the next bounded durable queue page after a streamed import commits.
+     * Existing in-memory items are matched by ID so legacy and disk-backed work
+     * remain one ordered queue without materializing the full corpus queue.
+     */
+    private suspend fun appendPendingQueuePageFromDatabase() {
+        val repository = repo ?: return
+
+        queueRefillMutex.lock()
+        try {
+            awaitQueuePersistenceIdle()
+            val availableCapacity = synchronized(queueLock) {
+                if (closed) return
+                (MAX_IN_MEMORY_QUEUE_ITEMS - _nextQueue.value.size).coerceAtLeast(0)
+            }
+            if (availableCapacity == 0) return
+
+            val page = repository.getPendingQueueSnapshot(MAX_IN_MEMORY_QUEUE_ITEMS)
+            if (page.isEmpty()) return
+
+            synchronized(queueLock) {
+                if (closed) return
+                val existingIds = _nextQueue.value.mapTo(HashSet()) { item -> item.id }
+                val remainingCapacity =
+                    (MAX_IN_MEMORY_QUEUE_ITEMS - _nextQueue.value.size).coerceAtLeast(0)
+                if (remainingCapacity == 0) return@synchronized
+
+                val additions = page
+                    .filterNot { item -> item.id in existingIds }
+                    .take(remainingCapacity)
+                if (additions.isNotEmpty()) {
+                    _nextQueue.value = (_nextQueue.value + additions)
+                        .sortedBy(TrainingData::timestamp)
+                    additions.maxOfOrNull(TrainingData::timestamp)?.let { latest ->
+                        lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
+                    }
+                }
+            }
+        } finally {
+            queueRefillMutex.unlock()
+        }
     }
 
     /**

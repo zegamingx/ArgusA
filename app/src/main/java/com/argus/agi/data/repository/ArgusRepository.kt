@@ -118,6 +118,10 @@ class ArgusRepository(
             trainingQueueDao.getPendingQueueSnapshot(limit).map { it.toDomain() }
         }
 
+    suspend fun getPendingTrainingQueueCount(): Int = withContext(Dispatchers.IO) {
+        trainingQueueDao.countPendingQueueItems()
+    }
+
     suspend fun getScreenTrainingItemsSnapshot(): List<TrainingData> =
         withContext(Dispatchers.IO) {
             trainingQueueDao.getItemsBySourcePattern(SCREEN_SOURCE_PATTERN).map { it.toDomain() }
@@ -336,21 +340,25 @@ class ArgusRepository(
 
         db.withTransaction {
             val insertedRowId = corpusDao.insertDocument(document)
-            if (insertedRowId == -1L) {
+            val storedDocumentId = if (insertedRowId == -1L) {
                 val existing = corpusDao.getDocumentByFingerprint(document.contentFingerprint)
                     ?: error("Corpus fingerprint conflict has no matching document.")
                 require(existing.datasetSplit == document.datasetSplit) {
                     "Identical content already belongs to the ${existing.datasetSplit} corpus; cross-split reuse is blocked."
                 }
-                return@withTransaction false
+                existing.id
+            } else {
+                document.id
             }
 
+            // Preserve every distinct import origin even when the payload fingerprint
+            // already exists. Repeated source identities remain idempotent.
             val sourceIdentity = document.canonicalUrl ?: document.source
-            val sourceId = sha256Utf16Be("${document.id}\u0000$sourceIdentity")
-            val insertedSourceId = corpusDao.insertSource(
+            val sourceId = sha256Utf16Be("${storedDocumentId}\u0000$sourceIdentity")
+            corpusDao.insertSource(
                 CorpusSourceEntity(
                     id = sourceId,
-                    documentId = document.id,
+                    documentId = storedDocumentId,
                     source = document.source,
                     canonicalUrl = document.canonicalUrl,
                     language = document.language,
@@ -366,13 +374,30 @@ class ArgusRepository(
                     reviewedAtEpochMs = sourceProvenance.reviewedAtEpochMs
                 )
             )
-            check(insertedSourceId != -1L) {
-                "The streamed corpus source provenance could not be inserted."
+            check(
+                corpusDao.updateSourceMetadata(
+                    sourceId = sourceId,
+                    source = document.source,
+                    canonicalUrl = document.canonicalUrl,
+                    language = document.language,
+                    rightsStatus = document.rightsStatus,
+                    importedAtEpochMs = document.createdAtEpochMs,
+                    licenseIdentifier = sourceProvenance.licenseIdentifier,
+                    licenseName = sourceProvenance.licenseName,
+                    licenseUrl = sourceProvenance.licenseUrl,
+                    attributionText = sourceProvenance.attributionText,
+                    rightsEvidenceUrl = sourceProvenance.rightsEvidenceUrl,
+                    userDeclarationText = sourceProvenance.userDeclarationText,
+                    userDeclaredAtEpochMs = sourceProvenance.userDeclaredAtEpochMs,
+                    reviewedAtEpochMs = sourceProvenance.reviewedAtEpochMs
+                ) == 1
+            ) {
+                "The streamed corpus source provenance could not be synchronized."
             }
-            check(corpusDao.refreshDocumentRightsStatus(document.id) == 1) {
+            check(corpusDao.refreshDocumentRightsStatus(storedDocumentId) == 1) {
                 "The streamed corpus rights status could not be synchronized."
             }
-            true
+            insertedRowId != -1L
         }
     }
 
