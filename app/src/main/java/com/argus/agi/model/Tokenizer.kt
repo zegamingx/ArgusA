@@ -1252,18 +1252,6 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             return special
         }
 
-        fun acceptEscapedLiteralSpecial(special: String, escapePrefix: String) {
-            for (index in special.indices) {
-                val character = special[index]
-                val sourceText = if (index == 0) {
-                    escapePrefix + character
-                } else {
-                    character.toString()
-                }
-                acceptPlainCodePoint(character.code, sourceText)
-            }
-        }
-
         while (true) {
             val next = input.read()
             if (next < 0) break
@@ -1304,10 +1292,19 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                                     LITERAL_CONTROL_ESCAPE_MARKER.toString()
                                 )
                             }
-                            acceptEscapedLiteralSpecial(
-                                special = special,
-                                escapePrefix = LITERAL_CONTROL_ESCAPE_MARKER.toString().repeat(2)
-                            )
+                            // The escape pair must stay adjacent to the complete control
+                            // spelling until encodeTextWithState can recognize it. Keep any
+                            // prefix whitespace in the same unit so pre-tokenization remains
+                            // identical to the whole-text path.
+                            flushWord()
+                            val escapedLiteral = buildString {
+                                append(pendingWhitespace)
+                                append(LITERAL_CONTROL_ESCAPE_MARKER)
+                                append(LITERAL_CONTROL_ESCAPE_MARKER)
+                                append(special)
+                            }
+                            pendingWhitespace.setLength(0)
+                            appendSafeUnit(escapedLiteral)
                         } else {
                             input.unread('<'.code)
                             repeat(markerCount) {
