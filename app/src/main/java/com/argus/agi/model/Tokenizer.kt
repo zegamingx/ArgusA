@@ -1,6 +1,9 @@
 package com.argus.agi.model
 
+import java.io.BufferedReader
 import java.io.ByteArrayInputStream
+import java.io.PushbackReader
+import java.io.Reader
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -62,6 +65,15 @@ data class TokenizerConfig(
  * reversible byte alphabet, and learned merges are appended from ID 288.
  * Inference reads one immutable state snapshot without acquiring the training lock.
  */
+/**
+ * One source-preserving tokenizer chunk. The token IDs use the same tokenizer
+ * generation as the complete streaming pass.
+ */
+data class TokenizerTextChunk(
+    val text: String,
+    val tokenIds: IntArray
+)
+
 class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
     companion object {
@@ -1056,13 +1068,8 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
      * Lock-free inference entry point. It reads one immutable vocabulary/merge snapshot
      * and returns primitive IDs to keep the training/generation hot path allocation-light.
      */
-    @Suppress("UNUSED_PARAMETER")
-    fun encodeToIds(text: String, autoRegister: Boolean = false): IntArray {
+    private fun encodeTextWithState(text: String, current: TokenizerState): IntArray {
         if (text.isEmpty()) return IntArray(0)
-        val current = state
-        val cached = current.encodedTextCache.get(text)
-        if (cached != null) return cached
-
         val output = IntAccumulator(text.length + 8)
         scanSpecialAwareText(text) { plainText, specialId ->
             if (specialId != null) {
@@ -1071,9 +1078,248 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 encodeNormalSegment(plainText, current, output)
             }
         }
-        val encoded = output.toIntArray()
+        return output.toIntArray()
+    }
+
+    @Suppress("UNUSED_PARAMETER")
+    fun encodeToIds(text: String, autoRegister: Boolean = false): IntArray {
+        if (text.isEmpty()) return IntArray(0)
+        val current = state
+        val cached = current.encodedTextCache.get(text)
+        if (cached != null) return cached
+
+        val encoded = encodeTextWithState(text, current)
         current.encodedTextCache.put(text, encoded)
         return encoded
+    }
+
+    /**
+     * Reads incrementally and emits chunks whose boundaries never split a tokenizer
+     * pre-token or a reserved control token. One immutable tokenizer generation is
+     * used for the entire pass, even if BPE training publishes a new state concurrently.
+     *
+     * An indivisible pre-token may exceed maxTokensPerChunk; it is kept intact rather
+     * than split and assigned different BPE IDs. The caller owns the Reader.
+     */
+    fun forEachSafeTextChunk(
+        reader: Reader,
+        maxTokensPerChunk: Int,
+        overlapTokens: Int = 0,
+        action: (TokenizerTextChunk) -> Unit
+    ) {
+        require(maxTokensPerChunk > 0) { "maxTokensPerChunk must be positive." }
+        require(overlapTokens in 0 until maxTokensPerChunk) {
+            "overlapTokens must be between zero and maxTokensPerChunk - 1."
+        }
+
+        val current = state
+        val maximumSpecialLength = SPECIAL_TOKENS.maxOfOrNull(String::length) ?: 1
+        val input = PushbackReader(BufferedReader(reader, 8_192), maximumSpecialLength + 2)
+
+        data class SafeUnit(val text: String, val tokenIds: IntArray)
+
+        val currentUnits = ArrayList<SafeUnit>()
+        var currentTokenCount = 0
+        val pendingWhitespace = StringBuilder()
+        val currentWord = StringBuilder()
+
+        fun emitCurrentChunk() {
+            if (currentUnits.isEmpty()) return
+            val textLength = currentUnits.sumOf { unit -> unit.text.length }
+            val tokenCount = currentUnits.sumOf { unit -> unit.tokenIds.size }
+            val chunkText = StringBuilder(textLength)
+            val chunkTokenIds = IntArray(tokenCount)
+            var tokenOffset = 0
+            for (unit in currentUnits) {
+                chunkText.append(unit.text)
+                unit.tokenIds.copyInto(chunkTokenIds, tokenOffset)
+                tokenOffset += unit.tokenIds.size
+            }
+            action(TokenizerTextChunk(chunkText.toString(), chunkTokenIds))
+            currentUnits.clear()
+            currentTokenCount = 0
+        }
+
+        fun appendSafeUnit(text: String) {
+            if (text.isEmpty()) return
+            val encoded = encodeTextWithState(text, current)
+            if (encoded.isEmpty()) return
+
+            if (
+                currentUnits.isNotEmpty() &&
+                currentTokenCount.toLong() + encoded.size.toLong() > maxTokensPerChunk.toLong()
+            ) {
+                val previousUnits = currentUnits.toList()
+                emitCurrentChunk()
+
+                if (overlapTokens > 0) {
+                    val suffix = ArrayDeque<SafeUnit>()
+                    var suffixTokenCount = 0
+                    for (unit in previousUnits.asReversed()) {
+                        val nextCount = suffixTokenCount.toLong() + unit.tokenIds.size.toLong()
+                        if (nextCount > overlapTokens.toLong()) break
+                        suffix.addFirst(unit)
+                        suffixTokenCount += unit.tokenIds.size
+                    }
+                    currentUnits.addAll(suffix)
+                    currentTokenCount = suffixTokenCount
+                }
+            }
+
+            currentUnits += SafeUnit(text, encoded)
+            currentTokenCount = Math.addExact(currentTokenCount, encoded.size)
+        }
+
+        fun flushWord() {
+            if (currentWord.isNotEmpty()) {
+                appendSafeUnit(currentWord.toString())
+                currentWord.setLength(0)
+            }
+        }
+
+        fun flushPlainText() {
+            flushWord()
+            if (pendingWhitespace.isNotEmpty()) {
+                appendSafeUnit(pendingWhitespace.toString())
+                pendingWhitespace.setLength(0)
+            }
+        }
+
+        fun acceptPlainCodePoint(codePoint: Int, rawText: String) {
+            when {
+                isUnicodeWhiteSpace(codePoint) -> {
+                    flushWord()
+                    pendingWhitespace.append(rawText)
+                }
+                isAsciiDigit(codePoint) || isPunctuation(codePoint) -> {
+                    flushWord()
+                    val isolated = StringBuilder(pendingWhitespace.length + rawText.length)
+                        .append(pendingWhitespace)
+                        .append(rawText)
+                    pendingWhitespace.setLength(0)
+                    appendSafeUnit(isolated.toString())
+                }
+                else -> {
+                    if (currentWord.isEmpty() && pendingWhitespace.isNotEmpty()) {
+                        currentWord.append(pendingWhitespace)
+                        pendingWhitespace.setLength(0)
+                    }
+                    currentWord.append(rawText)
+                }
+            }
+        }
+
+        fun readCodePoint(firstCharacter: Int): Pair<Int, String> {
+            val first = firstCharacter.toChar()
+            return when {
+                first.isHighSurrogate() -> {
+                    val next = input.read()
+                    if (next >= 0 && next.toChar().isLowSurrogate()) {
+                        val second = next.toChar()
+                        Character.toCodePoint(first, second) to "$first$second"
+                    } else {
+                        if (next >= 0) input.unread(next)
+                        0xFFFD to first.toString()
+                    }
+                }
+                first.isLowSurrogate() -> 0xFFFD to first.toString()
+                else -> first.code to first.toString()
+            }
+        }
+
+        fun readSpecialAfterOpenAngle(): String? {
+            val lookahead = StringBuilder(maximumSpecialLength - 1)
+            while (lookahead.length < maximumSpecialLength - 1) {
+                val next = input.read()
+                if (next < 0) break
+                lookahead.append(next.toChar())
+            }
+
+            val candidate = "<$lookahead"
+            val special = SPECIAL_TOKENS.firstOrNull { token -> candidate.startsWith(token) }
+            if (special == null) {
+                for (index in lookahead.length - 1 downTo 0) input.unread(lookahead[index].code)
+                return null
+            }
+
+            val consumedAfterOpenAngle = special.length - 1
+            for (index in lookahead.length - 1 downTo consumedAfterOpenAngle) {
+                input.unread(lookahead[index].code)
+            }
+            return special
+        }
+
+        while (true) {
+            val next = input.read()
+            if (next < 0) break
+
+            when (next.toChar()) {
+                '<' -> {
+                    val special = readSpecialAfterOpenAngle()
+                    if (special != null) {
+                        flushPlainText()
+                        appendSafeUnit(special)
+                    } else {
+                        acceptPlainCodePoint('<'.code, "<")
+                    }
+                }
+
+                LITERAL_CONTROL_ESCAPE_MARKER -> {
+                    var markerCount = 1
+                    while (true) {
+                        val marker = input.read()
+                        if (marker == LITERAL_CONTROL_ESCAPE_MARKER.code) {
+                            markerCount = Math.addExact(markerCount, 1)
+                        } else {
+                            if (marker >= 0) input.unread(marker)
+                            break
+                        }
+                    }
+
+                    val following = input.read()
+                    if (markerCount >= 2 && following == '<'.code) {
+                        val special = readSpecialAfterOpenAngle()
+                        if (special != null) {
+                            if (pendingWhitespace.isNotEmpty()) {
+                                currentWord.append(pendingWhitespace)
+                                pendingWhitespace.setLength(0)
+                            }
+                            repeat(markerCount) {
+                                currentWord.append(LITERAL_CONTROL_ESCAPE_MARKER)
+                            }
+                            currentWord.append(special)
+                            flushWord()
+                        } else {
+                            input.unread('<'.code)
+                            if (currentWord.isEmpty() && pendingWhitespace.isNotEmpty()) {
+                                currentWord.append(pendingWhitespace)
+                                pendingWhitespace.setLength(0)
+                            }
+                            repeat(markerCount) {
+                                currentWord.append(LITERAL_CONTROL_ESCAPE_MARKER)
+                            }
+                        }
+                    } else {
+                        if (following >= 0) input.unread(following)
+                        if (currentWord.isEmpty() && pendingWhitespace.isNotEmpty()) {
+                            currentWord.append(pendingWhitespace)
+                            pendingWhitespace.setLength(0)
+                        }
+                        repeat(markerCount) {
+                            currentWord.append(LITERAL_CONTROL_ESCAPE_MARKER)
+                        }
+                    }
+                }
+
+                else -> {
+                    val (codePoint, rawText) = readCodePoint(next)
+                    acceptPlainCodePoint(codePoint, rawText)
+                }
+            }
+        }
+
+        flushPlainText()
+        emitCurrentChunk()
     }
 
     @Suppress("UNUSED_PARAMETER")
