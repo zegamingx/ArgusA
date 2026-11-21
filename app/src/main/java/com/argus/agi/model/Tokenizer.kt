@@ -12,6 +12,7 @@ import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.util.ArrayDeque
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicReferenceArray
 import java.util.PriorityQueue
@@ -1114,7 +1115,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
         // Keep the tokenizer identity fixed for the complete streaming document.
         val current = state
-        val maximumSpecialLength = SPECIAL_TOKENS.maxOfOrNull(String::length) ?: 1
+        val maximumSpecialLength = SPECIAL_TOKENS.maxOfOrNull { token -> token.length } ?: 1
         val input = PushbackReader(BufferedReader(reader, 8_192), maximumSpecialLength + 2)
 
         data class SafeUnit(val sourceText: String, val tokenIds: IntArray)
