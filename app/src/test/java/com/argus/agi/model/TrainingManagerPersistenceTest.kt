@@ -213,6 +213,7 @@ class TrainingManagerPersistenceTest {
                             "Injected transient failure during the first Resume attempt."
                         )
                     }
+                    else -> Unit
                 }
             }
         ) { _, _, manager ->
@@ -240,9 +241,10 @@ class TrainingManagerPersistenceTest {
             }
 
             assertEquals(3, startupAttempts.get())
-            assertEquals(false, manager.isTrainingPaused.value)
+            assertFalse(manager.isTrainingPaused.value)
         }
     }
+
     @Test
     fun optimizerCommittedRowsSurviveInterruptedTrainingRecovery() = runBlocking {
         withTrainingManager { _, repository, manager ->
