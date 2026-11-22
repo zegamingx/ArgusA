@@ -1021,7 +1021,10 @@ class ArgusNeuralEngine private constructor(
      * Learns tokenizer merges from a document sample before its first neural update.
      * Existing token IDs and all existing tensor rows are retained when the vocabulary grows.
      */
-    fun trainTokenizerFromCorpus(corpus: List<String>): TokenizerTrainingResult {
+    fun trainTokenizerFromCorpus(
+        corpus: List<String>,
+        onProgress: (TokenizerTrainingProgress) -> Unit = {}
+    ): TokenizerTrainingResult {
         val result = synchronized(modelLock) {
             val previousVocabularySize = tokenizer.vocabSize
             val usesLearnedBpe = config.tokenizerConfig.algorithm.usesBpeMerges
@@ -1033,7 +1036,8 @@ class ArgusNeuralEngine private constructor(
             }
             val updatedVocabularySize = tokenizer.trainBpe(
                 corpus = corpus,
-                maxNewMerges = mergeBudget
+                maxNewMerges = mergeBudget,
+                onProgress = onProgress
             )
             ensureVocabCapacity(updatedVocabularySize)
             TokenizerTrainingResult(
