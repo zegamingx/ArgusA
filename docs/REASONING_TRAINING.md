@@ -27,6 +27,28 @@ JSON object and a JSON array of training objects are also accepted. Each record 
 include a non-empty `instruction`/`prompt`/`question` and a non-empty
 `response`/`completion`/`answer`.
 
+A text-wrapped reasoning record is also accepted when one JSONL object contains a
+`text` string with an explicit `Jawab:` or `Answer:` output boundary, followed
+by exactly one non-empty `<think>...</think>` section and one non-empty
+`<answer>...</answer>` section. A leading `Soal:`, `Pertanyaan:`,
+`Question:`, or `Prompt:` label is removed from the user prompt. The known
+instruction line asking the author to place content inside the two tags is omitted
+from the prompt; other prompt lines, including multiline bullet lists, are preserved.
+Tag spellings mentioned before the output boundary are treated as prompt text, not
+as the reasoning or answer payload.
+
+For example:
+
+```json
+{
+  "text": "Soal: Solve the proportion.\\nTuliskan penalaran di dalam tag <think> dan jawaban akhir di dalam tag <answer>.\\nJawab: <think>Calculate the ratio.</think><answer>2:1</answer>"
+}
+```
+
+Records using only `prompt` and `answer` remain valid supervised fine-tuning (SFT)
+examples without a reasoning span. This input format does not activate GRPO or any
+other reinforcement-learning objective.
+
 File and ZIP imports use bounded streaming ingestion. Use JSONL (one complete object
 per line) for larger datasets. A single streamed JSON object or pretty-printed array
 is buffered as one structured value and is limited to 256 KiB; larger collections
