@@ -108,7 +108,7 @@ class ReasoningTrainingTest {
         assertTrue(secondFormatted.contains("Petugas mencatat peminjaman pada sistem."))
         assertTrue(
             secondFormatted.contains(
-                "berdasarkan hubungan waktu dan makna:\\n- Dina memilih buku yang ingin dipinjam."
+                "berdasarkan hubungan waktu dan makna:\n- Dina memilih buku yang ingin dipinjam."
             )
         )
         assertFalse(secondFormatted.contains("Tuliskan penalaran"))
