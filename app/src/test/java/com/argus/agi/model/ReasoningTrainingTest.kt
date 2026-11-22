@@ -3,11 +3,11 @@ package com.argus.agi.model
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import java.io.File
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import org.json.JSONObject
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
@@ -106,6 +106,11 @@ class ReasoningTrainingTest {
         val secondFormatted = formattedRecords[1]
         assertTrue(secondFormatted.contains("Dina memilih buku yang ingin dipinjam."))
         assertTrue(secondFormatted.contains("Petugas mencatat peminjaman pada sistem."))
+        assertTrue(
+            secondFormatted.contains(
+                "berdasarkan hubungan waktu dan makna:\\n- Dina memilih buku yang ingin dipinjam."
+            )
+        )
         assertFalse(secondFormatted.contains("Tuliskan penalaran"))
         assertTrue(secondFormatted.contains(Tokenizer.THINK_START))
         assertTrue(secondFormatted.contains(Tokenizer.THINK_END))
