@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   promote:
-    if: ${{ github.ref == 'refs/heads/main' && github.event.head_commit.message == 'release: promote approved Release tag' }}
+    if: "${{ github.ref == 'refs/heads/main' && github.event.head_commit.message == 'release promote approved Release tag' }}"
     name: Promote the approved commit and dispatch Release
     runs-on: ubuntu-26.04
     timeout-minutes: 10
