@@ -86,7 +86,7 @@ class ReasoningTrainingTest {
                 .put("answer", "75")
                 .toString()
         )
-        val jsonl = taggedRecords.joinToString("\\n")
+        val jsonl = taggedRecords.joinToString("\n")
 
         val formattedRecords = requireNotNull(
             TextModalityProcessor.formatTrainingDatasetRecords(jsonl)
@@ -138,7 +138,7 @@ class ReasoningTrainingTest {
         val malformed = JSONObject()
             .put(
                 "text",
-                "Soal: Add two numbers.\\nJawab: <think>Incomplete reasoning</think><answer></answer>"
+                "Soal: Add two numbers.\nJawab: <think>Incomplete reasoning</think><answer></answer>"
             )
             .toString()
 
@@ -365,8 +365,8 @@ class ReasoningTrainingTest {
             val sample = TextModalityProcessor.process(
                 rawText = JSONObject().put(
                     "text",
-                    "Soal: Add 2 and 3.\\n" +
-                        "Tuliskan penalaran di dalam tag <think> dan jawaban akhir di dalam tag <answer>.\\n" +
+                    "Soal: Add 2 and 3.\n" +
+                        "Tuliskan penalaran di dalam tag <think> dan jawaban akhir di dalam tag <answer>.\n" +
                         "Jawab: <think>Identify the two values. Add 2 + 3.</think><answer>5.</answer>"
                 ).toString(),
                 documentTitle = "Reasoning smoke test",
