@@ -59,6 +59,27 @@ data class TokenizerConfig(
     }
 }
 
+enum class TokenizerTrainingStage(val displayName: String) {
+    PREPARING_CORPUS("Preparing tokenizer corpus"),
+    COUNTING_FREQUENCIES("Counting byte-level frequencies"),
+    BUILDING_SYMBOLS("Building byte symbols"),
+    REPLAYING_EXISTING_MERGES("Applying existing merge rules"),
+    LEARNING_MERGES("Learning BPE merge rules"),
+    COMPLETED("BPE training complete"),
+    CANCELLED("BPE training cancelled"),
+    FAILED("BPE training failed")
+}
+
+data class TokenizerTrainingProgress(
+    val stage: TokenizerTrainingStage,
+    val fraction: Float,
+    val processedItems: Long,
+    val totalItems: Long,
+    val learnedMerges: Int,
+    val targetMerges: Int,
+    val vocabularySize: Int
+)
+
 /**
  * Canonical byte-level BPE tokenizer.
  *
@@ -613,12 +634,47 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
     fun trainBpe(
         corpus: List<String>,
         targetVocabSize: Int = config.maxVocabularySize,
-        maxNewMerges: Int = DEFAULT_MAX_MERGES_PER_TRAINING_PASS
+        maxNewMerges: Int = DEFAULT_MAX_MERGES_PER_TRAINING_PASS,
+        onProgress: (TokenizerTrainingProgress) -> Unit = {}
     ): Int {
         require(maxNewMerges > 0) { "maxNewMerges must be positive." }
         val current = state
         val target = minOf(targetVocabSize, config.maxVocabularySize)
-        if (current.nextId >= target || corpus.isEmpty()) return current.nextId
+        val requestedMerges = if (current.nextId < target) maxNewMerges else 0
+        var lastFraction = 0f
+        var learnedMerges = 0
+        var currentVocabularySize = current.nextId
+
+        fun report(
+            stage: TokenizerTrainingStage,
+            fraction: Float,
+            processedItems: Long,
+            totalItems: Long
+        ) {
+            val monotonicFraction = fraction.coerceIn(lastFraction, 1f)
+            lastFraction = monotonicFraction
+            onProgress(
+                TokenizerTrainingProgress(
+                    stage = stage,
+                    fraction = monotonicFraction,
+                    processedItems = processedItems.coerceAtLeast(0L),
+                    totalItems = totalItems.coerceAtLeast(0L),
+                    learnedMerges = learnedMerges,
+                    targetMerges = requestedMerges,
+                    vocabularySize = currentVocabularySize
+                )
+            )
+        }
+
+        if (current.nextId >= target || corpus.isEmpty()) {
+            report(
+                stage = TokenizerTrainingStage.COMPLETED,
+                fraction = 1f,
+                processedItems = 0L,
+                totalItems = 0L
+            )
+            return current.nextId
+        }
 
         val candidate = copyMutableState(current)
         val wordFrequencies = LinkedHashMap<String, Long>()
@@ -660,16 +716,61 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             }
         }
 
+        val totalCorpusCharacters = corpus.sumOf { document -> document.length.toLong() }
+        var countedCharacters = 0L
+        var nextCountingReport = 8_192L
+        report(
+            stage = TokenizerTrainingStage.COUNTING_FREQUENCIES,
+            fraction = 0f,
+            processedItems = 0L,
+            totalItems = totalCorpusCharacters
+        )
         for (document in corpus) {
             forEachNormalTextSegment(document) { segment ->
                 for (preToken in cachedPreTokens(segment)) {
                     addWordFrequency(preToken)
                 }
+                countedCharacters = Math.addExact(countedCharacters, segment.length.toLong())
+                if (countedCharacters >= nextCountingReport) {
+                    val ratio = countedCharacters.toFloat() /
+                        totalCorpusCharacters.coerceAtLeast(1L).toFloat()
+                    report(
+                        stage = TokenizerTrainingStage.COUNTING_FREQUENCIES,
+                        fraction = 0.15f * ratio.coerceIn(0f, 1f),
+                        processedItems = countedCharacters,
+                        totalItems = totalCorpusCharacters
+                    )
+                    nextCountingReport = Math.addExact(countedCharacters, 8_192L)
+                }
             }
         }
-        if (wordFrequencies.isEmpty()) return current.nextId
+        report(
+            stage = TokenizerTrainingStage.COUNTING_FREQUENCIES,
+            fraction = 0.15f,
+            processedItems = totalCorpusCharacters,
+            totalItems = totalCorpusCharacters
+        )
+
+        if (wordFrequencies.isEmpty()) {
+            report(
+                stage = TokenizerTrainingStage.COMPLETED,
+                fraction = 1f,
+                processedItems = 0L,
+                totalItems = 0L
+            )
+            return current.nextId
+        }
 
         val wordSymbols = LinkedHashMap<String, MutableList<String>>(wordFrequencies.size)
+        val totalWords = wordFrequencies.size.toLong()
+        var builtWords = 0L
+        val symbolReportInterval = maxOf(32L, totalWords / 32L)
+        report(
+            stage = TokenizerTrainingStage.BUILDING_SYMBOLS,
+            fraction = 0.15f,
+            processedItems = 0L,
+            totalItems = totalWords
+        )
         for (word in wordFrequencies.keys) {
             val bytes = encodeUtf8WithReplacement(word)
             val symbols = ArrayList<String>(bytes.size)
@@ -677,18 +778,57 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 symbols += byteSymbol(byte.toInt() and 0xFF)
             }
             wordSymbols[word] = symbols
+            builtWords++
+            if (builtWords % symbolReportInterval == 0L || builtWords == totalWords) {
+                report(
+                    stage = TokenizerTrainingStage.BUILDING_SYMBOLS,
+                    fraction = 0.15f + 0.15f * builtWords.toFloat() / totalWords.toFloat(),
+                    processedItems = builtWords,
+                    totalItems = totalWords
+                )
+            }
         }
 
+        val totalReplayOperations = candidate.merges.size.toLong() * totalWords
+        val replayReportInterval = maxOf(128L, totalReplayOperations / 32L)
+        var replayedOperations = 0L
+        report(
+            stage = TokenizerTrainingStage.REPLAYING_EXISTING_MERGES,
+            fraction = 0.30f,
+            processedItems = 0L,
+            totalItems = totalReplayOperations
+        )
         for (merge in candidate.merges) {
             val combined = merge.left + merge.right
             for (symbols in wordSymbols.values) {
                 applyMerge(symbols, merge.left, merge.right, combined)
+                replayedOperations++
+                if (
+                    replayedOperations % replayReportInterval == 0L ||
+                    replayedOperations == totalReplayOperations
+                ) {
+                    val ratio = replayedOperations.toFloat() /
+                        totalReplayOperations.coerceAtLeast(1L).toFloat()
+                    report(
+                        stage = TokenizerTrainingStage.REPLAYING_EXISTING_MERGES,
+                        fraction = 0.30f + 0.10f * ratio,
+                        processedItems = replayedOperations,
+                        totalItems = totalReplayOperations
+                    )
+                }
             }
         }
+        report(
+            stage = TokenizerTrainingStage.REPLAYING_EXISTING_MERGES,
+            fraction = 0.40f,
+            processedItems = totalReplayOperations,
+            totalItems = totalReplayOperations
+        )
 
-        var newMergeCount = 0
-        while (candidate.nextId < target && newMergeCount < maxNewMerges) {
+        val wordScanReportInterval = maxOf(16L, totalWords / 8L)
+        while (candidate.nextId < target && learnedMerges < maxNewMerges) {
             val pairCounts = HashMap<MergePair, Long>()
+            var scannedWords = 0L
             for ((word, frequency) in wordFrequencies) {
                 val symbols = wordSymbols[word] ?: continue
                 for (index in 0 until symbols.size - 1) {
@@ -708,6 +848,19 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                         previous + frequency
                     }
                 }
+                scannedWords++
+                if (scannedWords % wordScanReportInterval == 0L || scannedWords == totalWords) {
+                    val passProgress = (
+                        learnedMerges.toFloat() +
+                            scannedWords.toFloat() / totalWords.coerceAtLeast(1L).toFloat()
+                        ) / requestedMerges.coerceAtLeast(1).toFloat()
+                    report(
+                        stage = TokenizerTrainingStage.LEARNING_MERGES,
+                        fraction = 0.40f + 0.59f * passProgress.coerceIn(0f, 1f),
+                        processedItems = scannedWords,
+                        totalItems = totalWords
+                    )
+                }
             }
 
             val bestEntry = pairCounts.entries.maxWithOrNull(
@@ -723,18 +876,33 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
             if (!candidate.tokenToId.containsKey(combined)) {
                 registerToken(candidate, combined)
+                currentVocabularySize = candidate.nextId
             }
             val rank = candidate.merges.size
             candidate.merges += bestPair
             candidate.mergeRanks.getOrPut(bestPair.left) { HashMap() }[bestPair.right] = rank
-            newMergeCount++
+            learnedMerges++
 
             for (symbols in wordSymbols.values) {
                 applyMerge(symbols, bestPair.left, bestPair.right, combined)
             }
+            val mergeProgress = learnedMerges.toFloat() /
+                requestedMerges.coerceAtLeast(1).toFloat()
+            report(
+                stage = TokenizerTrainingStage.LEARNING_MERGES,
+                fraction = 0.40f + 0.59f * mergeProgress,
+                processedItems = learnedMerges.toLong(),
+                totalItems = requestedMerges.toLong()
+            )
         }
 
         state = freeze(candidate)
+        report(
+            stage = TokenizerTrainingStage.COMPLETED,
+            fraction = 1f,
+            processedItems = learnedMerges.toLong(),
+            totalItems = requestedMerges.toLong()
+        )
         return state.nextId
     }
 

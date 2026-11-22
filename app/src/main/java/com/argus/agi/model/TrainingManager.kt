@@ -97,6 +97,31 @@ data class ActiveDocumentTraining(
     val runningAverageLoss: Float? = null
 )
 
+enum class StreamedImportStage(val displayName: String, val isTerminal: Boolean = false) {
+    READING_SOURCE("Streaming source"),
+    TOKENIZING_CHUNKS("Building token-safe chunks"),
+    PERSISTING_CORPUS("Saving local corpus"),
+    PERSISTING_QUEUE("Persisting training queue"),
+    COMPLETED("Import completed", isTerminal = true),
+    CANCELLED("Import cancelled", isTerminal = true),
+    FAILED("Import failed", isTerminal = true)
+}
+
+data class StreamedImportProgress(
+    val documentTitle: String,
+    val stage: StreamedImportStage,
+    val charactersRead: Long,
+    val chunksProcessed: Int,
+    val totalChunks: Int? = null,
+    val detail: String? = null
+)
+
+data class TokenizerTrainingStatus(
+    val documentTitle: String,
+    val progress: TokenizerTrainingProgress,
+    val failureMessage: String? = null
+)
+
 /** Runtime counters for this app session; they are not presented as lifetime corpus totals. */
 data class TrainingSessionMetrics(
     val completedChunks: Long = 0L,
@@ -304,6 +329,18 @@ class TrainingManager internal constructor(
         )
     )
     val trainingMetrics: StateFlow<TrainingSessionMetrics> = _trainingMetrics.asStateFlow()
+
+    private val _streamedImportProgress = MutableStateFlow<StreamedImportProgress?>(null)
+    val streamedImportProgress: StateFlow<StreamedImportProgress?> =
+        _streamedImportProgress.asStateFlow()
+
+    private val _tokenizerTrainingProgress = MutableStateFlow<TokenizerTrainingStatus?>(null)
+    val tokenizerTrainingProgress: StateFlow<TokenizerTrainingStatus?> =
+        _tokenizerTrainingProgress.asStateFlow()
+
+    fun dismissStreamedImportProgress() {
+        _streamedImportProgress.value = null
+    }
 
     private val _conversationalValidationState = MutableStateFlow(
         conversationalValidationPersistence.loadState()
@@ -818,6 +855,13 @@ class TrainingManager internal constructor(
             "Temporary ingestion storage is unavailable."
         }
 
+        _streamedImportProgress.value = StreamedImportProgress(
+            documentTitle = title,
+            stage = StreamedImportStage.READING_SOURCE,
+            charactersRead = 0L,
+            chunksProcessed = 0
+        )
+
         val stagingFile = File(
             ingestionStagingDirectory,
             "argus-ingest-${UUID.randomUUID()}.utf16be"
@@ -832,6 +876,23 @@ class TrainingManager internal constructor(
         var totalCharsRead = 0L
         var importedDocumentId: String? = null
         var importCommitted = false
+        var lastReportedProgressNanos = System.nanoTime()
+
+        fun publishImportProgress(
+            stage: StreamedImportStage,
+            chunksProcessed: Int = _streamedImportProgress.value?.chunksProcessed ?: 0,
+            totalChunks: Int? = null,
+            detail: String? = null
+        ) {
+            _streamedImportProgress.value = StreamedImportProgress(
+                documentTitle = title,
+                stage = stage,
+                charactersRead = totalCharsRead,
+                chunksProcessed = chunksProcessed,
+                totalChunks = totalChunks,
+                detail = detail
+            )
+        }
 
         try {
             // First pass: preserve the source as UTF-16BE on disk while computing the
@@ -847,7 +908,13 @@ class TrainingManager internal constructor(
                         readCount = 1
                     }
                     if (readCount < 0) break
-                    if (closed) return Pair(0, totalCharsRead)
+                    if (closed) {
+                        publishImportProgress(
+                            stage = StreamedImportStage.CANCELLED,
+                            detail = "The import was stopped before staging completed."
+                        )
+                        return Pair(0, totalCharsRead)
+                    }
 
                     val nextTotal = Math.addExact(totalCharsRead, readCount.toLong())
                     require(nextTotal <= Int.MAX_VALUE.toLong()) {
@@ -862,17 +929,43 @@ class TrainingManager internal constructor(
                     }
                     output.write(encodedBuffer, 0, readCount * 2)
                     totalCharsRead = nextTotal
+                    val nowNanos = System.nanoTime()
+                    if (nowNanos - lastReportedProgressNanos >= 200_000_000L) {
+                        publishImportProgress(StreamedImportStage.READING_SOURCE)
+                        lastReportedProgressNanos = nowNanos
+                    }
                 }
             }
+            publishImportProgress(StreamedImportStage.READING_SOURCE)
 
-            if (closed || totalCharsRead == 0L) return Pair(0, totalCharsRead)
+            if (closed) {
+                publishImportProgress(
+                    stage = StreamedImportStage.CANCELLED,
+                    detail = "The import was stopped before staging completed."
+                )
+                return Pair(0, totalCharsRead)
+            }
+            if (totalCharsRead == 0L) {
+                publishImportProgress(
+                    stage = StreamedImportStage.COMPLETED,
+                    detail = "The selected file is empty."
+                )
+                return Pair(0, totalCharsRead)
+            }
 
+            publishImportProgress(StreamedImportStage.TOKENIZING_CHUNKS)
             var chunkCount = 0
             fun writeChunk(output: DataOutputStream, content: String) {
                 if (content.isEmpty()) return
                 output.writeInt(content.length)
                 for (character in content) output.writeChar(character.code)
                 chunkCount = Math.addExact(chunkCount, 1)
+                if (chunkCount % 8 == 0) {
+                    publishImportProgress(
+                        stage = StreamedImportStage.TOKENIZING_CHUNKS,
+                        chunksProcessed = chunkCount
+                    )
+                }
             }
 
             // Second pass: produce safe tokenizer-boundary chunks into a disk spool.
@@ -915,6 +1008,10 @@ class TrainingManager internal constructor(
                                     tokenizer = neuralEngine.tokenizer
                                 )
                                 for (chunk in processed) writeChunk(chunkOutput, chunk.content)
+                                publishImportProgress(
+                                    stage = StreamedImportStage.TOKENIZING_CHUNKS,
+                                    chunksProcessed = chunkCount
+                                )
                             }
                         }
                     } else if (totalCharsRead <= MAX_STREAMED_JSON_VALUE_CHARACTERS.toLong()) {
@@ -941,7 +1038,13 @@ class TrainingManager internal constructor(
                                 chunkSize = chunkSize,
                                 overlap = overlap,
                                 output = chunkOutput
-                            ) { count -> chunkCount = Math.addExact(chunkCount, count) }
+                            ) { count ->
+                                chunkCount = Math.addExact(chunkCount, count)
+                                publishImportProgress(
+                                    stage = StreamedImportStage.TOKENIZING_CHUNKS,
+                                    chunksProcessed = chunkCount
+                                )
+                            }
                         }
                     } else {
                         writeStreamedPlainTextChunks(
@@ -950,12 +1053,30 @@ class TrainingManager internal constructor(
                             chunkSize = chunkSize,
                             overlap = overlap,
                             output = chunkOutput
-                        ) { count -> chunkCount = Math.addExact(chunkCount, count) }
+                        ) { count ->
+                                chunkCount = Math.addExact(chunkCount, count)
+                                publishImportProgress(
+                                    stage = StreamedImportStage.TOKENIZING_CHUNKS,
+                                    chunksProcessed = chunkCount
+                                )
+                            }
                     }
                 }
             }
 
-            if (chunkCount == 0) return Pair(0, totalCharsRead)
+            publishImportProgress(
+                stage = StreamedImportStage.TOKENIZING_CHUNKS,
+                chunksProcessed = chunkCount
+            )
+            if (chunkCount == 0) {
+                publishImportProgress(
+                    stage = StreamedImportStage.COMPLETED,
+                    chunksProcessed = 0,
+                    totalChunks = 0,
+                    detail = "The source did not contain any trainable text chunks."
+                )
+                return Pair(0, totalCharsRead)
+            }
             val totalScheduledChunks = Math.multiplyExact(chunkCount, epochs)
             require(totalScheduledChunks > 0) {
                 "The streamed document did not produce any trainable chunks."
@@ -988,9 +1109,20 @@ class TrainingManager internal constructor(
             )
             if (!stored) {
                 Log.i(TAG, "Duplicate corpus document skipped: $documentId")
+                publishImportProgress(
+                    stage = StreamedImportStage.COMPLETED,
+                    chunksProcessed = 0,
+                    totalChunks = 0,
+                    detail = "This document is already present in the local corpus."
+                )
                 return Pair(0, totalCharsRead)
             }
             importedDocumentId = documentId
+            publishImportProgress(
+                stage = StreamedImportStage.PERSISTING_CORPUS,
+                chunksProcessed = 0,
+                totalChunks = chunkCount
+            )
 
             // Persist corpus text in fixed-size Room batches.
             val corpusBatch = ArrayList<CorpusChunkEntity>(CORPUS_WRITE_BATCH_SIZE)
@@ -1022,6 +1154,11 @@ class TrainingManager internal constructor(
                     if (corpusBatch.size >= CORPUS_WRITE_BATCH_SIZE) {
                         activeRepository.appendStreamedCorpusChunks(documentId, corpusBatch)
                         corpusBatch.clear()
+                        publishImportProgress(
+                            stage = StreamedImportStage.PERSISTING_CORPUS,
+                            chunksProcessed = chunkIndex,
+                            totalChunks = chunkCount
+                        )
                     }
                 }
                 require(chunkIndex == chunkCount) {
@@ -1032,6 +1169,17 @@ class TrainingManager internal constructor(
                 activeRepository.appendStreamedCorpusChunks(documentId, corpusBatch)
                 corpusBatch.clear()
             }
+            publishImportProgress(
+                stage = StreamedImportStage.PERSISTING_CORPUS,
+                chunksProcessed = chunkCount,
+                totalChunks = chunkCount
+            )
+
+            publishImportProgress(
+                stage = StreamedImportStage.PERSISTING_QUEUE,
+                chunksProcessed = 0,
+                totalChunks = totalScheduledChunks
+            )
 
             // Queue only compact descriptors. Text is loaded from corpus_chunks for the
             // active training micro-batch, never duplicated into every training_items row.
@@ -1068,6 +1216,11 @@ class TrainingManager internal constructor(
                     if (queueBatch.size >= CORPUS_WRITE_BATCH_SIZE) {
                         activeRepository.saveTrainingItems(queueBatch)
                         queueBatch.clear()
+                        publishImportProgress(
+                            stage = StreamedImportStage.PERSISTING_QUEUE,
+                            chunksProcessed = scheduledIndex,
+                            totalChunks = totalScheduledChunks
+                        )
                     }
                 }
             }
@@ -1075,6 +1228,11 @@ class TrainingManager internal constructor(
                 activeRepository.saveTrainingItems(queueBatch)
                 queueBatch.clear()
             }
+            publishImportProgress(
+                stage = StreamedImportStage.PERSISTING_QUEUE,
+                chunksProcessed = scheduledIndex,
+                totalChunks = totalScheduledChunks
+            )
 
             check(scheduledIndex == totalScheduledChunks) {
                 "Streamed training queue count does not match the imported corpus."
@@ -1088,6 +1246,12 @@ class TrainingManager internal constructor(
                 "The streamed corpus queue could not be activated."
             }
             importCommitted = true
+            publishImportProgress(
+                stage = StreamedImportStage.COMPLETED,
+                chunksProcessed = totalScheduledChunks,
+                totalChunks = totalScheduledChunks,
+                detail = "Corpus and training queue were committed locally."
+            )
 
             synchronized(queueLock) {
                 if (_activeDocument.value == null) {
@@ -1104,6 +1268,10 @@ class TrainingManager internal constructor(
             wakeupSignal.trySend(Unit)
             return Pair(totalScheduledChunks, totalCharsRead)
         } catch (cancelled: CancellationException) {
+            publishImportProgress(
+                stage = StreamedImportStage.CANCELLED,
+                detail = "The import was cancelled."
+            )
             importedDocumentId?.let { documentId ->
                 if (!importCommitted) {
                     runCatching { repo?.rollbackStreamedCorpusDocument(documentId) }
@@ -1114,6 +1282,10 @@ class TrainingManager internal constructor(
             }
             throw cancelled
         } catch (error: Throwable) {
+            publishImportProgress(
+                stage = StreamedImportStage.FAILED,
+                detail = error.message ?: error.javaClass.simpleName
+            )
             importedDocumentId?.let { documentId ->
                 if (!importCommitted) {
                     runCatching { repo?.rollbackStreamedCorpusDocument(documentId) }
@@ -1177,11 +1349,19 @@ class TrainingManager internal constructor(
                 overlap = overlap,
                 tokenizer = neuralEngine.tokenizer
             )
+            var emittedChunks = 0
+            var unreportedChunks = 0
             for (chunk in processed) {
                 output.writeInt(chunk.content.length)
                 for (character in chunk.content) output.writeChar(character.code)
+                emittedChunks = Math.addExact(emittedChunks, 1)
+                unreportedChunks = Math.addExact(unreportedChunks, 1)
+                if (unreportedChunks >= 8) {
+                    addCount(unreportedChunks)
+                    unreportedChunks = 0
+                }
             }
-            addCount(processed.size)
+            if (unreportedChunks > 0) addCount(unreportedChunks)
             Log.d(
                 TAG,
                 "Streamed ${processed.size} atomic ${modality.displayName} sample(s) for '$title'."
@@ -1190,6 +1370,7 @@ class TrainingManager internal constructor(
         }
 
         var emittedChunks = 0
+        var unreportedChunks = 0
         InputStreamReader(
             FileInputStream(file),
             StandardCharsets.UTF_16BE
@@ -1206,10 +1387,15 @@ class TrainingManager internal constructor(
                     output.writeInt(trainingText.length)
                     for (character in trainingText) output.writeChar(character.code)
                     emittedChunks = Math.addExact(emittedChunks, 1)
+                    unreportedChunks = Math.addExact(unreportedChunks, 1)
+                    if (unreportedChunks >= 8) {
+                        addCount(unreportedChunks)
+                        unreportedChunks = 0
+                    }
                 }
             }
         }
-        addCount(emittedChunks)
+        if (unreportedChunks > 0) addCount(unreportedChunks)
         Log.d(TAG, "Streamed $emittedChunks token-safe chunks for '$title' ($modality).")
     }
 
@@ -3543,6 +3729,38 @@ class TrainingManager internal constructor(
         val documentId = item.documentId ?: return
         if (!preparedTokenizerDocuments.add(documentId)) return
 
+        val documentTitle = item.documentTitle ?: item.title
+        fun publishTokenizerStage(stage: TokenizerTrainingStage, failureMessage: String? = null) {
+            val previous = _tokenizerTrainingProgress.value?.progress
+            val progress = previous?.copy(stage = stage) ?: TokenizerTrainingProgress(
+                stage = stage,
+                fraction = 0f,
+                processedItems = 0L,
+                totalItems = 0L,
+                learnedMerges = 0,
+                targetMerges = 0,
+                vocabularySize = neuralEngine.tokenizer.vocabSize
+            )
+            _tokenizerTrainingProgress.value = TokenizerTrainingStatus(
+                documentTitle = documentTitle,
+                progress = progress,
+                failureMessage = failureMessage
+            )
+        }
+
+        _tokenizerTrainingProgress.value = TokenizerTrainingStatus(
+            documentTitle = documentTitle,
+            progress = TokenizerTrainingProgress(
+                stage = TokenizerTrainingStage.PREPARING_CORPUS,
+                fraction = 0f,
+                processedItems = 0L,
+                totalItems = 0L,
+                learnedMerges = 0,
+                targetMerges = 0,
+                vocabularySize = neuralEngine.tokenizer.vocabSize
+            )
+        )
+
         try {
             val storedSamples = repo?.getTokenizerCorpusSample(
                 documentId = documentId,
@@ -3561,7 +3779,12 @@ class TrainingManager internal constructor(
                 corpusSample.add(item.content.take(MAX_TOKENIZER_SAMPLE_CHARACTERS))
             }
 
-            val update = neuralEngine.trainTokenizerFromCorpus(corpusSample)
+            val update = neuralEngine.trainTokenizerFromCorpus(corpusSample) { progress ->
+                _tokenizerTrainingProgress.value = TokenizerTrainingStatus(
+                    documentTitle = documentTitle,
+                    progress = progress
+                )
+            }
             _trainingMetrics.update { current ->
                 current.copy(
                     vocabularySize = update.vocabularySize,
@@ -3571,18 +3794,27 @@ class TrainingManager internal constructor(
             }
             Log.i(
                 TAG,
-                "Tokenizer corpus prepared for '${item.documentTitle ?: item.title}': " +
+                "Tokenizer corpus prepared for '$documentTitle': " +
                     "${update.previousVocabularySize} -> ${update.vocabularySize} tokens, " +
                     "${update.mergeCount - update.previousMergeCount} new merges."
             )
         } catch (cancelled: CancellationException) {
             preparedTokenizerDocuments.remove(documentId)
+            publishTokenizerStage(TokenizerTrainingStage.CANCELLED)
             throw cancelled
         } catch (error: OutOfMemoryError) {
             preparedTokenizerDocuments.remove(documentId)
+            publishTokenizerStage(
+                TokenizerTrainingStage.FAILED,
+                error.message ?: "Insufficient memory while preparing the tokenizer."
+            )
             throw error
         } catch (error: Exception) {
             preparedTokenizerDocuments.remove(documentId)
+            publishTokenizerStage(
+                TokenizerTrainingStage.FAILED,
+                error.message ?: error.javaClass.simpleName
+            )
             Log.w(TAG, "Tokenizer preparation failed for document $documentId; existing vocabulary will be used.", error)
         }
     }

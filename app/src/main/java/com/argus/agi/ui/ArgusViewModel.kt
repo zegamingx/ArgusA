@@ -20,6 +20,8 @@ import com.argus.agi.model.TextModalityProcessor
 import com.argus.agi.model.Tokenizer
 import com.argus.agi.model.ReasoningOutputParser
 import com.argus.agi.model.TrainingSessionMetrics
+import com.argus.agi.model.StreamedImportProgress
+import com.argus.agi.model.TokenizerTrainingStatus
 import com.argus.agi.model.WorldEntity
 import android.media.MediaMetadataRetriever
 import com.argus.agi.sensor.ArticleExtractor
@@ -160,6 +162,14 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     val currentContextSummary: StateFlow<String> = worldModel.currentContextSummary
     val genesisState: StateFlow<com.argus.agi.model.GenesisLifecycleState> = genesisModelManager.lifecycleState
     val activeDocument: StateFlow<com.argus.agi.model.ActiveDocumentTraining?> = trainingManager.activeDocument
+    val streamedImportProgress: StateFlow<StreamedImportProgress?> = trainingManager.streamedImportProgress
+    val tokenizerTrainingProgress: StateFlow<TokenizerTrainingStatus?> =
+        trainingManager.tokenizerTrainingProgress
+
+    fun dismissStreamedImportProgress() {
+        trainingManager.dismissStreamedImportProgress()
+    }
+
     val conversationalValidationState: StateFlow<com.argus.agi.model.ConversationValidationState> =
         trainingManager.conversationalValidationState
 

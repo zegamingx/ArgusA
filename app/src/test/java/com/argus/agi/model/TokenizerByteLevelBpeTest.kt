@@ -255,6 +255,47 @@ class TokenizerByteLevelBpeTest {
     }
 
     @Test
+    fun bpeTrainingPublishesMonotonicProgressAndTheFinalVocabularyState() {
+        val corpus = List(80) {
+            "byte level tokenizer reports measurable BPE progress across repeated phrases"
+        }
+        val tokenizer = newTokenizer()
+        val progress = ArrayList<TokenizerTrainingProgress>()
+
+        val resultingVocabularySize = tokenizer.trainBpe(
+            corpus = corpus,
+            targetVocabSize = 512,
+            maxNewMerges = 64,
+            onProgress = { update -> progress.add(update) }
+        )
+
+        assertTrue("BPE training must emit progress events.", progress.isNotEmpty())
+        assertTrue(progress.any { it.stage == TokenizerTrainingStage.COUNTING_FREQUENCIES })
+        assertTrue(progress.any { it.stage == TokenizerTrainingStage.BUILDING_SYMBOLS })
+        assertTrue(progress.any { it.stage == TokenizerTrainingStage.LEARNING_MERGES })
+        assertEquals(TokenizerTrainingStage.COMPLETED, progress.last().stage)
+        assertEquals(1f, progress.last().fraction, 0f)
+        assertEquals(resultingVocabularySize, progress.last().vocabularySize)
+        assertEquals(tokenizer.mergeCount, progress.last().learnedMerges)
+
+        val withoutProgressCallback = newTokenizer()
+        withoutProgressCallback.trainBpe(
+            corpus = corpus,
+            targetVocabSize = 512,
+            maxNewMerges = 64
+        )
+        assertEquals(withoutProgressCallback.exportVocab(), tokenizer.exportVocab())
+        assertEquals(withoutProgressCallback.exportMerges(), tokenizer.exportMerges())
+
+        progress.zipWithNext().forEach { (previous, next) ->
+            assertTrue(
+                "BPE progress must never move backwards: ${previous.fraction} -> ${next.fraction}",
+                next.fraction >= previous.fraction
+            )
+        }
+    }
+
+    @Test
     fun trainingPublishesANewCacheGenerationWithoutStaleTokenIds() {
         val tokenizer = newTokenizer()
         val sample = "cached inference text repeats across local training"

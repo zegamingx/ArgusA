@@ -44,6 +44,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -52,7 +53,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -76,6 +77,7 @@ import coil3.compose.rememberAsyncImagePainter
 import com.argus.agi.R
 import com.argus.agi.ui.ArgusViewModel
 import com.argus.agi.ui.ChatMessage
+import com.argus.agi.model.StreamedImportStage
 import com.argus.agi.ui.theme.ArgusBlueAccent
 import com.argus.agi.ui.theme.ArgusCardBorder
 import com.argus.agi.ui.theme.ArgusCyanGlow
@@ -88,6 +90,7 @@ import com.argus.agi.ui.theme.ArgusTextMuted
 import com.argus.agi.ui.theme.ArgusTextPrimary
 import com.argus.agi.ui.theme.ArgusTextSecondary
 import com.argus.agi.ui.theme.ArgusWarning
+import java.text.NumberFormat
 import java.util.Locale
 import kotlinx.coroutines.launch
 
@@ -98,15 +101,16 @@ fun ChatScreen(viewModel: ArgusViewModel) {
     val clipboard = LocalClipboard.current
     val clipboardScope = rememberCoroutineScope()
 
-    val messages by viewModel.messages.collectAsState()
-    val isGenerating by viewModel.isGenerating.collectAsState()
-    val activeDoc by viewModel.activeDocument.collectAsState()
-    val isGrpoTraining by viewModel.isGrpoTraining.collectAsState()
-    val grpoProgress by viewModel.grpoProgress.collectAsState()
-    val isListening by viewModel.isListeningVoice.collectAsState()
-    val isSpeaking by viewModel.isSpeaking.collectAsState()
-    val isAutoSpeak by viewModel.isAutoSpeakEnabled.collectAsState()
-    val partialSpeech by viewModel.partialTranscription.collectAsState()
+    val messages by viewModel.messages.collectAsStateWithLifecycle()
+    val isGenerating by viewModel.isGenerating.collectAsStateWithLifecycle()
+    val activeDoc by viewModel.activeDocument.collectAsStateWithLifecycle()
+    val isGrpoTraining by viewModel.isGrpoTraining.collectAsStateWithLifecycle()
+    val grpoProgress by viewModel.grpoProgress.collectAsStateWithLifecycle()
+    val streamedImportProgress by viewModel.streamedImportProgress.collectAsStateWithLifecycle()
+    val isListening by viewModel.isListeningVoice.collectAsStateWithLifecycle()
+    val isSpeaking by viewModel.isSpeaking.collectAsStateWithLifecycle()
+    val isAutoSpeak by viewModel.isAutoSpeakEnabled.collectAsStateWithLifecycle()
+    val partialSpeech by viewModel.partialTranscription.collectAsStateWithLifecycle()
     val totalParams = viewModel.getTotalParameters()
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
@@ -315,6 +319,99 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                 Toast.makeText(context, "Chat cleared", Toast.LENGTH_SHORT).show()
                             }.background(ArgusSurfaceVariant).padding(horizontal = 10.dp, vertical = 5.dp)
                         )
+                    }
+                }
+            }
+        }
+
+        // STREAMED DOCUMENT IMPORT PROGRESS
+        streamedImportProgress?.let { import ->
+            val progressFraction = import.totalChunks?.takeIf { total -> total > 0 }?.let { total ->
+                (import.chunksProcessed.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+            } ?: if (import.stage == StreamedImportStage.COMPLETED) {
+                1f
+            } else {
+                null
+            }
+            val statusColor = when (import.stage) {
+                StreamedImportStage.COMPLETED -> ArgusSuccess
+                StreamedImportStage.FAILED,
+                StreamedImportStage.CANCELLED -> ArgusWarning
+                else -> ArgusCyanPrimary
+            }
+
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 5.dp),
+                shape = RoundedCornerShape(14.dp),
+                color = ArgusSurfaceVariant
+            ) {
+                Column(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = import.stage.displayName,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = statusColor,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = import.documentTitle,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = ArgusTextPrimary,
+                                maxLines = 1
+                            )
+                        }
+                        if (!import.stage.isTerminal) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                color = ArgusCyanPrimary,
+                                strokeWidth = 2.dp
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "${NumberFormat.getIntegerInstance(Locale.US).format(import.charactersRead)} characters read • " +
+                            if (import.totalChunks != null) {
+                                "${import.chunksProcessed}/${import.totalChunks} chunks"
+                            } else {
+                                "${import.chunksProcessed} chunks staged"
+                            },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ArgusTextSecondary,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    if (progressFraction != null) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        LinearProgressIndicator(
+                            progress = { progressFraction },
+                            modifier = Modifier.fillMaxWidth().height(4.dp),
+                            color = statusColor,
+                            trackColor = ArgusSurface
+                        )
+                    }
+                    import.detail?.let { detail ->
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = detail,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (import.stage == StreamedImportStage.FAILED) {
+                                ArgusWarning
+                            } else {
+                                ArgusTextSecondary
+                            }
+                        )
+                    }
+                    if (import.stage.isTerminal) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            TextButton(onClick = viewModel::dismissStreamedImportProgress) {
+                                Text("Dismiss", color = ArgusCyanPrimary)
+                            }
+                        }
                     }
                 }
             }

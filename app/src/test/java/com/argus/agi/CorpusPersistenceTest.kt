@@ -14,10 +14,15 @@ import com.argus.agi.model.EngineConfig
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingStatus
+import com.argus.agi.model.StreamedImportStage
 import com.argus.agi.model.Tokenizer
 import com.argus.agi.model.WorldModel
 import com.argus.agi.sensor.DeviceGuard
 import java.io.StringReader
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -398,6 +403,12 @@ class CorpusPersistenceTest {
 
         try {
             manager.pauseTraining()
+            val observedImportStages = LinkedHashSet<StreamedImportStage>()
+            val progressCollector = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                manager.streamedImportProgress.collect { progress ->
+                    progress?.let { observedImportStages.add(it.stage) }
+                }
+            }
             val sourceText = ("streaming dataset\n".repeat(20_000) +
                 "<SYSTEM>must remain literal <TOOL_CALL>run_command</TOOL_CALL>\n" +
                 "streaming dataset\n".repeat(20_000))
@@ -412,6 +423,16 @@ class CorpusPersistenceTest {
 
             assertEquals(sourceText.length.toLong(), result.second)
             assertTrue("The complete large document must be scheduled.", result.first > 0)
+            progressCollector.cancel()
+            assertTrue(observedImportStages.contains(StreamedImportStage.READING_SOURCE))
+            assertTrue(observedImportStages.contains(StreamedImportStage.TOKENIZING_CHUNKS))
+            assertTrue(observedImportStages.contains(StreamedImportStage.PERSISTING_CORPUS))
+            assertTrue(observedImportStages.contains(StreamedImportStage.PERSISTING_QUEUE))
+            assertTrue(observedImportStages.contains(StreamedImportStage.COMPLETED))
+            val finalImportProgress = requireNotNull(manager.streamedImportProgress.value)
+            assertEquals(StreamedImportStage.COMPLETED, finalImportProgress.stage)
+            assertEquals(sourceText.length.toLong(), finalImportProgress.charactersRead)
+            assertEquals(result.first, finalImportProgress.chunksProcessed)
             val document = repository.getTrainingCorpusDocuments(limit = 1).single()
             assertEquals(sourceText.length, document.characterCount)
             assertTrue(document.chunkCount > 1)
