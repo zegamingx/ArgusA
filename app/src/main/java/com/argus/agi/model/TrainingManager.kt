@@ -3139,13 +3139,13 @@ class TrainingManager internal constructor(
                     "Training is paused because startup checkpoint/queue recovery failed: ${error.message}"
                 )
                 return
-                }
-            } finally {
-                workerExecutionMutex.unlock()
             }
+        } finally {
+            workerExecutionMutex.unlock()
+        }
 
-            startupGate.complete(Unit)
-            while (isActive && !closed) {
+        startupGate.complete(Unit)
+        while (isActive && !closed) {
                 refillPendingQueueFromDatabase()
                 if (_isTrainingPaused.value) {
                     combine(_isTrainingPaused, _nextQueue) { paused, queue ->
@@ -3399,7 +3399,6 @@ class TrainingManager internal constructor(
                     workerExecutionMutex.unlock()
                 }
             }
-        }
     }
 
     private fun appendPersistingQueueItems(
