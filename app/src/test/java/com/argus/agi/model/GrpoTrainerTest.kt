@@ -51,6 +51,64 @@ class GrpoTrainerTest {
     }
 
     @Test
+    fun k3KlPenaltyIsZeroAtBehaviorPolicyAndPositiveWhenPoliciesDiverge() {
+        val identical = calculateGrpoTokenObjective(
+            oldLogProbability = -0.7f,
+            currentLogProbability = -0.7f,
+            advantage = 1f,
+            clipEpsilon = 0.2f,
+            klCoefficient = 0.1f
+        )
+        val diverged = calculateGrpoTokenObjective(
+            oldLogProbability = -0.7f,
+            currentLogProbability = -0.2f,
+            advantage = 1f,
+            clipEpsilon = 0.2f,
+            klCoefficient = 0.1f
+        )
+        assertEquals(1f, identical.importanceRatio, 1.0e-6f)
+        assertEquals(0f, identical.klPenalty, 1.0e-6f)
+        assertTrue(diverged.klPenalty > 0f)
+        assertTrue(diverged.isPolicyClipped)
+        assertTrue(diverged.derivativeWrtCurrentLogProbability > 0f)
+    }
+
+    @Test
+    fun clippedNegativeAdvantageUsesLowerRatioBoundary() {
+        val result = calculateGrpoTokenObjective(
+            oldLogProbability = -0.2f,
+            currentLogProbability = -0.9f,
+            advantage = -1f,
+            clipEpsilon = 0.2f,
+            klCoefficient = 0f
+        )
+        assertTrue(result.importanceRatio < 0.8f)
+        assertTrue(result.isPolicyClipped)
+        assertEquals(0f, result.derivativeWrtCurrentLogProbability, 0f)
+    }
+
+    @Test
+    fun groupRelativeAdvantagesAreStandardizedAndUniformGroupsAreSkipped() {
+        val advantages = requireNotNull(computeGroupRelativeAdvantages(listOf(0f, 0.5f, 1f)))
+        assertEquals(0f, advantages.average().toFloat(), 1.0e-6f)
+        assertTrue(advantages[0] < 0f)
+        assertEquals(null, computeGroupRelativeAdvantages(listOf(0.5f, 0.5f)))
+    }
+
+    @Test
+    fun parserRejectsDatasetThatExceedsAggregateCharacterBudget() {
+        val records = listOf(
+            JSONObject().put("prompt", "first prompt").put("answer", "first answer").toString(),
+            JSONObject().put("prompt", "second prompt").put("answer", "second answer").toString()
+        ).joinToString("\n")
+        val failure = runCatching {
+            parseGrpoJsonl(StringReader(records), maxTotalCharacters = 32L)
+        }.exceptionOrNull()
+        assertTrue(failure is IllegalArgumentException)
+        assertTrue(failure?.message.orEmpty().contains("character limit"))
+    }
+
+    @Test
     fun configurationRejectsSingleResponseGroupsAndUnsafeValues() {
         assertTrue(runCatching { GrpoTrainingConfig(groupSize = 1) }.isFailure)
         assertTrue(runCatching { GrpoTrainingConfig(temperature = Float.NaN) }.isFailure)

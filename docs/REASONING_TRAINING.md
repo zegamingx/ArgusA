@@ -64,18 +64,26 @@ verifier, not a learned reward model. It is appropriate only when textual
 comparison to the supplied answer is a meaningful quality signal. A custom
 `GrpoRewardEvaluator` can provide a task-specific verifier.
 
-Rewards are normalized within each prompt group to produce group-relative
-advantages. The model then applies a clipped policy-ratio objective and a
-sampled reverse-KL penalty against behavior log-probabilities frozen at rollout
-time. No critic/value network is trained. Groups with uniform rewards are
-skipped because they have no relative advantage signal. The behavior policy
-captured for each group is its KL reference in this initial implementation;
-it is not a permanently frozen copy of the pre-training model.
+Rewards are population-standardized within each prompt group to produce
+group-relative advantages. The model applies a clipped policy-ratio objective
+and the non-negative k3 estimator of KL(old behavior policy || current policy),
+using behavior log-probabilities frozen at rollout time. No critic/value network
+is trained. Groups with uniform rewards are skipped because they have no relative
+advantage signal. The behavior policy captured for each group is its KL reference
+in this initial implementation; it is not a permanently frozen copy of the
+pre-training model.
+
+Before sampling and before each optimizer window, GRPO rechecks device safety
+and the adaptive runtime planner. Group size and generation context are reduced
+to the current memory budget, and training is deferred when fewer than two
+responses fit or the device is thermally unsafe. Every optimizer group is
+anchored to the last verified local checkpoint; an exception during its PPO
+epochs or checkpoint verification triggers restoration of that checkpoint.
 
 The importer validates the entire JSONL file before the first optimizer update.
 Each row must contain string `prompt` and `answer` values. Each line is
-bounded to 256 Ki UTF-16 characters, and the default run is capped at 10,000
-examples. GRPO requires an idle SFT queue and saves a verified checkpoint after
+bounded to 256 Ki UTF-16 characters, the aggregate dataset is capped at 16 Mi
+UTF-16 characters, and the default run is capped at 10,000 examples. GRPO requires an idle SFT queue and saves a verified checkpoint after
 each group that updates the optimizer. Defaults: group size 4, 2 PPO epochs,
 temperature 0.8, clip epsilon 0.2, KL coefficient 0.02, and up to 32 generated
 tokens per response. These are initial values, not optimal settings for every

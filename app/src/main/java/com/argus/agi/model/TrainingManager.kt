@@ -8,6 +8,7 @@ import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.data.local.entity.TrainingReplaySessionEntity
 import com.argus.agi.runtime.DeviceAdaptiveRuntimePolicy
+import com.argus.agi.runtime.RuntimeConfiguration
 import com.argus.agi.runtime.RuntimeConfigurationPlanner
 import com.argus.agi.runtime.RuntimeDeferReason
 import com.argus.agi.runtime.RuntimeModelConstraints
@@ -366,6 +367,53 @@ class TrainingManager internal constructor(
         startTrainingWorker()
     }
 
+    private fun createGrpoRuntimeConfiguration(requestedGroupSize: Int): RuntimeConfiguration {
+        require(requestedGroupSize in 2..8)
+        deviceGuard.refreshState()
+        val safety = deviceGuard.safetyState.value
+        check(safety.isSafeToTrain) {
+            "GRPO is suspended by device safety: ${safety.statusMessage}"
+        }
+        val memory = captureTrainingMemorySnapshot()
+        return RuntimeConfigurationPlanner.create(
+            backend = neuralEngine.runtimeComputeBackend,
+            resources = RuntimeResourceSnapshot(
+                availableAppHeapBytes = memory.availableHeapBytes,
+                maximumAppHeapBytes = memory.maximumHeapBytes,
+                availableSystemMemoryBytes = memory.availableSystemMemoryBytes,
+                systemLowMemory = memory.isSystemLowMemory,
+                thermalStatus = safety.thermalStatus,
+                temperatureCelsius = safety.temperatureCelsius,
+                isPowerSaveMode = safety.isPowerSaveMode,
+                isCharging = safety.isCharging,
+                batteryPct = safety.batteryPct,
+                memoryRecovery = false
+            ),
+            model = RuntimeModelConstraints(
+                configuredBatchSize = requestedGroupSize,
+                configuredContextLength = neuralEngine.config.maxSeqLen,
+                dModel = neuralEngine.config.dModel,
+                feedForwardSize = neuralEngine.config.dFf,
+                vocabularySize = neuralEngine.tokenizer.vocabSize,
+                layerCount = neuralEngine.config.layerCount,
+                headCount = neuralEngine.config.nHeads
+            )
+        )
+    }
+
+    private fun verifyGrpoRuntimeBudget(budget: GrpoRuntimeBudget) {
+        val runtime = createGrpoRuntimeConfiguration(budget.groupSize)
+        check(runtime.canTrain) {
+            "GRPO was suspended by device resources: ${runtime.deferReason ?: "runtime unavailable"}."
+        }
+        check(runtime.effectiveTrainingBatchSize >= budget.groupSize) {
+            "Available memory no longer supports the active GRPO group size."
+        }
+        check(runtime.effectiveContextLength >= budget.contextLength) {
+            "Available memory no longer supports the active GRPO context length."
+        }
+    }
+
     suspend fun trainGrpoJsonl(
         reader: Reader,
         config: GrpoTrainingConfig = GrpoTrainingConfig(),
@@ -401,7 +449,36 @@ class TrainingManager internal constructor(
                 "GRPO requires an idle SFT queue. Finish or clear queued SFT work before starting policy optimization."
             }
 
-            return GrpoTrainer(neuralEngine).train(reader, config, onProgress)
+            return GrpoTrainer(neuralEngine).train(
+                reader = reader,
+                config = config,
+                onProgress = onProgress,
+                resolveRuntimeBudget = { requested ->
+                    val runtime = createGrpoRuntimeConfiguration(requested.groupSize)
+                    check(runtime.canTrain) {
+                        "GRPO is deferred by device resources: ${runtime.deferReason ?: "runtime unavailable"}."
+                    }
+                    val effectiveGroupSize = minOf(requested.groupSize, runtime.effectiveTrainingBatchSize)
+                    check(effectiveGroupSize >= 2) {
+                        "Current memory headroom supports fewer than two GRPO responses; policy optimization is deferred."
+                    }
+                    val effectiveContext = runtime.effectiveContextLength
+                    check(effectiveContext >= 2) {
+                        "Current memory headroom cannot provide the minimum GRPO context."
+                    }
+                    GrpoRuntimeBudget(
+                        groupSize = effectiveGroupSize,
+                        contextLength = effectiveContext,
+                        maxNewTokens = minOf(
+                            requested.maxNewTokens,
+                            (effectiveContext - 1).coerceAtLeast(1)
+                        )
+                    )
+                },
+                beforeRollout = { budget -> verifyGrpoRuntimeBudget(budget) },
+                beforeGroupUpdate = { budget -> verifyGrpoRuntimeBudget(budget) },
+                runtimeSafetyCheck = { budget -> verifyGrpoRuntimeBudget(budget) }
+            )
         } finally {
             if (!wasPaused && !closed) resumeTraining()
             grpoTrainingMutex.unlock()
