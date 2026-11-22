@@ -1,5 +1,6 @@
 package com.argus.agi.ui
 
+
 import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -65,6 +66,21 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipInputStream
 
+/**
+ * Reserves local cache capacity before assigning a bounded expansion budget to ZIP imports.
+ * The importer may use at most one quarter of the storage remaining after the reserve.
+ */
+internal fun calculateZipImportBudgetBytes(
+    availableBytes: Long,
+    reservedBytes: Long
+): Long {
+    require(availableBytes >= 0L) { "Available storage must not be negative." }
+    require(reservedBytes >= 0L) { "Reserved storage must not be negative." }
+
+    val bytesAfterReserve = (availableBytes - reservedBytes).coerceAtLeast(0L)
+    return bytesAfterReserve / 4L
+}
+
 data class ChatMessage(
     val id: String = UUID.randomUUID().toString(),
     val isUser: Boolean,
@@ -84,8 +100,9 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         private const val ABSOLUTE_MAX_FILE_SIZE_BYTES = 100L * 1024L * 1024L
         private const val MAX_IMAGE_SIDE = 2048
         private const val MAX_ZIP_ENTRIES = 1_000
-        private const val ABSOLUTE_MAX_ZIP_ENTRY_EXPANDED_BYTES = 20L * 1024L * 1024L
-        private const val ABSOLUTE_MAX_ZIP_EXPANDED_TOTAL_BYTES = 40L * 1024L * 1024L
+        private const val ZIP_DISK_RESERVE_BYTES = 256L * 1024L * 1024L
+        private const val MINIMUM_ZIP_IMPORT_BUDGET_BYTES = 1L * 1024L * 1024L
+        private const val ZIP_IMPORT_BUDGET_DIVISOR = 4L
     }
 
     private val neuralEngine = ArgusApp.neuralEngine
@@ -615,22 +632,6 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     cr.openFileDescriptor(uri, "r")?.use { it.statSize }
                 }.getOrNull()
 
-                val maxFileSizeBytes = maxImportFileSizeBytes()
-                if (sizeBytes != null && sizeBytes > maxFileSizeBytes) {
-                    withContext(Dispatchers.Main) {
-                        appendMessage(
-                            ChatMessage(
-                                isUser = false,
-                                text = "File is too large (${sizeBytes / 1024 / 1024} MB). " +
-                                    "The current device-memory-based import limit is " +
-                                    "${maxFileSizeBytes / 1024 / 1024} MB.",
-                                thinkReasoning = "Device-memory-aware import size guard triggered."
-                            )
-                        )
-                    }
-                    return@launch
-                }
-
                 val docDisplayName = runCatching {
                     var name: String? = null
                     cr.query(uri, null, null, null, null)?.use { cursor ->
@@ -754,11 +755,10 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 // Streaming chunk ingestion: membaca langsung secara buffered (4KB)
                 // tanpa pernah memuat seluruh file ke dalam sebuah String raksasa di heap RAM.
                 val (chunkCount, charsRead) = cr.openInputStream(uri)?.use { stream ->
-                    val boundedReader = BoundedReader(
+                    val reader = BufferedReader(
                         openImportReader(stream, strictUtf8 = isJsonLines),
-                        maxImportTextCharacters()
+                        16_384
                     )
-                    val reader = BufferedReader(boundedReader, 16_384)
                     trainingManager.enqueueDocumentStream(
                         source = "text_file|name=${encodeProvenanceField(docDisplayName)}",
                         title = docDisplayName,
@@ -806,7 +806,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             isUser = false,
                             text = "Document '$docDisplayName' ($sizeDisplay) was read incrementally.\n\n" +
                                     "The text was split into $chunkCount chunks and scheduled for local training. " +
-                                    "Queued chunks are currently held in application memory, so large imports require sufficient available RAM.\n\n" +
+                                    "The corpus and compact training queue were stored locally in bounded batches.\n\n" +
                                     "Track progress in the Neural Core tab.",
                             thinkReasoning = "Buffered document ingestion: $charsRead characters → $chunkCount queued blocks."
                         )
@@ -868,17 +868,18 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     private fun maxImportTextCharacters(): Long =
         maxQueuedTextMemoryBudgetBytes() / 4L
 
-    private fun maxZipEntryExpandedBytes(): Long =
-        minOf(
-            ABSOLUTE_MAX_ZIP_ENTRY_EXPANDED_BYTES,
-            maxQueuedTextMemoryBudgetBytes()
+    /**
+     * ZIP expansion is constrained by available cache storage, not by the app heap.
+     * The reserve accounts for Room/WAL files, the second staging pass and unrelated
+     * application cache use. Actual I/O failures still abort and roll back the import.
+     */
+    private fun availableZipImportDiskBudgetBytes(): Long {
+        val availableBytes = getApplication<Application>().cacheDir.usableSpace.coerceAtLeast(0L)
+        return calculateZipImportBudgetBytes(
+            availableBytes = availableBytes,
+            reservedBytes = ZIP_DISK_RESERVE_BYTES
         )
-
-    private fun maxZipExpandedTotalBytes(): Long =
-        minOf(
-            ABSOLUTE_MAX_ZIP_EXPANDED_TOTAL_BYTES,
-            maxQueuedTextMemoryBudgetBytes()
-        )
+    }
 
     private suspend fun enqueueExtractedDocument(
         extracted: ExtractedDocument,
@@ -1044,8 +1045,20 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 var totalCharsExtracted = 0L
                 var totalExpandedBytes = 0L
                 var entryCount = 0
-                val maxZipEntryBytes = maxZipEntryExpandedBytes()
-                val maxZipTotalBytes = maxZipExpandedTotalBytes()
+                val maxZipImportBytes = availableZipImportDiskBudgetBytes()
+                if (maxZipImportBytes < MINIMUM_ZIP_IMPORT_BUDGET_BYTES) {
+                    val minimumRequiredBytes =
+                        ZIP_DISK_RESERVE_BYTES +
+                            MINIMUM_ZIP_IMPORT_BUDGET_BYTES * ZIP_IMPORT_BUDGET_DIVISOR
+                    throw IOException(
+                        "ZIP import requires at least " +
+                            (minimumRequiredBytes / 1024L / 1024L) +
+                            " MB of free cache storage to preserve the safety reserve. " +
+                            "Free up local storage and retry."
+                    )
+                }
+                val maxZipEntryBytes = maxZipImportBytes
+                val maxZipTotalBytes = maxZipImportBytes
                 val maxTextCharacters = maxImportTextCharacters()
 
                 val plainTextExtensions = setOf(
@@ -1136,12 +1149,9 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                         else -> {
                                             val strictJsonLines = extension in setOf("jsonl", "ndjson")
                                             val reader = BufferedReader(
-                                                BoundedReader(
-                                                    openImportReader(
-                                                        boundedEntry,
-                                                        strictUtf8 = strictJsonLines
-                                                    ),
-                                                    maxTextCharacters
+                                                openImportReader(
+                                                    boundedEntry,
+                                                    strictUtf8 = strictJsonLines
                                                 ),
                                                 8_192
                                             )

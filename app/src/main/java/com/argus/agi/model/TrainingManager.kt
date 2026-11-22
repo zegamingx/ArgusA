@@ -41,6 +41,9 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedInputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.EOFException
 import java.io.BufferedOutputStream
 import java.io.BufferedReader
 import java.io.Closeable
@@ -183,9 +186,9 @@ class TrainingManager internal constructor(
         private const val MAX_TOKENIZER_SAMPLE_CHUNKS = 256
         private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
         private const val MAX_STREAMED_JSON_VALUE_CHARACTERS = 256 * 1024
-        // Import remains bounded even when the supplied Reader is unbounded.
-        const val MAX_STREAMED_DOCUMENT_CHARACTERS = 2 * 1024 * 1024
-        const val MAX_STREAMED_DOCUMENT_CHUNKS = 8_192
+        private const val QUEUE_PREFETCH_LIMIT = 64
+        private const val MAX_IN_MEMORY_QUEUE_ITEMS = 128
+        private const val CORPUS_WRITE_BATCH_SIZE = 128
         private const val IDLE_POLL_MS = 500L
         private const val SCREEN_SOURCE_PREFIX = "ScreenTrainingV2 ("
         private const val LEGACY_SCREEN_SOURCE_PREFIX = "Screen ("
@@ -214,6 +217,7 @@ class TrainingManager internal constructor(
     private var screenTrainingPurgePending = false
     private val corpusSchedulingMutex = Mutex()
     private val seedSchedulingMutex = Mutex()
+    private val queueRefillMutex = Mutex()
     private var lastScheduledTimestamp: Long = System.currentTimeMillis()
     private var queueGeneration: Long = 0L
     private val persistenceOperations =
@@ -314,6 +318,7 @@ class TrainingManager internal constructor(
         Log.e(TAG, "Unhandled exception in training scope", t)
     }
     private val scope = CoroutineScope(SupervisorJob() + trainingDispatcher + exceptionHandler)
+    private val streamedImportStartup = CompletableDeferred<Unit>()
     private var workerJob: Job? = null
     private var persistenceJob: Job? = null
 
@@ -383,7 +388,7 @@ class TrainingManager internal constructor(
                 // host checkpoint was recovered. Re-arm the optional runtime before work.
                 neuralEngine.resumeVulkanTensorResidencyAfterForeground()
                 val committedItems = repository.getOptimizerCommittedTrainingItemsSnapshot()
-                val pendingItems = repository.getPendingQueueSnapshot()
+                val pendingItems = repository.getPendingQueueSnapshot(QUEUE_PREFETCH_LIMIT)
                 val databaseIds = (committedItems + pendingItems).mapTo(HashSet()) { it.id }
                 val inMemoryItems = synchronized(queueLock) {
                     _nextQueue.value.filterNot { item -> item.id in databaseIds }
@@ -666,13 +671,14 @@ class TrainingManager internal constructor(
         sourceProvenance: CorpusSourceProvenance = CorpusSourceProvenance(),
         strictJsonLines: Boolean = false
     ): Pair<Int, Long> {
+        if (closed) return Pair(0, 0L)
+        streamedImportStartup.await()
         require(chunkSize > 0) { "chunkSize must be positive." }
-        require(overlap >= 0) { "overlap cannot be negative." }
-        require(overlap < chunkSize) {
-            "overlap ($overlap) must be less than chunkSize ($chunkSize)."
+        require(overlap >= 0 && overlap < chunkSize) {
+            "overlap must be between zero and chunkSize - 1."
         }
         require(overlap <= chunkSize / 3) {
-            "overlap ($overlap) must be <= one third of chunkSize (${chunkSize / 3})."
+            "overlap must be <= one third of chunkSize (${chunkSize / 3})."
         }
         require(epochs in 1..MAX_DOCUMENT_EPOCHS) {
             "epochs must be in 1..$MAX_DOCUMENT_EPOCHS."
@@ -683,18 +689,6 @@ class TrainingManager internal constructor(
         sourceProvenance.validateFor(rightsStatus)
         requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
         if (closed) return Pair(0, 0L)
-
-        val availableHeapBytes = captureTrainingMemorySnapshot().availableHeapBytes
-        // Do not infer token-queue capacity from character count: UTF-8 byte-level
-        // token density varies substantially by script. Enforce the live heap budget
-        // while reading, then validate the actual generated chunk count after parsing.
-        val streamCharacterLimit = DeviceAdaptiveRuntimePolicy.streamedDocumentCharacterLimit(
-            availableHeapBytes = availableHeapBytes,
-            hardLimitCharacters = MAX_STREAMED_DOCUMENT_CHARACTERS
-        )
-        require(streamCharacterLimit > 0) {
-            "There is not enough available app-heap headroom for a streamed document import."
-        }
 
         check(
             ingestionStagingDirectory.isDirectory ||
@@ -707,19 +701,25 @@ class TrainingManager internal constructor(
             ingestionStagingDirectory,
             "argus-ingest-${UUID.randomUUID()}.utf16be"
         )
-        val inputBuffer = CharArray(4096)
+        val chunkStagingFile = File(
+            ingestionStagingDirectory,
+            "argus-chunks-${UUID.randomUUID()}.bin"
+        )
+        val inputBuffer = CharArray(4_096)
         val encodedBuffer = ByteArray(inputBuffer.size * 2)
         val fingerprintDigest = MessageDigest.getInstance("SHA-256")
         var totalCharsRead = 0L
+        var importedDocumentId: String? = null
+        var importCommitted = false
 
         try {
+            // First pass: preserve the source as UTF-16BE on disk while computing the
+            // document fingerprint. Heap usage is independent of total file length.
             BufferedOutputStream(FileOutputStream(stagingFile)).use { output ->
                 while (true) {
                     currentCoroutineContext().ensureActive()
                     var readCount = reader.read(inputBuffer)
                     if (readCount == 0) {
-                        // Reader implementations should make progress for a non-empty buffer,
-                        // but handle a non-conforming zero-length read without spinning forever.
                         val singleCharacter = reader.read()
                         if (singleCharacter < 0) break
                         inputBuffer[0] = singleCharacter.toChar()
@@ -729,12 +729,10 @@ class TrainingManager internal constructor(
                     if (closed) return Pair(0, totalCharsRead)
 
                     val nextTotal = Math.addExact(totalCharsRead, readCount.toLong())
-                    require(nextTotal <= streamCharacterLimit.toLong()) {
-                        "Streamed document exceeds the current safe limit of " +
-                            "$streamCharacterLimit UTF-16 characters. " +
-                            "Split the source into smaller documents at a record or paragraph boundary."
+                    require(nextTotal <= Int.MAX_VALUE.toLong()) {
+                        "The current corpus schema supports a maximum of " +
+                            Int.MAX_VALUE + " UTF-16 code units per document."
                     }
-
                     updateUtf16BeDigest(fingerprintDigest, inputBuffer, readCount)
                     for (index in 0 until readCount) {
                         val value = inputBuffer[index].code
@@ -746,43 +744,100 @@ class TrainingManager internal constructor(
                 }
             }
 
-            if (closed) return Pair(0, totalCharsRead)
-            if (totalCharsRead == 0L) return Pair(0, 0L)
+            if (closed || totalCharsRead == 0L) return Pair(0, totalCharsRead)
 
-            val streamedJsonlChunks = processStagedJsonLinesIfValid(
-                file = stagingFile,
-                documentTitle = title,
-                chunkSize = chunkSize,
-                overlap = overlap,
-                strictJsonLines = strictJsonLines
-            )
-            val processedChunks = streamedJsonlChunks ?: run {
-                // Single-object ChatML, legacy plain text and other formats retain
-                // their document-level parser semantics under the dynamic heap cap.
-                val completeTranscript = readUtf16BeStagingFile(
-                    file = stagingFile,
-                    expectedCharacterCount = totalCharsRead.toInt()
-                )
-                if (completeTranscript.isBlank()) return Pair(0, totalCharsRead)
-
-                validateStreamedJsonValueSizes(completeTranscript)
-                TextModalityProcessor.process(
-                    rawText = completeTranscript,
-                    documentTitle = title,
-                    chunkSize = chunkSize,
-                    overlap = overlap,
-                    tokenizer = neuralEngine.tokenizer
-                )
+            var chunkCount = 0
+            fun writeChunk(output: DataOutputStream, content: String) {
+                if (content.isEmpty()) return
+                output.writeInt(content.length)
+                for (character in content) output.writeChar(character.code)
+                chunkCount = Math.addExact(chunkCount, 1)
             }
-            val rawChunks = processedChunks.map(ProcessedChunk::content)
-            val chunksPerEpoch = rawChunks.size
-            if (chunksPerEpoch == 0) return Pair(0, totalCharsRead)
 
-            val totalScheduledChunks = Math.multiplyExact(chunksPerEpoch, epochs)
-            require(totalScheduledChunks <= MAX_STREAMED_DOCUMENT_CHUNKS) {
-                "Streamed document would create $totalScheduledChunks queue chunks, " +
-                    "exceeding the safe limit of $MAX_STREAMED_DOCUMENT_CHUNKS. " +
-                    "Use a larger chunk size or split the source."
+            // Second pass: produce safe tokenizer-boundary chunks into a disk spool.
+            // This keeps the tokenizer callback synchronous without retaining all chunks
+            // in a Kotlin List or blocking it on Room transactions.
+            BufferedOutputStream(FileOutputStream(chunkStagingFile)).use { chunkBytes ->
+                DataOutputStream(chunkBytes).use { chunkOutput ->
+                    if (strictJsonLines) {
+                        BufferedReader(
+                            InputStreamReader(
+                                FileInputStream(stagingFile),
+                                StandardCharsets.UTF_16BE
+                            ),
+                            8_192
+                        ).use { stagedReader ->
+                            var lineNumber = 0
+                            while (true) {
+                                currentCoroutineContext().ensureActive()
+                                val line = readBoundedJsonLine(stagedReader, MAX_STREAMED_JSON_VALUE_CHARACTERS) ?: break
+                                lineNumber++
+                                val record = line.removePrefix("\uFEFF").trim()
+                                if (record.isEmpty()) continue
+                                require(record.length <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
+                                    "JSONL record $lineNumber exceeds the per-record safety limit of " +
+                                        "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters."
+                                }
+                                require(record.startsWith('{')) {
+                                    "Invalid JSONL record at line $lineNumber: expected a JSON object."
+                                }
+                                val validRecord = runCatching { org.json.JSONObject(record) }.isSuccess
+                                require(validRecord) {
+                                    "Malformed JSONL record at line $lineNumber: expected one complete JSON object."
+                                }
+
+                                val processed = TextModalityProcessor.process(
+                                    rawText = record,
+                                    documentTitle = title,
+                                    chunkSize = chunkSize,
+                                    overlap = overlap,
+                                    tokenizer = neuralEngine.tokenizer
+                                )
+                                for (chunk in processed) writeChunk(chunkOutput, chunk.content)
+                            }
+                        }
+                    } else if (totalCharsRead <= MAX_STREAMED_JSON_VALUE_CHARACTERS.toLong()) {
+                        // Small single-object ChatML/ShareGPT JSON keeps its existing
+                        // semantic formatter. Large files do not need to fit in one String.
+                        val transcript = readUtf16BeStagingFile(
+                            file = stagingFile,
+                            expectedCharacterCount = totalCharsRead.toInt()
+                        )
+                        val trimmed = transcript.trimStart()
+                        if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+                            val processed = TextModalityProcessor.process(
+                                rawText = transcript,
+                                documentTitle = title,
+                                chunkSize = chunkSize,
+                                overlap = overlap,
+                                tokenizer = neuralEngine.tokenizer
+                            )
+                            for (chunk in processed) writeChunk(chunkOutput, chunk.content)
+                        } else {
+                            writeStreamedPlainTextChunks(
+                                file = stagingFile,
+                                title = title,
+                                chunkSize = chunkSize,
+                                overlap = overlap,
+                                output = chunkOutput
+                            ) { count -> chunkCount = Math.addExact(chunkCount, count) }
+                        }
+                    } else {
+                        writeStreamedPlainTextChunks(
+                            file = stagingFile,
+                            title = title,
+                            chunkSize = chunkSize,
+                            overlap = overlap,
+                            output = chunkOutput
+                        ) { count -> chunkCount = Math.addExact(chunkCount, count) }
+                    }
+                }
+            }
+
+            if (chunkCount == 0) return Pair(0, totalCharsRead)
+            val totalScheduledChunks = Math.multiplyExact(chunkCount, epochs)
+            require(totalScheduledChunks > 0) {
+                "The streamed document did not produce any trainable chunks."
             }
 
             val documentId = fingerprintDigest.digest().toHexString()
@@ -795,177 +850,281 @@ class TrainingManager internal constructor(
                 language = language,
                 canonicalUrl = canonicalUrl,
                 characterCount = totalCharsRead.toInt(),
-                chunkCount = chunksPerEpoch,
+                chunkCount = chunkCount,
                 plannedEpochs = epochs,
                 rightsStatus = rightsStatus,
-                status = "READY",
+                status = "IMPORTING",
                 createdAtEpochMs = System.currentTimeMillis(),
                 lastTrainedAtEpochMs = null,
                 completedPassCount = 0
             )
-            val corpusChunks = rawChunks.mapIndexed { index, chunkText ->
-                CorpusChunkEntity(
-                    id = "$documentId:${index + 1}",
-                    documentId = documentId,
-                    chunkIndex = index + 1,
-                    content = chunkText,
-                    characterCount = chunkText.length
-                )
-            }
-
             val activeRepository = requireNotNull(repo) {
                 "Local corpus storage is unavailable; document training was not queued."
             }
-            val stored = activeRepository.storeCorpusDocument(
-                corpusDocument,
-                corpusChunks,
-                sourceProvenance
+            val stored = activeRepository.beginStreamedCorpusDocument(
+                document = corpusDocument,
+                sourceProvenance = sourceProvenance
             )
             if (!stored) {
                 Log.i(TAG, "Duplicate corpus document skipped: $documentId")
                 return Pair(0, totalCharsRead)
             }
+            importedDocumentId = documentId
 
-            val newItems = ArrayList<TrainingData>(totalScheduledChunks)
-            for (epochIndex in 0 until epochs) {
-                rawChunks.forEachIndexed { chunkIndex, chunkText ->
-                    val chunkTitle = if (epochs == 1) {
-                        "$title [Block ${chunkIndex + 1}/$chunksPerEpoch]"
-                    } else {
-                        "$title [Block ${chunkIndex + 1}/$chunksPerEpoch] " +
-                            "[Epoch ${epochIndex + 1}/$epochs]"
+            // Persist corpus text in fixed-size Room batches.
+            val corpusBatch = ArrayList<CorpusChunkEntity>(CORPUS_WRITE_BATCH_SIZE)
+            DataInputStream(BufferedInputStream(FileInputStream(chunkStagingFile))).use { input ->
+                var chunkIndex = 0
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    val characterCount = try {
+                        input.readInt()
+                    } catch (_: EOFException) {
+                        break
                     }
-
-                    newItems += TrainingData(
-                        source = source,
-                        title = chunkTitle,
+                    require(characterCount > 0) {
+                        "A token-safe corpus chunk cannot be empty."
+                    }
+                    val characters = CharArray(characterCount)
+                    for (characterIndex in characters.indices) {
+                        characters[characterIndex] = input.readChar()
+                    }
+                    val chunkText = String(characters)
+                    chunkIndex = Math.addExact(chunkIndex, 1)
+                    corpusBatch += CorpusChunkEntity(
+                        id = "$documentId:$chunkIndex",
+                        documentId = documentId,
+                        chunkIndex = chunkIndex,
                         content = chunkText,
-                        chunkIndex = epochIndex * chunksPerEpoch + chunkIndex + 1,
-                        totalChunks = totalScheduledChunks,
-                        documentTitle = title,
-                        status = TrainingStatus.QUEUED,
-                        documentId = documentId
+                        characterCount = chunkText.length
+                    )
+                    if (corpusBatch.size >= CORPUS_WRITE_BATCH_SIZE) {
+                        activeRepository.appendStreamedCorpusChunks(documentId, corpusBatch)
+                        corpusBatch.clear()
+                    }
+                }
+                require(chunkIndex == chunkCount) {
+                    "Token-safe staging chunk count does not match its manifest."
+                }
+            }
+            if (corpusBatch.isNotEmpty()) {
+                activeRepository.appendStreamedCorpusChunks(documentId, corpusBatch)
+                corpusBatch.clear()
+            }
+
+            // Queue only compact descriptors. Text is loaded from corpus_chunks for the
+            // active training micro-batch, never duplicated into every training_items row.
+            val firstTimestamp = synchronized(queueLock) {
+                maxOf(System.currentTimeMillis(), lastScheduledTimestamp + 1L).also { first ->
+                    lastScheduledTimestamp = Math.addExact(
+                        first,
+                        totalScheduledChunks.toLong() - 1L
                     )
                 }
             }
+            val queueBatch = ArrayList<TrainingData>(CORPUS_WRITE_BATCH_SIZE)
+            var scheduledIndex = 0
+            for (epochIndex in 0 until epochs) {
+                for (chunkIndex in 1..chunkCount) {
+                    currentCoroutineContext().ensureActive()
+                    scheduledIndex = Math.addExact(scheduledIndex, 1)
+                    val chunkTitle = if (epochs == 1) {
+                        "$title [Block $chunkIndex/$chunkCount]"
+                    } else {
+                        "$title [Block $chunkIndex/$chunkCount] [Epoch ${epochIndex + 1}/$epochs]"
+                    }
+                    queueBatch += TrainingData(
+                        source = source,
+                        title = chunkTitle,
+                        content = "",
+                        chunkIndex = scheduledIndex,
+                        totalChunks = totalScheduledChunks,
+                        documentTitle = title,
+                        timestamp = Math.addExact(firstTimestamp, scheduledIndex.toLong() - 1L),
+                        status = TrainingStatus.PERSISTING,
+                        documentId = documentId
+                    )
+                    if (queueBatch.size >= CORPUS_WRITE_BATCH_SIZE) {
+                        activeRepository.saveTrainingItems(queueBatch)
+                        queueBatch.clear()
+                    }
+                }
+            }
+            if (queueBatch.isNotEmpty()) {
+                activeRepository.saveTrainingItems(queueBatch)
+                queueBatch.clear()
+            }
+
+            check(scheduledIndex == totalScheduledChunks) {
+                "Streamed training queue count does not match the imported corpus."
+            }
+            check(
+                activeRepository.completeStreamedCorpusDocument(
+                    documentId = documentId,
+                    expectedQueueItems = totalScheduledChunks
+                ) == totalScheduledChunks
+            ) {
+                "The streamed corpus queue could not be activated."
+            }
+            importCommitted = true
 
             synchronized(queueLock) {
-                if (closed) return Pair(0, totalCharsRead)
-                val orderedItems = appendPersistingQueueItems(newItems)
-
-                if (_activeDocument.value == null && orderedItems.isNotEmpty()) {
+                if (_activeDocument.value == null) {
                     _activeDocument.value = ActiveDocumentTraining(
                         docTitle = title,
                         totalCharacters = totalCharsRead.toInt(),
-                        totalChunks = orderedItems.size,
+                        totalChunks = totalScheduledChunks,
                         completedChunks = 0,
                         currentChunkIndex = 1
                     )
                 }
-                return Pair(orderedItems.size, totalCharsRead)
             }
+            appendPendingQueuePageFromDatabase()
+            wakeupSignal.trySend(Unit)
+            return Pair(totalScheduledChunks, totalCharsRead)
+        } catch (cancelled: CancellationException) {
+            importedDocumentId?.let { documentId ->
+                if (!importCommitted) {
+                    runCatching { repo?.rollbackStreamedCorpusDocument(documentId) }
+                        .onFailure { rollbackError ->
+                            Log.e(TAG, "Could not roll back cancelled streamed import $documentId.", rollbackError)
+                        }
+                }
+            }
+            throw cancelled
+        } catch (error: Throwable) {
+            importedDocumentId?.let { documentId ->
+                if (!importCommitted) {
+                    runCatching { repo?.rollbackStreamedCorpusDocument(documentId) }
+                        .onFailure { rollbackError ->
+                            Log.e(TAG, "Could not roll back failed streamed import $documentId.", rollbackError)
+                        }
+                }
+            }
+            throw error
         } finally {
-            if (stagingFile.exists() && !stagingFile.delete()) {
-                Log.w(TAG, "Could not remove temporary streamed-ingestion file: ${stagingFile.name}")
+            for (file in listOf(stagingFile, chunkStagingFile)) {
+                if (file.exists() && !file.delete()) {
+                    Log.w(TAG, "Could not remove streamed ingestion staging file: ${file.name}")
+                }
             }
         }
     }
 
-    /**
-     * Processes JSONL one complete object per line. In automatic mode a non-JSONL source
-     * returns null so the caller can use the document-level parser. Explicit JSONL imports
-     * fail closed: malformed, mixed-format, or empty streams are rejected before persistence.
-     *
-     * The returned list is bounded by MAX_STREAMED_DOCUMENT_CHUNKS. Each JSONObject is
-     * parsed and released before the next source line is read; conversation objects stay
-     * atomic because TextModalityProcessor receives the full JSON object for each line.
-     */
-    private suspend fun processStagedJsonLinesIfValid(
+    private fun writeStreamedPlainTextChunks(
         file: File,
-        documentTitle: String,
+        title: String,
         chunkSize: Int,
         overlap: Int,
-        strictJsonLines: Boolean
-    ): List<ProcessedChunk>? {
-        val processed = ArrayList<ProcessedChunk>()
-        var foundRecord = false
-        var lineNumber = 0
-
-        BufferedReader(
-            InputStreamReader(
-                FileInputStream(file),
-                StandardCharsets.UTF_16BE
+        output: DataOutputStream,
+        addCount: (Int) -> Unit
+    ) {
+        val sample = CharArray(32 * 1_024)
+        val sampleCount = InputStreamReader(
+            FileInputStream(file),
+            StandardCharsets.UTF_16BE
+        ).use { sampleReader ->
+            var total = 0
+            while (total < sample.size) {
+                val count = sampleReader.read(sample, total, sample.size - total)
+                if (count < 0) break
+                if (count == 0) continue
+                total += count
+            }
+            total
+        }
+        val modality = if (sampleCount == 0) {
+            TextModality.GENERAL_PROSE
+        } else {
+            TextModalityProcessor.detectModality(String(sample, 0, sampleCount))
+        }
+        if (modality == TextModality.CONVERSATION || modality == TextModality.REASONING) {
+            val characterCount = file.length() / 2L
+            require(characterCount in 1..MAX_STREAMED_JSON_VALUE_CHARACTERS.toLong()) {
+                "A single streamed conversation or reasoning sample exceeds " +
+                    "$MAX_STREAMED_JSON_VALUE_CHARACTERS UTF-16 code units. " +
+                    "Split long datasets into complete JSONL records."
+            }
+            val transcript = readUtf16BeStagingFile(
+                file = file,
+                expectedCharacterCount = characterCount.toInt()
             )
-        ).use { reader ->
-            while (true) {
-                currentCoroutineContext().ensureActive()
-                val line = reader.readLine() ?: break
-                lineNumber++
-                val record = line.removePrefix("\uFEFF").trim()
-                if (record.isEmpty()) continue
-                if (!record.startsWith('{')) {
-                    if (strictJsonLines) {
-                        throw IllegalArgumentException(
-                            "Invalid JSONL record at line $lineNumber: expected a JSON object."
-                        )
-                    }
-                    return null
-                }
-                require(record.length <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
-                    "A streamed JSONL record exceeds " +
-                        "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
-                        "Split the record before importing it."
-                }
-
-                validateStreamedJsonValueSizes(record)
-                val isJsonObject = runCatching {
-                    org.json.JSONObject(record)
-                }.isSuccess
-                if (!isJsonObject) {
-                    if (strictJsonLines) {
-                        throw IllegalArgumentException(
-                            "Malformed JSONL record at line $lineNumber: expected one complete JSON object."
-                        )
-                    }
-                    return null
-                }
-                require(processed.size < MAX_STREAMED_DOCUMENT_CHUNKS) {
-                    "JSONL document exceeds the safe limit of " +
-                        "$MAX_STREAMED_DOCUMENT_CHUNKS processed records."
-                }
-
-                foundRecord = true
-                val nextChunks = TextModalityProcessor.process(
-                    rawText = record,
-                    documentTitle = documentTitle,
-                    chunkSize = chunkSize,
-                    overlap = overlap,
-                    tokenizer = neuralEngine.tokenizer
-                )
-                if (nextChunks.isEmpty()) {
-                    if (strictJsonLines) {
-                        throw IllegalArgumentException(
-                            "JSONL record at line $lineNumber did not produce a trainable sample."
-                        )
-                    }
-                    return null
-                }
-                val nextSize = Math.addExact(processed.size, nextChunks.size)
-                require(nextSize <= MAX_STREAMED_DOCUMENT_CHUNKS) {
-                    "JSONL document exceeds the safe limit of " +
-                        "$MAX_STREAMED_DOCUMENT_CHUNKS processed records."
-                }
-                processed.addAll(nextChunks)
+            val processed = TextModalityProcessor.process(
+                rawText = transcript,
+                documentTitle = title,
+                chunkSize = chunkSize,
+                overlap = overlap,
+                tokenizer = neuralEngine.tokenizer
+            )
+            for (chunk in processed) {
+                output.writeInt(chunk.content.length)
+                for (character in chunk.content) output.writeChar(character.code)
             }
+            addCount(processed.size)
+            Log.d(
+                TAG,
+                "Streamed ${processed.size} atomic ${modality.displayName} sample(s) for '$title'."
+            )
+            return
         }
 
-        val completedRecords = processed.takeIf { foundRecord }
-        if (strictJsonLines) {
-            require(completedRecords != null) {
-                "The JSONL file contains no non-empty JSON object records."
+        var emittedChunks = 0
+        InputStreamReader(
+            FileInputStream(file),
+            StandardCharsets.UTF_16BE
+        ).use { sourceReader ->
+            neuralEngine.tokenizer.forEachSafeTextChunk(
+                reader = sourceReader,
+                maxTokensPerChunk = chunkSize,
+                overlapTokens = overlap,
+                literalControlTokens = false,
+                allowSpecialTokens = false
+            ) { chunk ->
+                val trainingText = Tokenizer.escapeLiteralControlTokens(chunk.text)
+                if (trainingText.isNotEmpty()) {
+                    output.writeInt(trainingText.length)
+                    for (character in trainingText) output.writeChar(character.code)
+                    emittedChunks = Math.addExact(emittedChunks, 1)
+                }
             }
         }
-        return completedRecords
+        addCount(emittedChunks)
+        Log.d(TAG, "Streamed $emittedChunks token-safe chunks for '$title' ($modality).")
+    }
+
+
+    private fun readBoundedJsonLine(
+        reader: BufferedReader,
+        maximumCharacters: Int
+    ): String? {
+        require(maximumCharacters > 0) { "maximumCharacters must be positive." }
+        val line = StringBuilder(minOf(maximumCharacters, 4_096))
+        var hasContent = false
+
+        while (true) {
+            val next = reader.read()
+            if (next < 0) return if (hasContent) line.toString() else null
+
+            when (next.toChar()) {
+                '\n' -> return line.toString()
+                '\r' -> {
+                    reader.mark(1)
+                    val following = reader.read()
+                    if (following >= 0 && following.toChar() != '\n') reader.reset()
+                    return line.toString()
+                }
+                else -> {
+                    if (line.length >= maximumCharacters) {
+                        throw IllegalArgumentException(
+                            "A streamed JSONL record exceeds $maximumCharacters UTF-16 characters. " +
+                                "Split the record at a complete JSON object boundary."
+                        )
+                    }
+                    line.append(next.toChar())
+                    hasContent = true
+                }
+            }
+        }
     }
 
     /**
@@ -976,7 +1135,7 @@ class TrainingManager internal constructor(
         file: File,
         expectedCharacterCount: Int
     ): String {
-        require(expectedCharacterCount in 1..MAX_STREAMED_DOCUMENT_CHARACTERS)
+        require(expectedCharacterCount in 1..MAX_STREAMED_JSON_VALUE_CHARACTERS)
         val result = StringBuilder(expectedCharacterCount)
         val byteBuffer = ByteArray(8 * 1024)
         val charBuffer = CharArray(byteBuffer.size / 2)
@@ -1022,52 +1181,6 @@ class TrainingManager internal constructor(
             "Temporary streamed-ingestion character count does not match the source stream."
         }
         return result.toString()
-    }
-
-    private fun validateStreamedJsonValueSizes(text: String) {
-        fun skipWhitespace(start: Int): Int {
-            var index = start
-            while (index < text.length && text[index].isWhitespace()) index++
-            return index
-        }
-
-        var cursor = skipWhitespace(0)
-        if (cursor >= text.length) return
-
-        if (text[cursor] == '[') {
-            val end = TextModalityProcessor.findCompleteJsonValueEnd(text, cursor)
-                ?: throw IllegalArgumentException(
-                    "The streamed JSON array is incomplete. Check its closing brackets."
-                )
-            require(end - cursor <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
-                "A streamed JSON training array exceeds " +
-                    "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
-                    "Use JSONL with one training record per line."
-            }
-            require(skipWhitespace(end) == text.length) {
-                "Unexpected content follows the streamed JSON array."
-            }
-            return
-        }
-
-        if (text[cursor] != '{') return
-
-        while (cursor < text.length) {
-            cursor = skipWhitespace(cursor)
-            if (cursor >= text.length || text[cursor] != '{') return
-
-            val end = TextModalityProcessor.findCompleteJsonValueEnd(text, cursor)
-                ?: throw IllegalArgumentException(
-                    "A streamed JSON training record is incomplete. " +
-                        "Check the final JSONL record or closing JSON braces."
-                )
-            require(end - cursor <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
-                "A streamed JSON training record exceeds " +
-                    "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters. " +
-                    "Use smaller JSONL records."
-            }
-            cursor = end
-        }
     }
 
     /**
@@ -2526,6 +2639,20 @@ class TrainingManager internal constructor(
         }
     }
 
+    private fun removeInterruptedStreamedIngestionFiles() {
+        val abandonedFiles = ingestionStagingDirectory.listFiles().orEmpty().filter { file ->
+            file.isFile && (
+                (file.name.startsWith("argus-ingest-") && file.name.endsWith(".utf16be")) ||
+                    (file.name.startsWith("argus-chunks-") && file.name.endsWith(".bin"))
+                )
+        }
+        for (file in abandonedFiles) {
+            if (!file.delete() && file.exists()) {
+                Log.w(TAG, "Could not remove abandoned streamed-ingestion spool: ${file.name}")
+            }
+        }
+    }
+
     private fun startTrainingWorker() {
         workerJob = scope.launch {
             var validationRunActive = false
@@ -2535,6 +2662,11 @@ class TrainingManager internal constructor(
                 awaitQueuePersistenceIdle()
                 val repository = requireNotNull(repo) {
                     "Training cannot start without durable local queue storage."
+                }
+                removeInterruptedStreamedIngestionFiles()
+                val recoveredImports = repository.recoverIncompleteStreamedCorpusImports()
+                if (recoveredImports > 0) {
+                    Log.w(TAG, "Removed $recoveredImports incomplete streamed corpus imports after process restart.")
                 }
                 val persistedCommitted = repository.getOptimizerCommittedTrainingItemsSnapshot()
                 val interruptedCandidateRun =
@@ -2580,7 +2712,7 @@ class TrainingManager internal constructor(
                     }
 
                     val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
-                    val pending = repository.getPendingQueueSnapshot()
+                    val pending = repository.getPendingQueueSnapshot(QUEUE_PREFETCH_LIMIT)
                     val databaseIds = (committed + pending).mapTo(HashSet()) { it.id }
                     val inMemoryItems = synchronized(queueLock) {
                         _nextQueue.value.filterNot { item -> item.id in databaseIds }
@@ -2615,8 +2747,10 @@ class TrainingManager internal constructor(
                 }
                 wakeupSignal.trySend(Unit)
             } catch (cancelled: CancellationException) {
+                streamedImportStartup.completeExceptionally(cancelled)
                 throw cancelled
             } catch (error: Throwable) {
+                streamedImportStartup.completeExceptionally(error)
                 Log.e(TAG, "Training startup recovery failed.", error)
                 _isTrainingPaused.value = true
                 setConversationalValidationStatus(
@@ -2626,7 +2760,9 @@ class TrainingManager internal constructor(
                 return@launch
             }
 
+            streamedImportStartup.complete(Unit)
             while (isActive && !closed) {
+                refillPendingQueueFromDatabase()
                 if (_isTrainingPaused.value) {
                     combine(_isTrainingPaused, _nextQueue) { paused, queue ->
                         !paused || queue.any {
@@ -3148,6 +3284,122 @@ class TrainingManager internal constructor(
         return item
     }
 
+    /**
+     * Appends the next bounded durable queue page after a streamed import commits.
+     * Existing in-memory items are matched by ID so legacy and disk-backed work
+     * remain one ordered queue without materializing the full corpus queue.
+     */
+    private suspend fun appendPendingQueuePageFromDatabase() {
+        val repository = repo ?: return
+
+        queueRefillMutex.lock()
+        try {
+            awaitQueuePersistenceIdle()
+            val availableCapacity = synchronized(queueLock) {
+                if (closed) return
+                (MAX_IN_MEMORY_QUEUE_ITEMS - _nextQueue.value.size).coerceAtLeast(0)
+            }
+            if (availableCapacity == 0) return
+
+            val page = repository.getPendingQueueSnapshot(MAX_IN_MEMORY_QUEUE_ITEMS)
+            if (page.isEmpty()) return
+
+            synchronized(queueLock) {
+                if (closed) return
+                val existingIds = _nextQueue.value.mapTo(HashSet()) { item -> item.id }
+                val remainingCapacity =
+                    (MAX_IN_MEMORY_QUEUE_ITEMS - _nextQueue.value.size).coerceAtLeast(0)
+                if (remainingCapacity == 0) return@synchronized
+
+                val additions = page
+                    .filterNot { item -> item.id in existingIds }
+                    .take(remainingCapacity)
+                if (additions.isNotEmpty()) {
+                    _nextQueue.value = (_nextQueue.value + additions)
+                        .sortedBy(TrainingData::timestamp)
+                    additions.maxOfOrNull(TrainingData::timestamp)?.let { latest ->
+                        lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
+                    }
+                }
+            }
+        } finally {
+            queueRefillMutex.unlock()
+        }
+    }
+
+    /**
+     * Refill the in-memory queue from a small durable page instead of restoring every
+     * corpus row at once. This path is used for disk-backed streamed imports.
+     */
+    private suspend fun refillPendingQueueFromDatabase() {
+        if (_nextQueue.value.isNotEmpty() || closed) return
+        val repository = repo ?: return
+
+        queueRefillMutex.lock()
+        try {
+            if (_nextQueue.value.isNotEmpty() || closed) return
+            awaitQueuePersistenceIdle()
+
+            val page = repository.getPendingQueueSnapshot(QUEUE_PREFETCH_LIMIT)
+            if (page.isEmpty()) return
+
+            synchronized(queueLock) {
+                val existingIds = _nextQueue.value.mapTo(HashSet()) { item -> item.id }
+                val additions = page.filterNot { item -> item.id in existingIds }
+                if (additions.isNotEmpty()) {
+                    _nextQueue.value = (_nextQueue.value + additions)
+                        .sortedBy(TrainingData::timestamp)
+                    additions.maxOfOrNull(TrainingData::timestamp)?.let { latest ->
+                        lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
+                    }
+                }
+            }
+        } finally {
+            queueRefillMutex.unlock()
+        }
+    }
+
+    /**
+     * Disk-backed queue descriptors intentionally carry empty content. Resolve only
+     * the active micro-batch from corpus_chunks immediately before tokenizer preparation
+     * and the optimizer transaction.
+     */
+    private suspend fun hydrateCorpusQueueItems(
+        items: MutableList<TrainingData>,
+        repository: com.argus.agi.data.repository.ArgusRepository
+    ) {
+        val documents = HashMap<String, CorpusDocumentEntity>()
+        for (index in items.indices) {
+            val item = items[index]
+            val documentId = item.documentId ?: continue
+            if (item.content.isNotEmpty()) continue
+
+            val document = documents[documentId] ?: run {
+                val loaded = repository.getCorpusDocument(documentId)
+                    ?: throw IllegalStateException(
+                        "Training queue references missing corpus document $documentId."
+                    )
+                documents[documentId] = loaded
+                loaded
+            }
+            require(document.datasetSplit == "TRAIN" && document.chunkCount > 0) {
+                "Training queue references a non-training or empty corpus document $documentId."
+            }
+
+            val corpusChunkIndex = ((item.chunkIndex - 1) % document.chunkCount) + 1
+            val chunk = repository.getCorpusChunk(documentId, corpusChunkIndex)
+                ?: throw IllegalStateException(
+                    "Corpus document $documentId is missing chunk $corpusChunkIndex."
+                )
+            items[index] = item.copy(content = chunk.content)
+        }
+
+        items.firstOrNull()?.let { hydratedFirst ->
+            _currentTrainingItem.value = hydratedFirst
+            updateActiveDocumentEntering(hydratedFirst)
+        }
+    }
+
     private fun updateActiveDocumentEntering(item: TrainingData) {
         if (item.documentTitle == null) return
         _activeDocument.update { current ->
@@ -3242,6 +3494,8 @@ class TrainingManager internal constructor(
             _activeDocument.value = null
             return true
         }
+
+        hydrateCorpusQueueItems(items, repository)
 
         items.mapNotNull(TrainingData::documentId)
             .forEach(validationRunDocumentIds::add)

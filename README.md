@@ -203,12 +203,14 @@ Supported imports include plain text, Markdown, JSON/JSONL, CSV/TSV, logs, Kotli
 
 - PDF extraction supports selectable text. Scanned/image-only PDFs are rejected; OCR is not included.
 - DOCX reads the Word document XML body. EPUB follows its package spine order.
-- Archive entry counts, per-entry expansion, total expansion, source file size, and extracted text length are bounded.
-- Reader-based imports are bounded by live app-heap headroom and a 2 Mi UTF-16-code-unit hard cap per document. Actual tokenized chunk count is validated before Room persistence; raw character count is not used as a proxy for language-dependent token density.
-- `Reader` ingestion stages UTF-16BE code units in a temporary cache file using fixed-size buffers. The file is removed after success, rejection, or coroutine cancellation.
-- JSONL is validated and processed one complete object per line, with per-record size and total generated-record limits. JSONL records are persisted only after the entire source has passed validation, so a malformed tail cannot leave a partially imported document.
-- Single-object ChatML/ShareGPT, reasoning, and legacy plain-text inputs retain document-level parsing semantics. Their in-memory parser path is still bounded by the live-heap limit; this is not a constant-memory parser for every format.
-- The active training queue still holds generated chunk records in app memory; the queue itself is not fully disk-backed.
+- Direct Reader imports (plain text, Markdown, CSV/TSV, logs, and source files) are streamed from the content provider. The importer reads fixed-size character buffers, stages the source as UTF-16BE, and computes its SHA-256 fingerprint without constructing one document-sized heap `String`.
+- Plain-text tokenization reads the staged source incrementally. The tokenizer carries an incomplete pre-token across Reader-buffer boundaries and emits chunks only at complete pre-tokenization-safe boundaries. Token-safe chunks are staged to disk before corpus persistence.
+- Strict JSONL/NDJSON import reads and validates one complete object per line. A record is capped at 256 Ki UTF-16 code units while it is being read; the total document has no heap-derived character or record-count limit. Every record is canonicalized and written to the chunk spool before the document is committed, so malformed or oversized records cannot leave a partially active corpus document.
+- Direct Reader documents are bounded by the corpus schema's `Int.MAX_VALUE` UTF-16-code-unit count and available disk/I/O capacity, not by the previous live-heap-derived 675,840-character limit. This is not mathematically unlimited storage.
+- Small single-object JSON documents (including ChatML/ShareGPT) retain the structured in-memory formatter and its 256 Ki UTF-16-code-unit limit. Use JSONL/NDJSON for large collections of independent training records; large single-object JSON is not currently a streaming semantic parser.
+- PDF, DOCX, EPUB, and HTML continue through their structured extractors with live-heap-aware text/input limits. ZIP archives additionally enforce a 1,000-entry ceiling and a disk-expansion budget calculated once per import: 256 MiB is reserved, then at most one quarter of the remaining cache space is assigned to both the per-entry and whole-archive limits. The import is rejected when that safe budget is below 1 MiB; structured entries retain their extractor-specific limits.
+- Corpus chunks and compact training-queue descriptors are persisted to Room in batches of 128. Queue rows remain in Room rather than duplicating each chunk's text in an in-memory list; the worker prefetches a bounded 64-item snapshot and the observable pending queue is capped at 128 rows.
+- Streamed imports use an `IMPORTING` corpus state and `PERSISTING` queue rows. A single final Room transaction activates the complete document and its queue. Startup removes abandoned ingestion spool files and rolls back incomplete `IMPORTING` documents before training resumes; queue-clearing/recovery checks use aggregate SQL rather than materializing the full pending queue.
 
 ### Persistent corpus
 

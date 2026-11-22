@@ -882,6 +882,8 @@ class ArgusAppRobolectricTest {
         try {
             manager.pauseTraining()
             manager.clearQueue()
+            manager.awaitQueuePersistenceIdle()
+            val repository = com.argus.agi.data.repository.ArgusRepository(context)
             // 1. Validasi enqueueDocument memproses seluruh teks sampai selesai tanpa batas blok buatan
             val text = "Paragraf pengujian kelengkapan blok dataset besar. ".repeat(100)
             val count1 = manager.enqueueDocument("Test Source", "Buku Lengkap", text, chunkSize = 120, overlap = 20)
@@ -900,7 +902,16 @@ class ArgusAppRobolectricTest {
             )
             assertTrue("Streaming harus membaca seluruh karakter sampai EOF", streamChars > 0)
             assertTrue("Streaming harus menghasilkan semua blok secara tuntas", streamChunks > 20)
-            assertEquals("Total antrean harus mencakup dokumen pertama dan dokumen streaming", count1 + streamChunks, manager.nextQueue.value.size)
+            manager.awaitQueuePersistenceIdle()
+            assertEquals(
+                "Semua item antrean harus tersimpan secara durable, meskipun halaman RAM dibatasi.",
+                count1 + streamChunks,
+                repository.getPendingTrainingQueueCount()
+            )
+            assertTrue(
+                "Halaman antrean di memori tidak boleh melebihi batas prefetched.",
+                manager.nextQueue.value.size <= 128
+            )
         } finally {
             manager.close()
         }

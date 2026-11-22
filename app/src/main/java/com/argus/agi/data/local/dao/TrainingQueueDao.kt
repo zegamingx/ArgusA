@@ -9,11 +9,23 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface TrainingQueueDao {
-    @Query("SELECT * FROM training_items WHERE status = 'QUEUED' ORDER BY timestamp ASC")
+    @Query("SELECT * FROM training_items WHERE status = 'QUEUED' ORDER BY timestamp ASC LIMIT 128")
     fun getPendingQueue(): Flow<List<TrainingItemEntity>>
 
-    @Query("SELECT * FROM training_items WHERE status = 'QUEUED' ORDER BY timestamp ASC")
-    suspend fun getPendingQueueSnapshot(): List<TrainingItemEntity>
+    @Query("SELECT * FROM training_items WHERE status = 'QUEUED' ORDER BY timestamp ASC LIMIT :limit")
+    suspend fun getPendingQueueSnapshot(limit: Int = 64): List<TrainingItemEntity>
+
+    @Query("SELECT COUNT(*) FROM training_items WHERE status = 'QUEUED'")
+    suspend fun countPendingQueueItems(): Int
+
+    @Query(
+        "UPDATE training_items SET status = 'QUEUED' " +
+            "WHERE documentId = :documentId AND status = 'PERSISTING'"
+    )
+    suspend fun activateStreamedDocumentQueue(documentId: String): Int
+
+    @Query("DELETE FROM training_items WHERE documentId = :documentId AND status = 'PERSISTING'")
+    suspend fun deleteUncommittedStreamedDocumentQueue(documentId: String): Int
 
     @Query(
         "SELECT * FROM training_items WHERE status = 'OPTIMIZER_COMMITTED' ORDER BY timestamp ASC"
@@ -27,10 +39,21 @@ interface TrainingQueueDao {
     suspend fun getActiveCorpusDocumentIds(): List<String>
 
     @Query(
-        "SELECT * FROM training_items " +
-            "WHERE documentId IS NOT NULL AND status IN ('QUEUED', 'TRAINING', 'OPTIMIZER_COMMITTED')"
+        """
+        SELECT documentId
+        FROM training_items
+        WHERE documentId IS NOT NULL
+          AND status IN ('QUEUED', 'TRAINING', 'OPTIMIZER_COMMITTED')
+        GROUP BY documentId
+        HAVING COUNT(*) != 1 OR MAX(
+            CASE
+                WHEN status IN ('TRAINING', 'OPTIMIZER_COMMITTED') AND chunkIndex >= totalChunks THEN 1
+                ELSE 0
+            END
+        ) != 1
+        """
     )
-    suspend fun getActiveCorpusTrainingItems(): List<TrainingItemEntity>
+    suspend fun getInterruptedCorpusDocumentIds(): List<String>
 
     @Query("SELECT * FROM training_items WHERE status = 'COMPLETED' ORDER BY timestamp DESC LIMIT :limit")
     fun getCompletedItems(limit: Int = 50): Flow<List<TrainingItemEntity>>
