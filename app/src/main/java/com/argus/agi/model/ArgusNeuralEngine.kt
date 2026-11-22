@@ -1114,7 +1114,8 @@ class ArgusNeuralEngine private constructor(
         maxNewTokens: Int = 60,
         temperature: Float = 0.7f,
         includeReasoningMarkers: Boolean = false,
-        reasoningMode: Boolean = false
+        reasoningMode: Boolean = false,
+        maxContextTokens: Int = maxSeqLen
     ): GeneratedPolicyRollout = withContext(Dispatchers.Default) {
         val generationContext = currentCoroutineContext()
         generationContext.ensureActive()
@@ -1138,7 +1139,8 @@ class ArgusNeuralEngine private constructor(
             }
 
             val currentVocab = tokenizer.vocabSize
-            val generationWindow = resolveGenerationTokenWindow(maxSeqLen, maxNewTokens)
+            val effectiveContextLength = maxContextTokens.coerceIn(2, maxSeqLen)
+            val generationWindow = resolveGenerationTokenWindow(effectiveContextLength, maxNewTokens)
             val maxPromptLen = generationWindow.promptTokenLimit
             val effective = if (rawTokens.size > maxPromptLen) rawTokens.copyOfRange(rawTokens.size - maxPromptLen, rawTokens.size)
             else rawTokens
@@ -1920,8 +1922,15 @@ class ArgusNeuralEngine private constructor(
         clipEpsilon: Float,
         klCoefficient: Float,
         temperature: Float,
-        ppoEpochs: Int
+        ppoEpochs: Int,
+        runtimeSafetyCheck: () -> Unit = {}
     ): GrpoOptimizerResult {
+        if (!isCheckpointStateVerified) {
+            check(saveCheckpoint()) {
+                "GRPO cannot start because its baseline checkpoint could not be verified."
+            }
+        }
+        try {
         require(samples.size in 2..8)
         require(clipEpsilon.isFinite() && clipEpsilon in 0.01f..0.5f)
         require(klCoefficient.isFinite() && klCoefficient >= 0f)
@@ -1937,6 +1946,7 @@ class ArgusNeuralEngine private constructor(
         }
 
         val result = synchronized(modelLock) {
+            runtimeSafetyCheck()
             check(!checkpointRestoreBlocked) {
                 "GRPO is blocked because the current checkpoint requires explicit recovery."
             }
@@ -1950,10 +1960,12 @@ class ArgusNeuralEngine private constructor(
             var lossCount = 0
 
             repeat(ppoEpochs) {
+                runtimeSafetyCheck()
                 if (config.gradientAccumulationEnabled) {
                     val accumulator = createBatchGradientAccumulator()
                     try {
                         for (sample in samples) {
+                            runtimeSafetyCheck()
                             val loss = trainSingleWindow(
                                 seq = sample.tokenIds,
                                 currentVocab = currentVocab,
@@ -1972,7 +1984,10 @@ class ArgusNeuralEngine private constructor(
                                 lossCount++
                             }
                         }
-                        if (accumulator.targetCount > 0) applyAccumulatedGradients(accumulator)
+                        if (accumulator.targetCount > 0) {
+                            runtimeSafetyCheck()
+                            applyAccumulatedGradients(accumulator)
+                        }
                     } finally {
                         val resident = accumulator.resident
                         if (resident != null) {
@@ -1983,6 +1998,7 @@ class ArgusNeuralEngine private constructor(
                 } else {
                     // Low-memory devices update one rollout at a time.
                     for (sample in samples) {
+                        runtimeSafetyCheck()
                         val loss = trainSingleWindow(
                             seq = sample.tokenIds,
                             currentVocab = currentVocab,
@@ -2018,6 +2034,18 @@ class ArgusNeuralEngine private constructor(
             }
         }
         return result
+        } catch (failure: Throwable) {
+            val restored = runCatching { loadCheckpointIfExists() }.getOrDefault(false)
+            if (!restored) {
+                checkpointStateVerified = false
+                checkpointRestoreBlocked = true
+                throw IllegalStateException(
+                    "GRPO failed and the last verified checkpoint could not be restored. Further training is blocked.",
+                    failure
+                )
+            }
+            throw failure
+        }
     }
 
     private fun computeCrossEntropyLoss(
@@ -2377,24 +2405,19 @@ class ArgusNeuralEngine private constructor(
                 val offset = timeIndex - firstTargetIndex
                 val oldLogProbability = policyObjective.behaviorLogProbabilities[offset]
                 val currentLogProbability = (row[target] / temp - maximum) - ln(denominator)
-                val ratio = exp((currentLogProbability - oldLogProbability).coerceIn(-20f, 20f))
-                val clippedRatio = ratio.coerceIn(lower, upper)
-                val advantage = policyObjective.advantage
-                val surrogate = min(ratio * advantage, clippedRatio * advantage)
-                val isClipped = (advantage >= 0f && ratio > upper) ||
-                    (advantage < 0f && ratio < lower)
-                val surrogateDerivative = if (isClipped) 0f else advantage * ratio
-
-                val oldMinusCurrent = (oldLogProbability - currentLogProbability).coerceIn(-20f, 20f)
-                val reverseKlRatio = exp(oldMinusCurrent)
-                val sampledReverseKl = (reverseKlRatio - oldMinusCurrent - 1f).coerceAtLeast(0f)
-                val tokenLoss = -surrogate + policyObjective.klCoefficient * sampledReverseKl
-                if (!tokenLoss.isFinite()) continue
-                totalLoss += tokenLoss
+                val tokenObjective = calculateGrpoTokenObjective(
+                    oldLogProbability = oldLogProbability,
+                    currentLogProbability = currentLogProbability,
+                    advantage = policyObjective.advantage,
+                    clipEpsilon = policyObjective.clipEpsilon,
+                    klCoefficient = policyObjective.klCoefficient
+                )
+                if (!tokenObjective.loss.isFinite()) continue
+                totalLoss += tokenObjective.loss
                 validSteps++
 
                 val lossDerivativeByLogProbability =
-                    -surrogateDerivative + policyObjective.klCoefficient * (1f - reverseKlRatio)
+                    tokenObjective.derivativeWrtCurrentLogProbability
                 for (vocabularyIndex in 0 until currentVocab) {
                     val derivative = if (vocabularyIndex == target) {
                         1f - probabilities[vocabularyIndex]

@@ -66,8 +66,71 @@ data class GrpoTrainingReport(
     val exactMatchCount: Int,
     val optimizerUpdates: Int,
     val meanReward: Float,
-    val meanPolicyLoss: Float
+    val meanPolicyLoss: Float,
+    val effectiveGroupSize: Int = 4
 )
+
+internal data class GrpoRuntimeBudget(
+    val groupSize: Int,
+    val contextLength: Int,
+    val maxNewTokens: Int
+)
+
+internal data class GrpoTokenObjectiveResult(
+    val loss: Float,
+    val derivativeWrtCurrentLogProbability: Float,
+    val importanceRatio: Float,
+    val klPenalty: Float,
+    val isPolicyClipped: Boolean
+)
+
+/**
+ * Clipped PPO surrogate plus the non-negative k3 estimate of KL(old || current),
+ * sampled from the behavior policy: exp(log(current / old)) - log(current / old) - 1.
+ */
+internal fun calculateGrpoTokenObjective(
+    oldLogProbability: Float,
+    currentLogProbability: Float,
+    advantage: Float,
+    clipEpsilon: Float,
+    klCoefficient: Float
+): GrpoTokenObjectiveResult {
+    require(oldLogProbability.isFinite() && currentLogProbability.isFinite())
+    require(advantage.isFinite())
+    require(clipEpsilon.isFinite() && clipEpsilon in 0.01f..0.5f)
+    require(klCoefficient.isFinite() && klCoefficient >= 0f)
+    val logRatio = (currentLogProbability - oldLogProbability).coerceIn(-20f, 20f)
+    val ratio = kotlin.math.exp(logRatio)
+    val clippedRatio = ratio.coerceIn(1f - clipEpsilon, 1f + clipEpsilon)
+    val surrogate = minOf(ratio * advantage, clippedRatio * advantage)
+    val isClipped = (advantage >= 0f && ratio > 1f + clipEpsilon) ||
+        (advantage < 0f && ratio < 1f - clipEpsilon)
+    val klPenalty = (ratio - logRatio - 1f).coerceAtLeast(0f)
+    val policyDerivative = if (isClipped) 0f else -advantage * ratio
+    return GrpoTokenObjectiveResult(
+        loss = -surrogate + klCoefficient * klPenalty,
+        derivativeWrtCurrentLogProbability = policyDerivative + klCoefficient * (ratio - 1f),
+        importanceRatio = ratio,
+        klPenalty = klPenalty,
+        isPolicyClipped = isClipped
+    )
+}
+
+internal fun computeGroupRelativeAdvantages(rewards: List<Float>): FloatArray? {
+    require(rewards.size in 2..8)
+    require(rewards.all { it.isFinite() && it in 0f..1f })
+    val mean = rewards.average().toFloat()
+    var variance = 0.0
+    rewards.forEach { reward ->
+        val delta = reward.toDouble() - mean.toDouble()
+        variance += delta * delta
+    }
+    val standardDeviation = kotlin.math.sqrt(variance / rewards.size.toDouble()).toFloat()
+    if (!standardDeviation.isFinite() || standardDeviation < 1.0e-6f) return null
+    return FloatArray(rewards.size) { index ->
+        (rewards[index] - mean) / (standardDeviation + 1.0e-6f)
+    }
+}
 
 fun interface GrpoRewardEvaluator {
     fun evaluate(prompt: String, expectedAnswer: String, candidateAnswer: String): Float
@@ -127,10 +190,20 @@ class GrpoTrainer(
     suspend fun train(
         reader: Reader,
         config: GrpoTrainingConfig = GrpoTrainingConfig(),
-        onProgress: (GrpoTrainingProgress) -> Unit = {}
+        onProgress: (GrpoTrainingProgress) -> Unit = {},
+        resolveRuntimeBudget: suspend (GrpoTrainingConfig) -> GrpoRuntimeBudget = {
+            GrpoRuntimeBudget(it.groupSize, neuralEngine.config.maxSeqLen, it.maxNewTokens)
+        },
+        beforeRollout: suspend (GrpoRuntimeBudget) -> Unit = {},
+        beforeGroupUpdate: suspend (GrpoRuntimeBudget) -> Unit = {},
+        runtimeSafetyCheck: (GrpoRuntimeBudget) -> Unit = {}
     ): GrpoTrainingReport {
         val examples = parseGrpoJsonl(reader, config.maxExamples)
         require(examples.isNotEmpty()) { "The GRPO JSONL dataset contains no records." }
+        val runtimeBudget = resolveRuntimeBudget(config)
+        require(runtimeBudget.groupSize in 2..config.groupSize)
+        require(runtimeBudget.contextLength in 2..neuralEngine.config.maxSeqLen)
+        require(runtimeBudget.maxNewTokens in 1..config.maxNewTokens
 
         var trainedGroups = 0
         var skippedGroups = 0
@@ -143,14 +216,16 @@ class GrpoTrainer(
 
         examples.forEachIndexed { index, example ->
             coroutineContext.ensureActive()
-            val rollouts = ArrayList<GeneratedPolicyRollout>(config.groupSize)
-            val rewards = ArrayList<Float>(config.groupSize)
-            repeat(config.groupSize) {
+            val rollouts = ArrayList<GeneratedPolicyRollout>(runtimeBudget.groupSize)
+            val rewards = ArrayList<Float>(runtimeBudget.groupSize)
+            repeat(runtimeBudget.groupSize) {
                 coroutineContext.ensureActive()
+                beforeRollout(runtimeBudget)
                 val rollout = neuralEngine.generatePolicyRollout(
                     prompt = example.prompt,
-                    maxNewTokens = config.maxNewTokens,
-                    temperature = config.temperature
+                    maxNewTokens = runtimeBudget.maxNewTokens,
+                    temperature = config.temperature,
+                    maxContextTokens = runtimeBudget.contextLength
                 )
                 if (
                     rollout.promptTokenIds.isNotEmpty() &&
@@ -175,14 +250,8 @@ class GrpoTrainer(
             if (rollouts.size < 2) {
                 skippedGroups++
             } else {
-                val meanReward = rewards.average().toFloat()
-                var variance = 0.0
-                rewards.forEach { reward ->
-                    val difference = reward.toDouble() - meanReward.toDouble()
-                    variance += difference * difference
-                }
-                val standardDeviation = kotlin.math.sqrt(variance / rewards.size.toDouble()).toFloat()
-                if (!standardDeviation.isFinite() || standardDeviation < ADVANTAGE_EPSILON) {
+                val advantages = computeGroupRelativeAdvantages(rewards)
+                if (advantages == null) {
                     skippedGroups++
                 } else {
                     val samples = rollouts.mapIndexed { responseIndex, rollout ->
@@ -196,16 +265,17 @@ class GrpoTrainer(
                             tokenIds = sequence,
                             firstTargetIndex = rollout.promptTokenIds.lastIndex,
                             behaviorLogProbabilities = rollout.behaviorLogProbabilities,
-                            advantage = (rewards[responseIndex] - meanReward) /
-                                (standardDeviation + ADVANTAGE_EPSILON)
+                            advantage = advantages[responseIndex]
                         )
                     }
+                    beforeGroupUpdate(runtimeBudget)
                     val update = neuralEngine.trainGrpoGroup(
                         samples = samples,
                         clipEpsilon = config.clipEpsilon,
                         klCoefficient = config.klCoefficient,
                         temperature = config.temperature,
-                        ppoEpochs = config.ppoEpochs
+                        ppoEpochs = config.ppoEpochs,
+                        runtimeSafetyCheck = { runtimeSafetyCheck(runtimeBudget) }
                     )
                     if (update.optimizerUpdates > 0) {
                         trainedGroups++
@@ -249,7 +319,8 @@ class GrpoTrainer(
             } else Float.NaN,
             meanPolicyLoss = if (policyLossGroupCount > 0) {
                 (policyLossSum / policyLossGroupCount).toFloat()
-            } else Float.NaN
+            } else Float.NaN,
+            effectiveGroupSize = runtimeBudget.groupSize
         )
     }
 
@@ -258,14 +329,24 @@ class GrpoTrainer(
     }
 }
 
-internal fun parseGrpoJsonl(reader: Reader, maxExamples: Int = 10_000): List<GrpoTrainingExample> {
+internal fun parseGrpoJsonl(
+    reader: Reader,
+    maxExamples: Int = 10_000,
+    maxTotalCharacters: Long = 16L * 1024L * 1024L
+): List<GrpoTrainingExample> {
     require(maxExamples in 1..50_000)
+    require(maxTotalCharacters > 0L)
     val buffered = if (reader is BufferedReader) reader else BufferedReader(reader)
     val examples = ArrayList<GrpoTrainingExample>()
     var lineNumber = 0
+    var totalCharacters = 0L
     while (true) {
         val line = readBoundedGrpoLine(buffered, MAX_GRPO_JSONL_LINE_CHARS) ?: break
         lineNumber++
+        totalCharacters = Math.addExact(totalCharacters, line.length.toLong())
+        require(totalCharacters <= maxTotalCharacters) {
+            "GRPO dataset exceeds the configured $maxTotalCharacters UTF-16 character limit."
+        }
         if (line.isBlank()) continue
         try {
             val record = JSONObject(line)
