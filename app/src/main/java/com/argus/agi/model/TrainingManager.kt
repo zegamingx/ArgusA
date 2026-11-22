@@ -557,8 +557,15 @@ class TrainingManager internal constructor(
 
             val startupGate = CompletableDeferred<Unit>()
             streamedImportStartup = startupGate
-            workerJob = scope.launch {
+            val startedWorker = scope.launch {
                 runTrainingWorker(startupGate)
+            }
+            workerJob = startedWorker
+            startedWorker.invokeOnCompletion { cause ->
+                if (cause != null && cause !is CancellationException && !closed) {
+                    _isTrainingPaused.value = true
+                    Log.e(TAG, "Training worker stopped unexpectedly; Resume can restart it after durable recovery.", cause)
+                }
             }
         } finally {
             workerLifecycleMutex.unlock()
@@ -566,7 +573,9 @@ class TrainingManager internal constructor(
     }
 
     private suspend fun awaitTrainingWorkerReady() {
+        check(!closed) { "Training manager is already closed." }
         ensureTrainingWorkerStarted()
+        check(!closed) { "Training manager is already closed." }
         streamedImportStartup.await()
     }
 
@@ -3389,12 +3398,6 @@ class TrainingManager internal constructor(
                 } finally {
                     workerExecutionMutex.unlock()
                 }
-            }
-        }
-        workerJob?.invokeOnCompletion { cause ->
-            if (cause != null && cause !is CancellationException && !closed) {
-                _isTrainingPaused.value = true
-                Log.e(TAG, "Training worker stopped unexpectedly; Resume can restart it after durable recovery.", cause)
             }
         }
     }
