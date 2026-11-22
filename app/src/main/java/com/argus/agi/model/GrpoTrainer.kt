@@ -70,7 +70,8 @@ data class GrpoTrainingReport(
     val effectiveGroupSize: Int = 4
 )
 
-internal data class GrpoRuntimeBudget(
+/** Memory- and device-adaptive limits selected for one GRPO training run. */
+data class GrpoRuntimeBudget(
     val groupSize: Int,
     val contextLength: Int,
     val maxNewTokens: Int
