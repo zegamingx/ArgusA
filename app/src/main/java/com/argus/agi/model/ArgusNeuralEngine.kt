@@ -610,6 +610,14 @@ class ArgusNeuralEngine private constructor(
         var analyticalGradient: Float = Float.NaN
     )
 
+    private data class PolicyGradientObjective(
+        val behaviorLogProbabilities: FloatArray,
+        val advantage: Float,
+        val clipEpsilon: Float,
+        val klCoefficient: Float,
+        val temperature: Float
+    )
+
     companion object {
         private const val TAG = "ArgusNeuralEngine"
         private const val MAGIC_0 = 0x41.toByte()  // 'A'
@@ -1093,7 +1101,21 @@ class ArgusNeuralEngine private constructor(
         temperature: Float = 0.7f,
         includeReasoningMarkers: Boolean = false,
         reasoningMode: Boolean = false
-    ): String = withContext(Dispatchers.Default) {
+    ): String = generatePolicyRollout(
+        prompt = prompt,
+        maxNewTokens = maxNewTokens,
+        temperature = temperature,
+        includeReasoningMarkers = includeReasoningMarkers,
+        reasoningMode = reasoningMode
+    ).text
+
+    internal suspend fun generatePolicyRollout(
+        prompt: String,
+        maxNewTokens: Int = 60,
+        temperature: Float = 0.7f,
+        includeReasoningMarkers: Boolean = false,
+        reasoningMode: Boolean = false
+    ): GeneratedPolicyRollout = withContext(Dispatchers.Default) {
         val generationContext = currentCoroutineContext()
         generationContext.ensureActive()
         synchronized(modelLock) {
@@ -1106,7 +1128,14 @@ class ArgusNeuralEngine private constructor(
             // PENTING: autoRegister = false saat inference agar kamus token stabil
             val rawTokens = tokenizer.encodeToIds(formattedPrompt, autoRegister = false)
             generationContext.ensureActive()
-            if (rawTokens.isEmpty()) return@withContext "Input kosong."
+            if (rawTokens.isEmpty()) {
+                return@withContext GeneratedPolicyRollout(
+                    text = "Input kosong.",
+                    promptTokenIds = IntArray(0),
+                    completionTokenIds = IntArray(0),
+                    behaviorLogProbabilities = FloatArray(0)
+                )
+            }
 
             val currentVocab = tokenizer.vocabSize
             val generationWindow = resolveGenerationTokenWindow(maxSeqLen, maxNewTokens)
@@ -1115,6 +1144,7 @@ class ArgusNeuralEngine private constructor(
             else rawTokens
             val currentTokens = effective.toMutableList()
             val generatedTokens = mutableListOf<Int>()
+            val generatedLogProbabilities = mutableListOf<Float>()
 
             val kCache = Array(layerCount) { FloatArray(maxSeqLen * dModel) }
             val vCache = Array(layerCount) { FloatArray(maxSeqLen * dModel) }
@@ -1285,10 +1315,16 @@ class ArgusNeuralEngine private constructor(
                     logits[vIdx] = sum
                 }
 
-                val nextToken = sampleLogits(logits, currentVocab, temperature)
+                val sampledToken = sampleLogitsWithLogProbability(
+                    logits = logits,
+                    vocabSize = currentVocab,
+                    temperature = temperature
+                )
+                val nextToken = sampledToken.tokenId
                 if (nextToken == Tokenizer.EOS_ID) break
 
                 generatedTokens.add(nextToken)
+                generatedLogProbabilities.add(sampledToken.logProbability)
                 currentTokens.add(nextToken)
                 currentPos++
             }
@@ -1298,7 +1334,12 @@ class ArgusNeuralEngine private constructor(
                 generatedTokens,
                 keepReasoningTokens = includeReasoningMarkers || reasoningMode
             )
-            if (decoded.isBlank()) "..." else decoded
+            GeneratedPolicyRollout(
+                text = if (decoded.isBlank()) "..." else decoded,
+                promptTokenIds = effective.copyOf(),
+                completionTokenIds = generatedTokens.toIntArray(),
+                behaviorLogProbabilities = generatedLogProbabilities.toFloatArray()
+            )
         }
     }
 
@@ -1874,6 +1915,111 @@ class ArgusNeuralEngine private constructor(
         return result
     }
 
+    internal fun trainGrpoGroup(
+        samples: List<GrpoPolicyTrainingSample>,
+        clipEpsilon: Float,
+        klCoefficient: Float,
+        temperature: Float,
+        ppoEpochs: Int
+    ): GrpoOptimizerResult {
+        require(samples.size in 2..8)
+        require(clipEpsilon.isFinite() && clipEpsilon in 0.01f..0.5f)
+        require(klCoefficient.isFinite() && klCoefficient >= 0f)
+        require(temperature.isFinite() && temperature in 0.1f..2f)
+        require(ppoEpochs in 1..4)
+        samples.forEach { sample ->
+            require(sample.tokenIds.size >= 2)
+            require(sample.firstTargetIndex in 0 until sample.tokenIds.size - 1)
+            require(sample.behaviorLogProbabilities.size ==
+                sample.tokenIds.size - sample.firstTargetIndex - 1)
+            require(sample.behaviorLogProbabilities.all { it.isFinite() })
+            require(sample.advantage.isFinite())
+        }
+
+        val result = synchronized(modelLock) {
+            check(!checkpointRestoreBlocked) {
+                "GRPO is blocked because the current checkpoint requires explicit recovery."
+            }
+            check(computeBackend.synchronizeAuthoritativeState()) {
+                "Model and optimizer tensors must be synchronized before GRPO."
+            }
+            ensureVocabCapacity(tokenizer.vocabSize)
+            val currentVocab = tokenizer.vocabSize
+            val initialAdamStep = adamStep
+            var lossSum = 0.0
+            var lossCount = 0
+
+            repeat(ppoEpochs) {
+                if (config.gradientAccumulationEnabled) {
+                    val accumulator = createBatchGradientAccumulator()
+                    try {
+                        for (sample in samples) {
+                            val loss = trainSingleWindow(
+                                seq = sample.tokenIds,
+                                currentVocab = currentVocab,
+                                firstTargetIndex = sample.firstTargetIndex,
+                                gradientAccumulator = accumulator,
+                                policyObjective = PolicyGradientObjective(
+                                    behaviorLogProbabilities = sample.behaviorLogProbabilities,
+                                    advantage = sample.advantage,
+                                    clipEpsilon = clipEpsilon,
+                                    klCoefficient = klCoefficient,
+                                    temperature = temperature
+                                )
+                            )
+                            if (loss.isFinite()) {
+                                lossSum += loss.toDouble()
+                                lossCount++
+                            }
+                        }
+                        if (accumulator.targetCount > 0) applyAccumulatedGradients(accumulator)
+                    } finally {
+                        val resident = accumulator.resident
+                        if (resident != null) {
+                            VulkanTrainingBackend.discardResidentGradientAccumulator(resident)
+                            accumulator.resident = null
+                        }
+                    }
+                } else {
+                    // Low-memory devices update one rollout at a time.
+                    for (sample in samples) {
+                        val loss = trainSingleWindow(
+                            seq = sample.tokenIds,
+                            currentVocab = currentVocab,
+                            firstTargetIndex = sample.firstTargetIndex,
+                            policyObjective = PolicyGradientObjective(
+                                behaviorLogProbabilities = sample.behaviorLogProbabilities,
+                                advantage = sample.advantage,
+                                clipEpsilon = clipEpsilon,
+                                klCoefficient = klCoefficient,
+                                temperature = temperature
+                            )
+                        )
+                        if (loss.isFinite()) {
+                            lossSum += loss.toDouble()
+                            lossCount++
+                        }
+                    }
+                }
+            }
+
+            GrpoOptimizerResult(
+                meanPolicyLoss = if (lossCount > 0) (lossSum / lossCount).toFloat() else Float.NaN,
+                responseCount = samples.size,
+                targetTokenCount = samples.sumOf {
+                    it.tokenIds.size - it.firstTargetIndex - 1
+                },
+                optimizerUpdates = (adamStep - initialAdamStep).coerceAtLeast(0)
+            )
+        }
+        if (result.optimizerUpdates > 0) {
+            check(saveCheckpoint()) {
+                "GRPO optimizer updates completed, but checkpoint verification failed."
+            }
+        }
+        return result
+    }
+
     private fun computeCrossEntropyLoss(
         logits: Array<FloatArray>,
         sequence: IntArray,
@@ -1923,7 +2069,8 @@ class ArgusNeuralEngine private constructor(
         updateParameters: Boolean = true,
         firstTargetIndex: Int = 0,
         gradientProbe: GradientProbe? = null,
-        gradientAccumulator: BatchGradientAccumulator? = null
+        gradientAccumulator: BatchGradientAccumulator? = null,
+        policyObjective: PolicyGradientObjective? = null
     ): Float {
         val seqLen = seq.size
         if (seqLen < 2) return Float.NaN
@@ -2140,64 +2287,122 @@ class ArgusNeuralEngine private constructor(
 
         val dLogits = Array(seqLen) { FloatArray(currentVocab) }
 
-        // (1) Fused causal cross-entropy and output-head gradient.
-        val targetRows = FloatArray(seqLen) { row ->
-            if (row + 1 < seqLen) seq[row + 1].toFloat() else 0.0f
-        }
-        val stagedLogitGradient = FloatArray(Math.multiplyExact(seqLen, currentVocab))
-        val rowLossStatistics = FloatArray(Math.multiplyExact(seqLen, 2))
-        val crossEntropyOnGpu = VulkanTrainingBackend.isResidentBackwardAvailable &&
-            VulkanTrainingBackend.tryRunResidentBackward(
-                operation = VulkanTrainingBackend.BACKWARD_CROSS_ENTROPY,
-                rows = seqLen,
-                columns = currentVocab,
-                sequenceLength = firstTargetIndex,
-                inputs = arrayOf(flattenRows(logits), targetRows, null),
-                outputs = arrayOf(stagedLogitGradient, rowLossStatistics)
-            )
-        if (crossEntropyOnGpu) {
-            for (time in 0 until seqLen) {
-                System.arraycopy(
-                    stagedLogitGradient,
-                    time * currentVocab,
-                    dLogits[time],
-                    0,
-                    currentVocab
-                )
-                val statisticOffset = time * 2
-                totalLoss += rowLossStatistics[statisticOffset]
-                validSteps += rowLossStatistics[statisticOffset + 1].toInt()
+        if (policyObjective == null) {
+            // (1) Fused causal cross-entropy and output-head gradient.
+            val targetRows = FloatArray(seqLen) { row ->
+                if (row + 1 < seqLen) seq[row + 1].toFloat() else 0.0f
             }
+            val stagedLogitGradient = FloatArray(Math.multiplyExact(seqLen, currentVocab))
+            val rowLossStatistics = FloatArray(Math.multiplyExact(seqLen, 2))
+            val crossEntropyOnGpu = VulkanTrainingBackend.isResidentBackwardAvailable &&
+                VulkanTrainingBackend.tryRunResidentBackward(
+                    operation = VulkanTrainingBackend.BACKWARD_CROSS_ENTROPY,
+                    rows = seqLen,
+                    columns = currentVocab,
+                    sequenceLength = firstTargetIndex,
+                    inputs = arrayOf(flattenRows(logits), targetRows, null),
+                    outputs = arrayOf(stagedLogitGradient, rowLossStatistics)
+                )
+            if (crossEntropyOnGpu) {
+                for (time in 0 until seqLen) {
+                    System.arraycopy(
+                        stagedLogitGradient,
+                        time * currentVocab,
+                        dLogits[time],
+                        0,
+                        currentVocab
+                    )
+                    val statisticOffset = time * 2
+                    totalLoss += rowLossStatistics[statisticOffset]
+                    validSteps += rowLossStatistics[statisticOffset + 1].toInt()
+                }
+            } else {
+                // Numerically equivalent fallback for unsupported or failed Vulkan dispatch.
+                for (t in firstTargetIndex until seqLen - 1) {
+                    val target = seq[t + 1]
+                    if (target !in 0 until currentVocab) continue
+    
+                    val logitRow = logits[t]
+                    var maxLogit = -Float.MAX_VALUE
+                    for (vocabIndex in 0 until currentVocab) {
+                        if (logitRow[vocabIndex] > maxLogit) maxLogit = logitRow[vocabIndex]
+                    }
+    
+                    var sumExp = 0f
+                    for (vocabIndex in 0 until currentVocab) {
+                        sumExp += exp(logitRow[vocabIndex] - maxLogit)
+                    }
+    
+                    val logProbability =
+                        (logitRow[target] - maxLogit) - ln(max(sumExp, 1e-9f))
+                    val loss = -logProbability
+                    if (loss.isFinite()) {
+                        totalLoss += loss
+                        validSteps++
+                    }
+    
+                    val inverseSumExp = 1f / max(sumExp, 1e-9f)
+                    for (vocabIndex in 0 until currentVocab) {
+                        val probability = exp(logitRow[vocabIndex] - maxLogit) * inverseSumExp
+                        val gradient = if (vocabIndex == target) probability - 1f else probability
+                        dLogits[t][vocabIndex] = gradient
+                    }
+                }
+            }
+    
+    
         } else {
-            // Numerically equivalent fallback for unsupported or failed Vulkan dispatch.
-            for (t in firstTargetIndex until seqLen - 1) {
-                val target = seq[t + 1]
+            require(policyObjective.behaviorLogProbabilities.size == seqLen - firstTargetIndex - 1)
+            val temp = policyObjective.temperature.coerceAtLeast(0.1f)
+            val lower = 1f - policyObjective.clipEpsilon
+            val upper = 1f + policyObjective.clipEpsilon
+            for (timeIndex in firstTargetIndex until seqLen - 1) {
+                val target = seq[timeIndex + 1]
                 if (target !in 0 until currentVocab) continue
-
-                val logitRow = logits[t]
-                var maxLogit = -Float.MAX_VALUE
-                for (vocabIndex in 0 until currentVocab) {
-                    if (logitRow[vocabIndex] > maxLogit) maxLogit = logitRow[vocabIndex]
+                val row = logits[timeIndex]
+                var maximum = -Float.MAX_VALUE
+                for (vocabularyIndex in 0 until currentVocab) {
+                    maximum = max(maximum, row[vocabularyIndex] / temp)
                 }
-
-                var sumExp = 0f
-                for (vocabIndex in 0 until currentVocab) {
-                    sumExp += exp(logitRow[vocabIndex] - maxLogit)
+                val probabilities = FloatArray(currentVocab)
+                var denominator = 0f
+                for (vocabularyIndex in 0 until currentVocab) {
+                    val probability = exp((row[vocabularyIndex] / temp - maximum).coerceIn(-50f, 50f))
+                    probabilities[vocabularyIndex] = probability
+                    denominator += probability
                 }
+                if (!denominator.isFinite() || denominator <= 0f) continue
+                for (vocabularyIndex in 0 until currentVocab) probabilities[vocabularyIndex] /= denominator
 
-                val logProbability =
-                    (logitRow[target] - maxLogit) - ln(max(sumExp, 1e-9f))
-                val loss = -logProbability
-                if (loss.isFinite()) {
-                    totalLoss += loss
-                    validSteps++
-                }
+                val offset = timeIndex - firstTargetIndex
+                val oldLogProbability = policyObjective.behaviorLogProbabilities[offset]
+                val currentLogProbability = (row[target] / temp - maximum) - ln(denominator)
+                val ratio = exp((currentLogProbability - oldLogProbability).coerceIn(-20f, 20f))
+                val clippedRatio = ratio.coerceIn(lower, upper)
+                val advantage = policyObjective.advantage
+                val surrogate = min(ratio * advantage, clippedRatio * advantage)
+                val isClipped = (advantage >= 0f && ratio > upper) ||
+                    (advantage < 0f && ratio < lower)
+                val surrogateDerivative = if (isClipped) 0f else advantage * ratio
 
-                val inverseSumExp = 1f / max(sumExp, 1e-9f)
-                for (vocabIndex in 0 until currentVocab) {
-                    val probability = exp(logitRow[vocabIndex] - maxLogit) * inverseSumExp
-                    val gradient = if (vocabIndex == target) probability - 1f else probability
-                    dLogits[t][vocabIndex] = gradient
+                val oldMinusCurrent = (oldLogProbability - currentLogProbability).coerceIn(-20f, 20f)
+                val reverseKlRatio = exp(oldMinusCurrent)
+                val sampledReverseKl = (reverseKlRatio - oldMinusCurrent - 1f).coerceAtLeast(0f)
+                val tokenLoss = -surrogate + policyObjective.klCoefficient * sampledReverseKl
+                if (!tokenLoss.isFinite()) continue
+                totalLoss += tokenLoss
+                validSteps++
+
+                val lossDerivativeByLogProbability =
+                    -surrogateDerivative + policyObjective.klCoefficient * (1f - reverseKlRatio)
+                for (vocabularyIndex in 0 until currentVocab) {
+                    val derivative = if (vocabularyIndex == target) {
+                        1f - probabilities[vocabularyIndex]
+                    } else {
+                        -probabilities[vocabularyIndex]
+                    }
+                    dLogits[timeIndex][vocabularyIndex] =
+                        lossDerivativeByLogProbability * derivative / temp
                 }
             }
         }
@@ -2846,16 +3051,18 @@ class ArgusNeuralEngine private constructor(
                     }
                 }
 
+                // SFT accumulates token sums; GRPO averages each response sequence.
+                val accumulationWeight = if (policyObjective != null) 1 else validSteps
                 val residentAccumulator = gradientAccumulator.resident
                 if (residentAccumulator != null &&
                     VulkanTrainingBackend.accumulateResidentGradients(
                         residentAccumulator,
                         sampleGradients.toTypedArray(),
-                        validSteps
+                        accumulationWeight
                     )) {
                     gradientAccumulator.targetCount = Math.addExact(
                         gradientAccumulator.targetCount,
-                        validSteps
+                        accumulationWeight
                     )
                     return totalLoss / validSteps
                 }
@@ -2880,12 +3087,12 @@ class ArgusNeuralEngine private constructor(
                     val source = sampleGradients[tensorIndex]
                     val destination = gradientAccumulator.gradients[tensorIndex]
                     for (elementIndex in source.indices) {
-                        destination[elementIndex] += source[elementIndex] * validSteps
+                        destination[elementIndex] += source[elementIndex] * accumulationWeight
                     }
                 }
                 gradientAccumulator.targetCount = Math.addExact(
                     gradientAccumulator.targetCount,
-                    validSteps
+                    accumulationWeight
                 )
             }
             return if (validSteps > 0) totalLoss / validSteps else Float.NaN
@@ -3879,6 +4086,41 @@ class ArgusNeuralEngine private constructor(
             val y = (xPreLN[i] - mean) * invStd
             dX[i] = invStd * (dY[i] - sumDY * invDim - y * sumDYY * invDim)
         }
+    }
+
+    private data class SampledToken(val tokenId: Int, val logProbability: Float)
+
+    private fun sampleLogitsWithLogProbability(
+        logits: FloatArray,
+        vocabSize: Int,
+        temperature: Float
+    ): SampledToken {
+        require(vocabSize > 0 && vocabSize <= logits.size)
+        val temp = temperature.coerceAtLeast(0.1f)
+        var maximum = -Float.MAX_VALUE
+        for (index in 0 until vocabSize) maximum = max(maximum, logits[index] / temp)
+        val exponentials = FloatArray(vocabSize)
+        var denominator = 0f
+        for (index in 0 until vocabSize) {
+            val value = exp(((logits[index] / temp) - maximum).coerceIn(-50f, 50f))
+            exponentials[index] = value
+            denominator += value
+        }
+        if (!denominator.isFinite() || denominator <= 0f) {
+            return SampledToken(Tokenizer.EOS_ID, 0f)
+        }
+        val draw = Random.nextFloat() * denominator
+        var cumulative = 0f
+        var selected = vocabSize - 1
+        for (index in 0 until vocabSize) {
+            cumulative += exponentials[index]
+            if (cumulative >= draw) {
+                selected = index
+                break
+            }
+        }
+        val logProbability = (logits[selected] / temp - maximum) - ln(denominator)
+        return SampledToken(selected, logProbability)
     }
 
     private fun sampleLogits(logits: FloatArray, vocabSize: Int, temperature: Float): Int {

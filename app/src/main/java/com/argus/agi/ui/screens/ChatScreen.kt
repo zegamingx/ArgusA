@@ -88,6 +88,7 @@ import com.argus.agi.ui.theme.ArgusTextMuted
 import com.argus.agi.ui.theme.ArgusTextPrimary
 import com.argus.agi.ui.theme.ArgusTextSecondary
 import com.argus.agi.ui.theme.ArgusWarning
+import java.util.Locale
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -100,6 +101,8 @@ fun ChatScreen(viewModel: ArgusViewModel) {
     val messages by viewModel.messages.collectAsState()
     val isGenerating by viewModel.isGenerating.collectAsState()
     val activeDoc by viewModel.activeDocument.collectAsState()
+    val isGrpoTraining by viewModel.isGrpoTraining.collectAsState()
+    val grpoProgress by viewModel.grpoProgress.collectAsState()
     val isListening by viewModel.isListeningVoice.collectAsState()
     val isSpeaking by viewModel.isSpeaking.collectAsState()
     val isAutoSpeak by viewModel.isAutoSpeakEnabled.collectAsState()
@@ -125,6 +128,12 @@ fun ChatScreen(viewModel: ArgusViewModel) {
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let { viewModel.importFileContent(it) }
+    }
+
+    val grpoFilePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        uri?.let { viewModel.importGrpoFileContent(it) }
     }
 
     val mediaPickerLauncher = rememberLauncherForActivityResult(
@@ -176,6 +185,23 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                             showAttachDialog = false
                             filePickerLauncher.launch("*/*")
                         }.padding(12.dp)
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "GRPO JSONL — policy optimization",
+                        color = ArgusCyanPrimary,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(ArgusSurfaceVariant).clickable {
+                            showAttachDialog = false
+                            grpoFilePickerLauncher.launch("*/*")
+                        }.padding(12.dp)
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Uses prompt/answer pairs to sample response groups and optimize the local policy. Requires an idle SFT queue.",
+                        color = ArgusTextMuted,
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
@@ -370,6 +396,57 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                             Spacer(modifier = Modifier.width(10.dp))
                             Text(text = "ARGUS is thinking...", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp), color = ArgusCyanGlow, fontFamily = FontFamily.Monospace)
                         }
+                    }
+                }
+            }
+        }
+
+        // GRPO POLICY TRAINING BANNER
+        AnimatedVisibility(visible = isGrpoTraining) {
+            val progress = grpoProgress
+            val completed = progress?.exampleIndex ?: 0
+            val total = progress?.totalExamples ?: 0
+            val fraction = if (total > 0) completed.toFloat() / total.toFloat() else 0f
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                shape = RoundedCornerShape(12.dp),
+                color = ArgusSurfaceVariant,
+                border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder)
+            ) {
+                Column(modifier = Modifier.padding(10.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "GRPO policy training",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = ArgusCyanPrimary,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = if (total > 0) "$completed/$total prompts" else "Validating dataset",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = ArgusTextMuted,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    androidx.compose.material3.LinearProgressIndicator(
+                        progress = { fraction.coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+                        color = ArgusCyanPrimary,
+                        trackColor = ArgusSurface
+                    )
+                    if (progress != null && progress.generatedResponses > 0) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Groups updated: ${progress.trainedGroups} • Mean reward: " +
+                                if (progress.meanReward.isFinite()) String.format(Locale.US, "%.3f", progress.meanReward) else "n/a",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = ArgusTextSecondary
+                        )
                     }
                 }
             }

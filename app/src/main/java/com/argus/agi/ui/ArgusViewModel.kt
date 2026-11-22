@@ -14,6 +14,8 @@ import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.model.GenesisLifecycleStage
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingManager
+import com.argus.agi.model.GrpoTrainingConfig
+import com.argus.agi.model.GrpoTrainingProgress
 import com.argus.agi.model.TextModalityProcessor
 import com.argus.agi.model.Tokenizer
 import com.argus.agi.model.ReasoningOutputParser
@@ -131,6 +133,11 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
+
+    private val _isGrpoTraining = MutableStateFlow(false)
+    val isGrpoTraining: StateFlow<Boolean> = _isGrpoTraining.asStateFlow()
+    private val _grpoProgress = MutableStateFlow<GrpoTrainingProgress?>(null)
+    val grpoProgress: StateFlow<GrpoTrainingProgress?> = _grpoProgress.asStateFlow()
 
     private val _hardwareInfo = MutableStateFlow(ArgusApp.hardwareInfo)
     val hardwareInfo: StateFlow<SystemHardwareInfo> = _hardwareInfo.asStateFlow()
@@ -826,6 +833,81 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+
+    fun importGrpoFileContent(uri: Uri) {
+        if (_isGrpoTraining.value) return
+        _isGrpoTraining.value = true
+        _grpoProgress.value = GrpoTrainingProgress(
+            exampleIndex = 0,
+            totalExamples = 0,
+            trainedGroups = 0,
+            skippedUniformRewardGroups = 0,
+            generatedResponses = 0,
+            meanReward = Float.NaN,
+            meanPolicyLoss = Float.NaN
+        )
+        viewModelScope.launch(Dispatchers.IO) {
+            val contentResolver = getApplication<Application>().contentResolver
+            var displayName = "GRPO_dataset.jsonl"
+            try {
+                contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (nameIndex >= 0 && cursor.moveToFirst()) {
+                        displayName = cursor.getString(nameIndex) ?: displayName
+                    }
+                }
+                val report = contentResolver.openInputStream(uri)?.use { stream ->
+                    BufferedReader(openImportReader(stream, strictUtf8 = true), 16_384).use { reader ->
+                        trainingManager.trainGrpoJsonl(
+                            reader = reader,
+                            config = GrpoTrainingConfig(),
+                            onProgress = { progress -> _grpoProgress.value = progress }
+                        )
+                    }
+                } ?: throw IOException("Unable to open the selected GRPO JSONL file.")
+
+                withContext(Dispatchers.Main) {
+                    appendMessage(
+                        ChatMessage(
+                            isUser = false,
+                            text = "GRPO training completed for '$displayName'.\n\n" +
+                                "Records: ${report.recordCount}\n" +
+                                "Groups updated: ${report.trainedGroupCount}\n" +
+                                "Groups skipped (uniform reward): ${report.skippedUniformRewardGroups}\n" +
+                                "Generated responses: ${report.generatedResponses}\n" +
+                                "Exact matches: ${report.exactMatchCount}\n" +
+                                "Optimizer updates: ${report.optimizerUpdates}\n" +
+                                "Mean reward: ${formatGrpoMetric(report.meanReward)}\n" +
+                                "Mean policy loss: ${formatGrpoMetric(report.meanPolicyLoss)}",
+                            thinkReasoning = "Prompt/answer records were used as verifier pairs. " +
+                                "ARGUS generated response groups and applied clipped GRPO policy updates locally."
+                        )
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.e(TAG, "GRPO JSONL import or training failed.", error)
+                withContext(Dispatchers.Main) {
+                    appendMessage(
+                        ChatMessage(
+                            isUser = false,
+                            text = "GRPO training failed for '$displayName': ${error.message}",
+                            thinkReasoning = "GRPO import/training failure: ${error.javaClass.simpleName}"
+                        )
+                    )
+                }
+            } finally {
+                withContext(Dispatchers.Main) {
+                    _isGrpoTraining.value = false
+                    _grpoProgress.value = null
+                }
+            }
+        }
+    }
+
+    private fun formatGrpoMetric(value: Float): String =
+        if (value.isFinite()) String.format(Locale.US, "%.4f", value) else "n/a"
 
     /**
      * JSONL is a structured interchange format, so invalid UTF-8 must not be silently

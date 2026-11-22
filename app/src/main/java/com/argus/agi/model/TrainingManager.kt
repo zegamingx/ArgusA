@@ -190,6 +190,7 @@ class TrainingManager internal constructor(
         private const val MAX_IN_MEMORY_QUEUE_ITEMS = 128
         private const val CORPUS_WRITE_BATCH_SIZE = 128
         private const val IDLE_POLL_MS = 500L
+        private const val GRPO_ACTIVE_ITEM_DRAIN_TIMEOUT_MS = 5 * 60 * 1000L
         private const val SCREEN_SOURCE_PREFIX = "ScreenTrainingV2 ("
         private const val LEGACY_SCREEN_SOURCE_PREFIX = "Screen ("
         private const val SCREEN_PRIVACY_PREFERENCES = "argus_excluded_apps"
@@ -216,6 +217,7 @@ class TrainingManager internal constructor(
     @Volatile
     private var screenTrainingPurgePending = false
     private val corpusSchedulingMutex = Mutex()
+    private val grpoTrainingMutex = Mutex()
     private val seedSchedulingMutex = Mutex()
     private val queueRefillMutex = Mutex()
     private var lastScheduledTimestamp: Long = System.currentTimeMillis()
@@ -362,6 +364,48 @@ class TrainingManager internal constructor(
             )
         }
         startTrainingWorker()
+    }
+
+    suspend fun trainGrpoJsonl(
+        reader: Reader,
+        config: GrpoTrainingConfig = GrpoTrainingConfig(),
+        onProgress: (GrpoTrainingProgress) -> Unit = {}
+    ): GrpoTrainingReport {
+        grpoTrainingMutex.lock()
+        val wasPaused = _isTrainingPaused.value
+        try {
+            check(!closed) { "Training manager is already closed." }
+            streamedImportStartup.await()
+            pauseTraining()
+            withTimeout(GRPO_ACTIVE_ITEM_DRAIN_TIMEOUT_MS) {
+                _currentTrainingItem.first { it == null }
+            }
+            awaitQueuePersistenceIdle()
+
+            val activeRepository = requireNotNull(repo) {
+                "Durable local training storage is unavailable."
+            }
+            val hasQueuedMemoryItems = _nextQueue.value.any {
+                it.status != TrainingStatus.OPTIMIZER_COMMITTED
+            }
+            val hasPendingDatabaseItems =
+                activeRepository.getPendingQueueSnapshot(1).isNotEmpty()
+            val hasCommittedDatabaseItems =
+                activeRepository.getOptimizerCommittedTrainingItemsSnapshot().isNotEmpty()
+            check(
+                !hasQueuedMemoryItems &&
+                    !hasPendingDatabaseItems &&
+                    !hasCommittedDatabaseItems &&
+                    _currentTrainingItem.value == null
+            ) {
+                "GRPO requires an idle SFT queue. Finish or clear queued SFT work before starting policy optimization."
+            }
+
+            return GrpoTrainer(neuralEngine).train(reader, config, onProgress)
+        } finally {
+            if (!wasPaused && !closed) resumeTraining()
+            grpoTrainingMutex.unlock()
+        }
     }
 
     fun pauseTraining() {
