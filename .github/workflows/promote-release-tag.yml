@@ -1,0 +1,125 @@
+name: Promote approved Release tag
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/promote-release-tag.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: argus-release-tag-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: ${{ github.ref == 'refs/heads/main' && github.event.head_commit.message == 'release: promote approved Release tag' }}
+    name: Promote the approved commit and dispatch Release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+
+    steps:
+      - name: Checkout current main with tag-write credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Verify one-time tag promotion preconditions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_OLD_TAG: 1664f2292367c8ee0c9590c06654f7475d58c0ae
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          main_commit="$(git rev-parse refs/remotes/origin/main)"
+          if [[ "$main_commit" != "$GITHUB_SHA" ]]; then
+            echo "::error::main advanced after the approved promotion commit. Refusing to move Release."
+            exit 1
+          fi
+
+          git fetch --force origin refs/tags/Release:refs/tags/Release
+          current_tag="$(git rev-parse 'refs/tags/Release^{commit}')"
+          if [[ "$current_tag" != "$EXPECTED_OLD_TAG" && "$current_tag" != "$GITHUB_SHA" ]]; then
+            echo "::error::Release moved to an unexpected commit ($current_tag). Refusing to overwrite it."
+            exit 1
+          fi
+
+          release_response="$RUNNER_TEMP/argus-release-existing.json"
+          http_status="$(curl --silent --show-error \
+            --output "$release_response" \
+            --write-out '%{http_code}' \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/Release")"
+
+          case "$http_status" in
+            200)
+              if jq -e '[.assets[]?.name] | index("ARGUS.apk") != null' "$release_response" >/dev/null; then
+                echo "::error::ARGUS.apk is already published. Refusing to rebuild or replace the production APK."
+                exit 1
+              fi
+              ;;
+            404)
+              echo "No existing GitHub Release exists for the Release tag."
+              ;;
+            *)
+              echo "::error::Could not verify existing Release assets (HTTP $http_status)."
+              cat "$release_response"
+              exit 1
+              ;;
+          esac
+
+          if [[ "$current_tag" == "$EXPECTED_OLD_TAG" ]]; then
+            git push \
+              --force-with-lease="refs/tags/Release:$EXPECTED_OLD_TAG" \
+              origin \
+              "$GITHUB_SHA:refs/tags/Release"
+          else
+            echo "Release already points to this exact approved commit; continuing idempotently."
+          fi
+
+          git fetch --force origin refs/tags/Release:refs/tags/Release
+          promoted_commit="$(git rev-parse 'refs/tags/Release^{commit}')"
+          if [[ "$promoted_commit" != "$GITHUB_SHA" ]]; then
+            echo "::error::Release promotion verification failed."
+            exit 1
+          fi
+          echo "Release now points to the approved main commit $GITHUB_SHA."
+
+      - name: Dispatch the production workflow using the Release tag ref
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          response="$RUNNER_TEMP/argus-release-dispatch.json"
+          http_status="$(curl --silent --show-error \
+            --output "$response" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            --data '{"ref":"Release"}' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/argus-installable-release.yml/dispatches")"
+
+          if [[ "$http_status" != "200" ]]; then
+            echo "::error::Unable to dispatch the production release workflow (HTTP $http_status)."
+            cat "$response"
+            exit 1
+          fi
+
+          workflow_run_id="$(jq -er '.workflow_run_id' "$response")"
+          echo "Dispatched the production release workflow on refs/tags/Release."
+          echo "Production release run: $workflow_run_id"
