@@ -640,8 +640,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         require(maxNewMerges > 0) { "maxNewMerges must be positive." }
         val current = state
         val target = minOf(targetVocabSize, config.maxVocabularySize)
-        val requestedMerges = (target - current.nextId).coerceAtLeast(0)
-            .coerceAtMost(maxNewMerges)
+        val requestedMerges = if (current.nextId < target) maxNewMerges else 0
         var lastFraction = 0f
         var learnedMerges = 0
         var currentVocabularySize = current.nextId
@@ -765,6 +764,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         val wordSymbols = LinkedHashMap<String, MutableList<String>>(wordFrequencies.size)
         val totalWords = wordFrequencies.size.toLong()
         var builtWords = 0L
+        val symbolReportInterval = maxOf(32L, totalWords / 32L)
         report(
             stage = TokenizerTrainingStage.BUILDING_SYMBOLS,
             fraction = 0.15f,
@@ -779,7 +779,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             }
             wordSymbols[word] = symbols
             builtWords++
-            if (builtWords % 32L == 0L || builtWords == totalWords) {
+            if (builtWords % symbolReportInterval == 0L || builtWords == totalWords) {
                 report(
                     stage = TokenizerTrainingStage.BUILDING_SYMBOLS,
                     fraction = 0.15f + 0.15f * builtWords.toFloat() / totalWords.toFloat(),
@@ -790,6 +790,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         }
 
         val totalReplayOperations = candidate.merges.size.toLong() * totalWords
+        val replayReportInterval = maxOf(128L, totalReplayOperations / 32L)
         var replayedOperations = 0L
         report(
             stage = TokenizerTrainingStage.REPLAYING_EXISTING_MERGES,
@@ -803,7 +804,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 applyMerge(symbols, merge.left, merge.right, combined)
                 replayedOperations++
                 if (
-                    replayedOperations % 128L == 0L ||
+                    replayedOperations % replayReportInterval == 0L ||
                     replayedOperations == totalReplayOperations
                 ) {
                     val ratio = replayedOperations.toFloat() /
@@ -824,6 +825,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             totalItems = totalReplayOperations
         )
 
+        val wordScanReportInterval = maxOf(16L, totalWords / 8L)
         while (candidate.nextId < target && learnedMerges < maxNewMerges) {
             val pairCounts = HashMap<MergePair, Long>()
             var scannedWords = 0L
@@ -847,7 +849,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                     }
                 }
                 scannedWords++
-                if (scannedWords % 16L == 0L || scannedWords == totalWords) {
+                if (scannedWords % wordScanReportInterval == 0L || scannedWords == totalWords) {
                     val passProgress = (
                         learnedMerges.toFloat() +
                             scannedWords.toFloat() / totalWords.coerceAtLeast(1L).toFloat()
