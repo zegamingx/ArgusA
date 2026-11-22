@@ -44,6 +44,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -88,6 +89,7 @@ import com.argus.agi.ui.theme.ArgusTextMuted
 import com.argus.agi.ui.theme.ArgusTextPrimary
 import com.argus.agi.ui.theme.ArgusTextSecondary
 import com.argus.agi.ui.theme.ArgusWarning
+import java.text.NumberFormat
 import java.util.Locale
 import kotlinx.coroutines.launch
 
@@ -103,6 +105,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
     val activeDoc by viewModel.activeDocument.collectAsState()
     val isGrpoTraining by viewModel.isGrpoTraining.collectAsState()
     val grpoProgress by viewModel.grpoProgress.collectAsState()
+    val streamedImportProgress by viewModel.streamedImportProgress.collectAsState()
     val isListening by viewModel.isListeningVoice.collectAsState()
     val isSpeaking by viewModel.isSpeaking.collectAsState()
     val isAutoSpeak by viewModel.isAutoSpeakEnabled.collectAsState()
@@ -315,6 +318,99 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                                 Toast.makeText(context, "Chat cleared", Toast.LENGTH_SHORT).show()
                             }.background(ArgusSurfaceVariant).padding(horizontal = 10.dp, vertical = 5.dp)
                         )
+                    }
+                }
+            }
+        }
+
+        // STREAMED DOCUMENT IMPORT PROGRESS
+        streamedImportProgress?.let { import ->
+            val progressFraction = import.totalChunks?.takeIf { total -> total > 0 }?.let { total ->
+                (import.chunksProcessed.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+            } ?: if (import.stage.isTerminal && import.stage.displayName == "Import completed") {
+                1f
+            } else {
+                null
+            }
+            val statusColor = when (import.stage) {
+                com.argus.agi.model.StreamedImportStage.COMPLETED -> ArgusSuccess
+                com.argus.agi.model.StreamedImportStage.FAILED,
+                com.argus.agi.model.StreamedImportStage.CANCELLED -> ArgusWarning
+                else -> ArgusCyanPrimary
+            }
+
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 5.dp),
+                shape = RoundedCornerShape(14.dp),
+                color = ArgusSurfaceVariant
+            ) {
+                Column(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = import.stage.displayName,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = statusColor,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = import.documentTitle,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = ArgusTextPrimary,
+                                maxLines = 1
+                            )
+                        }
+                        if (!import.stage.isTerminal) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                color = ArgusCyanPrimary,
+                                strokeWidth = 2.dp
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "${NumberFormat.getIntegerInstance(Locale.US).format(import.charactersRead)} characters read • " +
+                            if (import.totalChunks != null) {
+                                "${import.chunksProcessed}/${import.totalChunks} chunks"
+                            } else {
+                                "${import.chunksProcessed} chunks staged"
+                            },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ArgusTextSecondary,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    if (progressFraction != null) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        LinearProgressIndicator(
+                            progress = { progressFraction },
+                            modifier = Modifier.fillMaxWidth().height(4.dp),
+                            color = statusColor,
+                            trackColor = ArgusSurface
+                        )
+                    }
+                    import.detail?.let { detail ->
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = detail,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (import.stage == com.argus.agi.model.StreamedImportStage.FAILED) {
+                                ArgusWarning
+                            } else {
+                                ArgusTextSecondary
+                            }
+                        )
+                    }
+                    if (import.stage.isTerminal) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            TextButton(onClick = viewModel::dismissStreamedImportProgress) {
+                                Text("Dismiss", color = ArgusCyanPrimary)
+                            }
+                        }
                     }
                 }
             }
