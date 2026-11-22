@@ -515,10 +515,10 @@ class CorpusPersistenceTest {
         try {
             manager.pauseTraining()
             val taggedReasoningRecord =
-                """{"text":"Soal: Dalam konteks kalimat 'Pemandangan di desa itu sangat indah.', apa padanan dekat kata 'indah'?\\nTuliskan penalaran di dalam tag <think> dan jawaban akhir di dalam tag <answer>.\\nJawab: <think>Padanan dekat 'indah' adalah 'elok'.</think><answer>elok</answer>"}"""
+                """{"text":"Soal: Dalam konteks kalimat 'Pemandangan di desa itu sangat indah.', apa padanan dekat kata 'indah'?\nTuliskan penalaran di dalam tag <think> dan jawaban akhir di dalam tag <answer>.\nJawab: <think>Padanan dekat 'indah' adalah 'elok'.</think><answer>elok</answer>"}"""
             val promptAnswerRecord =
                 """{"prompt":"What is 15 multiplied by 5?","answer":"75"}"""
-            val records = listOf(taggedReasoningRecord, promptAnswerRecord).joinToString("\\n")
+            val records = listOf(taggedReasoningRecord, promptAnswerRecord).joinToString("\n")
 
             val result = manager.enqueueDocumentStream(
                 source = "Mixed SFT JSONL regression",
