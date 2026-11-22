@@ -45,45 +45,24 @@ new tests can use JUnit Jupiter. AndroidX instrumentation dependencies remain
 on their AndroidX/JUnit 4 runner path; JUnit 6 is not placed on the
 instrumentation runtime for the API 34 minimum-device tier.
 
-## Local builds
+## Local verification
 
-Build a debug APK:
-
-```bash
-./gradlew :app:assembleDebug
-```
-
-For a direct local export, use:
+Routine local validation must not generate an APK. Run only the release-variant
+lint and unit tests:
 
 ```bash
-./gradlew :app:exportDebugApk
+./gradlew :app:lintRelease :app:testReleaseUnitTest
 ```
 
-This writes `ARGUS.apk` in the repository root. It is signed automatically with
-the machine-local Android Debug Keystore and is intended for local development.
-Keep that debug keystore stable on the development machine if the APK must
-update an earlier debug installation. A debug-signed APK cannot update an
-Argus 2026 release-signed installation.
-
-Run release-variant checks and build the unsigned intermediate APK:
-
-```bash
-./gradlew :app:lintRelease :app:testReleaseUnitTest :app:assembleRelease
-```
-
-The unsigned intermediate is not an installable app and is not published as a
-download artifact. `./gradlew :app:exportReleaseApk` intentionally writes
-`ARGUS-unsigned.apk`, never `ARGUS.apk`.
-
-Installable release artifacts are produced only by the protected
-`Argus Production Release` workflow from the `Release` tag. It refuses a stale
-tag unless it points to the exact current `main` commit. Before Gradle starts,
-the workflow detects the actual active keystore format (JKS, JCEKS or PKCS#12) and
-validates the store password, private-key password, alias, and pinned Argus
-2026 certificate fingerprint. It then runs release lint/tests and exactly one
-`assembleRelease`, verifies 16 KiB ZIP alignment, and publishes one
-`ARGUS.apk` with its checksum and manifest. It does not publish a CI APK or
-an additional Actions APK artifact.
+Do not run debug assembly, standalone release assembly, or APK export tasks.
+The installable application is produced only by the protected
+`Argus Production Release` workflow from the approved `Release` tag. The tag
+must point to the exact approved `main` commit. The workflow validates the active
+protected keystore secret, passwords, alias, and pinned Argus 2026 certificate;
+it then runs release lint/tests, performs exactly one `assembleRelease`, signs
+and verifies the APK, and publishes one `ARGUS.apk` with its checksum and
+build manifest. No debug APK, unsigned APK, or additional Actions APK artifact
+is published.
 
 ## GitHub releases and installable builds
 
