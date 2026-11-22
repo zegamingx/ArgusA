@@ -77,6 +77,7 @@ import coil3.compose.rememberAsyncImagePainter
 import com.argus.agi.R
 import com.argus.agi.ui.ArgusViewModel
 import com.argus.agi.ui.ChatMessage
+import com.argus.agi.model.StreamedImportStage
 import com.argus.agi.ui.theme.ArgusBlueAccent
 import com.argus.agi.ui.theme.ArgusCardBorder
 import com.argus.agi.ui.theme.ArgusCyanGlow
@@ -327,15 +328,15 @@ fun ChatScreen(viewModel: ArgusViewModel) {
         streamedImportProgress?.let { import ->
             val progressFraction = import.totalChunks?.takeIf { total -> total > 0 }?.let { total ->
                 (import.chunksProcessed.toFloat() / total.toFloat()).coerceIn(0f, 1f)
-            } ?: if (import.stage.isTerminal && import.stage.displayName == "Import completed") {
+            } ?: if (import.stage == StreamedImportStage.COMPLETED) {
                 1f
             } else {
                 null
             }
             val statusColor = when (import.stage) {
-                com.argus.agi.model.StreamedImportStage.COMPLETED -> ArgusSuccess
-                com.argus.agi.model.StreamedImportStage.FAILED,
-                com.argus.agi.model.StreamedImportStage.CANCELLED -> ArgusWarning
+                StreamedImportStage.COMPLETED -> ArgusSuccess
+                StreamedImportStage.FAILED,
+                StreamedImportStage.CANCELLED -> ArgusWarning
                 else -> ArgusCyanPrimary
             }
 
@@ -398,7 +399,7 @@ fun ChatScreen(viewModel: ArgusViewModel) {
                         Text(
                             text = detail,
                             style = MaterialTheme.typography.bodySmall,
-                            color = if (import.stage == com.argus.agi.model.StreamedImportStage.FAILED) {
+                            color = if (import.stage == StreamedImportStage.FAILED) {
                                 ArgusWarning
                             } else {
                                 ArgusTextSecondary
