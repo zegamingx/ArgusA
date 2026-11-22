@@ -644,6 +644,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             .coerceAtMost(maxNewMerges)
         var lastFraction = 0f
         var learnedMerges = 0
+        var currentVocabularySize = current.nextId
 
         fun report(
             stage: TokenizerTrainingStage,
@@ -661,11 +662,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                     totalItems = totalItems.coerceAtLeast(0L),
                     learnedMerges = learnedMerges,
                     targetMerges = requestedMerges,
-                    vocabularySize = if (stage == TokenizerTrainingStage.COMPLETED) {
-                        current.nextId + learnedMerges
-                    } else {
-                        current.nextId + learnedMerges
-                    }
+                    vocabularySize = currentVocabularySize
                 )
             )
         }
@@ -877,6 +874,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
             if (!candidate.tokenToId.containsKey(combined)) {
                 registerToken(candidate, combined)
+                currentVocabularySize = candidate.nextId
             }
             val rank = candidate.merges.size
             candidate.merges += bestPair
