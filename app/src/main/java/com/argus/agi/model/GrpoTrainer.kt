@@ -203,7 +203,7 @@ class GrpoTrainer(
         val runtimeBudget = resolveRuntimeBudget(config)
         require(runtimeBudget.groupSize in 2..config.groupSize)
         require(runtimeBudget.contextLength in 2..neuralEngine.config.maxSeqLen)
-        require(runtimeBudget.maxNewTokens in 1..config.maxNewTokens
+        require(runtimeBudget.maxNewTokens in 1..config.maxNewTokens)
 
         var trainedGroups = 0
         var skippedGroups = 0

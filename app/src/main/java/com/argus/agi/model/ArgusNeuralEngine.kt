@@ -2382,8 +2382,6 @@ class ArgusNeuralEngine private constructor(
         } else {
             require(policyObjective.behaviorLogProbabilities.size == seqLen - firstTargetIndex - 1)
             val temp = policyObjective.temperature.coerceAtLeast(0.1f)
-            val lower = 1f - policyObjective.clipEpsilon
-            val upper = 1f + policyObjective.clipEpsilon
             for (timeIndex in firstTargetIndex until seqLen - 1) {
                 val target = seq[timeIndex + 1]
                 if (target !in 0 until currentVocab) continue

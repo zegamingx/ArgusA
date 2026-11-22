@@ -100,7 +100,7 @@ class GrpoTrainerTest {
         val records = listOf(
             JSONObject().put("prompt", "first prompt").put("answer", "first answer").toString(),
             JSONObject().put("prompt", "second prompt").put("answer", "second answer").toString()
-        ).joinToString("\\n")
+        ).joinToString("\n")
         val failure = runCatching {
             parseGrpoJsonl(StringReader(records), maxTotalCharacters = 32L)
         }.exceptionOrNull()

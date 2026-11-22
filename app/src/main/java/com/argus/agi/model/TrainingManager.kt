@@ -8,6 +8,7 @@ import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.data.local.entity.TrainingReplaySessionEntity
 import com.argus.agi.runtime.DeviceAdaptiveRuntimePolicy
+import com.argus.agi.runtime.RuntimeConfiguration
 import com.argus.agi.runtime.RuntimeConfigurationPlanner
 import com.argus.agi.runtime.RuntimeDeferReason
 import com.argus.agi.runtime.RuntimeModelConstraints
