@@ -21,6 +21,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -557,7 +558,7 @@ class TrainingManager internal constructor(
 
             val startupGate = CompletableDeferred<Unit>()
             streamedImportStartup = startupGate
-            val startedWorker = scope.launch {
+            val startedWorker = scope.launch(start = CoroutineStart.LAZY) {
                 runTrainingWorker(startupGate)
             }
             workerJob = startedWorker
@@ -567,6 +568,7 @@ class TrainingManager internal constructor(
                     Log.e(TAG, "Training worker stopped unexpectedly; Resume can restart it after durable recovery.", cause)
                 }
             }
+            startedWorker.start()
         } finally {
             workerLifecycleMutex.unlock()
         }
