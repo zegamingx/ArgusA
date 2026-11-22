@@ -204,6 +204,9 @@ class GrpoTrainer(
         require(runtimeBudget.groupSize in 2..config.groupSize)
         require(runtimeBudget.contextLength in 2..neuralEngine.config.maxSeqLen)
         require(runtimeBudget.maxNewTokens in 1..config.maxNewTokens)
+        check(neuralEngine.saveCheckpoint()) {
+            "GRPO cannot begin until the current model and optimizer state have a verified checkpoint."
+        }
 
         var trainedGroups = 0
         var skippedGroups = 0
