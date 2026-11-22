@@ -27,7 +27,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -71,26 +71,26 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
 
     val totalParams = viewModel.getTotalParameters()
     val adapterBytes = viewModel.getAdapterSizeBytes()
-    val isPaused by viewModel.isTrainingPaused.collectAsState()
-    val safetyState by viewModel.safetyState.collectAsState()
-    val hardwareInfo by viewModel.hardwareInfo.collectAsState()
+    val isPaused by viewModel.isTrainingPaused.collectAsStateWithLifecycle()
+    val safetyState by viewModel.safetyState.collectAsStateWithLifecycle()
+    val hardwareInfo by viewModel.hardwareInfo.collectAsStateWithLifecycle()
     val inferenceCapacity = remember(hardwareInfo.availRamGb) {
         DeviceModelCapacityPolicy.recommend(hardwareInfo.availRamGb.toDouble())
     }
-    val currentItem by viewModel.currentTrainingItem.collectAsState()
-    val nextQueue by viewModel.nextQueue.collectAsState()
-    val completedQueue by viewModel.completedQueue.collectAsState()
-    val lossHistory by viewModel.lossHistory.collectAsState()
-    val totalSteps by viewModel.totalStepsExecuted.collectAsState()
-    val trainingMetrics by viewModel.trainingMetrics.collectAsState()
-    val activeDoc by viewModel.activeDocument.collectAsState()
-    val tokenizerTraining by viewModel.tokenizerTrainingProgress.collectAsState()
-    val conversationalValidation by viewModel.conversationalValidationState.collectAsState()
+    val currentItem by viewModel.currentTrainingItem.collectAsStateWithLifecycle()
+    val nextQueue by viewModel.nextQueue.collectAsStateWithLifecycle()
+    val completedQueue by viewModel.completedQueue.collectAsStateWithLifecycle()
+    val lossHistory by viewModel.lossHistory.collectAsStateWithLifecycle()
+    val totalSteps by viewModel.totalStepsExecuted.collectAsStateWithLifecycle()
+    val trainingMetrics by viewModel.trainingMetrics.collectAsStateWithLifecycle()
+    val activeDoc by viewModel.activeDocument.collectAsStateWithLifecycle()
+    val tokenizerTraining by viewModel.tokenizerTrainingProgress.collectAsStateWithLifecycle()
+    val conversationalValidation by viewModel.conversationalValidationState.collectAsStateWithLifecycle()
     val vocabSize = trainingMetrics.vocabularySize
-    val worldEntities by viewModel.worldEntities.collectAsState()
+    val worldEntities by viewModel.worldEntities.collectAsStateWithLifecycle()
     val modelConfig = viewModel.engineConfig
     val backendState = viewModel.activeComputeBackend
-    val computeBackendStatus by viewModel.computeBackendStatus.collectAsState()
+    val computeBackendStatus by viewModel.computeBackendStatus.collectAsStateWithLifecycle()
     val activeDocument = activeDoc
     val activeTrainingItem = currentItem
 
