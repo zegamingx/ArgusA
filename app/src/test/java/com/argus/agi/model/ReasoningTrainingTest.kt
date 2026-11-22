@@ -3,6 +3,7 @@ package com.argus.agi.model
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import java.io.File
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -59,6 +60,97 @@ class ReasoningTrainingTest {
         assertTrue(decodedWithReasoning.contains(Tokenizer.THINK_START))
         assertTrue(decodedWithReasoning.contains(Tokenizer.THINK_END))
         assertFalse(decodedWithReasoning.contains(Tokenizer.USER_TOKEN))
+    }
+
+    @Test
+    fun textWrappedReasoningAndPromptAnswerJsonlAreNormalizedForSft() {
+        val firstText = """
+            Soal: Dalam konteks kalimat 'Pemandangan di desa itu sangat indah.', apa padanan dekat kata 'indah'?
+            Tuliskan penalaran di dalam tag <think> dan jawaban akhir di dalam tag <answer>.
+            Jawab: <think>Padanan dekat 'indah' pada konteks ini adalah 'elok'.</think><answer>elok</answer>
+        """.trimIndent()
+        val secondText = """
+            Soal: Susun kalimat-kalimat berikut menjadi paragraf yang runtut berdasarkan hubungan waktu dan makna:
+            - Dina memilih buku yang ingin dipinjam.
+            - Ia membawa buku tersebut ke meja layanan.
+            - Petugas mencatat peminjaman pada sistem.
+            - Dina menerima buku dan membawanya pulang.
+            Tuliskan penalaran di dalam tag <think> dan jawaban akhir di dalam tag <answer>.
+            Jawab: <think>Urutkan tindakan dari memilih buku hingga menerima buku yang telah dicatat.</think><answer>Dina memilih buku, membawa buku ke meja layanan, petugas mencatat peminjaman, lalu Dina menerima buku.</answer>
+        """.trimIndent()
+        val taggedRecords = listOf(
+            JSONObject().put("text", firstText).toString(),
+            JSONObject().put("text", secondText).toString(),
+            JSONObject()
+                .put("prompt", "What is 15 multiplied by 5?")
+                .put("answer", "75")
+                .toString()
+        )
+        val jsonl = taggedRecords.joinToString("\n")
+
+        val formattedRecords = requireNotNull(
+            TextModalityProcessor.formatTrainingDatasetRecords(jsonl)
+        )
+        assertEquals(3, formattedRecords.size)
+
+        val firstFormatted = formattedRecords[0]
+        assertTrue(firstFormatted.startsWith(Tokenizer.USER_TOKEN))
+        assertTrue(firstFormatted.contains("apa padanan dekat kata 'indah'?"))
+        assertTrue(firstFormatted.contains("Padanan dekat 'indah'"))
+        assertTrue(firstFormatted.contains("elok"))
+        assertFalse(firstFormatted.contains("Tuliskan penalaran"))
+        assertTrue(firstFormatted.contains(Tokenizer.THINK_START))
+        assertTrue(firstFormatted.contains(Tokenizer.THINK_END))
+        assertTrue(firstFormatted.endsWith(Tokenizer.EOS_TOKEN))
+
+        val secondFormatted = formattedRecords[1]
+        assertTrue(secondFormatted.contains("Dina memilih buku yang ingin dipinjam."))
+        assertTrue(secondFormatted.contains("Petugas mencatat peminjaman pada sistem."))
+        assertTrue(
+            secondFormatted.contains(
+                "berdasarkan hubungan waktu dan makna:\n- Dina memilih buku yang ingin dipinjam."
+            )
+        )
+        assertFalse(secondFormatted.contains("Tuliskan penalaran"))
+        assertTrue(secondFormatted.contains(Tokenizer.THINK_START))
+        assertTrue(secondFormatted.contains(Tokenizer.THINK_END))
+
+        val grpoFormatted = formattedRecords[2]
+        assertTrue(grpoFormatted.startsWith(Tokenizer.USER_TOKEN))
+        assertTrue(grpoFormatted.contains("What is 15 multiplied by 5?"))
+        assertTrue(grpoFormatted.contains("75"))
+        assertFalse(grpoFormatted.contains(Tokenizer.THINK_START))
+
+        val chunks = TextModalityProcessor.process(
+            rawText = jsonl,
+            documentTitle = "Mixed SFT JSONL",
+            chunkSize = 512,
+            overlap = 0
+        )
+        assertEquals(
+            listOf(
+                TextModality.REASONING,
+                TextModality.REASONING,
+                TextModality.CONVERSATION
+            ),
+            chunks.map { it.modality }
+        )
+        assertEquals(3, chunks.size)
+    }
+
+    @Test
+    fun malformedTextWrappedReasoningDoesNotPassStructuredTrainingValidation() {
+        val malformed = JSONObject()
+            .put(
+                "text",
+                "Soal: Add two numbers.\nJawab: <think>Incomplete reasoning</think><answer></answer>"
+            )
+            .toString()
+
+        assertEquals(
+            null,
+            TextModalityProcessor.formatTrainingDatasetRecords(malformed)
+        )
     }
 
     @Test
@@ -276,7 +368,12 @@ class ReasoningTrainingTest {
                 )
             )
             val sample = TextModalityProcessor.process(
-                rawText = """{"instruction":"Add 2 and 3.","reasoning":["Identify the two values.","Add 2 + 3."],"response":"5."}""",
+                rawText = JSONObject().put(
+                    "text",
+                    "Soal: Add 2 and 3.\n" +
+                        "Tuliskan penalaran di dalam tag <think> dan jawaban akhir di dalam tag <answer>.\n" +
+                        "Jawab: <think>Identify the two values. Add 2 + 3.</think><answer>5.</answer>"
+                ).toString(),
                 documentTitle = "Reasoning smoke test",
                 chunkSize = 512,
                 overlap = 0

@@ -27,6 +27,65 @@ JSON object and a JSON array of training objects are also accepted. Each record 
 include a non-empty `instruction`/`prompt`/`question` and a non-empty
 `response`/`completion`/`answer`.
 
+A text-wrapped reasoning record is also accepted when one JSONL object contains a
+`text` string with an explicit `Jawab:` or `Answer:` output boundary, followed
+by exactly one non-empty `<think>...</think>` section and one non-empty
+`<answer>...</answer>` section. A leading `Soal:`, `Pertanyaan:`,
+`Question:`, or `Prompt:` label is removed from the user prompt. The known
+instruction line asking the author to place content inside the two tags is omitted
+from the prompt; other prompt lines, including multiline bullet lists, are preserved.
+Tag spellings mentioned before the output boundary are treated as prompt text, not
+as the reasoning or answer payload.
+
+For example:
+
+```json
+{
+  "text": "Soal: Solve the proportion.\nTuliskan penalaran di dalam tag <think> dan jawaban akhir di dalam tag <answer>.\\nJawab: <think>Calculate the ratio.</think><answer>2:1</answer>"
+}
+```
+
+Records using only `prompt` and `answer` remain valid SFT examples when
+imported through the regular document action. To use them for policy optimization,
+choose the dedicated GRPO import action described below.
+
+## Group Relative Policy Optimization (GRPO)
+
+GRPO is a separate objective, not an alias for the supervised next-token
+cross-entropy queue. Use the explicit **GRPO JSONL — policy optimization**
+import action for rows containing non-empty string `prompt` and `answer`
+fields. The regular document import action continues to treat these rows as SFT.
+
+For each prompt, ARGUS samples a configurable response group from the current
+local policy. The default `ReferenceAnswerReward` scores generated responses
+against the supplied answer: normalized exact matches receive 1.0 and
+non-exact responses receive token-level F1. This is a deterministic answer-key
+verifier, not a learned reward model. It is appropriate only when textual
+comparison to the supplied answer is a meaningful quality signal. A custom
+`GrpoRewardEvaluator` can provide a task-specific verifier.
+
+Rewards are normalized within each prompt group to produce group-relative
+advantages. The model then applies a clipped policy-ratio objective and a
+sampled reverse-KL penalty against behavior log-probabilities frozen at rollout
+time. No critic/value network is trained. Groups with uniform rewards are
+skipped because they have no relative advantage signal. The behavior policy
+captured for each group is its KL reference in this initial implementation;
+it is not a permanently frozen copy of the pre-training model.
+
+The importer validates the entire JSONL file before the first optimizer update.
+Each row must contain string `prompt` and `answer` values. Each line is
+bounded to 256 Ki UTF-16 characters, and the default run is capped at 10,000
+examples. GRPO requires an idle SFT queue and saves a verified checkpoint after
+each group that updates the optimizer. Defaults: group size 4, 2 PPO epochs,
+temperature 0.8, clip epsilon 0.2, KL coefficient 0.02, and up to 32 generated
+tokens per response. These are initial values, not optimal settings for every
+device or task.
+
+The supplied `grpo` file contains prompt/answer pairs, not precomputed
+completion groups or reward labels. ARGUS samples groups on-device and uses
+`answer` as the reference-verifier target. This is GRPO-style policy
+optimization, not supervised imitation of the answer column.
+
 File and ZIP imports use bounded streaming ingestion. Use JSONL (one complete object
 per line) for larger datasets. A single streamed JSON object or pretty-printed array
 is buffered as one structured value and is limited to 256 KiB; larger collections
