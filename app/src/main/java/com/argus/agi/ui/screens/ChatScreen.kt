@@ -53,7 +53,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -101,16 +101,16 @@ fun ChatScreen(viewModel: ArgusViewModel) {
     val clipboard = LocalClipboard.current
     val clipboardScope = rememberCoroutineScope()
 
-    val messages by viewModel.messages.collectAsState()
-    val isGenerating by viewModel.isGenerating.collectAsState()
-    val activeDoc by viewModel.activeDocument.collectAsState()
-    val isGrpoTraining by viewModel.isGrpoTraining.collectAsState()
-    val grpoProgress by viewModel.grpoProgress.collectAsState()
-    val streamedImportProgress by viewModel.streamedImportProgress.collectAsState()
-    val isListening by viewModel.isListeningVoice.collectAsState()
-    val isSpeaking by viewModel.isSpeaking.collectAsState()
-    val isAutoSpeak by viewModel.isAutoSpeakEnabled.collectAsState()
-    val partialSpeech by viewModel.partialTranscription.collectAsState()
+    val messages by viewModel.messages.collectAsStateWithLifecycle()
+    val isGenerating by viewModel.isGenerating.collectAsStateWithLifecycle()
+    val activeDoc by viewModel.activeDocument.collectAsStateWithLifecycle()
+    val isGrpoTraining by viewModel.isGrpoTraining.collectAsStateWithLifecycle()
+    val grpoProgress by viewModel.grpoProgress.collectAsStateWithLifecycle()
+    val streamedImportProgress by viewModel.streamedImportProgress.collectAsStateWithLifecycle()
+    val isListening by viewModel.isListeningVoice.collectAsStateWithLifecycle()
+    val isSpeaking by viewModel.isSpeaking.collectAsStateWithLifecycle()
+    val isAutoSpeak by viewModel.isAutoSpeakEnabled.collectAsStateWithLifecycle()
+    val partialSpeech by viewModel.partialTranscription.collectAsStateWithLifecycle()
     val totalParams = viewModel.getTotalParameters()
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
