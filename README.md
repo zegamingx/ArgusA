@@ -75,11 +75,15 @@ The unsigned intermediate is not an installable app and is not published as a
 download artifact. `./gradlew :app:exportReleaseApk` intentionally writes
 `ARGUS-unsigned.apk`, never `ARGUS.apk`.
 
-Installable release artifacts are produced by the protected
-`Argus Installable Release` workflow after changes reach `main`. The workflow
-signs with the Argus 2026 PKCS#12 identity, checks the pinned certificate
-fingerprint, validates 16 KiB ZIP alignment, and uploads only the final
-`ARGUS.apk` plus its checksum and manifest.
+Installable release artifacts are produced only by the protected
+`Argus Production Release` workflow from the `Release` tag. It refuses a stale
+tag unless it points to the exact current `main` commit. Before Gradle starts,
+the workflow detects the actual active keystore format (JKS or PKCS#12) and
+validates the store password, private-key password, alias, and pinned Argus
+2026 certificate fingerprint. It then runs release lint/tests and exactly one
+`assembleRelease`, verifies 16 KiB ZIP alignment, and publishes one
+`ARGUS.apk` with its checksum and manifest. It does not publish a CI APK or
+an additional Actions APK artifact.
 
 ## GitHub releases and installable builds
 
@@ -97,19 +101,23 @@ updates signed with that same key:
   signed by the exposed certificate. Back up app data before changing signing
   identity or package installation.
 
-The private PKCS#12 keystore and passwords must remain offline or in protected
-GitHub Environment secrets. Never commit them or upload them as build
-artifacts. Configure these one-time Environment secrets under
+The active Argus 2026 private keystore and passwords must remain offline or
+inside protected GitHub Environment secrets. Do not substitute an archived
+or retired keystore, commit private key material, or upload it as a build
+artifact. Configure these Environment secrets under
 **Settings → Environments → argus-release**:
 
-- `ARGUS_RELEASE_KEYSTORE_BASE64`: base64 encoding of the existing Argus 2026
-  PKCS#12 keystore.
+- `ARGUS_RELEASE_KEYSTORE_BASE64`: base64 encoding of the currently approved
+  Argus 2026 private keystore. The release workflow detects whether it is JKS
+  or PKCS#12; the file extension does not determine its format.
 - `ARGUS_RELEASE_STORE_PASSWORD`: keystore password.
 - `ARGUS_RELEASE_KEY_PASSWORD`: private-key password.
 
-The alias is pinned to `argus-release-2026` in the workflow. Restrict the
-Environment deployment branch to `main`; add required reviewers if the
-repository's release policy requires approval.
+The private-key alias is pinned to `argus-release-2026`, and the certificate
+must match SHA-256
+`40969E172BC0F8CB18ED2DDF274CAF3D3DB1456EDAEAF03939C0C0511797E64E`.
+Restrict the Environment deployment rule to the approved `Release` tag; add
+required reviewers if the repository's release policy requires approval.
 
 The `Argus Installable Release` workflow runs after relevant changes reach
 `main`. It performs release lint and unit tests, builds the native release

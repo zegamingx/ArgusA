@@ -27,31 +27,38 @@ and future updates signed with the same key:
   identity. Existing installations signed by the old certificate cannot be
   updated with this signer. Back up local app data before changing identity.
 
-Keep the PKCS#12 keystore and both passwords offline. For automated release
-builds, store them only as protected GitHub Environment secrets in the
-`argus-release` Environment:
+Keep the active Argus 2026 private keystore and both passwords offline. For
+automated release builds, store them only as protected GitHub Environment
+secrets in the `argus-release` Environment. The release workflow detects JKS
+or PKCS#12 from the keystore bytes, verifies both passwords, the private-key
+alias, and the pinned certificate before Gradle starts:
 
 - `ARGUS_RELEASE_KEYSTORE_BASE64`
 - `ARGUS_RELEASE_STORE_PASSWORD`
 - `ARGUS_RELEASE_KEY_PASSWORD`
 
-Restrict the Environment to the `main` branch and apply required reviewers
-where appropriate. The private key must never enter Git, pull-request jobs,
-Actions artifacts, caches, logs, or public issues. The workflow checks out only
-trusted `main` source for signing; PR validation has no access to release
+Restrict the Environment deployment rule to the approved `Release` tag and
+apply required reviewers where appropriate. The private key must never enter
+Git, pull-request jobs, Actions artifacts, caches, logs, or public issues.
+The production workflow checks out the `Release` tag and verifies that its
+commit exactly matches trusted `main`; PR validation has no access to release
 signing secrets.
 
-The `tools/security/sign-release.sh` helper decodes the protected PKCS#12
-secret into a short-lived permission-restricted temporary directory, aligns
+The `tools/security/verify-release-keystore.sh` preflight validates the
+current keystore format, both passwords, private-key alias, and pinned
+certificate before Gradle starts. The `tools/security/sign-release.sh`
+helper then decodes the same protected secret into a short-lived
+permission-restricted temporary directory, detects JKS or PKCS#12, aligns
 native libraries for 16 KiB pages, signs with v1/v2/v3 schemes, verifies the
 APK with `apksigner`, checks the pinned certificate fingerprint, and confirms
 the expected package ID before writing the final APK. Temporary key material is
 removed on exit.
 
 For local Windows signing, use `tools/security/sign-release.ps1` with the
-official Android SDK `zipalign` and `apksigner` tools. The helper also checks
-the expected certificate fingerprint and verifies the final APK before
-publishing it. Never store the PKCS#12 keystore or passwords in the repository.
+official Android SDK `zipalign` and `apksigner` tools. It detects JKS or
+PKCS#12, checks the expected certificate fingerprint, and verifies the final
+APK before publishing it. Never store the private keystore or passwords in
+the repository.
 
 ## Screen privacy
 
