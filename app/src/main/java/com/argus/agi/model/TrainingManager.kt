@@ -3145,7 +3145,7 @@ class TrainingManager internal constructor(
         }
 
         startupGate.complete(Unit)
-        while (isActive && !closed) {
+        while (currentCoroutineContext().isActive && !closed) {
                 refillPendingQueueFromDatabase()
                 if (_isTrainingPaused.value) {
                     combine(_isTrainingPaused, _nextQueue) { paused, queue ->
