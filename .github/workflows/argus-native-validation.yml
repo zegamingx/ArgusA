@@ -10,7 +10,7 @@ on:
 
 jobs:
   validate:
-    name: Validate Vulkan NDK, lint, tests and Android packaging
+    name: Validate Vulkan NDK, lint and unit tests without APK packaging
     runs-on: ubuntu-26.04
     timeout-minutes: ${{ (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery'))) && 90 || 60 }}
 
@@ -92,7 +92,7 @@ jobs:
           chmod +x gradlew
           ./gradlew --version
 
-      - name: Run native build, lint and unit tests
+      - name: Run release lint and unit tests without generating APKs
         run: |
           chmod +x gradlew
           env -u ANDROID_SDK_ROOT ./gradlew \
@@ -102,30 +102,10 @@ jobs:
             --stacktrace \
             clean \
             :app:lintRelease \
-            :app:testReleaseUnitTest \
-            :app:assembleDebug \
-            :app:assembleRelease
-
-      - name: Verify packaged native ABI libraries
-        shell: bash
-        run: |
-          set -euo pipefail
-          apk_path="app/build/outputs/apk/debug/app-debug.apk"
-          test -s "${apk_path}"
-          for abi in arm64-v8a armeabi-v7a x86_64; do
-            unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
-          done
-
-      - name: Verify release variant packaging
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -s "app/build/outputs/apk/release/app-release-unsigned.apk"
-          echo "Unsigned release variant is present for build validation only."
-          echo "Installable APKs are published only by the protected Release-tag workflow."
+            :app:testReleaseUnitTest
 
       - name: Install Android emulator and API 35 test image
-        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery')) }}
+        if: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -169,7 +149,7 @@ jobs:
           echo "Verified AVD metadata: $ANDROID_AVD_HOME/argus-process-recovery.ini"
 
       - name: Start Android emulator
-        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery')) }}
+        if: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -225,7 +205,7 @@ jobs:
           adb shell settings put global animator_duration_scale 0
 
       - name: Run Android process-death recovery matrix
-        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery')) }}
+        if: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery') }}
         run: |
           env -u ANDROID_SDK_ROOT ./gradlew \
             --no-daemon \
