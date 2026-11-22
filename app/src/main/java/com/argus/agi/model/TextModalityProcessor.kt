@@ -51,6 +51,12 @@ object TextModalityProcessor {
         val separator: String
     )
 
+    private data class TaggedReasoningRecord(
+        val instruction: String,
+        val reasoning: String,
+        val response: String
+    )
+
     private fun rolePayloadAfterHeader(line: String, headerEnd: Int): String {
         val payloadStart = if (headerEnd < line.length && line[headerEnd] == ' ') {
             headerEnd + 1
@@ -123,6 +129,15 @@ object TextModalityProcessor {
 
     private val BULLET_LINE_REGEX = Regex("^[\\-\\*\\+•●▪◦‣⁃]\\s+.*")
     private val NUMBERED_LINE_REGEX = Regex("^\\d+[.)]\\s+.*")
+
+    private val TAGGED_TEXT_ANSWER_HEADER_PATTERN =
+        Regex("(?im)^[\\t ]*(?:Jawab|Answer)[\\t ]*:[\\t ]*")
+    private val TAGGED_TEXT_PROMPT_HEADER_PATTERN =
+        Regex("^[\\t ]*(?:Soal|Pertanyaan|Question|Prompt)[\\t ]*:", RegexOption.IGNORE_CASE)
+    private val TAGGED_TEXT_THINK_START_PATTERN = Regex("<think>", RegexOption.IGNORE_CASE)
+    private val TAGGED_TEXT_THINK_END_PATTERN = Regex("</think>", RegexOption.IGNORE_CASE)
+    private val TAGGED_TEXT_ANSWER_START_PATTERN = Regex("<answer>", RegexOption.IGNORE_CASE)
+    private val TAGGED_TEXT_ANSWER_END_PATTERN = Regex("</answer>", RegexOption.IGNORE_CASE)
 
     /**
      * Explicit, lossy typography normalization for callers that deliberately opt in.
@@ -315,6 +330,91 @@ object TextModalityProcessor {
         return ""
     }
 
+    /**
+     * Parses datasets that store the complete example in a single "text" field.
+     *
+     * The source may mention <think>/<answer> in its prompt instructions. Only tags
+     * after an explicit Jawab:/Answer: header are treated as output structure.
+     */
+    private fun extractTextWrappedReasoningRecord(text: String): TaggedReasoningRecord? {
+        val source = text.trim()
+        if (source.isEmpty()) return null
+
+        val answerHeader = TAGGED_TEXT_ANSWER_HEADER_PATTERN.findAll(source).lastOrNull()
+            ?: return null
+        val responseSection = source.substring(answerHeader.range.last + 1)
+
+        val thinkStarts = TAGGED_TEXT_THINK_START_PATTERN.findAll(responseSection).toList()
+        val thinkEnds = TAGGED_TEXT_THINK_END_PATTERN.findAll(responseSection).toList()
+        val answerStarts = TAGGED_TEXT_ANSWER_START_PATTERN.findAll(responseSection).toList()
+        val answerEnds = TAGGED_TEXT_ANSWER_END_PATTERN.findAll(responseSection).toList()
+        if (
+            thinkStarts.size != 1 ||
+            thinkEnds.size != 1 ||
+            answerStarts.size != 1 ||
+            answerEnds.size != 1
+        ) {
+            return null
+        }
+
+        val thinkStart = thinkStarts.single()
+        val thinkEnd = thinkEnds.single()
+        val answerStart = answerStarts.single()
+        val answerEnd = answerEnds.single()
+        if (
+            thinkStart.range.first >= thinkEnd.range.first ||
+            thinkEnd.range.last >= answerStart.range.first ||
+            answerStart.range.first >= answerEnd.range.first
+        ) {
+            return null
+        }
+        if (
+            responseSection.substring(0, thinkStart.range.first).isNotBlank() ||
+            responseSection.substring(thinkEnd.range.last + 1, answerStart.range.first).isNotBlank() ||
+            responseSection.substring(answerEnd.range.last + 1).isNotBlank()
+        ) {
+            return null
+        }
+
+        val promptLines = source.substring(0, answerHeader.range.first)
+            .lineSequence()
+            .filterNot(::isTaggedReasoningInstructionLine)
+            .toMutableList()
+        if (promptLines.isEmpty()) return null
+
+        val firstPromptLine = promptLines.first()
+        val promptHeader = TAGGED_TEXT_PROMPT_HEADER_PATTERN.find(firstPromptLine)
+        if (promptHeader != null) {
+            promptLines[0] = firstPromptLine.substring(promptHeader.range.last + 1)
+        }
+
+        val instruction = promptLines.joinToString("\\n").trim()
+        val reasoning = responseSection.substring(
+            thinkStart.range.last + 1,
+            thinkEnd.range.first
+        ).trim()
+        val response = responseSection.substring(
+            answerStart.range.last + 1,
+            answerEnd.range.first
+        ).trim()
+        if (instruction.isBlank() || reasoning.isBlank() || response.isBlank()) return null
+
+        return TaggedReasoningRecord(
+            instruction = instruction,
+            reasoning = reasoning,
+            response = response
+        )
+    }
+
+    private fun isTaggedReasoningInstructionLine(line: String): Boolean {
+        val candidate = line.trim()
+        val isInstruction = candidate.startsWith("Tuliskan penalaran", ignoreCase = true) ||
+            candidate.startsWith("Write reasoning", ignoreCase = true)
+        return isInstruction &&
+            candidate.contains("<think>", ignoreCase = true) &&
+            candidate.contains("<answer>", ignoreCase = true)
+    }
+
     private fun isTrainingRecord(obj: JSONObject): Boolean {
         val hasPrompt = firstNonBlankText(
             obj,
@@ -324,7 +424,10 @@ object TextModalityProcessor {
             obj,
             listOf("response", "completion", "answer")
         ).isNotBlank()
-        return (hasPrompt && hasAnswer) || isConversationRecord(obj)
+        val hasTaggedTextReasoning = extractTextWrappedReasoningRecord(
+            firstNonBlankPayload(obj, listOf("text"))
+        ) != null
+        return (hasPrompt && hasAnswer) || hasTaggedTextReasoning || isConversationRecord(obj)
     }
 
     private fun isConversationRecord(obj: JSONObject): Boolean =
@@ -336,6 +439,18 @@ object TextModalityProcessor {
     private fun formatTrainingRecord(obj: JSONObject): Pair<TextModality, String>? {
         val turns = extractConversationTurns(obj)
         if (turns != null) return TextModality.CONVERSATION to serializeConversationTurns(turns)
+
+        val taggedTextReasoning = extractTextWrappedReasoningRecord(
+            firstNonBlankPayload(obj, listOf("text"))
+        )
+        if (taggedTextReasoning != null) {
+            return TextModality.REASONING to formatInstructionResponse(
+                instruction = taggedTextReasoning.instruction,
+                input = "",
+                reasoning = taggedTextReasoning.reasoning,
+                response = taggedTextReasoning.response
+            )
+        }
         if (!isTrainingRecord(obj)) return null
 
         val reasoning = extractReasoningText(obj)
