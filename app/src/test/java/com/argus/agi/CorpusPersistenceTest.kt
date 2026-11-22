@@ -530,7 +530,7 @@ class CorpusPersistenceTest {
             )
 
             assertEquals(records.length.toLong(), result.second)
-            assertEquals("Both source records must be converted into one atomic training chunk.", 2, result.first)
+            assertEquals("Both source records must become separate atomic training chunks.", 2, result.first)
             val document = repository.getTrainingCorpusDocuments(limit = 1).single()
             val chunks = repository.getCorpusChunks(document.id)
 
