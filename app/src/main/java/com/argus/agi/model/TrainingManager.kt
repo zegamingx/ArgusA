@@ -3398,7 +3398,7 @@ class TrainingManager internal constructor(
                 } finally {
                     workerExecutionMutex.unlock()
                 }
-            }
+        }
     }
 
     private fun appendPersistingQueueItems(
