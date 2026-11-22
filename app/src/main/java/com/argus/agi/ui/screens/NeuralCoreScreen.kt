@@ -84,6 +84,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
     val totalSteps by viewModel.totalStepsExecuted.collectAsState()
     val trainingMetrics by viewModel.trainingMetrics.collectAsState()
     val activeDoc by viewModel.activeDocument.collectAsState()
+    val tokenizerTraining by viewModel.tokenizerTrainingProgress.collectAsState()
     val conversationalValidation by viewModel.conversationalValidationState.collectAsState()
     val vocabSize = trainingMetrics.vocabularySize
     val worldEntities by viewModel.worldEntities.collectAsState()
@@ -524,6 +525,65 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             color = ArgusCyanGlow,
                             fontFamily = FontFamily.Monospace
                         )
+                        tokenizerTraining?.let { status ->
+                            val bpe = status.progress
+                            val bpeColor = when (bpe.stage) {
+                                com.argus.agi.model.TokenizerTrainingStage.COMPLETED -> ArgusSuccess
+                                com.argus.agi.model.TokenizerTrainingStage.FAILED,
+                                com.argus.agi.model.TokenizerTrainingStage.CANCELLED -> ArgusWarning
+                                else -> ArgusCyanPrimary
+                            }
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(Color.White.copy(alpha = 0.035f), RoundedCornerShape(10.dp))
+                                    .padding(10.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "BPE TOKENIZER • ${status.documentTitle}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = bpeColor,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1
+                                    )
+                                    Text(
+                                        text = "${(bpe.fraction * 100f).toInt()}%",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = bpeColor,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                }
+                                Text(
+                                    text = bpe.stage.displayName,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = ArgusTextSecondary
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                LinearProgressIndicator(
+                                    progress = { bpe.fraction.coerceIn(0f, 1f) },
+                                    modifier = Modifier.fillMaxWidth().height(4.dp),
+                                    color = bpeColor
+                                )
+                                Text(
+                                    text = "${bpe.learnedMerges}/${bpe.targetMerges} new merge rules • Vocabulary ${bpe.vocabularySize}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = ArgusTextMuted,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                                status.failureMessage?.let { message ->
+                                    Text(
+                                        text = message,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = ArgusWarning
+                                    )
+                                }
+                            }
+                        }
                         Text(
                             text = "> Learning totals: $inputTokensLabel input tokens • $contextWindowsLabel context windows • $optimizerUpdatesLabel optimizer updates",
                             style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
