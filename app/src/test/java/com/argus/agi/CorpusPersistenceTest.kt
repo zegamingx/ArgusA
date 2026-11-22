@@ -499,6 +499,59 @@ class CorpusPersistenceTest {
     }
 
     @Test
+    fun streamedJsonlImportsTextWrappedReasoningAndPromptAnswerRecords() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(context, ArgusDatabase::class.java)
+            .allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(context, EngineConfig(maxSeqLen = 64)),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val taggedReasoningRecord =
+                """{"text":"Soal: Dalam konteks kalimat 'Pemandangan di desa itu sangat indah.', apa padanan dekat kata 'indah'?\\nTuliskan penalaran di dalam tag <think> dan jawaban akhir di dalam tag <answer>.\\nJawab: <think>Padanan dekat 'indah' adalah 'elok'.</think><answer>elok</answer>"}"""
+            val promptAnswerRecord =
+                """{"prompt":"What is 15 multiplied by 5?","answer":"75"}"""
+            val records = listOf(taggedReasoningRecord, promptAnswerRecord).joinToString("\\n")
+
+            val result = manager.enqueueDocumentStream(
+                source = "Mixed SFT JSONL regression",
+                title = "Mixed reasoning and prompt-answer JSONL",
+                reader = StringReader(records),
+                chunkSize = 512,
+                overlap = 0,
+                strictJsonLines = true
+            )
+
+            assertEquals(records.length.toLong(), result.second)
+            assertEquals("Both source records must be converted into one atomic training chunk.", 2, result.first)
+            val document = repository.getTrainingCorpusDocuments(limit = 1).single()
+            val chunks = repository.getCorpusChunks(document.id)
+
+            assertEquals(document.chunkCount, chunks.size)
+            assertEquals(2, chunks.size)
+            assertTrue(chunks.any { it.content.contains(Tokenizer.THINK_START) })
+            assertTrue(chunks.any { it.content.contains(Tokenizer.THINK_END) })
+            assertTrue(
+                chunks.any { chunk ->
+                    chunk.content.contains("What is 15 multiplied by 5?") &&
+                        !chunk.content.contains(Tokenizer.THINK_START)
+                }
+            )
+            assertEquals(2, repository.getPendingQueueSnapshot().size)
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
+    @Test
     fun streamedJsonlPersistsRecordsAcrossMultipleRoomBatches() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val database = Room.inMemoryDatabaseBuilder(context, ArgusDatabase::class.java)
