@@ -195,6 +195,55 @@ class TrainingManagerPersistenceTest {
     }
 
     @Test
+    fun concurrentResumeRequestIsRetriedAfterAnEarlierRecoveryAttemptFails() = runBlocking {
+        val startupAttempts = AtomicInteger(0)
+        val firstResumeAttemptEnteredStartup = CompletableDeferred<Unit>()
+        val releaseFirstResumeAttempt = CompletableDeferred<Unit>()
+
+        withTrainingManager(
+            onWorkerStartup = {
+                when (startupAttempts.incrementAndGet()) {
+                    1 -> throw IllegalStateException(
+                        "Injected initial training worker startup failure."
+                    )
+                    2 -> {
+                        firstResumeAttemptEnteredStartup.complete(Unit)
+                        releaseFirstResumeAttempt.await()
+                        throw IllegalStateException(
+                            "Injected transient failure during the first Resume attempt."
+                        )
+                    }
+                }
+            }
+        ) { _, _, manager ->
+            withTimeout(10_000L) {
+                while (!manager.isTrainingPaused.value) {
+                    delay(20L)
+                }
+            }
+            assertEquals(1, startupAttempts.get())
+
+            manager.resumeTraining()
+            withTimeout(10_000L) {
+                firstResumeAttemptEnteredStartup.await()
+            }
+
+            // This request arrives while the first recovery owns the resume mutex.
+            // It must queue rather than disappear.
+            manager.resumeTraining()
+            releaseFirstResumeAttempt.complete(Unit)
+
+            withTimeout(10_000L) {
+                while (startupAttempts.get() < 3 || manager.isTrainingPaused.value) {
+                    delay(20L)
+                }
+            }
+
+            assertEquals(3, startupAttempts.get())
+            assertEquals(false, manager.isTrainingPaused.value)
+        }
+    }
+    @Test
     fun optimizerCommittedRowsSurviveInterruptedTrainingRecovery() = runBlocking {
         withTrainingManager { _, repository, manager ->
             manager.pauseTraining()
