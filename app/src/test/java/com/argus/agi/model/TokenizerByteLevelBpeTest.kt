@@ -266,7 +266,7 @@ class TokenizerByteLevelBpeTest {
             corpus = corpus,
             targetVocabSize = 512,
             maxNewMerges = 64,
-            onProgress = progress::add
+            onProgress = { update -> progress.add(update) }
         )
 
         assertTrue("BPE training must emit progress events.", progress.isNotEmpty())
@@ -277,6 +277,15 @@ class TokenizerByteLevelBpeTest {
         assertEquals(1f, progress.last().fraction, 0f)
         assertEquals(resultingVocabularySize, progress.last().vocabularySize)
         assertEquals(tokenizer.mergeCount, progress.last().learnedMerges)
+
+        val withoutProgressCallback = newTokenizer()
+        withoutProgressCallback.trainBpe(
+            corpus = corpus,
+            targetVocabSize = 512,
+            maxNewMerges = 64
+        )
+        assertEquals(withoutProgressCallback.exportVocab(), tokenizer.exportVocab())
+        assertEquals(withoutProgressCallback.exportMerges(), tokenizer.exportMerges())
 
         progress.zipWithNext().forEach { (previous, next) ->
             assertTrue(
