@@ -96,6 +96,7 @@ data class ActiveDocumentTraining(
     val latestLoss: Float? = null,
     val runningAverageLoss: Float? = null
 )
+
 enum class StreamedImportStage(val displayName: String, val isTerminal: Boolean = false) {
     READING_SOURCE("Streaming source"),
     TOKENIZING_CHUNKS("Building token-safe chunks"),
@@ -847,19 +848,19 @@ class TrainingManager internal constructor(
         requireDeclaredRightsForWebContent(source, canonicalUrl, rightsStatus)
         if (closed) return Pair(0, 0L)
 
-        _streamedImportProgress.value = StreamedImportProgress(
-            documentTitle = title,
-            stage = StreamedImportStage.READING_SOURCE,
-            charactersRead = 0L,
-            chunksProcessed = 0
-        )
-
         check(
             ingestionStagingDirectory.isDirectory ||
                 ingestionStagingDirectory.mkdirs()
         ) {
             "Temporary ingestion storage is unavailable."
         }
+
+        _streamedImportProgress.value = StreamedImportProgress(
+            documentTitle = title,
+            stage = StreamedImportStage.READING_SOURCE,
+            charactersRead = 0L,
+            chunksProcessed = 0
+        )
 
         val stagingFile = File(
             ingestionStagingDirectory,
@@ -907,7 +908,13 @@ class TrainingManager internal constructor(
                         readCount = 1
                     }
                     if (readCount < 0) break
-                    if (closed) return Pair(0, totalCharsRead)
+                    if (closed) {
+                        publishImportProgress(
+                            stage = StreamedImportStage.CANCELLED,
+                            detail = "The import was stopped before staging completed."
+                        )
+                        return Pair(0, totalCharsRead)
+                    }
 
                     val nextTotal = Math.addExact(totalCharsRead, readCount.toLong())
                     require(nextTotal <= Int.MAX_VALUE.toLong()) {
@@ -1101,6 +1108,12 @@ class TrainingManager internal constructor(
             )
             if (!stored) {
                 Log.i(TAG, "Duplicate corpus document skipped: $documentId")
+                publishImportProgress(
+                    stage = StreamedImportStage.COMPLETED,
+                    chunksProcessed = 0,
+                    totalChunks = 0,
+                    detail = "This document is already present in the local corpus."
+                )
                 return Pair(0, totalCharsRead)
             }
             importedDocumentId = documentId
