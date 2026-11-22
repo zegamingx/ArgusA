@@ -876,7 +876,7 @@ class TrainingManager internal constructor(
         var totalCharsRead = 0L
         var importedDocumentId: String? = null
         var importCommitted = false
-        var lastReportedCharacters = 0L
+        var lastReportedProgressNanos = System.nanoTime()
 
         fun publishImportProgress(
             stage: StreamedImportStage,
@@ -929,9 +929,10 @@ class TrainingManager internal constructor(
                     }
                     output.write(encodedBuffer, 0, readCount * 2)
                     totalCharsRead = nextTotal
-                    if (totalCharsRead - lastReportedCharacters >= 32_768L) {
+                    val nowNanos = System.nanoTime()
+                    if (nowNanos - lastReportedProgressNanos >= 200_000_000L) {
                         publishImportProgress(StreamedImportStage.READING_SOURCE)
-                        lastReportedCharacters = totalCharsRead
+                        lastReportedProgressNanos = nowNanos
                     }
                 }
             }
