@@ -159,7 +159,8 @@ class TrainingManager internal constructor(
     private val trainingDispatcher: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1),
     private val repository: com.argus.agi.data.repository.ArgusRepository? = null,
     private val onCommitBoundary: (TrainingCommitBoundary) -> Unit = {},
-    private val initiallyPaused: Boolean = false
+    private val initiallyPaused: Boolean = false,
+    private val onWorkerStartup: suspend () -> Unit = {}
 ) : Closeable {
 
     private val repositoryInitialization =
@@ -244,6 +245,7 @@ class TrainingManager internal constructor(
     private var screenTrainingPurgePending = false
     private val corpusSchedulingMutex = Mutex()
     private val grpoTrainingMutex = Mutex()
+    private val trainingResumeMutex = Mutex()
     private val seedSchedulingMutex = Mutex()
     private val queueRefillMutex = Mutex()
     private var lastScheduledTimestamp: Long = System.currentTimeMillis()
@@ -252,6 +254,8 @@ class TrainingManager internal constructor(
         Channel<QueuePersistenceOperation>(capacity = Channel.UNLIMITED)
 
     private val workerShutdown = MutableStateFlow(false)
+    private val workerExecutionMutex = Mutex()
+    private val workerLifecycleMutex = Mutex()
 
     private val _nextQueue = MutableStateFlow<List<TrainingData>>(emptyList())
     val nextQueue: StateFlow<List<TrainingData>> = _nextQueue.asStateFlow()
@@ -358,7 +362,9 @@ class TrainingManager internal constructor(
         Log.e(TAG, "Unhandled exception in training scope", t)
     }
     private val scope = CoroutineScope(SupervisorJob() + trainingDispatcher + exceptionHandler)
-    private val streamedImportStartup = CompletableDeferred<Unit>()
+    @Volatile
+    private var streamedImportStartup = CompletableDeferred<Unit>()
+    @Volatile
     private var workerJob: Job? = null
     private var persistenceJob: Job? = null
 
@@ -458,10 +464,13 @@ class TrainingManager internal constructor(
     ): GrpoTrainingReport {
         grpoTrainingMutex.lock()
         val wasPaused = _isTrainingPaused.value
+        var workerExecutionLocked = false
         try {
             check(!closed) { "Training manager is already closed." }
-            streamedImportStartup.await()
+            awaitTrainingWorkerReady()
             pauseTraining()
+            workerExecutionMutex.lock()
+            workerExecutionLocked = true
             withTimeout(GRPO_ACTIVE_ITEM_DRAIN_TIMEOUT_MS) {
                 _currentTrainingItem.first { it == null }
             }
@@ -517,6 +526,7 @@ class TrainingManager internal constructor(
                 runtimeSafetyCheck = { budget -> verifyGrpoRuntimeBudget(budget) }
             )
         } finally {
+            if (workerExecutionLocked) workerExecutionMutex.unlock()
             if (!wasPaused && !closed) resumeTraining()
             grpoTrainingMutex.unlock()
         }
@@ -527,54 +537,101 @@ class TrainingManager internal constructor(
         wakeupSignal.trySend(Unit)
     }
 
+    private suspend fun ensureTrainingWorkerStarted() {
+        workerLifecycleMutex.lock()
+        try {
+            if (closed) return
+
+            val previousWorker = workerJob
+            if (previousWorker?.isActive == true && !streamedImportStartup.isCompletedExceptionally) {
+                return
+            }
+
+            if (previousWorker?.isActive == true) {
+                previousWorker.cancel(
+                    CancellationException("Replacing a training worker that failed during startup.")
+                )
+            }
+            previousWorker?.join()
+            if (closed) return
+
+            val startupGate = CompletableDeferred<Unit>()
+            streamedImportStartup = startupGate
+            workerJob = scope.launch {
+                runTrainingWorker(startupGate)
+            }
+        } finally {
+            workerLifecycleMutex.unlock()
+        }
+    }
+
+    private suspend fun awaitTrainingWorkerReady() {
+        ensureTrainingWorkerStarted()
+        streamedImportStartup.await()
+    }
+
     private fun resumeAfterCommittedQueueRefresh(forceTrainingOnce: Boolean = false) {
         scope.launch {
-            val repository = repo
-            if (repository == null) {
-                _isTrainingPaused.value = true
-                Log.e(TAG, "Cannot resume training because durable queue storage is unavailable.")
-                return@launch
-            }
+            if (!trainingResumeMutex.tryLock()) return@launch
             try {
-                awaitQueuePersistenceIdle()
-                // Recover a prepared/committed journal before moving any interrupted
-                // TRAINING row back to QUEUED. A committed optimizer step must first
-                // receive its checkpoint; a partial pre-commit step must roll back.
-                reconcilePersistedTrainingCommit(repository)
-                repository.recoverInterruptedTrainingItems()
-                // OOM may have disabled or suspended the native device even when the
-                // host checkpoint was recovered. Re-arm the optional runtime before work.
-                neuralEngine.resumeVulkanTensorResidencyAfterForeground()
-                val committedItems = repository.getOptimizerCommittedTrainingItemsSnapshot()
-                val pendingItems = repository.getPendingQueueSnapshot(QUEUE_PREFETCH_LIMIT)
-                val databaseIds = (committedItems + pendingItems).mapTo(HashSet()) { it.id }
-                val inMemoryItems = synchronized(queueLock) {
-                    _nextQueue.value.filterNot { item -> item.id in databaseIds }
-                }
-                val restoredItems = committedItems.sortedBy { it.timestamp } +
-                    pendingItems.sortedBy { it.timestamp } +
-                    inMemoryItems.map { item -> item.copy(status = TrainingStatus.QUEUED) }
-                synchronized(queueLock) {
-                    _nextQueue.value = restoredItems.distinctBy(TrainingData::id)
-                    restoredItems.maxOfOrNull { it.timestamp }?.let { latest ->
-                        lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
+                awaitTrainingWorkerReady()
+                workerExecutionMutex.lock()
+                try {
+                    val repository = repo
+                    if (repository == null) {
+                        _isTrainingPaused.value = true
+                        Log.e(TAG, "Cannot resume training because durable queue storage is unavailable.")
+                        return@launch
                     }
+
+                    if (forceTrainingOnce) {
+                        deviceGuard.setForceTrainingOverride(true)
+                    }
+                    deviceGuard.refreshState()
+                    val safety = deviceGuard.safetyState.value
+                    if (!safety.isSafeToTrain) {
+                        _isTrainingPaused.value = true
+                        Log.i(TAG, "Training resume deferred by device safety: ${safety.statusMessage}")
+                        return@launch
+                    }
+
+                    awaitQueuePersistenceIdle()
+                    // Recover the durable optimizer journal before returning interrupted
+                    // TRAINING rows to QUEUED. Resume never races an active optimizer cycle.
+                    reconcilePersistedTrainingCommit(repository)
+                    repository.recoverInterruptedTrainingItems()
+                    neuralEngine.resumeVulkanTensorResidencyAfterForeground()
+
+                    val committedItems = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                    val pendingItems = repository.getPendingQueueSnapshot(QUEUE_PREFETCH_LIMIT)
+                    val databaseIds = (committedItems + pendingItems).mapTo(HashSet()) { it.id }
+                    val inMemoryItems = synchronized(queueLock) {
+                        _nextQueue.value.filterNot { item -> item.id in databaseIds }
+                    }
+                    val restoredItems = committedItems.sortedBy { it.timestamp } +
+                        pendingItems.sortedBy { it.timestamp } +
+                        inMemoryItems.map { item -> item.copy(status = TrainingStatus.QUEUED) }
+                    synchronized(queueLock) {
+                        _nextQueue.value = restoredItems.distinctBy(TrainingData::id)
+                        restoredItems.maxOfOrNull { it.timestamp }?.let { latest ->
+                            lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
+                        }
+                        oomRetryCounts.clear()
+                    }
+                    _currentTrainingItem.value = null
+                    _activeDocument.value = null
+                    _isTrainingPaused.value = false
+                    wakeupSignal.trySend(Unit)
+                } finally {
+                    workerExecutionMutex.unlock()
                 }
-                _currentTrainingItem.value = null
-                _activeDocument.value = null
-                synchronized(queueLock) {
-                    oomRetryCounts.clear()
-                }
-                if (forceTrainingOnce) {
-                    deviceGuard.setForceTrainingOverride(true)
-                }
-                _isTrainingPaused.value = false
-                wakeupSignal.trySend(Unit)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
-                Log.e(TAG, "Cannot resume training until checkpoint and queue recovery is complete.", error)
+                Log.e(TAG, "Cannot resume training until worker, checkpoint and queue recovery are complete.", error)
                 _isTrainingPaused.value = true
+            } finally {
+                trainingResumeMutex.unlock()
             }
         }
     }
@@ -2961,10 +3018,18 @@ class TrainingManager internal constructor(
     }
 
     private fun startTrainingWorker() {
-        workerJob = scope.launch {
-            var validationRunActive = false
-            var validationRunHadFailures = false
+        scope.launch {
+            ensureTrainingWorkerStarted()
+        }
+    }
+
+    private suspend fun runTrainingWorker(startupGate: CompletableDeferred<Unit>) {
+        var validationRunActive = false
+        var validationRunHadFailures = false
+        workerExecutionMutex.lock()
+        try {
             try {
+                onWorkerStartup()
                 // Finish in-memory queue writes before examining persisted state.
                 awaitQueuePersistenceIdle()
                 val repository = requireNotNull(repo) {
@@ -3054,20 +3119,23 @@ class TrainingManager internal constructor(
                 }
                 wakeupSignal.trySend(Unit)
             } catch (cancelled: CancellationException) {
-                streamedImportStartup.completeExceptionally(cancelled)
+                startupGate.completeExceptionally(cancelled)
                 throw cancelled
             } catch (error: Throwable) {
-                streamedImportStartup.completeExceptionally(error)
+                startupGate.completeExceptionally(error)
                 Log.e(TAG, "Training startup recovery failed.", error)
                 _isTrainingPaused.value = true
                 setConversationalValidationStatus(
                     ConversationValidationStatus.FAILED,
                     "Training is paused because startup checkpoint/queue recovery failed: ${error.message}"
                 )
-                return@launch
+                return
+                }
+            } finally {
+                workerExecutionMutex.unlock()
             }
 
-            streamedImportStartup.complete(Unit)
+            startupGate.complete(Unit)
             while (isActive && !closed) {
                 refillPendingQueueFromDatabase()
                 if (_isTrainingPaused.value) {
@@ -3084,8 +3152,18 @@ class TrainingManager internal constructor(
                 }.first { canContinue -> canContinue }
                 if (closed) break
 
-                resetForceOverrideIfSet()
-                deviceGuard.refreshState()
+                workerExecutionMutex.lock()
+                try {
+                    val hasCommittedFinalization = _nextQueue.value.any {
+                        it.status == TrainingStatus.OPTIMIZER_COMMITTED
+                    }
+                    if (_isTrainingPaused.value && !hasCommittedFinalization) continue
+
+                    deviceGuard.refreshState()
+                    if (!deviceGuard.safetyState.value.isSafeToTrain && !hasCommittedFinalization) {
+                        continue
+                    }
+                    resetForceOverrideIfSet()
 
                 val firstQueuedItem = _nextQueue.value.firstOrNull()
                 if (
@@ -3308,6 +3386,15 @@ class TrainingManager internal constructor(
                     isPowerSaveMode = currentSafety.isPowerSaveMode
                 )
                 delay(throttleMs)
+                } finally {
+                    workerExecutionMutex.unlock()
+                }
+            }
+        }
+        workerJob?.invokeOnCompletion { cause ->
+            if (cause != null && cause !is CancellationException && !closed) {
+                _isTrainingPaused.value = true
+                Log.e(TAG, "Training worker stopped unexpectedly; Resume can restart it after durable recovery.", cause)
             }
         }
     }

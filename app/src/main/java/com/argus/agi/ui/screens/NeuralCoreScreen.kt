@@ -102,15 +102,15 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
         isPaused
     )
     val trainingEtaLabel = when {
-        isPaused -> "Paused"
         !safetyState.isSafeToTrain -> "Blocked by device safety"
+        isPaused -> "Paused"
         trainingEtaMs == null -> "Calculating"
         trainingEtaMs == 0L -> "Queue empty"
         else -> "~${formatEta(trainingEtaMs)}"
     }
     val trainingStatusLabel = when {
-        isPaused -> "TRAINING PAUSED"
         !safetyState.isSafeToTrain -> "TRAINING BLOCKED"
+        isPaused -> "TRAINING PAUSED"
         activeTrainingItem != null -> "TRAINING IN PROGRESS"
         nextQueue.isNotEmpty() -> "TRAINING QUEUED"
         else -> "TRAINING IDLE"
@@ -434,14 +434,25 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             Spacer(modifier = Modifier.width(10.dp))
                             Button(
                                 onClick = { viewModel.toggleTrainingPause() },
+                                enabled = safetyState.isSafeToTrain,
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = if (isPaused) ArgusSuccess else ArgusWarning,
-                                    contentColor = ArgusDarkBg
+                                    contentColor = ArgusDarkBg,
+                                    disabledContainerColor = ArgusWarning.copy(alpha = 0.22f),
+                                    disabledContentColor = ArgusTextSecondary
                                 ),
                                 shape = RoundedCornerShape(12.dp),
                                 modifier = Modifier.testTag("toggle_training_pause_button")
                             ) {
-                                Text(text = if (isPaused) "Resume" else "Pause", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                Text(
+                                    text = when {
+                                        !safetyState.isSafeToTrain -> "Blocked"
+                                        isPaused -> "Resume"
+                                        else -> "Pause"
+                                    },
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 12.sp
+                                )
                             }
                         }
                         Spacer(modifier = Modifier.height(10.dp))

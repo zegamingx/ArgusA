@@ -23,6 +23,7 @@ import java.io.File
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -150,6 +151,46 @@ class TrainingManagerPersistenceTest {
             assertEquals(1, manager.completedQueue.value.size)
             assertEquals(TrainingStatus.FAILED, manager.completedQueue.value.single().status)
             assertEquals(0, manager.totalStepsExecuted.value)
+        }
+    }
+
+    @Test
+    fun resumeRestartsTheTrainingWorkerAfterARecoverableStartupFailure() = runBlocking {
+        val startupAttempts = AtomicInteger(0)
+        withTrainingManager(
+            onWorkerStartup = {
+                if (startupAttempts.incrementAndGet() == 1) {
+                    throw IllegalStateException("Injected one-time training worker startup failure.")
+                }
+            }
+        ) { _, repository, manager ->
+            withTimeout(10_000L) {
+                while (!manager.isTrainingPaused.value) {
+                    delay(20L)
+                }
+            }
+            assertEquals(1, startupAttempts.get())
+
+            manager.resumeTraining()
+            withTimeout(10_000L) {
+                while (manager.isTrainingPaused.value || startupAttempts.get() < 2) {
+                    delay(20L)
+                }
+            }
+            assertEquals(2, startupAttempts.get())
+
+            manager.pauseTraining()
+            manager.enqueueData(
+                source = "worker-restart-test",
+                title = "Resume after worker recovery",
+                content = "This queue item verifies that a restarted worker resumes durable local training."
+            )
+            awaitPersistence(manager)
+            val queuedItem = manager.nextQueue.value.single()
+
+            manager.resumeTraining()
+            awaitTrainingStatus(repository, queuedItem.id, TrainingStatus.COMPLETED)
+            assertEquals(1, manager.totalStepsExecuted.value)
         }
     }
 
@@ -320,6 +361,7 @@ class TrainingManagerPersistenceTest {
 
     private suspend fun withTrainingManager(
         onCommitBoundary: (TrainingCommitBoundary) -> Unit = {},
+        onWorkerStartup: suspend () -> Unit = {},
         test: suspend (
             ArgusDatabase,
             ArgusRepository,
@@ -402,7 +444,8 @@ class TrainingManagerPersistenceTest {
                 worldModel = worldModel,
                 trainingDispatcher = trainingDispatcher,
                 repository = repository,
-                onCommitBoundary = onCommitBoundary
+                onCommitBoundary = onCommitBoundary,
+                onWorkerStartup = onWorkerStartup
             )
             manager = activeManager
             test(database, repository, activeManager)

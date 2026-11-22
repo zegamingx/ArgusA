@@ -87,6 +87,15 @@ jobs:
           java-version: "25"
           cache: gradle
 
+      - name: Verify release keystore format, password, private key and pinned certificate
+        shell: bash
+        env:
+          ARGUS_RELEASE_KEYSTORE_BASE64: ${{ secrets.ARGUS_RELEASE_KEYSTORE_BASE64 }}
+          ARGUS_RELEASE_STORE_PASSWORD: ${{ secrets.ARGUS_RELEASE_STORE_PASSWORD }}
+          ARGUS_RELEASE_KEY_PASSWORD: ${{ secrets.ARGUS_RELEASE_KEY_PASSWORD }}
+          ARGUS_RELEASE_KEY_ALIAS: argus-release-2026
+        run: bash tools/security/verify-release-keystore.sh
+
       - name: Verify runner Android SDK
         shell: bash
         run: |

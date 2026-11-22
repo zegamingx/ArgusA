@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-# Sign an Argus release APK with the offline Argus 2026 PKCS#12 identity.
+# Sign an Argus release APK with the pinned offline Argus 2026 identity.
 # The private key is supplied by a protected GitHub Environment secret and is
 # written only to a short-lived, permission-restricted runner temp directory.
 
@@ -10,6 +10,9 @@ readonly EXPECTED_CERT_SHA256="40969E172BC0F8CB18ED2DDF274CAF3D3DB1456EDAEAF0393
 readonly MINIMUM_ANDROID_API="34"
 readonly EXPECTED_APPLICATION_ID="com.argus.agi"
 readonly DEFAULT_KEY_ALIAS="argus-release-2026"
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${script_dir}/keystore-format.sh"
 
 fail() {
   printf '::error::%s\n' "$*" >&2
@@ -60,7 +63,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-keystore="${work_dir}/argus-release-2026.p12"
+keystore="${work_dir}/argus-release-keystore"
 aligned_apk="${work_dir}/ARGUS-aligned.apk"
 signed_apk="${work_dir}/ARGUS-signed.apk"
 verification_log="${work_dir}/apksigner-verify.txt"
@@ -68,6 +71,7 @@ verification_log="${work_dir}/apksigner-verify.txt"
 printf '%s' "$ARGUS_RELEASE_KEYSTORE_BASE64" | base64 --decode > "$keystore"
 [[ -s "$keystore" ]] || fail "Decoded release keystore is empty."
 chmod 600 "$keystore"
+keystore_type="$(detect_argus_keystore_type "$keystore")" || fail "Unsupported release keystore format; expected JKS or PKCS12."
 
 echo "Aligning native libraries for 16 KiB memory pages..."
 "$zipalign" -f -P 16 4 "$input_apk" "$aligned_apk"
@@ -76,7 +80,7 @@ echo "Aligning native libraries for 16 KiB memory pages..."
 echo "Signing release APK with the protected Argus 2026 identity..."
 "$apksigner" sign \
   --ks "$keystore" \
-  --ks-type PKCS12 \
+  --ks-type "$keystore_type" \
   --ks-key-alias "$key_alias" \
   --ks-pass env:ARGUS_RELEASE_STORE_PASSWORD \
   --key-pass env:ARGUS_RELEASE_KEY_PASSWORD \

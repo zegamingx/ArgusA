@@ -131,6 +131,21 @@ try {
     $env:ARGUS_RELEASE_STORE_PASSWORD = $storePassword
     $env:ARGUS_RELEASE_KEY_PASSWORD = $keyPassword
 
+    $keystoreBytes = [System.IO.File]::ReadAllBytes($resolvedKeystore)
+    if ($keystoreBytes.Length -lt 4) {
+        throw "The configured release keystore is truncated."
+    }
+    if ($keystoreBytes[0] -eq 0xFE -and $keystoreBytes[1] -eq 0xED -and $keystoreBytes[2] -eq 0xFE -and $keystoreBytes[3] -eq 0xED) {
+        $keystoreType = "JKS"
+    }
+    elseif ($keystoreBytes[0] -eq 0x30) {
+        $keystoreType = "PKCS12"
+    }
+    else {
+        throw "Unsupported release keystore format. Expected JKS or PKCS12."
+    }
+    $keystoreBytes = $null
+
     Write-Host "Aligning APK for 16 KiB native library pages..."
     Invoke-NativeTool -Executable $resolvedZipalign -Operation "zipalign" -Arguments @(
         "-f",
@@ -151,6 +166,7 @@ try {
     Invoke-NativeTool -Executable $resolvedApksigner -Operation "apksigner sign" -Arguments @(
         "sign",
         "--ks", $resolvedKeystore,
+        "--ks-type", $keystoreType,
         "--ks-key-alias", $KeyAlias,
         "--ks-pass", "env:ARGUS_RELEASE_STORE_PASSWORD",
         "--key-pass", "env:ARGUS_RELEASE_KEY_PASSWORD",
@@ -201,7 +217,7 @@ try {
     Write-Host "Certificate SHA-256: $actualFingerprint"
     Write-Host "APK SHA-256: $apkHash"
     Write-Host ""
-    Write-Host "Keep the PKCS#12 keystore and both passwords offline for all future Argus updates."
+    Write-Host "Keep the verified Argus release keystore and both passwords offline for all future updates."
 }
 finally {
     $env:ARGUS_RELEASE_STORE_PASSWORD = $null
