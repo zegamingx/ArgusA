@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - Release
     paths:
       - "app/**"
       - "gradle/**"
@@ -29,7 +31,7 @@ concurrency:
 
 jobs:
   build-sign:
-    if: ${{ github.ref == 'refs/heads/main' }}
+    if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/tags/Release' }}
     name: Build, sign and verify installable APK
     runs-on: ubuntu-26.04
     timeout-minutes: 60
@@ -41,7 +43,22 @@ jobs:
       - name: Checkout trusted main source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          fetch-depth: 0
+
+      - name: Verify Release tag targets the current main commit
+        if: ${{ github.ref == 'refs/tags/Release' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          release_commit="$(git rev-parse HEAD)"
+          main_commit="$(git rev-parse refs/remotes/origin/main)"
+          if [[ "$release_commit" != "$main_commit" ]]; then
+            echo "::error::The Release tag points to $release_commit, but main is $main_commit."
+            echo "::error::Move the Release tag only after the reviewed changes are merged to main, then push the updated tag."
+            exit 1
+          fi
+          echo "Release tag and main both point to $main_commit."
 
       - name: Set up JDK 25
         uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
@@ -128,6 +145,7 @@ jobs:
           done
 
       - name: Create and verify installable CI APK
+        if: ${{ github.ref == 'refs/heads/main' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -136,7 +154,7 @@ jobs:
           signing_dir="$RUNNER_TEMP/argus-ephemeral-signing"
           dist_dir="dist"
           aligned_apk="$signing_dir/ARGUS-aligned.apk"
-          signed_apk="$dist_dir/ARGUS.apk"
+          signed_apk="$dist_dir/ARGUS-CI.apk"
           keystore="$signing_dir/argus-ci-ephemeral.p12"
           verify_log="$signing_dir/apksigner-verify.txt"
 
@@ -205,20 +223,21 @@ jobs:
           cat "$dist_dir/BUILD-MANIFEST.txt"
 
       - name: Upload installable CI APK
+        if: ${{ github.ref == 'refs/heads/main' }}
         uses: actions/upload-artifact@v7
         with:
           name: argus-installable-ci-apk
           path: |
-            dist/ARGUS.apk
-            dist/ARGUS.apk.sha256
-            dist/ARGUS.apk.certificate-sha256
+            dist/ARGUS-CI.apk
+            dist/ARGUS-CI.apk.sha256
+            dist/ARGUS-CI.apk.certificate-sha256
             dist/BUILD-MANIFEST.txt
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
 
       - name: Check protected release signing secrets
-        id: release-secrets
+        if: ${{ github.ref == 'refs/tags/Release' }}
         shell: bash
         env:
           ARGUS_RELEASE_KEYSTORE_BASE64: ${{ secrets.ARGUS_RELEASE_KEYSTORE_BASE64 }}
@@ -235,17 +254,14 @@ jobs:
               missing+=("$name")
             fi
           done
-
           if (( ${#missing[@]} > 0 )); then
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Persistent release signing is not configured. Missing Environment secrets: ${missing[*]}. The verified CI-signed APK artifact remains available; no production release will be published."
-          else
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-            echo "Persistent release signing secrets are configured."
+            echo "::error::Production Release is blocked. Missing protected environment secrets: ${missing[*]}."
+            exit 1
           fi
+          echo "All protected production signing secrets are present."
 
       - name: Sign and cryptographically verify release APK
-        if: ${{ steps.release-secrets.outputs.ready == 'true' }}
+        if: ${{ github.ref == 'refs/tags/Release' }}
         shell: bash
         env:
           ARGUS_RELEASE_KEYSTORE_BASE64: ${{ secrets.ARGUS_RELEASE_KEYSTORE_BASE64 }}
@@ -260,7 +276,7 @@ jobs:
             "dist/ARGUS.apk"
 
       - name: Write verified build manifest
-        if: ${{ steps.release-secrets.outputs.ready == 'true' }}
+        if: ${{ github.ref == 'refs/tags/Release' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -280,10 +296,10 @@ jobs:
           cat "dist/BUILD-MANIFEST.txt"
 
       - name: Upload installable Argus APK
-        if: ${{ steps.release-secrets.outputs.ready == 'true' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v4
+        if: ${{ github.ref == 'refs/tags/Release' }}
+        uses: actions/upload-artifact@v7
         with:
-          name: argus-installable-apk
+          name: argus-production-release
           path: |
             dist/ARGUS.apk
             dist/ARGUS.apk.sha256
@@ -292,3 +308,59 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
+
+  publish-release:
+    if: ${{ github.ref == 'refs/tags/Release' }}
+    name: Publish verified APK to GitHub Release
+    needs: build-sign
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download production APK and verification manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name argus-production-release \
+            --dir dist
+          for asset in \
+            dist/ARGUS.apk \
+            dist/ARGUS.apk.sha256 \
+            dist/ARGUS.apk.certificate-sha256 \
+            dist/BUILD-MANIFEST.txt; do
+            test -s "$asset"
+          done
+
+      - name: Create or update the GitHub Release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          assets=(
+            dist/ARGUS.apk
+            dist/ARGUS.apk.sha256
+            dist/ARGUS.apk.certificate-sha256
+            dist/BUILD-MANIFEST.txt
+          )
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --verify-tag \
+              --title "Argus $tag" \
+              --notes "Production-signed Android APK built from the verified main commit. See BUILD-MANIFEST.txt for source commit, package, certificate fingerprint, and APK checksum." \
+              --repo "$GITHUB_REPOSITORY"
+          fi
+          echo "Published verified production APK assets for $tag."
