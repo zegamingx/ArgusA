@@ -29,10 +29,8 @@ trap cleanup EXIT HUP INT TERM
 keystore="${work_dir}/argus-release-keystore"
 java_source="${work_dir}/ArgusKeystorePreflight.java"
 
-printf '%s' "$ARGUS_RELEASE_KEYSTORE_BASE64" | base64 --decode > "$keystore"
-[[ -s "$keystore" ]] || fail "Decoded production keystore is empty."
-keystore_type="$(detect_argus_keystore_type "$keystore")" || {
-  fail "The configured production keystore is not a supported JKS or PKCS12 file."
+keystore_type="$(decode_argus_keystore_base64 "$ARGUS_RELEASE_KEYSTORE_BASE64" "$keystore")" || {
+  fail "The protected signing secret does not decode to a supported JKS, JCEKS or PKCS12 private keystore."
 }
 
 cat > "$java_source" <<'JAVA'

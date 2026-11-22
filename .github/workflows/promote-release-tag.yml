@@ -35,7 +35,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_OLD_TAG: fe973e99526f626d0117e2d112655b0343c3982f
+          EXPECTED_OLD_TAG: 852dd4ed775cce0d3bb5a999ee1f1ff2172a6f57
         run: |
           set -euo pipefail
 

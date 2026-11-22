@@ -68,10 +68,8 @@ aligned_apk="${work_dir}/ARGUS-aligned.apk"
 signed_apk="${work_dir}/ARGUS-signed.apk"
 verification_log="${work_dir}/apksigner-verify.txt"
 
-printf '%s' "$ARGUS_RELEASE_KEYSTORE_BASE64" | base64 --decode > "$keystore"
-[[ -s "$keystore" ]] || fail "Decoded release keystore is empty."
+keystore_type="$(decode_argus_keystore_base64 "$ARGUS_RELEASE_KEYSTORE_BASE64" "$keystore")" || fail "Unsupported release keystore encoding or format; expected JKS, JCEKS or PKCS12."
 chmod 600 "$keystore"
-keystore_type="$(detect_argus_keystore_type "$keystore")" || fail "Unsupported release keystore format; expected JKS or PKCS12."
 
 echo "Aligning native libraries for 16 KiB memory pages..."
 "$zipalign" -f -P 16 4 "$input_apk" "$aligned_apk"

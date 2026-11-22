@@ -78,7 +78,7 @@ download artifact. `./gradlew :app:exportReleaseApk` intentionally writes
 Installable release artifacts are produced only by the protected
 `Argus Production Release` workflow from the `Release` tag. It refuses a stale
 tag unless it points to the exact current `main` commit. Before Gradle starts,
-the workflow detects the actual active keystore format (JKS or PKCS#12) and
+the workflow detects the actual active keystore format (JKS, JCEKS or PKCS#12) and
 validates the store password, private-key password, alias, and pinned Argus
 2026 certificate fingerprint. It then runs release lint/tests and exactly one
 `assembleRelease`, verifies 16 KiB ZIP alignment, and publishes one
@@ -104,7 +104,8 @@ updates signed with that same key:
 The active Argus 2026 private keystore and passwords must remain offline or
 inside protected GitHub Environment secrets. Do not substitute an archived
 or retired keystore, commit private key material, or upload it as a build
-artifact. Configure these Environment secrets under
+artifact. The preflight accepts normal Base64 or one additional Base64 wrapper,
+but only when the final bytes have a recognized Java keystore header. Configure these Environment secrets under
 **Settings → Environments → argus-release**:
 
 - `ARGUS_RELEASE_KEYSTORE_BASE64`: base64 encoding of the currently approved

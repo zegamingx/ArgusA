@@ -46,9 +46,10 @@ signing secrets.
 
 The `tools/security/verify-release-keystore.sh` preflight validates the
 current keystore format, both passwords, private-key alias, and pinned
-certificate before Gradle starts. The `tools/security/sign-release.sh`
+certificate before Gradle starts. It unwraps at most one extra Base64 layer,
+and only if the result has a recognized JKS, JCEKS or PKCS#12 header. The `tools/security/sign-release.sh`
 helper then decodes the same protected secret into a short-lived
-permission-restricted temporary directory, detects JKS or PKCS#12, aligns
+permission-restricted temporary directory, detects JKS, JCEKS or PKCS#12, aligns
 native libraries for 16 KiB pages, signs with v1/v2/v3 schemes, verifies the
 APK with `apksigner`, checks the pinned certificate fingerprint, and confirms
 the expected package ID before writing the final APK. Temporary key material is

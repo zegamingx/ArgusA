@@ -138,11 +138,14 @@ try {
     if ($keystoreBytes[0] -eq 0xFE -and $keystoreBytes[1] -eq 0xED -and $keystoreBytes[2] -eq 0xFE -and $keystoreBytes[3] -eq 0xED) {
         $keystoreType = "JKS"
     }
+    elseif ($keystoreBytes[0] -eq 0xCE -and $keystoreBytes[1] -eq 0xCE -and $keystoreBytes[2] -eq 0xCE -and $keystoreBytes[3] -eq 0xCE) {
+        $keystoreType = "JCEKS"
+    }
     elseif ($keystoreBytes[0] -eq 0x30) {
         $keystoreType = "PKCS12"
     }
     else {
-        throw "Unsupported release keystore format. Expected JKS or PKCS12."
+        throw "Unsupported release keystore format. Expected JKS, JCEKS or PKCS12."
     }
     $keystoreBytes = $null
 
