@@ -94,7 +94,7 @@ jobs:
             echo "::error::Release promotion verification failed."
             exit 1
           fi
-          echo "Release now points to the approved main commit $GITHUB_SHA; production is permitted only from the Release tag."
+          echo "Release promotion verified for $GITHUB_SHA; the only production APK build is from refs/tags/Release."
 
       - name: Dispatch the production workflow using the Release tag ref
         shell: bash
