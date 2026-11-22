@@ -388,7 +388,7 @@ object TextModalityProcessor {
             promptLines[0] = firstPromptLine.substring(promptHeader.range.last + 1)
         }
 
-        val instruction = promptLines.joinToString("\\n").trim()
+        val instruction = promptLines.joinToString("\n").trim()
         val reasoning = responseSection.substring(
             thinkStart.range.last + 1,
             thinkEnd.range.first
