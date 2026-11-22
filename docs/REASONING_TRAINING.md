@@ -41,7 +41,7 @@ For example:
 
 ```json
 {
-  "text": "Soal: Solve the proportion.\\nTuliskan penalaran di dalam tag <think> dan jawaban akhir di dalam tag <answer>.\\nJawab: <think>Calculate the ratio.</think><answer>2:1</answer>"
+  "text": "Soal: Solve the proportion.\nTuliskan penalaran di dalam tag <think> dan jawaban akhir di dalam tag <answer>.\\nJawab: <think>Calculate the ratio.</think><answer>2:1</answer>"
 }
 ```
 
