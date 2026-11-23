@@ -3,6 +3,9 @@ package com.argus.agi.model
 import android.app.ActivityManager
 import android.content.Context
 import android.util.Log
+import com.argus.agi.ArgusApp
+import com.argus.agi.diagnostics.ArgusDiagnosticSeverity
+import com.argus.agi.diagnostics.ArgusDiagnosticSubsystem
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceProvenance
@@ -164,9 +167,46 @@ class TrainingManager internal constructor(
     private val onWorkerStartup: suspend () -> Unit = {}
 ) : Closeable {
 
+    private val appContext = context.applicationContext
+
     private val repositoryInitialization =
         runCatching { repository ?: com.argus.agi.data.repository.ArgusRepository(context) }
     private val repo = repositoryInitialization.getOrNull()
+
+    private fun safeTrainingDiagnosticMessage(message: String): String =
+        message
+            .replace(Regex("'[^']*'"), "'[REDACTED]'")
+            .replace(
+                Regex("(?i)(documentId|itemId|sourceUrl|fileName)=\\S+"),
+                "$1=[REDACTED]"
+            )
+
+    private fun logError(message: String, throwable: Throwable? = null) {
+        logError( message, throwable)
+        val argusApp = appContext as? ArgusApp
+        if (argusApp != null) {
+            argusApp.recordDiagnostic(
+                message = safeTrainingDiagnosticMessage(message),
+                severity = ArgusDiagnosticSeverity.ERROR,
+                subsystem = ArgusDiagnosticSubsystem.TRAINING,
+                throwable = throwable
+            )
+        }
+    }
+
+    private fun logWarning(message: String, throwable: Throwable? = null) {
+        logWarning( message, throwable)
+        val argusApp = appContext as? ArgusApp
+        if (argusApp != null) {
+            argusApp.recordDiagnostic(
+                message = safeTrainingDiagnosticMessage(message),
+                severity = ArgusDiagnosticSeverity.WARNING,
+                subsystem = ArgusDiagnosticSubsystem.TRAINING,
+                throwable = throwable
+            )
+        }
+    }
+
     private val activityManager =
         context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
     private val validationFilesDirectory = context.applicationContext.filesDir
@@ -366,7 +406,7 @@ class TrainingManager internal constructor(
     @Volatile private var closed = false
 
     private val exceptionHandler = CoroutineExceptionHandler { _, t ->
-        Log.e(TAG, "Unhandled exception in training scope", t)
+        logError( "Unhandled exception in training scope", t)
     }
     private val scope = CoroutineScope(SupervisorJob() + trainingDispatcher + exceptionHandler)
     @Volatile
@@ -388,7 +428,7 @@ class TrainingManager internal constructor(
                         throw cancelled
                     } catch (error: Exception) {
                         failPendingPersistenceOperation(operation, error)
-                        Log.e(TAG, "Training queue persistence operation failed unexpectedly.", error)
+                        logError( "Training queue persistence operation failed unexpectedly.", error)
                     } finally {
                         activeOperation = null
                     }
@@ -571,7 +611,7 @@ class TrainingManager internal constructor(
             startedWorker.invokeOnCompletion { cause ->
                 if (cause != null && cause !is CancellationException && !closed) {
                     _isTrainingPaused.value = true
-                    Log.e(TAG, "Training worker stopped unexpectedly; Resume can restart it after durable recovery.", cause)
+                    logError( "Training worker stopped unexpectedly; Resume can restart it after durable recovery.", cause)
                 }
             }
             startedWorker.start()
@@ -600,7 +640,7 @@ class TrainingManager internal constructor(
                     val repository = repo
                     if (repository == null) {
                         _isTrainingPaused.value = true
-                        Log.e(TAG, "Cannot resume training because durable queue storage is unavailable.")
+                        logError( "Cannot resume training because durable queue storage is unavailable.")
                         return@launch
                     }
 
@@ -648,7 +688,7 @@ class TrainingManager internal constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
-                Log.e(TAG, "Cannot resume training until worker, checkpoint and queue recovery are complete.", error)
+                logError( "Cannot resume training until worker, checkpoint and queue recovery are complete.", error)
                 _isTrainingPaused.value = true
             } finally {
                 trainingResumeMutex.unlock()
@@ -1393,7 +1433,7 @@ class TrainingManager internal constructor(
                 if (!importCommitted) {
                     runCatching { repo?.rollbackStreamedCorpusDocument(documentId) }
                         .onFailure { rollbackError ->
-                            Log.e(TAG, "Could not roll back cancelled streamed import $documentId.", rollbackError)
+                            logError( "Could not roll back cancelled streamed import $documentId.", rollbackError)
                         }
                 }
             }
@@ -1407,7 +1447,7 @@ class TrainingManager internal constructor(
                 if (!importCommitted) {
                     runCatching { repo?.rollbackStreamedCorpusDocument(documentId) }
                         .onFailure { rollbackError ->
-                            Log.e(TAG, "Could not roll back failed streamed import $documentId.", rollbackError)
+                            logError( "Could not roll back failed streamed import $documentId.", rollbackError)
                         }
                 }
             }
@@ -1415,7 +1455,7 @@ class TrainingManager internal constructor(
         } finally {
             for (file in listOf(stagingFile, chunkStagingFile)) {
                 if (file.exists() && !file.delete()) {
-                    Log.w(TAG, "Could not remove streamed ingestion staging file: ${file.name}")
+                    logWarning( "Could not remove streamed ingestion staging file: ${file.name}")
                 }
             }
         }
@@ -1781,7 +1821,7 @@ class TrainingManager internal constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
-                Log.e(TAG, "Manual conversational validation failed.", error)
+                logError( "Manual conversational validation failed.", error)
                 setConversationalValidationStatus(
                     ConversationValidationStatus.FAILED,
                     "Conversational evaluation failed: ${error.message}"
@@ -1940,7 +1980,7 @@ class TrainingManager internal constructor(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Throwable) {
-            Log.e(TAG, "Conversational checkpoint evaluation or promotion failed.", error)
+            logError( "Conversational checkpoint evaluation or promotion failed.", error)
             val restored = runCatching { restoreAcceptedConversationCheckpoint() }.getOrDefault(false)
             val status = if (restored) {
                 ConversationValidationStatus.ROLLED_BACK
@@ -2374,7 +2414,7 @@ class TrainingManager internal constructor(
             scope.launch {
                 runSuspendCatching { enqueueDocument(source, title, content) }
                     .onFailure { error ->
-                        Log.e(TAG, "Failed to persist long-form training input", error)
+                        logError( "Failed to persist long-form training input", error)
                     }
             }
             return
@@ -2699,7 +2739,7 @@ class TrainingManager internal constructor(
             if (sendResult.isFailure) {
                 val itemIds = orderedItems.mapTo(HashSet(orderedItems.size)) { it.id }
                 _nextQueue.value = _nextQueue.value.filterNot { it.id in itemIds }
-                Log.e(TAG, "Training persistence worker rejected the high-priority OOM retry batch.")
+                logError( "Training persistence worker rejected the high-priority OOM retry batch.")
                 return emptyList()
             }
             return orderedItems
@@ -2829,14 +2869,14 @@ class TrainingManager internal constructor(
         }.getOrDefault(false)
         if (!residencyReleased) {
             _isTrainingPaused.value = true
-            Log.e(TAG, "Training paused because Vulkan state could not be safely released after OOM.")
+            logError( "Training paused because Vulkan state could not be safely released after OOM.")
             return
         }
 
         val committed = runCatching {
             ensureLiveBatchCommitPersisted(activeItems)
         }.onFailure { recoveryError ->
-            Log.e(TAG, "Could not secure the committed optimizer transaction after OOM.", recoveryError)
+            logError( "Could not secure the committed optimizer transaction after OOM.", recoveryError)
         }.getOrDefault(false)
 
         if (committed) {
@@ -2849,7 +2889,7 @@ class TrainingManager internal constructor(
                     .filter { item -> item.id in activeIds }
                 prependCommittedQueueItems(pendingCommitted)
             }.onFailure { recoveryError ->
-                Log.e(TAG, "Committed training finalization could not be returned to the queue.", recoveryError)
+                logError( "Committed training finalization could not be returned to the queue.", recoveryError)
             }
             _currentTrainingItem.value = null
             _activeDocument.value = null
@@ -2864,7 +2904,7 @@ class TrainingManager internal constructor(
         val journal = runCatching {
             TrainingCommitJournal.read(trainingCommitJournalFile)
         }.onFailure { journalError ->
-            Log.e(TAG, "Training commit journal could not be read during OOM recovery.", journalError)
+            logError( "Training commit journal could not be read during OOM recovery.", journalError)
         }.getOrNull()
         val baselineStep = activeBatchBaselineOptimizerStep
             ?: journal?.baselineOptimizerStep
@@ -2875,7 +2915,7 @@ class TrainingManager internal constructor(
                 repository.getOptimizerCommittedTrainingItemsSnapshot()
                     .mapTo(HashSet()) { it.id }
             }.getOrElse { roomError ->
-                Log.e(TAG, "Could not verify Room commit state during OOM recovery.", roomError)
+                logError( "Could not verify Room commit state during OOM recovery.", roomError)
                 _isTrainingPaused.value = true
                 return
             }
@@ -2919,7 +2959,7 @@ class TrainingManager internal constructor(
             neuralEngine.resumeVulkanTensorResidencyAfterForeground()
         }.onFailure { recoveryError ->
             _isTrainingPaused.value = true
-            Log.e(TAG, "Training rollback completed but Vulkan/journal recovery did not finish.", recoveryError)
+            logError( "Training rollback completed but Vulkan/journal recovery did not finish.", recoveryError)
             return
         }
 
@@ -2933,7 +2973,7 @@ class TrainingManager internal constructor(
 
         if (requeued.isEmpty()) {
             _isTrainingPaused.value = true
-            Log.e(TAG, "OOM recovery could not persist the batch at the front of the queue.")
+            logError( "OOM recovery could not persist the batch at the front of the queue.")
             return
         }
 
@@ -2947,7 +2987,7 @@ class TrainingManager internal constructor(
         }
         if (shouldPauseForRepeatedOom) {
             _isTrainingPaused.value = true
-            Log.e(TAG, "The same training item hit OOM more than once. It was preserved for explicit user retry.")
+            logError( "The same training item hit OOM more than once. It was preserved for explicit user retry.")
         } else {
             Log.w(
                 TAG,
@@ -2960,7 +3000,7 @@ class TrainingManager internal constructor(
         item: TrainingData,
         error: OutOfMemoryError
     ) {
-        Log.e(TAG, "Finalizing an already committed training item hit OOM; the item will not be retrained.", error)
+        logError( "Finalizing an already committed training item hit OOM; the item will not be retrained.", error)
         val released = runCatching {
             neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()
         }.getOrDefault(false)
@@ -2975,7 +3015,7 @@ class TrainingManager internal constructor(
                 .filter { committed -> committed.id == item.id }
             prependCommittedQueueItems(pending)
         }.onFailure { recoveryError ->
-            Log.e(TAG, "Committed item could not be returned to finalization queue.", recoveryError)
+            logError( "Committed item could not be returned to finalization queue.", recoveryError)
         }
         _currentTrainingItem.value = null
         _activeDocument.value = null
@@ -2993,7 +3033,7 @@ class TrainingManager internal constructor(
                 ?.entries
                 ?.firstOrNull { entry -> entry.itemId == item.id }
         }.getOrElse { error ->
-            Log.e(TAG, "Could not read committed result for '${item.id}'.", error)
+            logError( "Could not read committed result for '${item.id}'.", error)
             throw error
         }
         val result = journalEntry?.result ?: NeuralTrainingStepResult(
@@ -3039,7 +3079,7 @@ class TrainingManager internal constructor(
         }
         for (file in abandonedFiles) {
             if (!file.delete() && file.exists()) {
-                Log.w(TAG, "Could not remove abandoned streamed-ingestion spool: ${file.name}")
+                logWarning( "Could not remove abandoned streamed-ingestion spool: ${file.name}")
             }
         }
     }
@@ -3065,7 +3105,7 @@ class TrainingManager internal constructor(
                 removeInterruptedStreamedIngestionFiles()
                 val recoveredImports = repository.recoverIncompleteStreamedCorpusImports()
                 if (recoveredImports > 0) {
-                    Log.w(TAG, "Removed $recoveredImports incomplete streamed corpus imports after process restart.")
+                    logWarning( "Removed $recoveredImports incomplete streamed corpus imports after process restart.")
                 }
                 val persistedCommitted = repository.getOptimizerCommittedTrainingItemsSnapshot()
                 val interruptedCandidateRun =
@@ -3166,7 +3206,7 @@ class TrainingManager internal constructor(
                 throw cancelled
             } catch (error: Throwable) {
                 startupGate.completeExceptionally(error)
-                Log.e(TAG, "Training startup recovery failed.", error)
+                logError( "Training startup recovery failed.", error)
                 _isTrainingPaused.value = true
                 setConversationalValidationStatus(
                     ConversationValidationStatus.FAILED,
@@ -3222,7 +3262,7 @@ class TrainingManager internal constructor(
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (error: Throwable) {
-                        Log.e(TAG, "Could not prepare the conversational training baseline.", error)
+                        logError( "Could not prepare the conversational training baseline.", error)
                         _isTrainingPaused.value = true
                         setConversationalValidationStatus(
                             ConversationValidationStatus.FAILED,
@@ -3362,7 +3402,7 @@ class TrainingManager internal constructor(
                             val committed = runCatching {
                                 ensureLiveBatchCommitPersisted(activeItems)
                             }.onFailure { recoveryError ->
-                                Log.e(TAG, "Could not reconcile optimizer state after a training failure.", recoveryError)
+                                logError( "Could not reconcile optimizer state after a training failure.", recoveryError)
                             }.getOrDefault(false)
 
                             if (committed || activeBatchRoomCommitted) {
@@ -3392,7 +3432,7 @@ class TrainingManager internal constructor(
                                     }.getOrDefault(false)
                                     if (!rolledBack) {
                                         _isTrainingPaused.value = true
-                                        Log.e(TAG, "Training paused because the failed batch could not be rolled back to its baseline.")
+                                        logError( "Training paused because the failed batch could not be rolled back to its baseline.")
                                     } else {
                                         TrainingCommitJournal.delete(trainingCommitJournalFile)
                                         neuralEngine.resumeVulkanTensorResidencyAfterForeground()
@@ -3457,7 +3497,7 @@ class TrainingManager internal constructor(
             orderedItems.forEach { item ->
                 pushCompleted(item.copy(status = TrainingStatus.FAILED))
             }
-            Log.e(TAG, "Training persistence worker is not accepting queue items.")
+            logError( "Training persistence worker is not accepting queue items.")
             return emptyList()
         }
 
@@ -3493,7 +3533,7 @@ class TrainingManager internal constructor(
                     )
                     repository.clearPendingQueueAndMarkInterruptedCorpusDocumentsPartial()
                 }.onFailure { error ->
-                    Log.e(TAG, "Failed to clear persisted training queue", error)
+                    logError( "Failed to clear persisted training queue", error)
                 }
             }
 
@@ -3529,7 +3569,7 @@ class TrainingManager internal constructor(
                     )
                     repository.deleteTrainingItem(operation.itemId)
                 }.onFailure { error ->
-                    Log.e(TAG, "Failed to delete a revoked screen-training item.", error)
+                    logError( "Failed to delete a revoked screen-training item.", error)
                 }
             }
 
@@ -3637,7 +3677,7 @@ class TrainingManager internal constructor(
                     QueuePersistenceOperation.DeleteItem(first.id)
                 )
                 if (deletion.isFailure) {
-                    Log.e(TAG, "Could not queue deletion of screen data after training consent was revoked.")
+                    logError( "Could not queue deletion of screen data after training consent was revoked.")
                     return@synchronized null
                 }
                 _nextQueue.value = list.drop(1)
@@ -3657,7 +3697,7 @@ class TrainingManager internal constructor(
                 )
             )
             if (sendResult.isFailure) {
-                Log.e(TAG, "Could not persist training start for '${first.id}'.")
+                logError( "Could not persist training start for '${first.id}'.")
                 return@synchronized null
             }
 
@@ -3967,7 +4007,7 @@ class TrainingManager internal constructor(
                 TokenizerTrainingStage.FAILED,
                 error.message ?: error.javaClass.simpleName
             )
-            Log.w(TAG, "Tokenizer preparation failed for document $documentId; existing vocabulary will be used.", error)
+            logWarning( "Tokenizer preparation failed for document $documentId; existing vocabulary will be used.", error)
         }
     }
 
@@ -4015,7 +4055,7 @@ class TrainingManager internal constructor(
                     } catch (error: OutOfMemoryError) {
                         throw error
                     } catch (error: Throwable) {
-                        Log.w(TAG, "Failed to mark corpus document as training", error)
+                        logWarning( "Failed to mark corpus document as training", error)
                     }
                 }
                 prepareTokenizerForDocument(item)
@@ -4174,7 +4214,7 @@ class TrainingManager internal constructor(
             purgeLegacyScreenCorpusIfResolved(repository)
         }
         if (!reason.isNullOrBlank()) {
-            Log.w(TAG, "Training item '${item.title}' failed: $reason")
+            logWarning( "Training item '${item.title}' failed: $reason")
         }
     }
 
@@ -4203,7 +4243,7 @@ class TrainingManager internal constructor(
         val stepLoss = stepResult.loss
         // Invalid loss is a failed step, never a completed training item.
         if (!stepLoss.isFinite()) {
-            Log.w(TAG, "trainBatchDetailed returned non-finite loss=$stepLoss for '${item.title}'")
+            logWarning( "trainBatchDetailed returned non-finite loss=$stepLoss for '${item.title}'")
             markTrainingItemFailed(item, "The model produced a non-finite loss.")
             return false
         }
@@ -4273,7 +4313,7 @@ class TrainingManager internal constructor(
                 _totalStepsExecuted.value.toString(),
                 "On-Device Neural Core"
             )
-        }.onFailure { Log.w(TAG, "Failed to record training telemetry.", it) }
+        }.onFailure { logWarning( "Failed to record training telemetry.", it) }
 
         if (item.documentTitle != null) {
             var documentCompletedInUi = false
@@ -4302,7 +4342,7 @@ class TrainingManager internal constructor(
                         "Document '${item.documentTitle}' completed assimilation (${item.totalChunks} training items).",
                         "Document Trainer"
                     )
-                }.onFailure { Log.w(TAG, "Failed to record document completion telemetry.", it) }
+                }.onFailure { logWarning( "Failed to record document completion telemetry.", it) }
                 _activeDocument.value = null
             }
         }
@@ -4336,7 +4376,7 @@ class TrainingManager internal constructor(
             } catch (error: OutOfMemoryError) {
                 throw error
             } catch (error: Throwable) {
-                Log.w(TAG, "Failed to update completed corpus document state", error)
+                logWarning( "Failed to update completed corpus document state", error)
             }
         }
         return true
@@ -4367,7 +4407,7 @@ class TrainingManager internal constructor(
             if (deviceGuard.forceTrainingOverride.value) {
                 deviceGuard.consumeForceOverride()
             }
-        }.onFailure { Log.w(TAG, "Gagal reset force override", it) }
+        }.onFailure { logWarning( "Gagal reset force override", it) }
     }
 
     // =====================================================================
@@ -4395,7 +4435,7 @@ class TrainingManager internal constructor(
                     persistenceJob?.join()
                 }
             }.onFailure {
-                Log.w(TAG, "Training workers did not finish before shutdown timeout", it)
+                logWarning( "Training workers did not finish before shutdown timeout", it)
             }
         }
         scope.cancel()
