@@ -50,7 +50,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_OLD_TAG: b19842ef211ef7c603f5284c7b0427ab7c352447
+          EXPECTED_OLD_TAG: fda6b56fe6f26ec1af3ba2ea74fe36419c857512
         run: |
           set -euo pipefail
 
@@ -79,9 +79,20 @@ jobs:
 
           case "$http_status" in
             200)
-              if jq -e '[.assets[]?.name] | index("ARGUS.apk") != null' "$release_response" >/dev/null; then
-                echo "::error::ARGUS.apk is already published. Refusing to rebuild or replace the production APK."
+              apk_asset_count="$(jq '[.assets[]?.name | select(endswith(".apk"))] | length' "$release_response")"
+              if (( apk_asset_count > 1 )); then
+                echo "::error::Multiple APK assets already exist for Release. Refusing to add another APK."
                 exit 1
+              fi
+              if (( apk_asset_count == 1 )); then
+                existing_apk="$(jq -r '[.assets[]?.name | select(endswith(".apk"))][0]' "$release_response")"
+                if [[ "$existing_apk" != "ARGUS.apk" ]]; then
+                  echo "::error::Unexpected existing APK asset ($existing_apk). Refusing to replace it."
+                  exit 1
+                fi
+                echo "Exactly one ARGUS.apk exists; the production workflow will replace that asset in place."
+              else
+                echo "No APK asset exists for Release; one production APK may be published."
               fi
               ;;
             404)
@@ -126,15 +137,13 @@ jobs:
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "X-GitHub-Api-Version: 2026-03-10" \
-            --data '{"ref":"Release"}' \
+            --data '{"ref":"main","inputs":{"release_channel":"Release"}}' \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/argus-installable-release.yml/dispatches")"
 
-          if [[ "$http_status" != "200" ]]; then
+          if [[ "$http_status" != "204" ]]; then
             echo "::error::Unable to dispatch the production release workflow (HTTP $http_status)."
             cat "$response"
             exit 1
           fi
 
-          workflow_run_id="$(jq -er '.workflow_run_id' "$response")"
-          echo "Dispatched the production release workflow on refs/tags/Release."
-          echo "Production release run: $workflow_run_id"
+          echo "Dispatched exactly one production release workflow on main after verifying Release points to the same commit."
