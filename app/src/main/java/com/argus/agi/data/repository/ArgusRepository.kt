@@ -12,6 +12,7 @@ import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.data.local.entity.TrainingItemEntity
 import com.argus.agi.data.local.entity.TrainingReplaySessionEntity
 import com.argus.agi.data.local.entity.WorldMemoryEntity
+import com.argus.agi.data.local.dao.TokenizerCorpusSample
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingStatus
 import com.argus.agi.model.WorldEntity
@@ -614,11 +615,23 @@ class ArgusRepository(
         }
 
 
-    suspend fun getTokenizerCorpusSample(documentId: String, limit: Int): List<String> =
-        withContext(Dispatchers.IO) {
-            require(limit in 1..512) { "Tokenizer corpus sample limit must be in 1..512." }
-            corpusDao.getTokenizerCorpusSample(documentId, limit)
+    suspend fun getNextTokenizerCorpusSample(
+        documentId: String,
+        afterChunkIndex: Int,
+        maxCharacters: Int
+    ): TokenizerCorpusSample? = withContext(Dispatchers.IO) {
+        require(afterChunkIndex >= 0) {
+            "Tokenizer corpus cursor cannot be negative."
         }
+        require(maxCharacters in 1..8_192) {
+            "Tokenizer sample projection must be between 1 and 8,192 characters."
+        }
+        corpusDao.getNextTokenizerCorpusSample(
+            documentId = documentId,
+            afterChunkIndex = afterChunkIndex,
+            maxCharacters = maxCharacters
+        )
+    }
 
     suspend fun getCorpusSources(documentId: String): List<CorpusSourceEntity> =
         withContext(Dispatchers.IO) {
