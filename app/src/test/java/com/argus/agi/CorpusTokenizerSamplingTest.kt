@@ -91,7 +91,20 @@ class CorpusTokenizerSamplingTest {
                 val current = requireNotNull(sample)
                 assertEquals(expectedIndex + 1, current.chunkIndex)
                 assertEquals(4_096, current.content.length)
-                assertTrue(current.content.all { character -> character == 'x' })
+                if (expectedIndex + 1 == chunks.size) {
+                    // The final row holds supplementary characters: 4,096
+                    // UTF-16 code units are 2,048 complete emoji, never a
+                    // split surrogate pair and never 4,096 code points
+                    // (which would be 8,192 UTF-16 code units).
+                    assertEquals("😀".repeat(2_048), current.content)
+                    assertEquals(
+                        2_048,
+                        current.content.codePointCount(0, current.content.length)
+                    )
+                    assertTrue(current.content.last().isLowSurrogate())
+                } else {
+                    assertTrue(current.content.all { character -> character == 'x' })
+                }
 
                 cursor = current.chunkIndex
                 sampledCharacters += current.content.length

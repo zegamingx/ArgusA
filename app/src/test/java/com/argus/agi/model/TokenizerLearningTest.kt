@@ -89,7 +89,7 @@ class TokenizerLearningTest {
         assertEquals(ArgusTokenizerAlgorithm.BYTE_LEVEL_BPE_V1, config.algorithm)
         assertEquals(2, config.schemaVersion)
         assertEquals(2_048, config.maxVocabularySize)
-        assertEquals(32, config.maxTokenLength)
+        assertEquals(64, config.maxTokenLength)
         assertEquals(288, Tokenizer(config).vocabSize)
     }
 }
