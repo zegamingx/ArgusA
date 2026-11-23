@@ -1059,8 +1059,8 @@ class TrainingManager internal constructor(
                                 lineNumber++
                                 val record = line.removePrefix("\uFEFF").trim()
                                 if (record.isEmpty()) continue
-                                require(record.startsWith('{')) {
-                                    "Invalid JSONL record at line $lineNumber: expected a JSON object."
+                                require(record.startsWith('{') && record.endsWith('}')) {
+                                    "Invalid JSONL record at line $lineNumber: expected one complete JSON object."
                                 }
                                 val processed = try {
                                     TextModalityProcessor.processStrictJsonObjectLine(
