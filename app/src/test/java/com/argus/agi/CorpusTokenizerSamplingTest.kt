@@ -104,6 +104,11 @@ class CorpusTokenizerSamplingTest {
             assertEquals(3 * 1024 * 1024, reconstructedText.length)
             assertTrue(reconstructedText.all { character -> character == 'x' })
 
+            val replayChunks = repository.getCorpusChunks(documentId)
+            assertEquals(21, replayChunks.size)
+            assertEquals(3 * 1024 * 1024, replayChunks.last().content.length)
+            assertTrue(replayChunks.last().content.all { character -> character == 'x' })
+
             assertNull(
                 "The cursor must stop after the final corpus row.",
                 repository.getNextTokenizerCorpusSample(
