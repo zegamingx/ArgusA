@@ -573,52 +573,6 @@ class CorpusPersistenceTest {
     }
 
     @Test
-    fun streamedJsonlAcceptsSingleRecordLargerThanLegacy256KiLimit() = runTest {
-        val context: Context = ApplicationProvider.getApplicationContext()
-        val database = Room.inMemoryDatabaseBuilder(context, ArgusDatabase::class.java)
-            .allowMainThreadQueries().build()
-        val repository = ArgusRepository(context, database)
-        val manager = TrainingManager(
-            context = context,
-            neuralEngine = ArgusNeuralEngine.createBlocking(context, EngineConfig(maxSeqLen = 64)),
-            deviceGuard = DeviceGuard(context),
-            worldModel = WorldModel(context),
-            repository = repository
-        )
-
-        try {
-            manager.pauseTraining()
-            val response = "Large JSONL response payload retained without a fixed record cap. ".repeat(6_000)
-            val jsonlRecord =
-                """{"instruction":"Preserve this complete large training sample.","response":"$response"}"""
-            assertTrue(
-                "The regression fixture must exceed the former 256 Ki UTF-16 record ceiling.",
-                jsonlRecord.length > 256 * 1024
-            )
-
-            val result = manager.enqueueDocumentStream(
-                source = "Large JSONL record regression",
-                title = "Large JSONL record",
-                reader = StringReader(jsonlRecord),
-                chunkSize = 512,
-                overlap = 0,
-                strictJsonLines = true
-            )
-
-            assertEquals(jsonlRecord.length.toLong(), result.second)
-            assertEquals("One complete JSONL object must remain one atomic training chunk.", 1, result.first)
-            val document = repository.getTrainingCorpusDocuments(limit = 1).single()
-            val storedChunk = repository.getCorpusChunks(document.id).single()
-            assertTrue("The entire response payload must survive canonicalization.", storedChunk.content.contains(response))
-            assertEquals(jsonlRecord.length, document.characterCount)
-            assertEquals(1, repository.getPendingQueueSnapshot().size)
-        } finally {
-            manager.close()
-            database.close()
-        }
-    }
-
-    @Test
     fun streamedJsonlPersistsRecordsAcrossMultipleRoomBatches() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val database = Room.inMemoryDatabaseBuilder(context, ArgusDatabase::class.java)
@@ -659,7 +613,7 @@ class CorpusPersistenceTest {
     }
 
     @Test
-    fun streamedJsonlRejectsOversizedRecordBeforePersistingAnyDocument() = runTest {
+    fun streamedJsonlAcceptsRecordAbove256KiAndPersistsItAtomically() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val database = Room.inMemoryDatabaseBuilder(
             context,
@@ -679,28 +633,35 @@ class CorpusPersistenceTest {
 
         try {
             manager.pauseTraining()
-            val oversizedRecord = """{"instruction":"prompt","response":"${
-                "x".repeat(256 * 1024 + 1)
-            }"}"""
-            val failure = runCatching {
-                manager.enqueueDocumentStream(
-                    source = "JSONL field-size regression",
-                    title = "Oversized JSONL record",
-                    reader = StringReader(oversizedRecord),
-                    chunkSize = 512,
-                    overlap = 0,
-                    strictJsonLines = true
-                )
-            }.exceptionOrNull()
-
+            val response = "Large response payload retained without a fixed record cap. ".repeat(6_000)
+            val largeRecord =
+                """{"instruction":"Preserve this complete large training sample.","response":"$response"}"""
             assertTrue(
-                "A JSONL value above the per-record limit must be rejected.",
-                failure is IllegalArgumentException
+                "The fixture must exceed the removed 256 Ki UTF-16 record ceiling.",
+                largeRecord.length > 256 * 1024
             )
-            assertTrue(repository.getCorpusDocuments().isEmpty())
-            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+
+            val result = manager.enqueueDocumentStream(
+                source = "JSONL large-record regression",
+                title = "Large JSONL record",
+                reader = StringReader(largeRecord),
+                chunkSize = 512,
+                overlap = 0,
+                strictJsonLines = true
+            )
+
+            assertEquals(largeRecord.length.toLong(), result.second)
+            assertEquals("One JSONL object must remain one atomic training chunk.", 1, result.first)
+            val document = repository.getTrainingCorpusDocuments(limit = 1).single()
+            val storedChunk = repository.getCorpusChunks(document.id).single()
             assertTrue(
-                "The temporary spool must be deleted after JSON value rejection.",
+                "The full response payload must survive canonicalization and persistence.",
+                storedChunk.content.contains(response)
+            )
+            assertEquals(largeRecord.length, document.characterCount)
+            assertEquals(1, repository.getPendingQueueSnapshot().size)
+            assertTrue(
+                "The temporary spool must be deleted after successful persistence.",
                 context.cacheDir.listFiles().orEmpty().none { file ->
                     file.name.startsWith("argus-ingest-")
                 }
