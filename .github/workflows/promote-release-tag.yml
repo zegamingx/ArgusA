@@ -43,6 +43,7 @@ jobs:
           ARGUS_RELEASE_KEY_ALIAS: argus-release-2026
         run: |
           set -euo pipefail
+          # Never move the Release tag or dispatch APK packaging before this succeeds.
           bash tools/security/verify-release-keystore.sh
 
       - name: Verify one-time tag promotion preconditions
