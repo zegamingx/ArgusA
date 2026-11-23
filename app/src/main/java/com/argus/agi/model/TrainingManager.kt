@@ -1212,9 +1212,22 @@ class TrainingManager internal constructor(
                 totalChunks = chunkCount
             )
 
-            // Persist corpus text in batches bounded by row count and total character count.
+            // Flush before adding a row that would exceed either Room batch budget.
             val corpusBatch = ArrayList<CorpusChunkEntity>(CORPUS_WRITE_BATCH_SIZE)
             var corpusBatchCharacters = 0L
+
+            suspend fun flushCorpusBatch(processedChunks: Int) {
+                if (corpusBatch.isEmpty()) return
+                activeRepository.appendStreamedCorpusChunks(documentId, corpusBatch)
+                corpusBatch.clear()
+                corpusBatchCharacters = 0L
+                publishImportProgress(
+                    stage = StreamedImportStage.PERSISTING_CORPUS,
+                    chunksProcessed = processedChunks,
+                    totalChunks = chunkCount
+                )
+            }
+
             DataInputStream(BufferedInputStream(FileInputStream(chunkStagingFile))).use { input ->
                 var chunkIndex = 0
                 while (true) {
@@ -1233,6 +1246,20 @@ class TrainingManager internal constructor(
                     }
                     val chunkText = String(characters)
                     chunkIndex = Math.addExact(chunkIndex, 1)
+                    val nextBatchCharacters = Math.addExact(
+                        corpusBatchCharacters,
+                        chunkText.length.toLong()
+                    )
+                    if (
+                        corpusBatch.isNotEmpty() &&
+                        (
+                            corpusBatch.size >= CORPUS_WRITE_BATCH_SIZE ||
+                                nextBatchCharacters > CORPUS_WRITE_BATCH_CHARACTERS
+                            )
+                    ) {
+                        flushCorpusBatch(chunkIndex - 1)
+                    }
+
                     corpusBatch += CorpusChunkEntity(
                         id = "$documentId:$chunkIndex",
                         documentId = documentId,
@@ -1248,24 +1275,14 @@ class TrainingManager internal constructor(
                         corpusBatch.size >= CORPUS_WRITE_BATCH_SIZE ||
                         corpusBatchCharacters >= CORPUS_WRITE_BATCH_CHARACTERS
                     ) {
-                        activeRepository.appendStreamedCorpusChunks(documentId, corpusBatch)
-                        corpusBatch.clear()
-                        corpusBatchCharacters = 0L
-                        publishImportProgress(
-                            stage = StreamedImportStage.PERSISTING_CORPUS,
-                            chunksProcessed = chunkIndex,
-                            totalChunks = chunkCount
-                        )
+                        flushCorpusBatch(chunkIndex)
                     }
                 }
                 require(chunkIndex == chunkCount) {
                     "Token-safe staging chunk count does not match its manifest."
                 }
             }
-            if (corpusBatch.isNotEmpty()) {
-                activeRepository.appendStreamedCorpusChunks(documentId, corpusBatch)
-                corpusBatch.clear()
-            }
+            flushCorpusBatch(chunkCount)
             publishImportProgress(
                 stage = StreamedImportStage.PERSISTING_CORPUS,
                 chunksProcessed = chunkCount,
