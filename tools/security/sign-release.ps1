@@ -38,7 +38,7 @@ param(
     [string]$KeyAlias = "argus-release-2026",
 
     [string]$ExpectedCertificateSha256 =
-        "40969E172BC0F8CB18ED2DDF274CAF3D3DB1456EDAEAF03939C0C0511797E64E",
+        "D4D24FEDCDC3395ADA6B89ACDE861CE3523560D35EDEB7DA48709C8CE4F63CAA",
 
     [ValidateRange(1, 100)]
     [int]$MinimumAndroidApi = 34

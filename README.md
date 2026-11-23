@@ -74,7 +74,7 @@ The replacement Argus 2026 identity is used for clean installs and all future
 updates signed with that same key:
 
 - Alias: `argus-release-2026`
-- Certificate SHA-256: `40969E172BC0F8CB18ED2DDF274CAF3D3DB1456EDAEAF03939C0C0511797E64E`
+- Certificate SHA-256: `D4D24FEDCDC3395ADA6B89ACDE861CE3523560D35EDEB7DA48709C8CE4F63CAA`
 - It is not a signing-certificate lineage successor to the exposed v1.0.13
   identity. An APK signed with this key cannot update an older installation
   signed by the exposed certificate. Back up app data before changing signing
@@ -95,7 +95,7 @@ but only when the final bytes have a recognized Java keystore header. Configure 
 
 The private-key alias is pinned to `argus-release-2026`, and the certificate
 must match SHA-256
-`40969E172BC0F8CB18ED2DDF274CAF3D3DB1456EDAEAF03939C0C0511797E64E`.
+`D4D24FEDCDC3395ADA6B89ACDE861CE3523560D35EDEB7DA48709C8CE4F63CAA`.
 Restrict the Environment deployment rule to the approved `Release` tag; add
 required reviewers if the repository's release policy requires approval.
 
