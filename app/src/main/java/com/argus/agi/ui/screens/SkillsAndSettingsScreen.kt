@@ -78,12 +78,19 @@ import com.argus.agi.ui.theme.ArgusTextPrimary
 import com.argus.agi.ui.theme.ArgusTextSecondary
 import com.argus.agi.ui.theme.ArgusWarning
 import androidx.compose.ui.res.painterResource
+import com.argus.agi.ArgusApp
 import com.argus.agi.R
 
 @Composable
 fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val argusApp = remember(context) {
+        context.applicationContext as ArgusApp
+    }
+    var isSharedDiagnosticsReady by remember {
+        mutableStateOf(argusApp.isSharedDiagnosticsDirectoryReady())
+    }
     val installedApps by viewModel.installedApps.collectAsState()
     val worldEntities by viewModel.worldEntities.collectAsState()
     val searchResults by viewModel.searchResults.collectAsState()
@@ -123,6 +130,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 isIgnoringOpt = pm?.isIgnoringBatteryOptimizations(context.packageName) ?: false
+                isSharedDiagnosticsReady = argusApp.refreshSharedDiagnosticsStorage()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -176,7 +184,99 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
             }
         }
 
-        // 1. BATTERY
+        // 1. DIAGNOSTIC LOG STORAGE
+        item {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = ArgusSurface,
+                border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                text = "Diagnostic logs",
+                                style = MaterialTheme.typography.titleMedium.copy(fontSize = 15.sp),
+                                color = ArgusTextPrimary,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = if (isSharedDiagnosticsReady) {
+                                    "Shared .Argus folder is ready"
+                                } else {
+                                    "Private diagnostic logging is active"
+                                },
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                                color = if (isSharedDiagnosticsReady) ArgusSuccess else ArgusWarning
+                            )
+                        }
+                        Text(
+                            text = if (isSharedDiagnosticsReady) "READY" else "PRIVATE",
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                            color = if (isSharedDiagnosticsReady) ArgusSuccess else ArgusWarning,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "ARGUS records warnings and errors only. Training batches, normal progress, chat content, dataset text, and personal memories are not written to these files.",
+                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                        color = ArgusTextSecondary,
+                        lineHeight = 16.sp
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = argusApp.sharedDiagnosticsDirectoryPath(),
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace
+                        ),
+                        color = ArgusTextMuted
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Button(
+                        onClick = {
+                            val appSettingsIntent = Intent(
+                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                Uri.parse("package:${context.packageName}")
+                            )
+                            try {
+                                context.startActivity(appSettingsIntent)
+                            } catch (_: Exception) {
+                                runCatching {
+                                    context.startActivity(
+                                        Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                    )
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = ArgusCyanPrimary,
+                            contentColor = ArgusDarkBg
+                        ),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text(
+                            text = if (isSharedDiagnosticsReady) {
+                                "Review storage access"
+                            } else {
+                                "Enable shared .Argus folder"
+                            },
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+        }
+
+        // 2. BATTERY
         item {
             Surface(shape = RoundedCornerShape(18.dp), color = ArgusSurface, border = androidx.compose.foundation.BorderStroke(1.dp, ArgusCardBorder), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
