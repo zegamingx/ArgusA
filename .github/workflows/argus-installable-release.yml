@@ -2,28 +2,18 @@ name: Argus Production Release
 
 on:
   push:
-    tags:
-      - Release
-  workflow_dispatch:
-    inputs:
-      release_channel:
-        description: "Production release channel"
-        required: true
-        type: choice
-        options:
-          - Release
-        default: Release
+    branches:
+      - main
 
 permissions:
   contents: read
 
 concurrency:
-  group: argus-production-release-${{ github.ref }}
+  group: argus-production-release
   cancel-in-progress: false
 
 jobs:
   release:
-    if: ${{ (github.event_name == 'push' && github.ref == 'refs/tags/Release') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.release_channel == 'Release') }}
     name: Build, sign and publish the single production APK
     runs-on: ubuntu-26.04
     timeout-minutes: 75
@@ -35,25 +25,22 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout the approved Release tag
+      - name: Checkout the main commit that triggered this release
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - name: Verify Release tag targets the current main commit
+      - name: Verify this run targets the current main commit
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
-          git fetch --force origin refs/tags/Release:refs/tags/Release
-          release_commit="$(git rev-parse HEAD)"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           main_commit="$(git rev-parse refs/remotes/origin/main)"
-          tag_commit="$(git rev-parse 'refs/tags/Release^{commit}')"
-          if [[ "$release_commit" != "$main_commit" || "$release_commit" != "$tag_commit" ]]; then
-            echo "::error::Release workflow source ($release_commit), main ($main_commit), and Release tag ($tag_commit) must be identical."
+          if [[ "$GITHUB_SHA" != "$main_commit" ]]; then
+            echo "::error::This run targets $GITHUB_SHA but main has advanced to $main_commit. The newer main push will publish the current APK."
             exit 1
           fi
-          echo "Release tag, main, and checked-out source all point to $release_commit."
+          echo "Production source matches current main commit $GITHUB_SHA."
 
       - name: Verify the existing production APK can be replaced in place
         shell: bash
@@ -232,6 +219,27 @@ jobs:
             echo "Production output: one APK, published as ARGUS.apk"
           } > "dist/BUILD-MANIFEST.txt"
           cat "dist/BUILD-MANIFEST.txt"
+
+      - name: Move Release tag to the verified main commit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          main_commit="$(git rev-parse refs/remotes/origin/main)"
+          if [[ "$main_commit" != "$GITHUB_SHA" ]]; then
+            echo "::error::main advanced during the production build ($main_commit). Refusing to publish an APK from an outdated commit."
+            exit 1
+          fi
+
+          old_tag_oid="$(git ls-remote --refs origin refs/tags/Release | awk 'NR == 1 { print $1 }')"
+          git tag --force Release "$GITHUB_SHA"
+          if [[ -n "$old_tag_oid" ]]; then
+            git push --force-with-lease="refs/tags/Release:$old_tag_oid" origin refs/tags/Release
+          else
+            git push origin refs/tags/Release
+          fi
+          echo "Release tag now points to verified main commit $GITHUB_SHA."
 
       - name: Publish the single verified APK to GitHub Release
         shell: bash

@@ -1143,18 +1143,22 @@ Do not run `assembleDebug`, `assembleRelease`, `exportDebugApk`, or
 `exportReleaseApk` during ordinary development or non-release CI validation.
 Do not upload intermediate, debug, unsigned, or additional APK artifacts.
 
-The only application APK assembly is `:app:assembleRelease` inside the protected
-`Argus Production Release` workflow, running from the approved `Release` tag.
-That workflow must produce and publish one signed `ARGUS.apk`. Do not dispatch
-duplicate release runs or create a second APK-producing workflow.
+The only application APK assembly is `:app:assembleRelease` inside the single
+`Argus Production Release` workflow, triggered by pushes to `main`. That workflow
+must build, sign, and verify one production APK, then move the `Release` tag to
+the exact source commit and publish or replace exactly one signed `ARGUS.apk`.
+The `Release` tag is the publication target, not the workflow trigger. Do not add
+tag-only triggers, separate tag-promotion workflows, or a second APK-producing
+workflow.
 
 Do not claim that any command passed unless its actual exit status confirms success.
 
 16.3 Native Verification
 
-The protected Release-tag assembly is responsible for compiling and packaging the
-production native libraries for every configured ABI, along with the Vulkan and
-shader build inputs. Do not start a separate APK-producing native build.
+The single main-triggered production release workflow is responsible for
+compiling and packaging the production native libraries for every configured
+ABI, along with the Vulkan and shader build inputs. Do not start a separate
+APK-producing native build.
 
 Host-side native unit tests may run independently because they do not package an
 Android application. Verify C++23 configuration, allocator and tensor behavior,
@@ -1213,9 +1217,11 @@ git log -1 --oneline
 
 For ArgusA:
 
-- Use "master" as the development branch unless the project owner explicitly changes it.
-- Treat "main" as the integration or release destination.
-- Never merge into "main" without explicit authorization.
+- Inspect the actual available branches; do not assume "master" exists.
+- Use the owner-designated development branch for ongoing work.
+- Treat "main" as the canonical production source; a push to "main" triggers the
+  single production build and updates the `Release` tag only after verification.
+- Never merge or push into "main" without explicit authorization.
 
 Always inspect the actual repository state rather than assuming branches are synchronized.
 
@@ -1253,32 +1259,38 @@ Do not commit code that has not undergone the required verification for its scop
 
 GitHub Actions execution must be controlled.
 
-Do not automatically:
+The only production workflow is `.github/workflows/argus-installable-release.yml`.
+Every push to `main` automatically triggers it. It runs release lint, unit tests,
+native host tests, one production APK build, signing and verification, then moves
+the `Release` tag to that exact main commit and publishes or replaces the single
+`ARGUS.apk` asset plus its verification metadata.
 
-- Enable disabled workflows.
-- Dispatch workflows.
-- Trigger redundant CI runs.
-- Publish release artifacts.
-- Create releases.
-- Merge pull requests.
+The `Release` tag is the publication destination, not a workflow trigger.
+Do not add a tag-only build trigger, manual dispatch input, separate tag-promotion
+workflow, or separate native-validation workflow unless the project owner
+explicitly requests a different pipeline.
+
+Do not manually:
+- Dispatch or rerun production workflows.
+- Start duplicate or redundant release builds.
+- Publish APK assets outside the canonical production workflow.
+- Create or retarget the `Release` tag outside the canonical production workflow.
+- Create additional APK-producing workflows.
+- Merge pull requests without authorization.
 - Change repository secrets.
 - Modify repository security settings.
 
-These actions require explicit project-owner authorization.
-
-Before triggering CI:
+Before changing the canonical production workflow:
 
 1. Complete the implementation.
-2. Review the diff.
-3. Run available local validation.
-4. Confirm the intended branch.
-5. Confirm that CI execution is authorized.
+2. Review the full diff.
+3. Verify that the workflow still produces exactly one signed `ARGUS.apk`.
+4. Confirm that only pushes to `main` trigger production packaging.
+5. Confirm the `Release` tag is moved only after the APK is built and verified.
 
-When CI is enabled by the project owner, review the resulting workflow run and investigate every failure.
-
-Never report a successful CI build using an earlier run when the current commit has not been tested.
-
-Do not create repeated commits merely to trigger CI without meaningful changes.
+Never report a successful CI build using an earlier run when the current commit
+has not been tested. Do not create repeated commits merely to trigger CI without
+meaningful changes.
 
 ---
 
