@@ -222,6 +222,7 @@ class TrainingManager internal constructor(
         private const val QUEUE_PREFETCH_LIMIT = 64
         private const val MAX_IN_MEMORY_QUEUE_ITEMS = 128
         private const val CORPUS_WRITE_BATCH_SIZE = 128
+        private const val CORPUS_WRITE_BATCH_CHARACTERS = 256L * 1024L
         private const val IDLE_POLL_MS = 500L
         private const val GRPO_ACTIVE_ITEM_DRAIN_TIMEOUT_MS = 5 * 60 * 1000L
         private const val SCREEN_SOURCE_PREFIX = "ScreenTrainingV2 ("
@@ -1202,6 +1203,7 @@ class TrainingManager internal constructor(
 
             // Persist corpus text in fixed-size Room batches.
             val corpusBatch = ArrayList<CorpusChunkEntity>(CORPUS_WRITE_BATCH_SIZE)
+            var corpusBatchCharacters = 0L
             DataInputStream(BufferedInputStream(FileInputStream(chunkStagingFile))).use { input ->
                 var chunkIndex = 0
                 while (true) {
@@ -1227,9 +1229,17 @@ class TrainingManager internal constructor(
                         content = chunkText,
                         characterCount = chunkText.length
                     )
-                    if (corpusBatch.size >= CORPUS_WRITE_BATCH_SIZE) {
+                    corpusBatchCharacters = Math.addExact(
+                        corpusBatchCharacters,
+                        chunkText.length.toLong()
+                    )
+                    if (
+                        corpusBatch.size >= CORPUS_WRITE_BATCH_SIZE ||
+                        corpusBatchCharacters >= CORPUS_WRITE_BATCH_CHARACTERS
+                    ) {
                         activeRepository.appendStreamedCorpusChunks(documentId, corpusBatch)
                         corpusBatch.clear()
+                        corpusBatchCharacters = 0L
                         publishImportProgress(
                             stage = StreamedImportStage.PERSISTING_CORPUS,
                             chunksProcessed = chunkIndex,
