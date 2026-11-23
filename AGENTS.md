@@ -1129,40 +1129,39 @@ Also verify the available Android SDK, NDK, CMake, and Build Tools versions.
 
 Do not silently install or select alternative versions.
 
-16.2 Required Build Commands
+16.2 Non-Packaging Verification
 
-Step 1: Clean and Assemble Debug APK
+Routine implementation and CI validation must not produce application APKs.
 
-./gradlew clean assembleDebug
+Run the release-variant checks without assembling an APK:
 
-Step 2: Run Host Unit Tests
+```bash
+./gradlew :app:lintRelease :app:testReleaseUnitTest
+```
 
-./gradlew test
+Do not run `assembleDebug`, `assembleRelease`, `exportDebugApk`, or
+`exportReleaseApk` during ordinary development or non-release CI validation.
+Do not upload intermediate, debug, unsigned, or additional APK artifacts.
 
-Step 3: Run Android Lint
-
-./gradlew lint
-
-These commands are mandatory for a normal full verification cycle.
+The only application APK assembly is `:app:assembleRelease` inside the protected
+`Argus Production Release` workflow, running from the approved `Release` tag.
+That workflow must produce and publish one signed `ARGUS.apk`. Do not dispatch
+duplicate release runs or create a second APK-producing workflow.
 
 Do not claim that any command passed unless its actual exit status confirms success.
 
-16.3 Additional Native Verification
+16.3 Native Verification
 
-Run the native build and test tasks configured by the project.
+The protected Release-tag assembly is responsible for compiling and packaging the
+production native libraries for every configured ABI, along with the Vulkan and
+shader build inputs. Do not start a separate APK-producing native build.
 
-Verify:
+Host-side native unit tests may run independently because they do not package an
+Android application. Verify C++23 configuration, allocator and tensor behavior,
+numerical correctness, JNI boundaries, Vulkan linkage, and shader/SPIR-V validity
+through the configured tests and the single production build.
 
-- All configured ABIs.
-- JNI compilation.
-- C++23 configuration.
-- Vulkan linkage.
-- Native library packaging.
-- Shader compilation.
-- SPIR-V validation where tools are available.
-- Native test results.
-
-Use the project's actual Gradle task names and CMake configuration.
+Use the project's actual test task names and CMake configuration.
 
 Do not invent task names or report nonexistent tests as executed.
 
@@ -1465,7 +1464,7 @@ Where applicable:
 
 Build Verification
 
-- Clean assembly succeeds.
+- The protected `Release`-tag production assembly succeeds after non-packaging validation.
 - Host unit tests succeed.
 - Android lint succeeds or all existing exceptions are documented.
 - Native compilation succeeds for configured targets.

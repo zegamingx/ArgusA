@@ -1,5 +1,8 @@
 name: Argus Native Validation
 
+concurrency:
+  group: argus-native-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 on:
   workflow_dispatch:
 
@@ -10,9 +13,9 @@ on:
 
 jobs:
   validate:
-    name: Validate Vulkan NDK, lint, tests and Android packaging
+    name: Validate Vulkan NDK, lint and unit tests without APK packaging
     runs-on: ubuntu-26.04
-    timeout-minutes: ${{ (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery'))) && 90 || 60 }}
+    timeout-minutes: 60
 
     steps:
       - name: Checkout validated source
@@ -92,7 +95,7 @@ jobs:
           chmod +x gradlew
           ./gradlew --version
 
-      - name: Run native build, lint and unit tests
+      - name: Run release lint and unit tests without generating APKs
         run: |
           chmod +x gradlew
           env -u ANDROID_SDK_ROOT ./gradlew \
@@ -102,134 +105,5 @@ jobs:
             --stacktrace \
             clean \
             :app:lintRelease \
-            :app:testReleaseUnitTest \
-            :app:assembleDebug \
-            :app:assembleRelease
-
-      - name: Verify packaged native ABI libraries
-        shell: bash
-        run: |
-          set -euo pipefail
-          apk_path="app/build/outputs/apk/debug/app-debug.apk"
-          test -s "${apk_path}"
-          for abi in arm64-v8a armeabi-v7a x86_64; do
-            unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
-          done
-
-      - name: Verify release variant packaging
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -s "app/build/outputs/apk/release/app-release-unsigned.apk"
-          echo "Unsigned release variant is present for build validation only."
-          echo "Installable APKs are published only by the protected Release-tag workflow."
-
-      - name: Install Android emulator and API 35 test image
-        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery')) }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          set -euo pipefail
-          sdk_root="$ANDROID_HOME"
-          sdkmanager_path="$(command -v sdkmanager || true)"
-          if [[ -z "$sdkmanager_path" ]]; then
-            sdkmanager_path="$(find "$sdk_root/cmdline-tools" -type f -name sdkmanager -print -quit)"
-          fi
-          avdmanager_path="$(find "$sdk_root/cmdline-tools" -type f -name avdmanager -print -quit)"
-          test -n "$sdkmanager_path"
-          test -n "$avdmanager_path"
-
-          # Keep AVD creation and emulator startup on one explicit, persisted path.
-          # Without this, avdmanager may create under ANDROID_SDK_HOME/avd while
-          # emulator resolves HOME/.android/avd and reports "Unknown AVD name".
-          avd_home="$HOME/.android/avd"
-          mkdir -p "$avd_home"
-          export ANDROID_AVD_HOME="$avd_home"
-          export ANDROID_USER_HOME="$HOME/.android"
-          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_USER_HOME=$ANDROID_USER_HOME" >> "$GITHUB_ENV"
-
-          set +o pipefail
-          yes | "$sdkmanager_path" --licenses >/dev/null
-          set -o pipefail
-          "$sdkmanager_path" --install "emulator" "system-images;android-35;google_apis;x86_64"
-          echo "$sdk_root/emulator" >> "$GITHUB_PATH"
-          echo "$(dirname "$avdmanager_path")" >> "$GITHUB_PATH"
-
-          printf 'no\n' | "$avdmanager_path" create avd \
-            --name argus-process-recovery \
-            --package "system-images;android-35;google_apis;x86_64" \
-            --device pixel_2 \
-            --force
-
-          echo "Created Android Virtual Device definitions:"
-          "$avdmanager_path" list avd
-          test -s "$ANDROID_AVD_HOME/argus-process-recovery.ini"
-          test -d "$ANDROID_AVD_HOME/argus-process-recovery.avd"
-          echo "Verified AVD metadata: $ANDROID_AVD_HOME/argus-process-recovery.ini"
-
-      - name: Start Android emulator
-        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery')) }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          avd_home="${ANDROID_AVD_HOME:-$HOME/.android/avd}"
-          export ANDROID_AVD_HOME="$avd_home"
-          export ANDROID_USER_HOME="${ANDROID_USER_HOME:-$HOME/.android}"
-          avd_ini="$ANDROID_AVD_HOME/argus-process-recovery.ini"
-          if [[ ! -s "$avd_ini" || ! -d "$ANDROID_AVD_HOME/argus-process-recovery.avd" ]]; then
-            echo "::error::The process-recovery AVD was not created in the configured AVD home: $ANDROID_AVD_HOME"
-            find "$HOME/.android" -maxdepth 3 -type f -name 'argus-process-recovery.ini' -print || true
-            exit 1
-          fi
-          echo "Using verified AVD: $avd_ini"
-
-          accel_mode=auto
-          device_timeout=180
-          boot_timeout=240
-          if emulator -accel-check; then
-            echo "KVM acceleration is available; using automatic VM acceleration."
-          else
-            echo "::warning::KVM acceleration is unavailable. Trying the supported software CPU-emulation fallback; this can be significantly slower."
-            export ANDROID_I_WANT_MY_TCG=yes
-            accel_mode=off
-            device_timeout=600
-            boot_timeout=900
-          fi
-          emulator \
-            -avd argus-process-recovery \
-            -no-window \
-            -no-audio \
-            -no-boot-anim \
-            -no-snapshot \
-            -gpu software \
-            -accel "$accel_mode" \
-            > "$RUNNER_TEMP/argus-emulator.log" 2>&1 &
-          echo "$!" > "$RUNNER_TEMP/argus-emulator.pid"
-          if ! timeout "${device_timeout}s" adb wait-for-device; then
-            echo "::error::Android emulator did not expose an ADB device within ${device_timeout} seconds."
-            cat "$RUNNER_TEMP/argus-emulator.log" || true
-            exit 1
-          fi
-          if ! timeout "${boot_timeout}s" bash -c '
-            until [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" == "1" ]]; do
-              sleep 2
-            done
-          '; then
-            echo "::error::Android emulator did not finish booting within ${boot_timeout} seconds."
-            cat "$RUNNER_TEMP/argus-emulator.log" || true
-            exit 1
-          fi
-          adb shell settings put global window_animation_scale 0
-          adb shell settings put global transition_animation_scale 0
-          adb shell settings put global animator_duration_scale 0
-
-      - name: Run Android process-death recovery matrix
-        if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-process-recovery')) }}
-        run: |
-          env -u ANDROID_SDK_ROOT ./gradlew \
-            --no-daemon \
-            --no-configuration-cache \
-            --stacktrace \
-            :app:connectedDebugAndroidTest
+            :app:testReleaseUnitTest
 

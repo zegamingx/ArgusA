@@ -544,7 +544,7 @@ class TrainingManager internal constructor(
             if (closed) return
 
             val previousWorker = workerJob
-            if (previousWorker?.isActive == true && !streamedImportStartup.isCompletedExceptionally) {
+            if (previousWorker?.isActive == true && !streamedImportStartup.isCancelled) {
                 return
             }
 
@@ -583,8 +583,11 @@ class TrainingManager internal constructor(
 
     private fun resumeAfterCommittedQueueRefresh(forceTrainingOnce: Boolean = false) {
         scope.launch {
-            if (!trainingResumeMutex.tryLock()) return@launch
+            // Serialize recovery requests. A second explicit Resume must wait for the
+            // current attempt and retry if that attempt fails; tryLock would drop it.
+            trainingResumeMutex.lock()
             try {
+                if (!forceTrainingOnce && !_isTrainingPaused.value) return@launch
                 awaitTrainingWorkerReady()
                 workerExecutionMutex.lock()
                 try {
