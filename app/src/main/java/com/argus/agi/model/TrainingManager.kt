@@ -449,8 +449,7 @@ class TrainingManager internal constructor(
         }
 
         if (repo == null) {
-            Log.e(
-                TAG,
+            logError(
                 "Training persistence is unavailable; queued work will not be reported as durable.",
                 repositoryInitialization.exceptionOrNull()
             )
@@ -2502,8 +2501,7 @@ class TrainingManager internal constructor(
     ) {
         val activeModelState = neuralEngine.snapshotModelState()
         if (snapshot.modelIdentityFingerprint == null) {
-            Log.w(
-                TAG,
+            logWarning(
                 "Legacy training journal has no model identity fingerprint; preserving its prior optimizer-step recovery path."
             )
         } else {
@@ -2518,8 +2516,7 @@ class TrainingManager internal constructor(
             }
         }
         if (snapshot.optimizerConfigFingerprint == null) {
-            Log.w(
-                TAG,
+            logWarning(
                 "Legacy training journal has no optimizer configuration fingerprint; compatibility is unverified."
             )
         } else {
@@ -2545,8 +2542,7 @@ class TrainingManager internal constructor(
                     "The checkpoint was preserved and queue recovery was stopped."
             }
             if (activeModelState.checkpointFormat == ModelCheckpointFormat.ARG5) {
-                Log.w(
-                    TAG,
+                logWarning(
                     "Journal v3 is being recovered from a verified ARG5 checkpoint without embedded optimizer identity; checkpoint optimizer compatibility remains unverified."
                 )
             }
@@ -2859,8 +2855,7 @@ class TrainingManager internal constructor(
         activeItems: MutableList<TrainingData>,
         error: OutOfMemoryError
     ) {
-        Log.e(
-            TAG,
+        logError(
             "Training batch hit memory pressure; recovering from its durable optimizer transaction.",
             error
         )
@@ -2895,8 +2890,7 @@ class TrainingManager internal constructor(
             _currentTrainingItem.value = null
             _activeDocument.value = null
             _isTrainingPaused.value = true
-            Log.w(
-                TAG,
+            logWarning(
                 "The optimizer commit was preserved. Training is paused so the remaining committed items can be finalized without retraining."
             )
             return
@@ -2925,8 +2919,7 @@ class TrainingManager internal constructor(
         }
         if (activeItems.any { it.id in committedIdsInRoom }) {
             _isTrainingPaused.value = true
-            Log.e(
-                TAG,
+            logError(
                 "Room already contains optimizer-committed items, but the corresponding model checkpoint could not be verified. The queue was left untouched."
             )
             return
@@ -2948,8 +2941,7 @@ class TrainingManager internal constructor(
         }
         if (!rolledBack) {
             _isTrainingPaused.value = true
-            Log.e(
-                TAG,
+            logError(
                 "Training paused because the model could not be restored to its pre-batch optimizer checkpoint."
             )
             return
@@ -2990,8 +2982,7 @@ class TrainingManager internal constructor(
             _isTrainingPaused.value = true
             logError( "The same training item hit OOM more than once. It was preserved for explicit user retry.")
         } else {
-            Log.w(
-                TAG,
+            logWarning(
                 "The uncommitted batch was rolled back and moved to the front of the queue. Its retry is constrained to batch 1 and reduced context."
             )
         }
@@ -3303,8 +3294,7 @@ class TrainingManager internal constructor(
                         } catch (outOfMemory: OutOfMemoryError) {
                             handleCommittedFinalizationOutOfMemory(firstItem, outOfMemory)
                         } catch (error: Throwable) {
-                            Log.e(
-                                TAG,
+                            logError(
                                 "Committed training item '${firstItem.id}' could not be finalized.",
                                 error
                             )
@@ -3395,8 +3385,7 @@ class TrainingManager internal constructor(
                         } catch (outOfMemory: OutOfMemoryError) {
                             handleTrainingOutOfMemory(activeItems, outOfMemory)
                         } catch (error: Throwable) {
-                            Log.e(
-                                TAG,
+                            logError(
                                 "Training batch failed (${activeItems.size} samples).",
                                 error
                             )
@@ -3549,8 +3538,7 @@ class TrainingManager internal constructor(
                     }
                 }
                 result.onFailure { error ->
-                    Log.e(
-                        TAG,
+                    logError(
                         "Failed to persist active training state for '${operation.itemId}'",
                         error
                     )
@@ -3614,8 +3602,7 @@ class TrainingManager internal constructor(
                 }
 
                 if (persistenceFailure != null) {
-                    Log.e(
-                        TAG,
+                    logError(
                         "Failed to persist " + operation.items.size + " training items",
                         persistenceFailure
                     )
@@ -3725,8 +3712,7 @@ class TrainingManager internal constructor(
                     _nextQueue.value = listOf(item) + _nextQueue.value
                 }
             }
-            Log.e(
-                TAG,
+            logError(
                 "Training item '${item.id}' was returned to the queue because its start state was not persisted.",
                 persistenceResult.exceptionOrNull()
             )
@@ -3743,8 +3729,7 @@ class TrainingManager internal constructor(
             try {
                 persistenceOperations.send(QueuePersistenceOperation.DeleteItem(item.id))
             } catch (closedChannel: ClosedSendChannelException) {
-                Log.e(
-                    TAG,
+                logError(
                     "Could not queue deletion of screen item '${item.id}' after consent was revoked.",
                     closedChannel
                 )
