@@ -12,6 +12,9 @@ import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.argus.agi.diagnostics.ArgusDiagnosticLogger
+import com.argus.agi.diagnostics.ArgusDiagnosticSeverity
+import com.argus.agi.diagnostics.ArgusDiagnosticSubsystem
 import com.argus.agi.model.ArgusNeuralEngine
 import com.argus.agi.model.EngineConfig
 import com.argus.agi.model.GenesisModelManager
@@ -51,7 +54,6 @@ class ArgusApp : Application() {
     companion object {
         private const val TAG = "ArgusApp"
         const val CHANNEL_ID = "argus_core_service_channel"
-        private const val DIAGNOSTICS_FILE_NAME = "argus_runtime_diagnostics.txt"
         private const val MAX_DIAGNOSTICS_CHARS = 12_000
 
         @Volatile
@@ -152,9 +154,9 @@ class ArgusApp : Application() {
     private val _runtimeDiagnostics = MutableStateFlow<String?>(null)
     val runtimeDiagnostics: StateFlow<String?> = _runtimeDiagnostics.asStateFlow()
 
-    private val diagnosticsLock = Any()
-    private val diagnosticsFile: File by lazy(LazyThreadSafetyMode.NONE) {
-        File(noBackupFilesDir, DIAGNOSTICS_FILE_NAME)
+    private val diagnosticsPreviewLock = Any()
+    private val diagnosticLogger: ArgusDiagnosticLogger by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        ArgusDiagnosticLogger(this)
     }
 
     @Volatile
@@ -182,6 +184,7 @@ class ArgusApp : Application() {
         }
 
         _instance = this
+        diagnosticLogger.initialize()
         capturePreviousProcessExit()
         installUncaughtExceptionHandler()
         createNotificationChannel()
@@ -217,26 +220,67 @@ class ArgusApp : Application() {
     }
 
     fun recordRuntimeDiagnostic(message: String) {
+        recordDiagnostic(
+            message = message,
+            severity = ArgusDiagnosticSeverity.ERROR,
+            subsystem = ArgusDiagnosticSubsystem.APP
+        )
+    }
+
+    fun recordDiagnostic(
+        message: String,
+        severity: ArgusDiagnosticSeverity = ArgusDiagnosticSeverity.ERROR,
+        subsystem: ArgusDiagnosticSubsystem = ArgusDiagnosticSubsystem.APP,
+        throwable: Throwable? = null,
+        immediate: Boolean = false
+    ) {
         val timestamp = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date())
-        synchronized(diagnosticsLock) {
+        synchronized(diagnosticsPreviewLock) {
             val updated = (_runtimeDiagnostics.value.orEmpty() + "\n[" + timestamp + "] " + message)
                 .trim()
                 .takeLast(MAX_DIAGNOSTICS_CHARS)
-            runCatching { diagnosticsFile.writeText(updated) }
             _runtimeDiagnostics.value = updated
         }
+        diagnosticLogger.record(
+            subsystem = subsystem,
+            severity = severity,
+            message = message,
+            throwable = throwable,
+            immediate = immediate
+        )
     }
 
+    fun hasSharedDiagnosticsAccess(): Boolean =
+        diagnosticLogger.hasSharedStorageAccess()
+
+    fun isSharedDiagnosticsDirectoryReady(): Boolean =
+        diagnosticLogger.isSharedDirectoryReady()
+
+    fun refreshSharedDiagnosticsStorage(): Boolean =
+        diagnosticLogger.synchronizeSharedStorage()
+
+    fun sharedDiagnosticsDirectoryPath(): String =
+        diagnosticLogger.sharedDirectoryPath()
+
     private fun capturePreviousProcessExit() {
-        val savedReport = runCatching {
-            if (diagnosticsFile.isFile) diagnosticsFile.readText() else ""
-        }.getOrDefault("")
+        val savedReport = diagnosticLogger.readRecent(
+            subsystem = ArgusDiagnosticSubsystem.APP,
+            maximumCharacters = MAX_DIAGNOSTICS_CHARS
+        ).orEmpty()
         _runtimeDiagnostics.value = savedReport.takeIf { it.isNotBlank() }
 
         val activityManager = getSystemService(ActivityManager::class.java) ?: return
         val previousExit = runCatching {
             activityManager.getHistoricalProcessExitReasons(packageName, 0, 5).firstOrNull()
         }.getOrNull() ?: return
+
+        // Normal app exits and explicit user stops are not diagnostic warnings.
+        if (previousExit.reason == ApplicationExitInfo.REASON_EXIT_SELF ||
+            previousExit.reason == ApplicationExitInfo.REASON_USER_REQUESTED ||
+            previousExit.reason == ApplicationExitInfo.REASON_USER_STOPPED
+        ) {
+            return
+        }
 
         val exitReport = buildString {
             appendLine("Previous process exit")
@@ -248,7 +292,19 @@ class ArgusApp : Application() {
             appendLine("RSS: " + previousExit.rss)
             append("System description: " + (previousExit.description ?: "Not provided"))
         }
-        recordRuntimeDiagnostic(exitReport)
+        val severity = when (previousExit.reason) {
+            ApplicationExitInfo.REASON_CRASH,
+            ApplicationExitInfo.REASON_CRASH_NATIVE,
+            ApplicationExitInfo.REASON_ANR,
+            ApplicationExitInfo.REASON_LOW_MEMORY,
+            ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> ArgusDiagnosticSeverity.ERROR
+            else -> ArgusDiagnosticSeverity.WARNING
+        }
+        recordDiagnostic(
+            message = exitReport,
+            severity = severity,
+            subsystem = ArgusDiagnosticSubsystem.RECOVERY
+        )
     }
 
     private fun exitReasonLabel(reason: Int): String = when (reason) {
@@ -272,10 +328,12 @@ class ArgusApp : Application() {
         val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
             runCatching {
-                recordRuntimeDiagnostic(
-                    "Uncaught exception on thread '" + thread.name + "': " +
-                        error.javaClass.name + ": " + (error.message ?: "No message") +
-                        "\n" + Log.getStackTraceString(error)
+                recordDiagnostic(
+                    message = "Uncaught exception on thread '" + thread.name + "'.",
+                    severity = ArgusDiagnosticSeverity.ERROR,
+                    subsystem = ArgusDiagnosticSubsystem.APP,
+                    throwable = error,
+                    immediate = true
                 )
             }.onFailure { reportingError ->
                 Log.e(TAG, "Could not persist the uncaught exception report.", reportingError)
@@ -463,6 +521,7 @@ class ArgusApp : Application() {
             runCatching { trainingManager.close() }
                 .onFailure { Log.w(TAG, "Failed to close the training manager", it) }
         }
+        diagnosticLogger.close()
         applicationScope.cancel()
         super.onTerminate()
     }
