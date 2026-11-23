@@ -1,5 +1,7 @@
 package com.argus.agi.sensor
 
+import com.argus.agi.diagnostics.ArgusDiagnosticBridge
+
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -49,7 +51,7 @@ class WebSearchEngine(
         val generalResults = runCatching {
             fetchDdgResults(normalizedQuery)
         }.onFailure { error ->
-            android.util.Log.w("WebSearchEngine", "General web provider failed.", error)
+            ArgusDiagnosticBridge.warning("WebSearchEngine", "General web provider failed.", error)
         }.getOrDefault(emptyList())
 
         val supplementaryResults = if (generalResults.size < MAX_RESULTS) {
@@ -63,7 +65,7 @@ class WebSearchEngine(
                 val indonesian = fetchWikiResults(indonesianUrl)
                 if (indonesian.isEmpty()) fetchWikiResults(englishUrl) else indonesian
             }.onFailure { error ->
-                android.util.Log.w("WebSearchEngine", "Wikipedia enrichment provider failed.", error)
+                ArgusDiagnosticBridge.warning("WebSearchEngine", "Wikipedia enrichment provider failed.", error)
             }.getOrDefault(emptyList())
         } else {
             emptyList()
