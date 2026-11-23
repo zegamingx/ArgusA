@@ -50,7 +50,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_OLD_TAG: b19842ef211ef7c603f5284c7b0427ab7c352447
+          EXPECTED_OLD_TAG: a0cde666f0c5302ffca8a5a52fff2748b3256012
         run: |
           set -euo pipefail
 
@@ -79,9 +79,20 @@ jobs:
 
           case "$http_status" in
             200)
-              if jq -e '[.assets[]?.name] | index("ARGUS.apk") != null' "$release_response" >/dev/null; then
-                echo "::error::ARGUS.apk is already published. Refusing to rebuild or replace the production APK."
+              apk_asset_count="$(jq '[.assets[]?.name | select(endswith(".apk"))] | length' "$release_response")"
+              if (( apk_asset_count > 1 )); then
+                echo "::error::Multiple APK assets already exist for Release. Refusing to add another APK."
                 exit 1
+              fi
+              if (( apk_asset_count == 1 )); then
+                existing_apk="$(jq -r '[.assets[]?.name | select(endswith(".apk"))][0]' "$release_response")"
+                if [[ "$existing_apk" != "ARGUS.apk" ]]; then
+                  echo "::error::Unexpected existing APK asset ($existing_apk). Refusing to replace it."
+                  exit 1
+                fi
+                echo "Exactly one ARGUS.apk exists; the production workflow will replace that asset in place."
+              else
+                echo "No APK asset exists for Release; one production APK may be published."
               fi
               ;;
             404)
