@@ -901,7 +901,7 @@ class TrainingManager internal constructor(
         strictJsonLines: Boolean = false
     ): Pair<Int, Long> {
         if (closed) return Pair(0, 0L)
-        streamedImportStartup.await()
+        awaitTrainingWorkerReady()
         require(chunkSize > 0) { "chunkSize must be positive." }
         require(overlap >= 0 && overlap < chunkSize) {
             "overlap must be between zero and chunkSize - 1."
