@@ -92,8 +92,11 @@ data class TokenizerTrainingProgress(
  * generation as the complete streaming pass.
  */
 data class TokenizerTextChunk(
+    /** Original, source-preserving text presented to the corpus/UI layer. */
     val text: String,
-    val tokenIds: IntArray
+    val tokenIds: IntArray,
+    /** Exact text representation used to produce tokenIds and persist the chunk. */
+    val encodedText: String = text
 )
 
 class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
@@ -1276,6 +1279,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         overlapTokens: Int = 0,
         literalControlTokens: Boolean = false,
         allowSpecialTokens: Boolean = true,
+        maxCharactersPerChunk: Int = 8_192,
         action: (TokenizerTextChunk) -> Unit
     ) {
         require(maxTokensPerChunk > 0) { "maxTokensPerChunk must be positive." }
@@ -1286,40 +1290,66 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         // Keep the tokenizer identity fixed for the complete streaming document.
         val current = state
         val maximumSpecialLength = SPECIAL_TOKENS.maxOfOrNull { token -> token.length } ?: 1
+        require(maxCharactersPerChunk >= maximumSpecialLength * 2 + 2) {
+            "maxCharactersPerChunk is too small to preserve complete reserved control tokens."
+        }
+        val maximumBufferedPreTokenCharacters = maxOf(2, maxCharactersPerChunk / 2)
         val input = PushbackReader(BufferedReader(reader, 8_192), maximumSpecialLength + 2)
 
-        data class SafeUnit(val sourceText: String, val tokenIds: IntArray)
+        data class SafeUnit(
+            val sourceText: String,
+            val storageText: String,
+            val tokenIds: IntArray
+        ) {
+            val storageCharacterCount: Int
+                get() = storageText.length
+        }
 
         val currentUnits = ArrayList<SafeUnit>()
         var currentTokenCount = 0
+        var currentCharacterCount = 0
         val pendingWhitespace = StringBuilder()
         val currentWord = StringBuilder()
 
         fun emitCurrentChunk() {
             if (currentUnits.isEmpty()) return
             val textLength = currentUnits.sumOf { unit -> unit.sourceText.length }
-            val tokenCount = currentUnits.sumOf { unit -> unit.tokenIds.size }
+            val storageTextLength = currentUnits.sumOf { unit -> unit.storageText.length }
             val chunkText = StringBuilder(textLength)
-            val chunkTokenIds = IntArray(tokenCount)
-            var tokenOffset = 0
+            val storageText = StringBuilder(storageTextLength)
             for (unit in currentUnits) {
                 chunkText.append(unit.sourceText)
-                unit.tokenIds.copyInto(chunkTokenIds, tokenOffset)
-                tokenOffset += unit.tokenIds.size
+                storageText.append(unit.storageText)
             }
-            action(TokenizerTextChunk(chunkText.toString(), chunkTokenIds))
+            val encodedChunkText = storageText.toString()
+            val chunkTokenIds = encodeTextWithState(encodedChunkText, current)
+            action(
+                TokenizerTextChunk(
+                    text = chunkText.toString(),
+                    tokenIds = chunkTokenIds,
+                    encodedText = encodedChunkText
+                )
+            )
             currentUnits.clear()
             currentTokenCount = 0
+            currentCharacterCount = 0
         }
 
         fun appendSafeUnit(sourceText: String, encodingText: String = sourceText) {
             if (sourceText.isEmpty()) return
+            require(encodingText.length <= maxCharactersPerChunk) {
+                "A persisted tokenizer-safe unit exceeds the configured character limit."
+            }
             val encoded = encodeTextWithState(encodingText, current)
             if (encoded.isEmpty()) return
 
             if (
                 currentUnits.isNotEmpty() &&
-                currentTokenCount.toLong() + encoded.size.toLong() > maxTokensPerChunk.toLong()
+                (
+                    currentTokenCount.toLong() + encoded.size.toLong() > maxTokensPerChunk.toLong() ||
+                        currentCharacterCount.toLong() + encodingText.length.toLong() >
+                        maxCharactersPerChunk.toLong()
+                    )
             ) {
                 val previousUnits = currentUnits.toList()
                 emitCurrentChunk()
@@ -1327,19 +1357,38 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 if (overlapTokens > 0) {
                     val suffix = ArrayDeque<SafeUnit>()
                     var suffixTokenCount = 0
+                    var suffixCharacterCount = 0
                     for (unit in previousUnits.asReversed()) {
-                        val nextCount = suffixTokenCount.toLong() + unit.tokenIds.size.toLong()
-                        if (nextCount > overlapTokens.toLong()) break
+                        val nextTokenCount =
+                            suffixTokenCount.toLong() + unit.tokenIds.size.toLong()
+                        val nextCharacterCount =
+                            suffixCharacterCount.toLong() + unit.storageCharacterCount.toLong()
+                        if (
+                            nextTokenCount > overlapTokens.toLong() ||
+                            nextTokenCount + encoded.size.toLong() > maxTokensPerChunk.toLong() ||
+                            nextCharacterCount + encodingText.length.toLong() >
+                            maxCharactersPerChunk.toLong()
+                        ) {
+                            break
+                        }
                         suffix.addFirst(unit)
-                        suffixTokenCount += unit.tokenIds.size
+                        suffixTokenCount = Math.addExact(suffixTokenCount, unit.tokenIds.size)
+                        suffixCharacterCount =
+                            Math.addExact(suffixCharacterCount, unit.storageCharacterCount)
                     }
                     currentUnits.addAll(suffix)
                     currentTokenCount = suffixTokenCount
+                    currentCharacterCount = suffixCharacterCount
                 }
             }
 
-            currentUnits += SafeUnit(sourceText, encoded)
+            currentUnits += SafeUnit(
+                sourceText = sourceText,
+                storageText = encodingText,
+                tokenIds = encoded
+            )
             currentTokenCount = Math.addExact(currentTokenCount, encoded.size)
+            currentCharacterCount = Math.addExact(currentCharacterCount, encodingText.length)
         }
 
         fun flushWord() {
@@ -1349,19 +1398,32 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             }
         }
 
-        fun flushPlainText() {
-            flushWord()
+        fun flushPendingWhitespace() {
             if (pendingWhitespace.isNotEmpty()) {
                 appendSafeUnit(pendingWhitespace.toString())
                 pendingWhitespace.setLength(0)
             }
         }
 
+        fun flushPlainText() {
+            flushWord()
+            flushPendingWhitespace()
+        }
+
         fun acceptPlainCodePoint(codePoint: Int, sourceText: String) {
             when {
                 isUnicodeWhiteSpace(codePoint) -> {
                     flushWord()
+                    if (
+                        pendingWhitespace.length.toLong() + sourceText.length.toLong() >
+                        maximumBufferedPreTokenCharacters.toLong()
+                    ) {
+                        flushPendingWhitespace()
+                    }
                     pendingWhitespace.append(sourceText)
+                    if (pendingWhitespace.length >= maximumBufferedPreTokenCharacters) {
+                        flushPendingWhitespace()
+                    }
                 }
                 isAsciiDigit(codePoint) || isPunctuation(codePoint) -> {
                     flushWord()
@@ -1376,7 +1438,17 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                         currentWord.append(pendingWhitespace)
                         pendingWhitespace.setLength(0)
                     }
+                    if (
+                        currentWord.isNotEmpty() &&
+                        currentWord.length.toLong() + sourceText.length.toLong() >
+                        maximumBufferedPreTokenCharacters.toLong()
+                    ) {
+                        flushWord()
+                    }
                     currentWord.append(sourceText)
+                    if (currentWord.length >= maximumBufferedPreTokenCharacters) {
+                        flushWord()
+                    }
                 }
             }
         }

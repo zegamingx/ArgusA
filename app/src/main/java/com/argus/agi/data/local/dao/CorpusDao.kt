@@ -9,6 +9,24 @@ import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceEntity
 import kotlinx.coroutines.flow.Flow
 
+/**
+ * Bounded projection used by tokenizer preparation. Never hydrate the complete corpus row.
+ */
+data class TokenizerCorpusSample(
+    val chunkIndex: Int,
+    val content: String
+)
+
+/**
+ * Small metadata projection used to reconstruct a large retained training chunk safely.
+ */
+data class CorpusChunkMetadata(
+    val id: String,
+    val documentId: String,
+    val chunkIndex: Int,
+    val characterCount: Int
+)
+
 @Dao
 interface CorpusDao {
 
@@ -110,8 +128,32 @@ interface CorpusDao {
     @Query("UPDATE corpus_documents SET status = 'READY' WHERE id = :documentId AND status = 'IMPORTING'")
     suspend fun completeStreamedImport(documentId: String): Int
 
-    @Query("SELECT * FROM corpus_chunks WHERE documentId = :documentId AND chunkIndex = :chunkIndex LIMIT 1")
-    suspend fun getChunk(documentId: String, chunkIndex: Int): CorpusChunkEntity?
+    @Query(
+        """
+        SELECT id, documentId, chunkIndex, characterCount
+        FROM corpus_chunks
+        WHERE documentId = :documentId AND chunkIndex = :chunkIndex
+        LIMIT 1
+        """
+    )
+    suspend fun getChunkMetadata(
+        documentId: String,
+        chunkIndex: Int
+    ): CorpusChunkMetadata?
+
+    @Query(
+        """
+        SELECT substr(content, :startCodePoint, :maxCodePoints)
+        FROM corpus_chunks
+        WHERE id = :chunkId
+        LIMIT 1
+        """
+    )
+    suspend fun getChunkContentSegment(
+        chunkId: String,
+        startCodePoint: Int,
+        maxCodePoints: Int
+    ): String?
 
 
     @Query("SELECT * FROM corpus_documents WHERE contentFingerprint = :fingerprint LIMIT 1")
@@ -140,14 +182,34 @@ interface CorpusDao {
     )
     suspend fun getTrainingDocuments(limit: Int): List<CorpusDocumentEntity>
 
-    @Query("SELECT * FROM corpus_chunks WHERE documentId = :documentId ORDER BY chunkIndex ASC")
-    suspend fun getChunks(documentId: String): List<CorpusChunkEntity>
+    @Query(
+        """
+        SELECT id, documentId, chunkIndex, characterCount
+        FROM corpus_chunks
+        WHERE documentId = :documentId AND chunkIndex > :afterChunkIndex
+        ORDER BY chunkIndex ASC
+        LIMIT 1
+        """
+    )
+    suspend fun getNextChunkMetadata(
+        documentId: String,
+        afterChunkIndex: Int
+    ): CorpusChunkMetadata?
 
     @Query(
-        "SELECT content FROM corpus_chunks WHERE documentId = :documentId " +
-            "ORDER BY chunkIndex ASC LIMIT :limit"
+        """
+        SELECT chunkIndex, substr(content, 1, :maxCharacters) AS content
+        FROM corpus_chunks
+        WHERE documentId = :documentId AND chunkIndex > :afterChunkIndex
+        ORDER BY chunkIndex ASC
+        LIMIT 1
+        """
     )
-    suspend fun getTokenizerCorpusSample(documentId: String, limit: Int): List<String>
+    suspend fun getNextTokenizerCorpusSample(
+        documentId: String,
+        afterChunkIndex: Int,
+        maxCharacters: Int
+    ): TokenizerCorpusSample?
 
     @Query(
         "UPDATE corpus_documents SET status = :status, " +

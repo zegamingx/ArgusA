@@ -64,9 +64,10 @@ class TokenizerStreamingBoundaryTest {
                 )
 
                 assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+                assertEquals(sample, chunks.joinToString(separator = "") { it.encodedText })
                 assertArrayEquals(tokenizer.encodeToIds(sample), flatten(chunks))
                 for (chunk in chunks) {
-                    assertArrayEquals(tokenizer.encodeToIds(chunk.text), chunk.tokenIds)
+                    assertArrayEquals(tokenizer.encodeToIds(chunk.encodedText), chunk.tokenIds)
                 }
             }
         }
@@ -125,6 +126,7 @@ class TokenizerStreamingBoundaryTest {
         )
 
         assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+        assertEquals(escaped, chunks.joinToString(separator = "") { it.encodedText })
         assertArrayEquals(tokenizer.encodeToIds(escaped), flatten(chunks))
         assertTrue(flatten(chunks).none { it == Tokenizer.USER_ID || it == Tokenizer.EOS_ID })
     }
@@ -150,8 +152,10 @@ class TokenizerStreamingBoundaryTest {
         )
 
         val streamedIds = flatten(chunks)
-        val expectedLiteralIds = tokenizer.encodeToIds(Tokenizer.escapeLiteralControlTokens(sample))
+        val escapedSample = Tokenizer.escapeLiteralControlTokens(sample)
+        val expectedLiteralIds = tokenizer.encodeToIds(escapedSample)
         assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+        assertEquals(escapedSample, chunks.joinToString(separator = "") { it.encodedText })
         assertArrayEquals(expectedLiteralIds, streamedIds)
         val reservedIds = setOf(
             Tokenizer.SYSTEM_ID,
@@ -180,6 +184,129 @@ class TokenizerStreamingBoundaryTest {
         assertEquals(sample, chunks.single().text)
         assertArrayEquals(tokenizer.encodeToIds(sample), chunks.single().tokenIds)
         assertTrue(chunks.single().tokenIds.size > 2)
+    }
+
+    @Test
+    fun oversizedUnbrokenPreTokensAreSplitIntoBoundedChunks() {
+        val tokenizer = tokenizer()
+        val sample = "a".repeat(24_000)
+        val chunks = ArrayList<TokenizerTextChunk>()
+
+        tokenizer.forEachSafeTextChunk(
+            reader = FragmentingReader(sample, 17),
+            maxTokensPerChunk = 512,
+            maxCharactersPerChunk = 2_048,
+            action = chunks::add
+        )
+
+        assertTrue("An oversized pre-token must be split across bounded rows.", chunks.size > 1)
+        assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+        for (chunk in chunks) {
+            assertTrue("A persisted chunk exceeded its character budget.", chunk.text.length <= 2_048)
+            assertArrayEquals(tokenizer.encodeToIds(chunk.text), chunk.tokenIds)
+        }
+    }
+
+    @Test
+    fun oversizedPreTokenChunkIdsMatchLearnedBpeState() {
+        val tokenizer = tokenizer()
+        tokenizer.trainBpe(
+            corpus = List(80) {
+                "tokenizationpattern tokenizationpattern tokenizationpattern"
+            },
+            targetVocabSize = 512,
+            maxNewMerges = 96
+        )
+
+        val sample = "tokenizationpattern".repeat(4_000)
+        val chunks = ArrayList<TokenizerTextChunk>()
+        tokenizer.forEachSafeTextChunk(
+            reader = FragmentingReader(sample, 23),
+            maxTokensPerChunk = 512,
+            maxCharactersPerChunk = 2_048,
+            action = chunks::add
+        )
+
+        assertTrue(chunks.size > 1)
+        assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+        for (chunk in chunks) {
+            assertTrue(chunk.text.length <= 2_048)
+            assertArrayEquals(tokenizer.encodeToIds(chunk.text), chunk.tokenIds)
+        }
+    }
+
+    @Test
+    fun oversizedUnicodePreTokensNeverSplitSurrogatePairs() {
+        val tokenizer = tokenizer()
+        val sample = "😀".repeat(6_000)
+        val chunks = ArrayList<TokenizerTextChunk>()
+
+        tokenizer.forEachSafeTextChunk(
+            reader = FragmentingReader(sample, 7),
+            maxTokensPerChunk = 512,
+            maxCharactersPerChunk = 2_048,
+            action = chunks::add
+        )
+
+        assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+        assertTrue(chunks.size > 1)
+        for (chunk in chunks) {
+            assertTrue(chunk.text.length <= 2_048)
+            assertTrue(chunk.text.first().isLowSurrogate().not())
+            assertTrue(chunk.text.last().isHighSurrogate().not())
+            assertArrayEquals(tokenizer.encodeToIds(chunk.text), chunk.tokenIds)
+        }
+    }
+
+    @Test
+    fun escapedLiteralControlTokensRemainWithinPersistedChunkLimit() {
+        val tokenizer = tokenizer()
+        val sample = Tokenizer.USER_TOKEN.repeat(600)
+        val chunks = ArrayList<TokenizerTextChunk>()
+
+        tokenizer.forEachSafeTextChunk(
+            reader = FragmentingReader(sample, 5),
+            maxTokensPerChunk = 512,
+            allowSpecialTokens = false,
+            maxCharactersPerChunk = 128,
+            action = chunks::add
+        )
+
+        assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+        assertTrue(chunks.size > 1)
+        for (chunk in chunks) {
+            val persistedText = Tokenizer.escapeLiteralControlTokens(chunk.text)
+            assertEquals(persistedText, chunk.encodedText)
+            assertTrue(
+                "Escaped control tokens exceeded the persisted row character limit.",
+                persistedText.length <= 128
+            )
+            assertArrayEquals(tokenizer.encodeToIds(chunk.encodedText), chunk.tokenIds)
+        }
+    }
+
+    @Test
+    fun escapedLiteralControlOverlapStaysWithinPersistedChunkLimit() {
+        val tokenizer = tokenizer()
+        val sample = Tokenizer.USER_TOKEN.repeat(1_000)
+        val chunks = ArrayList<TokenizerTextChunk>()
+
+        tokenizer.forEachSafeTextChunk(
+            reader = FragmentingReader(sample, 7),
+            maxTokensPerChunk = 256,
+            overlapTokens = 200,
+            allowSpecialTokens = false,
+            maxCharactersPerChunk = 126,
+            action = chunks::add
+        )
+
+        assertTrue(chunks.size > 1)
+        for (chunk in chunks) {
+            val persistedText = Tokenizer.escapeLiteralControlTokens(chunk.text)
+            assertEquals(persistedText, chunk.encodedText)
+            assertTrue(persistedText.length <= 126)
+            assertArrayEquals(tokenizer.encodeToIds(chunk.encodedText), chunk.tokenIds)
+        }
     }
 
     @Test

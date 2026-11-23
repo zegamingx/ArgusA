@@ -212,11 +212,14 @@ class TrainingManager internal constructor(
         const val MAX_DEFAULT_CORPUS_REPLAY_CHUNKS = 4_096
         const val MAX_CORPUS_REPLAY_CHUNKS = 50_000
         private const val MAX_TOKENIZER_SAMPLE_CHUNKS = 256
+        private const val MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS = 4 * 1024
         private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
+        private const val MAX_PERSISTED_CORPUS_CHUNK_CHARACTERS = 8 * 1024
         private const val MAX_STREAMED_JSON_VALUE_CHARACTERS = 256 * 1024
         private const val QUEUE_PREFETCH_LIMIT = 64
         private const val MAX_IN_MEMORY_QUEUE_ITEMS = 128
         private const val CORPUS_WRITE_BATCH_SIZE = 128
+        private const val CORPUS_WRITE_BATCH_CHARACTERS = 256L * 1024L
         private const val IDLE_POLL_MS = 500L
         private const val GRPO_ACTIVE_ITEM_DRAIN_TIMEOUT_MS = 5 * 60 * 1000L
         private const val SCREEN_SOURCE_PREFIX = "ScreenTrainingV2 ("
@@ -1209,8 +1212,22 @@ class TrainingManager internal constructor(
                 totalChunks = chunkCount
             )
 
-            // Persist corpus text in fixed-size Room batches.
+            // Flush before adding a row that would exceed either Room batch budget.
             val corpusBatch = ArrayList<CorpusChunkEntity>(CORPUS_WRITE_BATCH_SIZE)
+            var corpusBatchCharacters = 0L
+
+            suspend fun flushCorpusBatch(processedChunks: Int) {
+                if (corpusBatch.isEmpty()) return
+                activeRepository.appendStreamedCorpusChunks(documentId, corpusBatch)
+                corpusBatch.clear()
+                corpusBatchCharacters = 0L
+                publishImportProgress(
+                    stage = StreamedImportStage.PERSISTING_CORPUS,
+                    chunksProcessed = processedChunks,
+                    totalChunks = chunkCount
+                )
+            }
+
             DataInputStream(BufferedInputStream(FileInputStream(chunkStagingFile))).use { input ->
                 var chunkIndex = 0
                 while (true) {
@@ -1229,6 +1246,20 @@ class TrainingManager internal constructor(
                     }
                     val chunkText = String(characters)
                     chunkIndex = Math.addExact(chunkIndex, 1)
+                    val nextBatchCharacters = Math.addExact(
+                        corpusBatchCharacters,
+                        chunkText.length.toLong()
+                    )
+                    if (
+                        corpusBatch.isNotEmpty() &&
+                        (
+                            corpusBatch.size >= CORPUS_WRITE_BATCH_SIZE ||
+                                nextBatchCharacters > CORPUS_WRITE_BATCH_CHARACTERS
+                            )
+                    ) {
+                        flushCorpusBatch(chunkIndex - 1)
+                    }
+
                     corpusBatch += CorpusChunkEntity(
                         id = "$documentId:$chunkIndex",
                         documentId = documentId,
@@ -1236,24 +1267,22 @@ class TrainingManager internal constructor(
                         content = chunkText,
                         characterCount = chunkText.length
                     )
-                    if (corpusBatch.size >= CORPUS_WRITE_BATCH_SIZE) {
-                        activeRepository.appendStreamedCorpusChunks(documentId, corpusBatch)
-                        corpusBatch.clear()
-                        publishImportProgress(
-                            stage = StreamedImportStage.PERSISTING_CORPUS,
-                            chunksProcessed = chunkIndex,
-                            totalChunks = chunkCount
-                        )
+                    corpusBatchCharacters = Math.addExact(
+                        corpusBatchCharacters,
+                        chunkText.length.toLong()
+                    )
+                    if (
+                        corpusBatch.size >= CORPUS_WRITE_BATCH_SIZE ||
+                        corpusBatchCharacters >= CORPUS_WRITE_BATCH_CHARACTERS
+                    ) {
+                        flushCorpusBatch(chunkIndex)
                     }
                 }
                 require(chunkIndex == chunkCount) {
                     "Token-safe staging chunk count does not match its manifest."
                 }
             }
-            if (corpusBatch.isNotEmpty()) {
-                activeRepository.appendStreamedCorpusChunks(documentId, corpusBatch)
-                corpusBatch.clear()
-            }
+            flushCorpusBatch(chunkCount)
             publishImportProgress(
                 stage = StreamedImportStage.PERSISTING_CORPUS,
                 chunksProcessed = chunkCount,
@@ -1465,9 +1494,10 @@ class TrainingManager internal constructor(
                 maxTokensPerChunk = chunkSize,
                 overlapTokens = overlap,
                 literalControlTokens = false,
-                allowSpecialTokens = false
+                allowSpecialTokens = false,
+                maxCharactersPerChunk = MAX_PERSISTED_CORPUS_CHUNK_CHARACTERS
             ) { chunk ->
-                val trainingText = Tokenizer.escapeLiteralControlTokens(chunk.text)
+                val trainingText = chunk.encodedText
                 if (trainingText.isNotEmpty()) {
                     output.writeInt(trainingText.length)
                     for (character in trainingText) output.writeChar(character.code)
@@ -3852,21 +3882,50 @@ class TrainingManager internal constructor(
         )
 
         try {
-            val storedSamples = repo?.getTokenizerCorpusSample(
-                documentId = documentId,
-                limit = MAX_TOKENIZER_SAMPLE_CHUNKS
-            ).orEmpty()
-
             var remainingCharacters = MAX_TOKENIZER_SAMPLE_CHARACTERS
-            val corpusSample = ArrayList<String>(storedSamples.size)
-            for (chunk in storedSamples) {
-                if (remainingCharacters <= 0) break
-                val sample = chunk.take(remainingCharacters)
-                if (sample.isNotBlank()) corpusSample.add(sample)
-                remainingCharacters -= sample.length
+            var afterChunkIndex = 0
+            var sampledChunks = 0
+            val corpusSample = ArrayList<String>(
+                minOf(MAX_TOKENIZER_SAMPLE_CHUNKS, 16)
+            )
+            val activeRepository = repo
+
+            while (
+                activeRepository != null &&
+                remainingCharacters > 0 &&
+                sampledChunks < MAX_TOKENIZER_SAMPLE_CHUNKS
+            ) {
+                currentCoroutineContext().ensureActive()
+                val sample = activeRepository.getNextTokenizerCorpusSample(
+                    documentId = documentId,
+                    afterChunkIndex = afterChunkIndex,
+                    maxCharacters = minOf(
+                        MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS,
+                        remainingCharacters
+                    )
+                ) ?: break
+
+                check(sample.chunkIndex > afterChunkIndex) {
+                    "Tokenizer corpus query did not advance its chunk cursor."
+                }
+                afterChunkIndex = sample.chunkIndex
+                sampledChunks = Math.addExact(sampledChunks, 1)
+
+                if (sample.content.isNotBlank()) {
+                    corpusSample.add(sample.content)
+                }
+                remainingCharacters -= sample.content.length
             }
+
             if (corpusSample.isEmpty() && item.content.isNotBlank()) {
-                corpusSample.add(item.content.take(MAX_TOKENIZER_SAMPLE_CHARACTERS))
+                corpusSample.add(
+                    item.content.take(
+                        minOf(
+                            MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS,
+                            MAX_TOKENIZER_SAMPLE_CHARACTERS
+                        )
+                    )
+                )
             }
 
             val update = neuralEngine.trainTokenizerFromCorpus(corpusSample) { progress ->

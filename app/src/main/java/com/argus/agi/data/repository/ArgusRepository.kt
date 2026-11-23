@@ -8,6 +8,8 @@ import com.argus.agi.data.local.entity.ChatMessageEntity
 import com.argus.agi.data.local.entity.CorpusChunkEntity
 import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceEntity
+import com.argus.agi.data.local.dao.CorpusChunkMetadata
+import com.argus.agi.data.local.dao.TokenizerCorpusSample
 import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.data.local.entity.TrainingItemEntity
 import com.argus.agi.data.local.entity.TrainingReplaySessionEntity
@@ -45,6 +47,7 @@ class ArgusRepository(
     private companion object {
         const val SCREEN_SOURCE_PATTERN = "Screen%"
         const val LEGACY_SCREEN_SOURCE_PATTERN = "Screen (%"
+        const val MAX_CORPUS_CHUNK_READ_CODE_POINTS = 128 * 1024
     }
 
     // =========================================================================
@@ -604,21 +607,89 @@ class ArgusRepository(
 
     suspend fun getCorpusChunks(documentId: String): List<CorpusChunkEntity> =
         withContext(Dispatchers.IO) {
-            corpusDao.getChunks(documentId)
+            val chunks = ArrayList<CorpusChunkEntity>()
+            var afterChunkIndex = 0
+            while (true) {
+                val metadata = corpusDao.getNextChunkMetadata(
+                    documentId = documentId,
+                    afterChunkIndex = afterChunkIndex
+                ) ?: break
+                check(metadata.chunkIndex > afterChunkIndex) {
+                    "Corpus chunk metadata query did not advance its cursor."
+                }
+                chunks += readCorpusChunk(metadata)
+                afterChunkIndex = metadata.chunkIndex
+            }
+            chunks
         }
 
     suspend fun getCorpusChunk(documentId: String, chunkIndex: Int): CorpusChunkEntity? =
         withContext(Dispatchers.IO) {
             require(chunkIndex > 0) { "Corpus chunk index must be positive." }
-            corpusDao.getChunk(documentId, chunkIndex)
+            val metadata = corpusDao.getChunkMetadata(documentId, chunkIndex)
+                ?: return@withContext null
+            readCorpusChunk(metadata)
         }
 
-
-    suspend fun getTokenizerCorpusSample(documentId: String, limit: Int): List<String> =
-        withContext(Dispatchers.IO) {
-            require(limit in 1..512) { "Tokenizer corpus sample limit must be in 1..512." }
-            corpusDao.getTokenizerCorpusSample(documentId, limit)
+    private suspend fun readCorpusChunk(
+        metadata: CorpusChunkMetadata
+    ): CorpusChunkEntity {
+        require(metadata.characterCount >= 0) {
+            "Corpus chunk ${metadata.id} has an invalid UTF-16 character count."
         }
+
+        val content = StringBuilder(
+            minOf(metadata.characterCount, 64 * 1024)
+        )
+        var nextCodePoint = 1
+        while (true) {
+            val segment = corpusDao.getChunkContentSegment(
+                chunkId = metadata.id,
+                startCodePoint = nextCodePoint,
+                maxCodePoints = MAX_CORPUS_CHUNK_READ_CODE_POINTS
+            )
+            if (segment.isNullOrEmpty()) break
+
+            val segmentCodePoints = segment.codePointCount(0, segment.length)
+            require(segmentCodePoints in 1..MAX_CORPUS_CHUNK_READ_CODE_POINTS) {
+                "Corpus chunk ${metadata.id} returned an invalid text segment."
+            }
+            content.append(segment)
+            nextCodePoint = Math.addExact(nextCodePoint, segmentCodePoints)
+        }
+        check(content.length == metadata.characterCount) {
+            "Corpus chunk ${metadata.id} was not fully reconstructed: " +
+                "expected ${metadata.characterCount} UTF-16 code units, " +
+                "received ${content.length}."
+        }
+
+        return CorpusChunkEntity(
+            id = metadata.id,
+            documentId = metadata.documentId,
+            chunkIndex = metadata.chunkIndex,
+            content = content.toString(),
+            characterCount = metadata.characterCount
+        )
+    }
+
+
+    suspend fun getNextTokenizerCorpusSample(
+        documentId: String,
+        afterChunkIndex: Int,
+        maxCharacters: Int
+    ): TokenizerCorpusSample? = withContext(Dispatchers.IO) {
+        require(afterChunkIndex >= 0) {
+            "Tokenizer corpus cursor cannot be negative."
+        }
+        require(maxCharacters in 1..8_192) {
+            "Tokenizer sample projection must be between 1 and 8,192 characters."
+        }
+        corpusDao.getNextTokenizerCorpusSample(
+            documentId = documentId,
+            afterChunkIndex = afterChunkIndex,
+            maxCharacters = maxCharacters
+        )
+    }
 
     suspend fun getCorpusSources(documentId: String): List<CorpusSourceEntity> =
         withContext(Dispatchers.IO) {
