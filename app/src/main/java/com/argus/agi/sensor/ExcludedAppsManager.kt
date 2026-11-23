@@ -1,5 +1,7 @@
 package com.argus.agi.sensor
 
+import com.argus.agi.diagnostics.ArgusDiagnosticBridge
+
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -260,7 +262,7 @@ class ExcludedAppsManager(private val context: Context) {
                 .toSet()
             result
         } catch (error: Exception) {
-            Log.e(TAG, "Failed to query launchable applications.", error)
+            ArgusDiagnosticBridge.error(TAG, "Failed to query launchable applications.", error)
             emptyList()
         }
     }
