@@ -212,7 +212,9 @@ class TrainingManager internal constructor(
         const val MAX_DEFAULT_CORPUS_REPLAY_CHUNKS = 4_096
         const val MAX_CORPUS_REPLAY_CHUNKS = 50_000
         private const val MAX_TOKENIZER_SAMPLE_CHUNKS = 256
+        private const val MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS = 4 * 1024
         private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
+        private const val MAX_PERSISTED_CORPUS_CHUNK_CHARACTERS = 8 * 1024
         private const val MAX_STREAMED_JSON_VALUE_CHARACTERS = 256 * 1024
         private const val QUEUE_PREFETCH_LIMIT = 64
         private const val MAX_IN_MEMORY_QUEUE_ITEMS = 128
@@ -1451,7 +1453,8 @@ class TrainingManager internal constructor(
                 maxTokensPerChunk = chunkSize,
                 overlapTokens = overlap,
                 literalControlTokens = false,
-                allowSpecialTokens = false
+                allowSpecialTokens = false,
+                maxCharactersPerChunk = MAX_PERSISTED_CORPUS_CHUNK_CHARACTERS
             ) { chunk ->
                 val trainingText = Tokenizer.escapeLiteralControlTokens(chunk.text)
                 if (trainingText.isNotEmpty()) {
@@ -3856,21 +3859,50 @@ class TrainingManager internal constructor(
         )
 
         try {
-            val storedSamples = repo?.getTokenizerCorpusSample(
-                documentId = documentId,
-                limit = MAX_TOKENIZER_SAMPLE_CHUNKS
-            ).orEmpty()
-
             var remainingCharacters = MAX_TOKENIZER_SAMPLE_CHARACTERS
-            val corpusSample = ArrayList<String>(storedSamples.size)
-            for (chunk in storedSamples) {
-                if (remainingCharacters <= 0) break
-                val sample = chunk.take(remainingCharacters)
-                if (sample.isNotBlank()) corpusSample.add(sample)
-                remainingCharacters -= sample.length
+            var afterChunkIndex = 0
+            var sampledChunks = 0
+            val corpusSample = ArrayList<String>(
+                minOf(MAX_TOKENIZER_SAMPLE_CHUNKS, 16)
+            )
+            val activeRepository = repo
+
+            while (
+                activeRepository != null &&
+                remainingCharacters > 0 &&
+                sampledChunks < MAX_TOKENIZER_SAMPLE_CHUNKS
+            ) {
+                currentCoroutineContext().ensureActive()
+                val sample = activeRepository.getNextTokenizerCorpusSample(
+                    documentId = documentId,
+                    afterChunkIndex = afterChunkIndex,
+                    maxCharacters = minOf(
+                        MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS,
+                        remainingCharacters
+                    )
+                ) ?: break
+
+                check(sample.chunkIndex > afterChunkIndex) {
+                    "Tokenizer corpus query did not advance its chunk cursor."
+                }
+                afterChunkIndex = sample.chunkIndex
+                sampledChunks = Math.addExact(sampledChunks, 1)
+
+                if (sample.content.isNotBlank()) {
+                    corpusSample.add(sample.content)
+                }
+                remainingCharacters -= sample.content.length
             }
+
             if (corpusSample.isEmpty() && item.content.isNotBlank()) {
-                corpusSample.add(item.content.take(MAX_TOKENIZER_SAMPLE_CHARACTERS))
+                corpusSample.add(
+                    item.content.take(
+                        minOf(
+                            MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS,
+                            MAX_TOKENIZER_SAMPLE_CHARACTERS
+                        )
+                    )
+                )
             }
 
             val update = neuralEngine.trainTokenizerFromCorpus(corpusSample) { progress ->
