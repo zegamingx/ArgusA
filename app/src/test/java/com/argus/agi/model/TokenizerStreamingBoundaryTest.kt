@@ -64,9 +64,10 @@ class TokenizerStreamingBoundaryTest {
                 )
 
                 assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+                assertEquals(sample, chunks.joinToString(separator = "") { it.encodedText })
                 assertArrayEquals(tokenizer.encodeToIds(sample), flatten(chunks))
                 for (chunk in chunks) {
-                    assertArrayEquals(tokenizer.encodeToIds(chunk.text), chunk.tokenIds)
+                    assertArrayEquals(tokenizer.encodeToIds(chunk.encodedText), chunk.tokenIds)
                 }
             }
         }
