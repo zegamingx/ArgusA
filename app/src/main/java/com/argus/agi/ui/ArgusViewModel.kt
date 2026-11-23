@@ -270,11 +270,6 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
         runCatching { ArgusForegroundService.startService(application) }
             .onFailure { error ->
                 ArgusDiagnosticBridge.error(TAG, "Failed to start foreground service", error)
-                ArgusApp.instance.recordRuntimeDiagnostic(
-                    "Foreground service request failed: " +
-                        error.javaClass.simpleName + ": " + (error.message ?: "No message") +
-                        "\n" + Log.getStackTraceString(error)
-                )
             }
 
         // Restore durable chat history independently from model/checkpoint recovery.
