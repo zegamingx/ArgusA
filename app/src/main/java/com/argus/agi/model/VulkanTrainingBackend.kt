@@ -671,8 +671,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
 
     private fun invalidateTensorResidency(releaseAllocations: Boolean): Boolean {
         if (releaseAllocations && nativeReady && !synchronizeTrainingStateMirrors()) {
-            Log.e(
-                TAG,
+            ArgusDiagnosticBridge.error(TAG,
                 "Tensor Arena release was refused because model or optimizer state could not be recovered."
             )
             return false
@@ -791,8 +790,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 isInitializing = false,
                 isCpuFallback = false
             )
-            Log.e(
-                TAG,
+            ArgusDiagnosticBridge.error(TAG,
                 "Vulkan teardown was postponed because model or optimizer state could not be recovered."
             )
             return false
@@ -1117,8 +1115,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     "${_optimizerStateResidencyBudgetBytes.value} bytes."
             )
         }.onFailure { error ->
-            Log.w(
-                TAG,
+            ArgusDiagnosticBridge.warning(TAG,
                 "Could not refresh Vulkan memory-budget telemetry; retaining the last verified budget.",
                 error
             )
@@ -1152,8 +1149,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
         if (!synchronized) {
             invalidateTensorResidency(releaseAllocations = true)
             residencyBlockedAfterFailure = true
-            Log.w(
-                TAG,
+            ArgusDiagnosticBridge.warning(TAG,
                 "Complete FP16 model residency was not established within the device memory budget; " +
                     "persistent FP16 dispatch is disabled until the next foreground recovery. " +
                     "The verified FP32 Vulkan/CPU fallback remains active."
@@ -1190,8 +1186,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 if (!synchronizeTrainingStateMirrors()) {
                     residencySuspended = false
                     _modelTensorResidencyReady.value = wasResidencyReady
-                    Log.e(
-                        TAG,
+                    ArgusDiagnosticBridge.error(TAG,
                         "Memory-pressure release was postponed; disabled Vulkan still owns unrecovered model or optimizer state."
                     )
                     return false
@@ -1214,8 +1209,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 residencyRebuildPending = false
                 runtimeRestartPending = true
                 _modelTensorResidencyReady.value = false
-                Log.e(
-                    TAG,
+                ArgusDiagnosticBridge.error(TAG,
                     "Memory-pressure release was postponed; recovered host state is safe, but Vulkan teardown must be retried before residency resumes."
                 )
                 return false
@@ -2000,45 +1994,38 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 verifyResidentAdamwKernel()
             }.getOrDefault(false)
             if (verified && residentActivationLinearReady && !residentAdamwReady) {
-                Log.w(
-                    TAG,
+                ArgusDiagnosticBridge.warning(TAG,
                     "Resident FP16 AdamW self-check failed; staged optimizer and CPU fallback remain available."
                 )
             }
             if (verified && residentBackwardReady && !residentGradientAccumulatorReady) {
-                Log.w(
-                    TAG,
+                ArgusDiagnosticBridge.warning(TAG,
                     "Resident gradient accumulation/norm/clipping self-check failed; the Kotlin accumulation fallback remains active."
                 )
             }
             if (verified && residentAttentionReady && !residentResidualLayerNormReady) {
-                Log.w(
-                    TAG,
+                ArgusDiagnosticBridge.warning(TAG,
                     "Resident residual LayerNorm self-check failed; the existing feed-forward fallback remains active."
                 )
             }
             if (verified && !residentSwiGluReady) {
-                Log.w(
-                    TAG,
+                ArgusDiagnosticBridge.warning(TAG,
                     "Resident SwiGLU self-check failed; the Kotlin activation fallback remains active."
                 )
             }
             if (verified && !residentAttentionReady) {
-                Log.w(
-                    TAG,
+                ArgusDiagnosticBridge.warning(TAG,
                     "Resident causal-attention self-check failed; the existing Kotlin attention fallback remains active."
                 )
             }
             if (verified && !residentActivationLinearReady) {
-                Log.w(
-                    TAG,
+                ArgusDiagnosticBridge.warning(TAG,
                     "Resident activation-linear kernel self-check failed; existing verified Vulkan/CPU paths remain active."
                 )
             }
 
             if (verified && !residentBackwardReady) {
-                Log.w(
-                    TAG,
+                ArgusDiagnosticBridge.warning(TAG,
                     "Resident backward numerical self-check failed; the verified Kotlin backward path remains active."
                 )
             }
@@ -2053,8 +2040,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     verifyNativeFp16Kernel()
                 }.getOrDefault(false)
                 if (!fp16RuntimeReady) {
-                    Log.w(
-                        TAG,
+                    ArgusDiagnosticBridge.warning(TAG,
                         "Vulkan FP16 kernel self-check failed; the verified FP32 Vulkan path remains available."
                     )
                 }
@@ -2625,8 +2611,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
         }
         if (!applied) {
             residentResidualLayerNormReady = false
-            Log.w(
-                TAG,
+            ArgusDiagnosticBridge.warning(TAG,
                 "Resident residual LayerNorm dispatch failed; the complete feed-forward " +
                     "GPU chain is disabled for this runtime."
             )
@@ -4985,8 +4970,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             fp16DisabledAfterRuntimeFailure = true
             fp16RuntimeReady = false
             invalidateTensorResidency(releaseAllocations = true)
-            Log.w(
-                TAG,
+            ArgusDiagnosticBridge.warning(TAG,
                 "Persistent batched FP16 dispatch failed; retaining the verified FP32 Vulkan/CPU fallback."
             )
             return false
@@ -5571,8 +5555,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 optimizerStateResidencyRegistry.finishReplacementAfterPreflight()
             }.getOrDefault(false)
             if (!oldParametersReleased || !oldMomentsReleased) {
-                Log.w(
-                    TAG,
+                ArgusDiagnosticBridge.warning(TAG,
                     "Resident AdamW committed successfully; one or more old buffers remain tracked for deferred release."
                 )
             }
@@ -5647,8 +5630,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     _currentBackend = "Kotlin CPU — resident gradient recovery pending"
                     _runtimeStatus.value =
                         "Vulkan dispatch disabled — recovering resident M4 gradients before teardown"
-                    Log.e(
-                        TAG,
+                    ArgusDiagnosticBridge.error(TAG,
                         "Resident AdamW dispatch failed; native teardown is postponed until the M4 gradient has been recovered."
                     )
                 } else {
