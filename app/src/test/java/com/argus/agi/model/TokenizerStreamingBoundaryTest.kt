@@ -253,6 +253,29 @@ class TokenizerStreamingBoundaryTest {
     }
 
     @Test
+    fun escapedLiteralControlOverlapStaysWithinPersistedChunkLimit() {
+        val tokenizer = tokenizer()
+        val sample = Tokenizer.USER_TOKEN.repeat(1_000)
+        val chunks = ArrayList<TokenizerTextChunk>()
+
+        tokenizer.forEachSafeTextChunk(
+            reader = FragmentingReader(sample, 7),
+            maxTokensPerChunk = 256,
+            overlapTokens = 64,
+            allowSpecialTokens = false,
+            maxCharactersPerChunk = 128,
+            action = chunks::add
+        )
+
+        assertTrue(chunks.size > 1)
+        for (chunk in chunks) {
+            val persistedText = Tokenizer.escapeLiteralControlTokens(chunk.text)
+            assertTrue(persistedText.length <= 128)
+            assertArrayEquals(tokenizer.encodeToIds(persistedText), chunk.tokenIds)
+        }
+    }
+
+    @Test
     fun overlapIsAppliedOnlyAtSafePreTokenBoundaries() {
         val tokenizer = tokenizer()
         val sample = "one two three four five six seven eight nine ten"
