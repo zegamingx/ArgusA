@@ -216,6 +216,9 @@ class TrainingManager internal constructor(
         private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
         private const val MAX_PERSISTED_CORPUS_CHUNK_CHARACTERS = 8 * 1024
         private const val MAX_STREAMED_JSON_VALUE_CHARACTERS = 256 * 1024
+        private const val JSONL_RECORD_HEAP_BYTES_PER_CHARACTER = 64L
+        private const val MIN_JSONL_RECORD_HEAP_BUDGET_BYTES =
+            JSONL_RECORD_HEAP_BYTES_PER_CHARACTER * 4_096L
         private const val QUEUE_PREFETCH_LIMIT = 64
         private const val MAX_IN_MEMORY_QUEUE_ITEMS = 128
         private const val CORPUS_WRITE_BATCH_SIZE = 128
@@ -1057,14 +1060,14 @@ class TrainingManager internal constructor(
                             var lineNumber = 0
                             while (true) {
                                 currentCoroutineContext().ensureActive()
-                                val line = readBoundedJsonLine(stagedReader, MAX_STREAMED_JSON_VALUE_CHARACTERS) ?: break
+                                val recordCharacterBudget = maximumJsonlRecordCharacters()
+                                val line = readBoundedJsonLine(
+                                    reader = stagedReader,
+                                    maximumCharacters = recordCharacterBudget
+                                ) ?: break
                                 lineNumber++
                                 val record = line.removePrefix("\uFEFF").trim()
                                 if (record.isEmpty()) continue
-                                require(record.length <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
-                                    "JSONL record $lineNumber exceeds the per-record safety limit of " +
-                                        "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters."
-                                }
                                 require(record.startsWith('{')) {
                                     "Invalid JSONL record at line $lineNumber: expected a JSON object."
                                 }
@@ -1474,6 +1477,29 @@ class TrainingManager internal constructor(
     }
 
 
+    /**
+     * One JSONL object is an atomic training sample. Its in-memory allowance is derived
+     * from currently free app heap rather than a fixed per-record character ceiling.
+     * A conservative 1/64 ratio reserves headroom for the source line, JSON object graph,
+     * canonical text, and modality-processing intermediates.
+     */
+    private fun maximumJsonlRecordCharacters(): Int {
+        val memory = captureTrainingMemorySnapshot()
+        val availableHeapBytes = if (memory.isSystemLowMemory) {
+            memory.availableHeapBytes / 2L
+        } else {
+            memory.availableHeapBytes
+        }
+        require(availableHeapBytes >= MIN_JSONL_RECORD_HEAP_BUDGET_BYTES) {
+            "Not enough free app heap to safely parse a JSONL record. " +
+                "Pause training or free memory, then retry the import."
+        }
+        val characterBudget = availableHeapBytes / JSONL_RECORD_HEAP_BYTES_PER_CHARACTER
+        return characterBudget
+            .coerceAtMost((Int.MAX_VALUE - 8).toLong())
+            .toInt()
+    }
+
     private fun readBoundedJsonLine(
         reader: BufferedReader,
         maximumCharacters: Int
@@ -1497,8 +1523,9 @@ class TrainingManager internal constructor(
                 else -> {
                     if (line.length >= maximumCharacters) {
                         throw IllegalArgumentException(
-                            "A streamed JSONL record exceeds $maximumCharacters UTF-16 characters. " +
-                                "Split the record at a complete JSON object boundary."
+                            "A JSONL record exceeds the current memory-safe budget of " +
+                                "$maximumCharacters UTF-16 code units. Each JSONL object remains atomic; " +
+                                "the importer will not split it into unrelated training samples."
                         )
                     }
                     line.append(next.toChar())
