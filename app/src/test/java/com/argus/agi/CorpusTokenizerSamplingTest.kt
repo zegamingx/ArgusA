@@ -58,7 +58,11 @@ class CorpusTokenizerSamplingTest {
                 } else {
                     128 * 1024
                 }
-                val text = "x".repeat(characterCount)
+                val text = if (index == 21) {
+                    "😀".repeat(characterCount / 2)
+                } else {
+                    "x".repeat(characterCount)
+                }
                 CorpusChunkEntity(
                     id = "$documentId:$index",
                     documentId = documentId,
@@ -101,13 +105,20 @@ class CorpusTokenizerSamplingTest {
                 reconstructedLargeChunk
             )
             val reconstructedText = requireNotNull(reconstructedLargeChunk).content
+            val expectedUnicodeText = "😀".repeat(1_536 * 1_024)
             assertEquals(3 * 1024 * 1024, reconstructedText.length)
-            assertTrue(reconstructedText.all { character -> character == 'x' })
+            assertEquals(expectedUnicodeText, reconstructedText)
+            assertEquals(1_536 * 1_024, reconstructedText.codePointCount(0, reconstructedText.length))
+            assertTrue(reconstructedText.first().isHighSurrogate())
+            assertTrue(reconstructedText.last().isLowSurrogate())
 
             val replayChunks = repository.getCorpusChunks(documentId)
             assertEquals(21, replayChunks.size)
-            assertEquals(3 * 1024 * 1024, replayChunks.last().content.length)
-            assertTrue(replayChunks.last().content.all { character -> character == 'x' })
+            assertEquals(expectedUnicodeText, replayChunks.last().content)
+            assertEquals(
+                1_536 * 1_024,
+                replayChunks.last().content.codePointCount(0, replayChunks.last().content.length)
+            )
 
             assertNull(
                 "The cursor must stop after the final corpus row.",
