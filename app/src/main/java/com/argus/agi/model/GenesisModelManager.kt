@@ -476,8 +476,7 @@ class GenesisModelManager(
                     )
                 }
             }
-            Log.w(
-                TAG,
+            ArgusDiagnosticBridge.warning(TAG,
                 "Stored Genesis identity was invalidated because no compatible checkpoint was restored or verified."
             )
             return null
