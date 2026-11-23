@@ -1480,7 +1480,7 @@ class TrainingManager internal constructor(
                 allowSpecialTokens = false,
                 maxCharactersPerChunk = MAX_PERSISTED_CORPUS_CHUNK_CHARACTERS
             ) { chunk ->
-                val trainingText = Tokenizer.escapeLiteralControlTokens(chunk.text)
+                val trainingText = chunk.encodedText
                 if (trainingText.isNotEmpty()) {
                     output.writeInt(trainingText.length)
                     for (character in trainingText) output.writeChar(character.code)
