@@ -573,6 +573,52 @@ class CorpusPersistenceTest {
     }
 
     @Test
+    fun streamedJsonlAcceptsSingleRecordLargerThanLegacy256KiLimit() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(context, ArgusDatabase::class.java)
+            .allowMainThreadQueries().build()
+        val repository = ArgusRepository(context, database)
+        val manager = TrainingManager(
+            context = context,
+            neuralEngine = ArgusNeuralEngine.createBlocking(context, EngineConfig(maxSeqLen = 64)),
+            deviceGuard = DeviceGuard(context),
+            worldModel = WorldModel(context),
+            repository = repository
+        )
+
+        try {
+            manager.pauseTraining()
+            val response = "Large JSONL response payload retained without a fixed record cap. ".repeat(6_000)
+            val jsonlRecord =
+                """{"instruction":"Preserve this complete large training sample.","response":"$response"}"""
+            assertTrue(
+                "The regression fixture must exceed the former 256 Ki UTF-16 record ceiling.",
+                jsonlRecord.length > 256 * 1024
+            )
+
+            val result = manager.enqueueDocumentStream(
+                source = "Large JSONL record regression",
+                title = "Large JSONL record",
+                reader = StringReader(jsonlRecord),
+                chunkSize = 512,
+                overlap = 0,
+                strictJsonLines = true
+            )
+
+            assertEquals(jsonlRecord.length.toLong(), result.second)
+            assertEquals("One complete JSONL object must remain one atomic training chunk.", 1, result.first)
+            val document = repository.getTrainingCorpusDocuments(limit = 1).single()
+            val storedChunk = repository.getCorpusChunks(document.id).single()
+            assertTrue("The entire response payload must survive canonicalization.", storedChunk.content.contains(response))
+            assertEquals(jsonlRecord.length, document.characterCount)
+            assertEquals(1, repository.getPendingQueueSnapshot().size)
+        } finally {
+            manager.close()
+            database.close()
+        }
+    }
+
+    @Test
     fun streamedJsonlPersistsRecordsAcrossMultipleRoomBatches() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val database = Room.inMemoryDatabaseBuilder(context, ArgusDatabase::class.java)
