@@ -81,7 +81,7 @@ class CorpusTokenizerSamplingTest {
                 val sample = repository.getNextTokenizerCorpusSample(
                     documentId = documentId,
                     afterChunkIndex = cursor,
-                    maxCharacters = 4_096
+                    maxCharacters = 8_192
                 )
 
                 assertNotNull(
@@ -90,14 +90,27 @@ class CorpusTokenizerSamplingTest {
                 )
                 val current = requireNotNull(sample)
                 assertEquals(expectedIndex + 1, current.chunkIndex)
-                assertEquals(4_096, current.content.length)
-                assertTrue(current.content.all { character -> character == 'x' })
+                assertEquals(8_192, current.content.length)
+                if (expectedIndex + 1 == chunks.size) {
+                    // The final row holds supplementary characters: 8,192
+                    // UTF-16 code units are 4,096 complete emoji, never a
+                    // split surrogate pair and never 8,192 code points
+                    // (which would be 16,384 UTF-16 code units).
+                    assertEquals("😀".repeat(4_096), current.content)
+                    assertEquals(
+                        4_096,
+                        current.content.codePointCount(0, current.content.length)
+                    )
+                    assertTrue(current.content.last().isLowSurrogate())
+                } else {
+                    assertTrue(current.content.all { character -> character == 'x' })
+                }
 
                 cursor = current.chunkIndex
                 sampledCharacters += current.content.length
             }
 
-            assertEquals(21 * 4_096, sampledCharacters)
+            assertEquals(21 * 8_192, sampledCharacters)
 
             val reconstructedLargeChunk = repository.getCorpusChunk(documentId, 21)
             assertNotNull(
@@ -125,7 +138,7 @@ class CorpusTokenizerSamplingTest {
                 repository.getNextTokenizerCorpusSample(
                     documentId = documentId,
                     afterChunkIndex = cursor,
-                    maxCharacters = 4_096
+                    maxCharacters = 8_192
                 )
             )
         } finally {

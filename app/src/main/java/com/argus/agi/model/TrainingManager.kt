@@ -212,7 +212,10 @@ class TrainingManager internal constructor(
         const val MAX_DEFAULT_CORPUS_REPLAY_CHUNKS = 4_096
         const val MAX_CORPUS_REPLAY_CHUNKS = 50_000
         private const val MAX_TOKENIZER_SAMPLE_CHUNKS = 256
-        private const val MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS = 4 * 1024
+        // Matches MAX_PERSISTED_CORPUS_CHUNK_CHARACTERS below and the
+        // repository's 8,192-character projection limit, so one persisted
+        // corpus chunk is sampled whole instead of being cut in half.
+        private const val MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS = 8 * 1024
         private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
         private const val MAX_PERSISTED_CORPUS_CHUNK_CHARACTERS = 8 * 1024
         private const val MAX_STREAMED_JSON_VALUE_CHARACTERS = 256 * 1024

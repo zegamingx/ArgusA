@@ -684,11 +684,24 @@ class ArgusRepository(
         require(maxCharacters in 1..8_192) {
             "Tokenizer sample projection must be between 1 and 8,192 characters."
         }
-        corpusDao.getNextTokenizerCorpusSample(
+        val sample = corpusDao.getNextTokenizerCorpusSample(
             documentId = documentId,
             afterChunkIndex = afterChunkIndex,
             maxCharacters = maxCharacters
-        )
+        ) ?: return@withContext null
+        if (sample.content.length <= maxCharacters) return@withContext sample
+        // SQLite substr() counts Unicode code points, not UTF-16 code units.
+        // A supplementary character (for example an emoji) therefore occupies
+        // two Kotlin Chars, so a code-point-bounded projection can return up
+        // to twice the requested UTF-16 length. Trim it back to the caller's
+        // bound here, where UTF-16 semantics are defined (see
+        // readCorpusChunk), and never split a surrogate pair: a trailing
+        // high surrogate is dropped whole rather than left unpaired.
+        var endExclusive = maxCharacters
+        if (sample.content[endExclusive - 1].isHighSurrogate()) {
+            endExclusive--
+        }
+        sample.copy(content = sample.content.substring(0, endExclusive))
     }
 
     suspend fun getCorpusSources(documentId: String): List<CorpusSourceEntity> =
