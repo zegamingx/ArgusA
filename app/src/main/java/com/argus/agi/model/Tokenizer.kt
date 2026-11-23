@@ -1294,7 +1294,11 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         val maximumBufferedPreTokenCharacters = maxOf(2, maxCharactersPerChunk / 2)
         val input = PushbackReader(BufferedReader(reader, 8_192), maximumSpecialLength + 2)
 
-        data class SafeUnit(val sourceText: String, val tokenIds: IntArray)
+        data class SafeUnit(
+            val sourceText: String,
+            val tokenIds: IntArray,
+            val storageCharacterCount: Int
+        )
 
         val currentUnits = ArrayList<SafeUnit>()
         var currentTokenCount = 0
@@ -1322,8 +1326,8 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
         fun appendSafeUnit(sourceText: String, encodingText: String = sourceText) {
             if (sourceText.isEmpty()) return
-            require(sourceText.length <= maxCharactersPerChunk) {
-                "A tokenizer-safe unit exceeds the configured character limit."
+            require(encodingText.length <= maxCharactersPerChunk) {
+                "A persisted tokenizer-safe unit exceeds the configured character limit."
             }
             val encoded = encodeTextWithState(encodingText, current)
             if (encoded.isEmpty()) return
@@ -1332,7 +1336,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 currentUnits.isNotEmpty() &&
                 (
                     currentTokenCount.toLong() + encoded.size.toLong() > maxTokensPerChunk.toLong() ||
-                        currentCharacterCount.toLong() + sourceText.length.toLong() >
+                        currentCharacterCount.toLong() + encodingText.length.toLong() >
                         maxCharactersPerChunk.toLong()
                     )
             ) {
@@ -1347,7 +1351,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                         val nextTokenCount =
                             suffixTokenCount.toLong() + unit.tokenIds.size.toLong()
                         val nextCharacterCount =
-                            suffixCharacterCount.toLong() + unit.sourceText.length.toLong()
+                            suffixCharacterCount.toLong() + unit.storageCharacterCount.toLong()
                         if (
                             nextTokenCount > overlapTokens.toLong() ||
                             nextTokenCount + encoded.size.toLong() > maxTokensPerChunk.toLong() ||
@@ -1359,7 +1363,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                         suffix.addFirst(unit)
                         suffixTokenCount = Math.addExact(suffixTokenCount, unit.tokenIds.size)
                         suffixCharacterCount =
-                            Math.addExact(suffixCharacterCount, unit.sourceText.length)
+                            Math.addExact(suffixCharacterCount, unit.storageCharacterCount)
                     }
                     currentUnits.addAll(suffix)
                     currentTokenCount = suffixTokenCount
@@ -1367,9 +1371,13 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 }
             }
 
-            currentUnits += SafeUnit(sourceText, encoded)
+            currentUnits += SafeUnit(
+                sourceText = sourceText,
+                tokenIds = encoded,
+                storageCharacterCount = encodingText.length
+            )
             currentTokenCount = Math.addExact(currentTokenCount, encoded.size)
-            currentCharacterCount = Math.addExact(currentCharacterCount, sourceText.length)
+            currentCharacterCount = Math.addExact(currentCharacterCount, encodingText.length)
         }
 
         fun flushWord() {
