@@ -92,8 +92,11 @@ data class TokenizerTrainingProgress(
  * generation as the complete streaming pass.
  */
 data class TokenizerTextChunk(
+    /** Original, source-preserving text presented to the corpus/UI layer. */
     val text: String,
-    val tokenIds: IntArray
+    val tokenIds: IntArray,
+    /** Exact text representation used to produce tokenIds and persist the chunk. */
+    val encodedText: String = text
 )
 
 class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
@@ -1318,8 +1321,15 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                 chunkText.append(unit.sourceText)
                 storageText.append(unit.storageText)
             }
-            val chunkTokenIds = encodeTextWithState(storageText.toString(), current)
-            action(TokenizerTextChunk(chunkText.toString(), chunkTokenIds))
+            val encodedChunkText = storageText.toString()
+            val chunkTokenIds = encodeTextWithState(encodedChunkText, current)
+            action(
+                TokenizerTextChunk(
+                    text = chunkText.toString(),
+                    tokenIds = chunkTokenIds,
+                    encodedText = encodedChunkText
+                )
+            )
             currentUnits.clear()
             currentTokenCount = 0
             currentCharacterCount = 0
