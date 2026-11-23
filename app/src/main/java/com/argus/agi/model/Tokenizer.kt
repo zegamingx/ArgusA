@@ -1295,9 +1295,12 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
         data class SafeUnit(
             val sourceText: String,
-            val tokenIds: IntArray,
+            val storageText: String,
+            val tokenIds: IntArray
+        ) {
             val storageCharacterCount: Int
-        )
+                get() = storageText.length
+        }
 
         val currentUnits = ArrayList<SafeUnit>()
         var currentTokenCount = 0
@@ -1308,15 +1311,14 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         fun emitCurrentChunk() {
             if (currentUnits.isEmpty()) return
             val textLength = currentUnits.sumOf { unit -> unit.sourceText.length }
-            val tokenCount = currentUnits.sumOf { unit -> unit.tokenIds.size }
+            val storageTextLength = currentUnits.sumOf { unit -> unit.storageText.length }
             val chunkText = StringBuilder(textLength)
-            val chunkTokenIds = IntArray(tokenCount)
-            var tokenOffset = 0
+            val storageText = StringBuilder(storageTextLength)
             for (unit in currentUnits) {
                 chunkText.append(unit.sourceText)
-                unit.tokenIds.copyInto(chunkTokenIds, tokenOffset)
-                tokenOffset += unit.tokenIds.size
+                storageText.append(unit.storageText)
             }
+            val chunkTokenIds = encodeTextWithState(storageText.toString(), current)
             action(TokenizerTextChunk(chunkText.toString(), chunkTokenIds))
             currentUnits.clear()
             currentTokenCount = 0
@@ -1372,8 +1374,8 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
             currentUnits += SafeUnit(
                 sourceText = sourceText,
-                tokenIds = encoded,
-                storageCharacterCount = encodingText.length
+                storageText = encodingText,
+                tokenIds = encoded
             )
             currentTokenCount = Math.addExact(currentTokenCount, encoded.size)
             currentCharacterCount = Math.addExact(currentCharacterCount, encodingText.length)
