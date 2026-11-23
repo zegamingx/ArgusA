@@ -88,9 +88,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
     val argusApp = remember(context) {
         context.applicationContext as ArgusApp
     }
-    var isSharedDiagnosticsReady by remember {
-        mutableStateOf(argusApp.isSharedDiagnosticsDirectoryReady())
-    }
+    val isSharedDiagnosticsReady by argusApp.sharedDiagnosticsReady.collectAsState()
     val installedApps by viewModel.installedApps.collectAsState()
     val worldEntities by viewModel.worldEntities.collectAsState()
     val searchResults by viewModel.searchResults.collectAsState()
@@ -130,7 +128,6 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 isIgnoringOpt = pm?.isIgnoringBatteryOptimizations(context.packageName) ?: false
-                isSharedDiagnosticsReady = argusApp.refreshSharedDiagnosticsStorage()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
