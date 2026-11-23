@@ -125,6 +125,7 @@ class TokenizerStreamingBoundaryTest {
         )
 
         assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+        assertEquals(escaped, chunks.joinToString(separator = "") { it.encodedText })
         assertArrayEquals(tokenizer.encodeToIds(escaped), flatten(chunks))
         assertTrue(flatten(chunks).none { it == Tokenizer.USER_ID || it == Tokenizer.EOS_ID })
     }
@@ -150,8 +151,10 @@ class TokenizerStreamingBoundaryTest {
         )
 
         val streamedIds = flatten(chunks)
-        val expectedLiteralIds = tokenizer.encodeToIds(Tokenizer.escapeLiteralControlTokens(sample))
+        val escapedSample = Tokenizer.escapeLiteralControlTokens(sample)
+        val expectedLiteralIds = tokenizer.encodeToIds(escapedSample)
         assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+        assertEquals(escapedSample, chunks.joinToString(separator = "") { it.encodedText })
         assertArrayEquals(expectedLiteralIds, streamedIds)
         val reservedIds = setOf(
             Tokenizer.SYSTEM_ID,
