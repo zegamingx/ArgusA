@@ -613,7 +613,7 @@ class CorpusPersistenceTest {
     }
 
     @Test
-    fun streamedJsonlRejectsOversizedRecordBeforePersistingAnyDocument() = runTest {
+    fun streamedJsonlAcceptsRecordAboveLegacy256KiBLimitWithinHeapBudget() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val database = Room.inMemoryDatabaseBuilder(
             context,
@@ -633,32 +633,27 @@ class CorpusPersistenceTest {
 
         try {
             manager.pauseTraining()
-            val oversizedRecord = """{"instruction":"prompt","response":"${
-                "x".repeat(256 * 1024 + 1)
-            }"}"""
-            val failure = runCatching {
-                manager.enqueueDocumentStream(
-                    source = "JSONL field-size regression",
-                    title = "Oversized JSONL record",
-                    reader = StringReader(oversizedRecord),
-                    chunkSize = 512,
-                    overlap = 0,
-                    strictJsonLines = true
-                )
-            }.exceptionOrNull()
+            val response = "x".repeat(256 * 1024 + 1)
+            val oversizedRecord =
+                """{"instruction":"prompt","response":"$response"}"""
+            val result = manager.enqueueDocumentStream(
+                source = "JSONL adaptive record-size regression",
+                title = "Large JSONL record",
+                reader = StringReader(oversizedRecord),
+                chunkSize = 512,
+                overlap = 0,
+                strictJsonLines = true
+            )
 
+            assertEquals(oversizedRecord.length.toLong(), result.second)
             assertTrue(
-                "A JSONL value above the per-record limit must be rejected.",
-                failure is IllegalArgumentException
+                "The complete JSONL record must remain one atomic training item.",
+                result.first > 0
             )
-            assertTrue(repository.getCorpusDocuments().isEmpty())
-            assertTrue(repository.getPendingQueueSnapshot().isEmpty())
-            assertTrue(
-                "The temporary spool must be deleted after JSON value rejection.",
-                context.cacheDir.listFiles().orEmpty().none { file ->
-                    file.name.startsWith("argus-ingest-")
-                }
-            )
+            val document = repository.getTrainingCorpusDocuments(limit = 1).single()
+            assertEquals(1, document.chunkCount)
+            assertTrue(repository.getCorpusChunk(document.id, 1)?.content?.contains(response) == true)
+            assertEquals(1, repository.getPendingQueueSnapshot().size)
         } finally {
             manager.close()
             database.close()
