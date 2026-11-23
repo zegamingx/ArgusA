@@ -472,13 +472,13 @@ class ArgusApp : Application() {
                     val message = "Core initialization failed at " + initializationStage +
                         ": " + error.javaClass.simpleName + ": " + (error.message ?: "No message")
                     Log.e(TAG, message, error)
-                    recordRuntimeDiagnostic(message + "\n" + Log.getStackTraceString(error))
+                    recordDiagnostic(message, throwable = error)
                     _coreInitializationState.value = ArgusCoreInitializationState.Failed(message)
                 } catch (error: Exception) {
                     val message = "Core initialization failed at " + initializationStage +
                         ": " + error.javaClass.simpleName + ": " + (error.message ?: "No message")
                     Log.e(TAG, message, error)
-                    recordRuntimeDiagnostic(message + "\n" + Log.getStackTraceString(error))
+                    recordDiagnostic(message, throwable = error)
                     _coreInitializationState.value = ArgusCoreInitializationState.Failed(message)
                 }
             }
