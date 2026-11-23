@@ -94,6 +94,16 @@ class CorpusTokenizerSamplingTest {
             }
 
             assertEquals(21 * 4_096, sampledCharacters)
+
+            val reconstructedLargeChunk = repository.getCorpusChunk(documentId, 21)
+            assertNotNull(
+                "A legacy multi-megabyte row must be reconstructed through bounded SQLite reads.",
+                reconstructedLargeChunk
+            )
+            val reconstructedText = requireNotNull(reconstructedLargeChunk).content
+            assertEquals(3 * 1024 * 1024, reconstructedText.length)
+            assertTrue(reconstructedText.all { character -> character == 'x' })
+
             assertNull(
                 "The cursor must stop after the final corpus row.",
                 repository.getNextTokenizerCorpusSample(
