@@ -50,7 +50,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_OLD_TAG: 9c953bf9bfb50ce9a8709171ad4a912e1e762d02
+          EXPECTED_OLD_TAG: b6e277439000388e6c0f8dd1bc38677f5211d33b
         run: |
           set -euo pipefail
 
@@ -137,15 +137,13 @@ jobs:
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "X-GitHub-Api-Version: 2026-03-10" \
-            --data '{"ref":"Release","inputs":{"release_channel":"Release"}}' \
+            --data '{"ref":"main","inputs":{"release_channel":"Release"}}' \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/argus-installable-release.yml/dispatches")"
 
-          if [[ "$http_status" != "200" ]]; then
+          if [[ "$http_status" != "204" ]]; then
             echo "::error::Unable to dispatch the production release workflow (HTTP $http_status)."
             cat "$response"
             exit 1
           fi
 
-          workflow_run_id="$(jq -er '.workflow_run_id' "$response")"
-          echo "Dispatched the production release workflow on refs/tags/Release."
-          echo "Production release run: $workflow_run_id"
+          echo "Dispatched exactly one production release workflow on main after verifying Release points to the same commit."
