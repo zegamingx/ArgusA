@@ -295,7 +295,8 @@ class ArgusDiagnosticLogger(context: Context) {
                     .append(frame.fileName ?: "Unknown Source")
                     .append(':')
                     .append(frame.lineNumber)
-                    .appendLine(')')
+                    .append(')')
+                    .append('\n')
             }
             current = current.cause
             if (current != null) appendLine("Caused by:")
