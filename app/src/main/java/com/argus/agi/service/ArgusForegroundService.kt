@@ -65,10 +65,8 @@ class ArgusForegroundService : Service() {
                 try {
                     startForegroundCompat()
                 } catch (error: Exception) {
-                    val message = "Foreground service promotion failed: " +
-                        error.javaClass.simpleName + ": " + (error.message ?: "No message")
+                    val message = "Foreground service promotion failed: " + error.javaClass.simpleName
                     ArgusDiagnosticBridge.error(TAG, message, error)
-                    (application as? ArgusApp)?.recordRuntimeDiagnostic(message)
                     stopSelfResult(startId)
                     return START_NOT_STICKY
                 }
