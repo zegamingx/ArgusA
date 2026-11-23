@@ -204,6 +204,34 @@ class TokenizerStreamingBoundaryTest {
     }
 
     @Test
+    fun oversizedPreTokenChunkIdsMatchLearnedBpeState() {
+        val tokenizer = tokenizer()
+        tokenizer.trainBpe(
+            corpus = List(80) {
+                "tokenizationpattern tokenizationpattern tokenizationpattern"
+            },
+            targetVocabSize = 512,
+            maxNewMerges = 96
+        )
+
+        val sample = "tokenizationpattern".repeat(4_000)
+        val chunks = ArrayList<TokenizerTextChunk>()
+        tokenizer.forEachSafeTextChunk(
+            reader = FragmentingReader(sample, 23),
+            maxTokensPerChunk = 512,
+            maxCharactersPerChunk = 2_048,
+            action = chunks::add
+        )
+
+        assertTrue(chunks.size > 1)
+        assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+        for (chunk in chunks) {
+            assertTrue(chunk.text.length <= 2_048)
+            assertArrayEquals(tokenizer.encodeToIds(chunk.text), chunk.tokenIds)
+        }
+    }
+
+    @Test
     fun oversizedUnicodePreTokensNeverSplitSurrogatePairs() {
         val tokenizer = tokenizer()
         val sample = "😀".repeat(6_000)
