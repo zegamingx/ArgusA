@@ -44,18 +44,211 @@ jobs:
           fi
           echo "Release tag and main both point to $main_commit."
 
-      - name: Refuse to rebuild an already published release APK
+      - name: Verify the existing production APK can be replaced in place
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="$GITHUB_REF_NAME"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq "ARGUS.apk"; then
-            echo "::error::ARGUS.apk is already published for $tag. Refusing to create a second production build."
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets >/dev/null 2>&1; then
+            mapfile -t apk_assets < <(
+              gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
+                grep -E '\\.apk
+
+      - name: Check protected production signing secrets
+        shell: bash
+        env:
+          ARGUS_RELEASE_KEYSTORE_BASE64: ${{ secrets.ARGUS_RELEASE_KEYSTORE_BASE64 }}
+          ARGUS_RELEASE_STORE_PASSWORD: ${{ secrets.ARGUS_RELEASE_STORE_PASSWORD }}
+          ARGUS_RELEASE_KEY_PASSWORD: ${{ secrets.ARGUS_RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in \
+            ARGUS_RELEASE_KEYSTORE_BASE64 \
+            ARGUS_RELEASE_STORE_PASSWORD \
+            ARGUS_RELEASE_KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Production release is blocked. Missing protected environment secrets: ${missing[*]}."
             exit 1
           fi
-          echo "No production APK is published for $tag; a single release build is permitted."
+          echo "All protected production signing secrets are present."
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: gradle
+
+      - name: Verify release keystore format, password, private key and pinned certificate
+        shell: bash
+        env:
+          ARGUS_RELEASE_KEYSTORE_BASE64: ${{ secrets.ARGUS_RELEASE_KEYSTORE_BASE64 }}
+          ARGUS_RELEASE_STORE_PASSWORD: ${{ secrets.ARGUS_RELEASE_STORE_PASSWORD }}
+          ARGUS_RELEASE_KEY_PASSWORD: ${{ secrets.ARGUS_RELEASE_KEY_PASSWORD }}
+          ARGUS_RELEASE_KEY_ALIAS: argus-release-2026
+        run: bash tools/security/verify-release-keystore.sh
+
+      - name: Verify runner Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${sdk_root}" >> "${GITHUB_ENV}"
+          echo "${sdk_root}/platform-tools" >> "${GITHUB_PATH}"
+          test -s "${sdk_root}/platforms/android-37.0/android.jar"
+
+      - name: Install Android NDK r30 and CMake 4.5.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager_path="$(command -v sdkmanager || true)"
+          if [[ -z "${sdkmanager_path}" ]]; then
+            sdkmanager_path="$(find "${ANDROID_HOME}/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          fi
+          test -n "${sdkmanager_path}"
+
+          set +o pipefail
+          yes | "${sdkmanager_path}" --licenses >/dev/null
+          set -o pipefail
+          "${sdkmanager_path}" --install "build-tools;37.0.0" "ndk;30.0.16248370"
+          test -x "${ANDROID_HOME}/build-tools/37.0.0/zipalign"
+          test -x "${ANDROID_HOME}/build-tools/37.0.0/apksigner"
+          test -x "${ANDROID_HOME}/build-tools/37.0.0/aapt"
+
+          cmake_version="4.5.0"
+          cmake_archive="cmake-${cmake_version}-linux-x86_64.tar.gz"
+          cmake_archive_path="${RUNNER_TEMP}/${cmake_archive}"
+          cmake_root="${RUNNER_TEMP}/cmake-${cmake_version}"
+          curl --fail --location --retry 3 --silent --show-error \
+            "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/${cmake_archive}" \
+            --output "${cmake_archive_path}"
+          printf '%s  %s\n' "81f0d5b0960fb6adc8197030ffc827fba937640d51e73e39e0e9e40d88c66f6f" "${cmake_archive_path}" | sha256sum --check --status
+          mkdir -p "${cmake_root}"
+          tar -xzf "${cmake_archive_path}" --strip-components=1 -C "${cmake_root}"
+          tools/cmake-compat/install-wrapper.sh "${cmake_root}/bin/cmake" "${RUNNER_TEMP}/argus-cmake-compat"
+          "${RUNNER_TEMP}/argus-cmake-compat/bin/cmake" --version | grep -Fx "cmake version ${cmake_version}"
+
+          glslc_path="$(find "${ANDROID_HOME}/ndk/30.0.16248370/shader-tools" -type f -name glslc -print -quit)"
+          test -n "${glslc_path}"
+          test -x "${glslc_path}"
+          echo "NDK r30, CMake ${cmake_version}, and NDK glslc are ready."
+
+      - name: Run Tensor Arena host unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          c++ -std=c++23 -Wall -Wextra -Wpedantic -Werror \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -O2 \
+            tools/native-tests/tensor_arena_core_test.cpp \
+            -o "${RUNNER_TEMP}/argus-tensor-arena-core-test"
+          "${RUNNER_TEMP}/argus-tensor-arena-core-test"
+
+      - name: Run release lint, unit tests and native APK build
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          env -u ANDROID_SDK_ROOT ./gradlew \
+            --no-daemon \
+            --no-configuration-cache \
+            --warning-mode=all \
+            --stacktrace \
+            clean \
+            :app:lintRelease \
+            :app:testReleaseUnitTest \
+            :app:assembleRelease
+
+          apk_path="app/build/outputs/apk/release/app-release-unsigned.apk"
+          test -s "${apk_path}"
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
+          done
+
+      - name: Sign and cryptographically verify the production APK
+        shell: bash
+        env:
+          ARGUS_RELEASE_KEYSTORE_BASE64: ${{ secrets.ARGUS_RELEASE_KEYSTORE_BASE64 }}
+          ARGUS_RELEASE_STORE_PASSWORD: ${{ secrets.ARGUS_RELEASE_STORE_PASSWORD }}
+          ARGUS_RELEASE_KEY_PASSWORD: ${{ secrets.ARGUS_RELEASE_KEY_PASSWORD }}
+          ARGUS_RELEASE_KEY_ALIAS: argus-release-2026
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bash tools/security/sign-release.sh \
+            "app/build/outputs/apk/release/app-release-unsigned.apk" \
+            "dist/ARGUS.apk"
+
+      - name: Write verified production manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="dist/ARGUS.apk"
+          metadata="$("$ANDROID_HOME/build-tools/37.0.0/aapt" dump badging "$apk" | grep -m1 '^package:')"
+          {
+            echo "Application: com.argus.agi"
+            echo "Source commit: ${GITHUB_SHA}"
+            echo "Release tag: ${GITHUB_REF_NAME}"
+            echo "Package metadata: ${metadata}"
+            echo "Signing certificate SHA-256: $(cat "${apk}.certificate-sha256")"
+            echo "APK SHA-256: $(awk '{print $1}' "${apk}.sha256")"
+            echo "Native ABI packaging: arm64-v8a, armeabi-v7a, x86_64"
+            echo "Signature: apksigner verified; v3 scheme valid for minSdk 34"
+            echo "ZIP alignment: verified for 16 KiB native-library pages"
+            echo "Production output: one APK, published as ARGUS.apk"
+          } > "dist/BUILD-MANIFEST.txt"
+          cat "dist/BUILD-MANIFEST.txt"
+
+      - name: Publish the single verified APK to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          assets=(
+            dist/ARGUS.apk
+            dist/ARGUS.apk.sha256
+            dist/ARGUS.apk.certificate-sha256
+            dist/BUILD-MANIFEST.txt
+          )
+          for asset in "${assets[@]}"; do
+            test -s "$asset"
+          done
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --verify-tag \
+              --title "Argus $tag" \
+              --notes "Single production-signed Android APK built from the verified main commit. See BUILD-MANIFEST.txt for source commit, package, certificate fingerprint, and APK checksum." \
+              --repo "$GITHUB_REPOSITORY"
+          fi
+          echo "Published one verified production APK for $tag."
+ || true
+            )
+            if (( ${#apk_assets[@]} > 1 )); then
+              echo "::error::Multiple APK assets already exist for $tag; refusing to publish another APK."
+              exit 1
+            fi
+            if (( ${#apk_assets[@]} == 1 )) && [[ "${apk_assets[0]}" != "ARGUS.apk" ]]; then
+              echo "::error::The existing APK asset has an unexpected name (${apk_assets[0]})."
+              exit 1
+            fi
+            if (( ${#apk_assets[@]} == 1 )); then
+              echo "Exactly one ARGUS.apk exists and will be replaced in place after the new build is verified."
+            else
+              echo "No APK asset exists; one production APK may be published."
+            fi
+          else
+            echo "No GitHub Release exists yet; one production APK may be published."
+          fi
 
       - name: Check protected production signing secrets
         shell: bash
