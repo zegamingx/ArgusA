@@ -4,7 +4,15 @@ on:
   push:
     tags:
       - Release
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      release_channel:
+        description: "Production release channel"
+        required: true
+        type: choice
+        options:
+          - Release
+        default: Release
 
 permissions:
   contents: read
@@ -15,12 +23,14 @@ concurrency:
 
 jobs:
   release:
-    if: ${{ github.ref == 'refs/tags/Release' }}
+    if: ${{ (github.event_name == 'push' && github.ref == 'refs/tags/Release') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.release_channel == 'Release') }}
     name: Build, sign and publish the single production APK
     runs-on: ubuntu-26.04
     timeout-minutes: 75
     environment:
       name: argus-release
+    env:
+      RELEASE_TAG: Release
     permissions:
       contents: write
 
@@ -35,27 +45,44 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          git fetch --force origin refs/tags/Release:refs/tags/Release
           release_commit="$(git rev-parse HEAD)"
           main_commit="$(git rev-parse refs/remotes/origin/main)"
-          if [[ "$release_commit" != "$main_commit" ]]; then
-            echo "::error::The Release tag points to $release_commit, but main is $main_commit."
-            echo "::error::Promote the Release tag only after the approved source is on main."
+          tag_commit="$(git rev-parse 'refs/tags/Release^{commit}')"
+          if [[ "$release_commit" != "$main_commit" || "$release_commit" != "$tag_commit" ]]; then
+            echo "::error::Release workflow source ($release_commit), main ($main_commit), and Release tag ($tag_commit) must be identical."
             exit 1
           fi
-          echo "Release tag and main both point to $main_commit."
+          echo "Release tag, main, and checked-out source all point to $release_commit."
 
-      - name: Refuse to rebuild an already published release APK
+      - name: Verify the existing production APK can be replaced in place
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq "ARGUS.apk"; then
-            echo "::error::ARGUS.apk is already published for $tag. Refusing to create a second production build."
-            exit 1
+          tag="$RELEASE_TAG"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets >/dev/null 2>&1; then
+            mapfile -t apk_assets < <(
+              gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets \
+                --jq '[.assets[].name | select(endswith(".apk"))] | .[]'
+            )
+            if (( ${#apk_assets[@]} > 1 )); then
+              echo "::error::Multiple APK assets already exist for $tag; refusing to publish another APK."
+              exit 1
+            fi
+            if (( ${#apk_assets[@]} == 1 )) && [[ "${apk_assets[0]}" != "ARGUS.apk" ]]; then
+              echo "::error::The existing APK asset has an unexpected name (${apk_assets[0]})."
+              exit 1
+            fi
+            if (( ${#apk_assets[@]} == 1 )); then
+              echo "Exactly one ARGUS.apk exists and will be replaced in place after the new build is verified."
+            else
+              echo "No APK asset exists; one production APK may be published."
+            fi
+          else
+            echo "No GitHub Release exists yet; one production APK may be published."
           fi
-          echo "No production APK is published for $tag; a single release build is permitted."
 
       - name: Check protected production signing secrets
         shell: bash
@@ -195,7 +222,7 @@ jobs:
           {
             echo "Application: com.argus.agi"
             echo "Source commit: ${GITHUB_SHA}"
-            echo "Release tag: ${GITHUB_REF_NAME}"
+            echo "Release tag: ${RELEASE_TAG}"
             echo "Package metadata: ${metadata}"
             echo "Signing certificate SHA-256: $(cat "${apk}.certificate-sha256")"
             echo "APK SHA-256: $(awk '{print $1}' "${apk}.sha256")"
@@ -212,7 +239,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
+          tag="$RELEASE_TAG"
           assets=(
             dist/ARGUS.apk
             dist/ARGUS.apk.sha256
