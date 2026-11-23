@@ -182,8 +182,19 @@ interface CorpusDao {
     )
     suspend fun getTrainingDocuments(limit: Int): List<CorpusDocumentEntity>
 
-    @Query("SELECT * FROM corpus_chunks WHERE documentId = :documentId ORDER BY chunkIndex ASC")
-    suspend fun getChunks(documentId: String): List<CorpusChunkEntity>
+    @Query(
+        """
+        SELECT id, documentId, chunkIndex, characterCount
+        FROM corpus_chunks
+        WHERE documentId = :documentId AND chunkIndex > :afterChunkIndex
+        ORDER BY chunkIndex ASC
+        LIMIT 1
+        """
+    )
+    suspend fun getNextChunkMetadata(
+        documentId: String,
+        afterChunkIndex: Int
+    ): CorpusChunkMetadata?
 
     @Query(
         """
