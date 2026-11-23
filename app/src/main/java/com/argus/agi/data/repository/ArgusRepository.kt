@@ -12,7 +12,6 @@ import com.argus.agi.data.local.entity.CorpusSourceProvenance
 import com.argus.agi.data.local.entity.TrainingItemEntity
 import com.argus.agi.data.local.entity.TrainingReplaySessionEntity
 import com.argus.agi.data.local.entity.WorldMemoryEntity
-import com.argus.agi.data.local.dao.CorpusChunkMetadata
 import com.argus.agi.data.local.dao.TokenizerCorpusSample
 import com.argus.agi.model.TrainingData
 import com.argus.agi.model.TrainingStatus
@@ -615,36 +614,33 @@ class ArgusRepository(
             require(chunkIndex > 0) { "Corpus chunk index must be positive." }
             val metadata = corpusDao.getChunkMetadata(documentId, chunkIndex)
                 ?: return@withContext null
-            require(metadata.contentCodePointCount >= 0) {
-                "Corpus chunk ${metadata.id} has an invalid SQLite text length."
+            require(metadata.characterCount >= 0) {
+                "Corpus chunk ${metadata.id} has an invalid UTF-16 character count."
             }
 
             val content = StringBuilder(
-                minOf(metadata.characterCount.coerceAtLeast(0), 64 * 1024)
+                minOf(metadata.characterCount, 64 * 1024)
             )
             var nextCodePoint = 1
-            var loadedCodePoints = 0
-            while (loadedCodePoints < metadata.contentCodePointCount) {
+            while (true) {
                 val segment = corpusDao.getChunkContentSegment(
                     chunkId = metadata.id,
                     startCodePoint = nextCodePoint,
                     maxCodePoints = MAX_CORPUS_CHUNK_READ_CODE_POINTS
-                ) ?: throw IllegalStateException(
-                    "Corpus chunk ${metadata.id} disappeared during bounded reading."
                 )
-                require(segment.isNotEmpty()) {
-                    "Corpus chunk ${metadata.id} ended before its declared SQLite text length."
-                }
+                if (segment.isNullOrEmpty()) break
+
                 val segmentCodePoints = segment.codePointCount(0, segment.length)
                 require(segmentCodePoints in 1..MAX_CORPUS_CHUNK_READ_CODE_POINTS) {
                     "Corpus chunk ${metadata.id} returned an invalid text segment."
                 }
                 content.append(segment)
-                loadedCodePoints = Math.addExact(loadedCodePoints, segmentCodePoints)
                 nextCodePoint = Math.addExact(nextCodePoint, segmentCodePoints)
-                require(loadedCodePoints <= metadata.contentCodePointCount) {
-                    "Corpus chunk ${metadata.id} exceeded its declared SQLite text length."
-                }
+            }
+            check(content.length == metadata.characterCount) {
+                "Corpus chunk ${metadata.id} was not fully reconstructed: " +
+                    "expected ${metadata.characterCount} UTF-16 code units, " +
+                    "received ${content.length}."
             }
 
             CorpusChunkEntity(
