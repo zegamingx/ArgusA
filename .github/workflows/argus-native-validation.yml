@@ -1,5 +1,8 @@
 name: Argus Native Validation
 
+concurrency:
+  group: argus-native-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 on:
   workflow_dispatch:
 
