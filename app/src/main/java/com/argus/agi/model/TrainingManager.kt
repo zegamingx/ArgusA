@@ -182,7 +182,7 @@ class TrainingManager internal constructor(
             )
 
     private fun logError(message: String, throwable: Throwable? = null) {
-        logError( message, throwable)
+        Log.e(TAG, message, throwable)
         val argusApp = appContext as? ArgusApp
         if (argusApp != null) {
             argusApp.recordDiagnostic(
@@ -195,7 +195,7 @@ class TrainingManager internal constructor(
     }
 
     private fun logWarning(message: String, throwable: Throwable? = null) {
-        logWarning( message, throwable)
+        Log.w(TAG, message, throwable)
         val argusApp = appContext as? ArgusApp
         if (argusApp != null) {
             argusApp.recordDiagnostic(
