@@ -263,14 +263,14 @@ class TokenizerStreamingBoundaryTest {
             maxTokensPerChunk = 256,
             overlapTokens = 64,
             allowSpecialTokens = false,
-            maxCharactersPerChunk = 128,
+            maxCharactersPerChunk = 126,
             action = chunks::add
         )
 
         assertTrue(chunks.size > 1)
         for (chunk in chunks) {
             val persistedText = Tokenizer.escapeLiteralControlTokens(chunk.text)
-            assertTrue(persistedText.length <= 128)
+            assertTrue(persistedText.length <= 126)
             assertArrayEquals(tokenizer.encodeToIds(persistedText), chunk.tokenIds)
         }
     }
