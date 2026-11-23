@@ -4,7 +4,15 @@ on:
   push:
     tags:
       - Release
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      release_channel:
+        description: "Production release channel"
+        required: true
+        type: choice
+        options:
+          - Release
+        default: Release
 
 permissions:
   contents: read
