@@ -9,6 +9,7 @@ import com.argus.agi.runtime.RuntimeConfigurationPlanner
 import com.argus.agi.runtime.AdaptiveComputePerformanceMonitor
 
 import android.util.Log
+import com.argus.agi.diagnostics.ArgusDiagnosticBridge
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -698,7 +699,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 "Kotlin CPU fallback — Vulkan tensor-arena release failed"
             runCatching { destroyNativeRuntime() }
                 .onFailure { error ->
-                    Log.e(TAG, "Vulkan runtime teardown after an arena-release failure failed.", error)
+                    ArgusDiagnosticBridge.error(TAG, "Vulkan runtime teardown after an arena-release failure failed.", error)
                 }
         }
         return released
@@ -823,13 +824,13 @@ internal object VulkanTrainingBackend : ComputeBackend {
             disabledAfterRuntimeFailure = true
             _currentBackend = "Kotlin CPU — Vulkan teardown failed after state recovery"
             _runtimeStatus.value = "Vulkan teardown failed; recovered host state is retained"
-            Log.e(TAG, "Vulkan native runtime destruction failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan native runtime destruction failed.", error)
             false
         } catch (error: LinkageError) {
             disabledAfterRuntimeFailure = true
             _currentBackend = "Kotlin CPU — Vulkan teardown entry point unavailable"
             _runtimeStatus.value = "Vulkan teardown failed; recovered host state is retained"
-            Log.e(TAG, "Vulkan native runtime destruction entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan native runtime destruction entry point is unavailable.", error)
             false
         }
     }
@@ -840,7 +841,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
         if (nativeLibraryLoaded) {
             runCatching { destroyNativeRuntime() }
                 .onFailure { error ->
-                    Log.w(TAG, "Failed to release a partially initialized Vulkan runtime.", error)
+                    ArgusDiagnosticBridge.warning(TAG, "Failed to release a partially initialized Vulkan runtime.", error)
                 }
         } else {
             invalidateTensorResidency(releaseAllocations = false)
@@ -904,10 +905,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
         val handle = try {
             nativeAllocateTensor(byteCount)
         } catch (error: LinkageError) {
-            Log.e(TAG, "Vulkan tensor allocation entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan tensor allocation entry point is unavailable.", error)
             return null
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Vulkan tensor allocation failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan tensor allocation failed.", error)
             return null
         }
         if (handle == 0L) return null
@@ -921,10 +922,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
         val uploaded = try {
             nativeUploadTensor(allocation.nativeHandle, bytes)
         } catch (error: LinkageError) {
-            Log.e(TAG, "Vulkan tensor upload entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan tensor upload entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Vulkan tensor upload failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan tensor upload failed.", error)
             false
         }
         if (uploaded) refreshTensorArenaMetrics()
@@ -937,10 +938,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
         val downloaded = try {
             nativeDownloadTensor(allocation.nativeHandle, destination)
         } catch (error: LinkageError) {
-            Log.e(TAG, "Vulkan tensor readback entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan tensor readback entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Vulkan tensor readback failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan tensor readback failed.", error)
             false
         }
         if (downloaded) refreshTensorArenaMetrics()
@@ -953,10 +954,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
         val released = try {
             nativeReleaseTensor(allocation.nativeHandle)
         } catch (error: LinkageError) {
-            Log.e(TAG, "Vulkan tensor release entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan tensor release entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Vulkan tensor release failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan tensor release failed.", error)
             false
         }
         if (released) refreshTensorArenaMetrics()
@@ -977,10 +978,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
             }
             synchronized
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Model-parameter recovery readback exceeded the available heap.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Model-parameter recovery readback exceeded the available heap.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Model-parameter recovery readback failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Model-parameter recovery readback failed.", error)
             false
         }
     }
@@ -1001,10 +1002,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
             }
             true
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Selected model-parameter readback exceeded the available heap.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Selected model-parameter readback exceeded the available heap.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Selected model-parameter readback failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Selected model-parameter readback failed.", error)
             false
         }
     }
@@ -1019,10 +1020,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
             if (synchronized) modelParameterMirrorReliable = true
             synchronized
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Model-parameter recovery readback exceeded the available heap.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Model-parameter recovery readback exceeded the available heap.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Model-parameter recovery readback failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Model-parameter recovery readback failed.", error)
             false
         }
     }
@@ -1037,10 +1038,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
             if (synchronized) optimizerStateMirrorReliable = true
             synchronized
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Optimizer-state recovery readback exceeded the available heap.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Optimizer-state recovery readback exceeded the available heap.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Optimizer-state recovery readback failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Optimizer-state recovery readback failed.", error)
             false
         }
     }
@@ -1063,21 +1064,21 @@ internal object VulkanTrainingBackend : ComputeBackend {
     @Synchronized
     internal fun invalidateOptimizerStateResidency(): Boolean {
         if (nativeReady && !synchronizeTrainingStateMirrors()) {
-            Log.e(TAG, "Cannot invalidate GPU optimizer state because host recovery was not verified.")
+            ArgusDiagnosticBridge.error(TAG, "Cannot invalidate GPU optimizer state because host recovery was not verified.")
             return false
         }
         if (!modelParameterMirrorReliable || !optimizerStateMirrorReliable) {
-            Log.e(TAG, "CPU fallback is blocked because a host training-state mirror is stale.")
+            ArgusDiagnosticBridge.error(TAG, "CPU fallback is blocked because a host training-state mirror is stale.")
             return false
         }
         val released = optimizerStateResidencyRegistry.invalidate(
             releaseAllocations = nativeReady
         )
         if (!released && nativeReady) {
-            Log.w(TAG, "Optimizer-state release failed; rebuilding the optional Vulkan runtime.")
+            ArgusDiagnosticBridge.warning(TAG, "Optimizer-state release failed; rebuilding the optional Vulkan runtime.")
             runCatching { destroyNativeRuntime() }
                 .onFailure { error ->
-                    Log.e(TAG, "Vulkan teardown after optimizer-state release failure failed.", error)
+                    ArgusDiagnosticBridge.error(TAG, "Vulkan teardown after optimizer-state release failure failed.", error)
                 }
             return false
         }
@@ -1141,10 +1142,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
         val synchronized = try {
             tensorResidencyRegistry.synchronizeAll(tensors)
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Full model tensor residency exceeded available memory.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Full model tensor residency exceeded available memory.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Full model tensor residency synchronization failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Full model tensor residency synchronization failed.", error)
             false
         }
 
@@ -1230,17 +1231,17 @@ internal object VulkanTrainingBackend : ComputeBackend {
         if (!synchronizeTrainingStateMirrors()) {
             residencySuspended = false
             _modelTensorResidencyReady.value = wasResidencyReady
-            Log.e(TAG, "Memory-pressure release was postponed because model or optimizer state could not be recovered.")
+            ArgusDiagnosticBridge.error(TAG, "Memory-pressure release was postponed because model or optimizer state could not be recovered.")
             return false
         }
 
         val cleared = try {
             nativeClearTensorArena()
         } catch (error: LinkageError) {
-            Log.e(TAG, "Vulkan arena-clear entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan arena-clear entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Vulkan arena clear failed during memory pressure.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan arena clear failed during memory pressure.", error)
             false
         }
 
@@ -1259,7 +1260,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             "Kotlin CPU fallback — Vulkan arena could not be returned under memory pressure"
         runCatching { destroyNativeRuntime() }
             .onFailure { error ->
-                Log.e(TAG, "Vulkan teardown after memory-pressure release failure failed.", error)
+                ArgusDiagnosticBridge.error(TAG, "Vulkan teardown after memory-pressure release failure failed.", error)
             }
         refreshTensorArenaMetrics()
         return false
@@ -1312,10 +1313,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
         return try {
             tensorResidencyRegistry.acquire(parameters)
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident model parameter synchronization exceeded available memory.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident model parameter synchronization exceeded available memory.", error)
             null
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident model parameter synchronization failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident model parameter synchronization failed.", error)
             null
         }
     }
@@ -1412,9 +1413,9 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 }
             }
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident projection-set activation allocation exceeded the GPU/host budget.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident projection-set activation allocation exceeded the GPU/host budget.", error)
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident projection-set dispatch failed before output commit.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident projection-set dispatch failed before output commit.", error)
         } finally {
             for (tensor in temporaryActivations.asReversed()) {
                 if (!activationTensorRegistry.release(tensor)) cleanupSucceeded = false
@@ -1422,7 +1423,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
         }
 
         if (!cleanupSucceeded) {
-            Log.w(TAG, "Resident projection-set temporary activation cleanup was incomplete; using fallback.")
+            ArgusDiagnosticBridge.warning(TAG, "Resident projection-set temporary activation cleanup was incomplete; using fallback.")
             return false
         }
         if (!dispatchAndReadbackSucceeded) return false
@@ -1489,9 +1490,9 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 }
             }
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident SwiGLU workspace exceeded the activation memory budget.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident SwiGLU workspace exceeded the activation memory budget.", error)
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident SwiGLU failed before host-output commit.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident SwiGLU failed before host-output commit.", error)
         } finally {
             for (tensor in temporary.asReversed()) {
                 if (!activationTensorRegistry.release(tensor)) cleanupSucceeded = false
@@ -1499,7 +1500,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
         }
 
         if (!cleanupSucceeded) {
-            Log.w(TAG, "Resident SwiGLU tensor release failed; rebuilding Tensor Arena residency.")
+            ArgusDiagnosticBridge.warning(TAG, "Resident SwiGLU tensor release failed; rebuilding Tensor Arena residency.")
             invalidateTensorResidency(releaseAllocations = true)
             residencyRebuildPending = lastModelParameterInventory.isNotEmpty()
             return false
@@ -1616,9 +1617,9 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     stagedNormalized != null
             }
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident feed-forward workspace exceeded the activation memory budget.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident feed-forward workspace exceeded the activation memory budget.", error)
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident feed-forward graph failed before host-output commit.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident feed-forward graph failed before host-output commit.", error)
         } finally {
             for (tensor in temporary.asReversed()) {
                 if (!activationTensorRegistry.release(tensor)) cleanupSucceeded = false
@@ -1626,7 +1627,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
         }
 
         if (!cleanupSucceeded) {
-            Log.w(TAG, "Resident feed-forward cleanup failed; invalidating Tensor Arena residency.")
+            ArgusDiagnosticBridge.warning(TAG, "Resident feed-forward cleanup failed; invalidating Tensor Arena residency.")
             invalidateTensorResidency(releaseAllocations = true)
             residencyRebuildPending = lastModelParameterInventory.isNotEmpty()
             return false
@@ -1784,9 +1785,9 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 }
             }
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident attention workspace exceeded the activation memory budget.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident attention workspace exceeded the activation memory budget.", error)
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident attention graph failed before host-output commit.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident attention graph failed before host-output commit.", error)
         } finally {
             for (tensor in temporary.asReversed()) {
                 if (!activationTensorRegistry.release(tensor)) cleanupSucceeded = false
@@ -1794,7 +1795,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
         }
 
         if (!cleanupSucceeded) {
-            Log.w(TAG, "Resident attention tensor release failed; rebuilding residency before retry.")
+            ArgusDiagnosticBridge.warning(TAG, "Resident attention tensor release failed; rebuilding residency before retry.")
             invalidateTensorResidency(releaseAllocations = true)
             residencyRebuildPending = lastModelParameterInventory.isNotEmpty()
             return false
@@ -1840,17 +1841,17 @@ internal object VulkanTrainingBackend : ComputeBackend {
     @Synchronized
     fun resetRuntimeForRetry() {
         if (nativeReady && !synchronizeTrainingStateMirrors()) {
-            Log.e(TAG, "Vulkan retry was postponed because model or optimizer state could not be recovered.")
+            ArgusDiagnosticBridge.error(TAG, "Vulkan retry was postponed because model or optimizer state could not be recovered.")
             return
         }
         if (!modelParameterMirrorReliable || !optimizerStateMirrorReliable) {
-            Log.e(TAG, "Vulkan retry was refused because a host training-state mirror is stale.")
+            ArgusDiagnosticBridge.error(TAG, "Vulkan retry was refused because a host training-state mirror is stale.")
             return
         }
         if (initializationAttempted) {
             runCatching { nativeDestroy() }
                 .onFailure { error ->
-                    Log.w(TAG, "Vulkan native cleanup during runtime retry failed.", error)
+                    ArgusDiagnosticBridge.warning(TAG, "Vulkan native cleanup during runtime retry failed.", error)
                 }
         }
         nativeReady = false
@@ -1900,7 +1901,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
         }
         if (initializationAttempted) return false
         if (!modelParameterMirrorReliable || !optimizerStateMirrorReliable) {
-            Log.e(TAG, "Vulkan initialization is blocked because the host training-state mirror is stale.")
+            ArgusDiagnosticBridge.error(TAG, "Vulkan initialization is blocked because the host training-state mirror is stale.")
             return false
         }
 
@@ -1933,7 +1934,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 val detectedCapabilities = runCatching {
                     VulkanDeviceCapabilities.fromJson(nativeGetDeviceCapabilities())
                 }.onFailure { error ->
-                    Log.w(TAG, "Vulkan runtime started but capability metadata could not be parsed.", error)
+                    ArgusDiagnosticBridge.warning(TAG, "Vulkan runtime started but capability metadata could not be parsed.", error)
                 }.getOrNull()
                 val detectedProfile = detectedCapabilities?.toDeviceProfile()
                 _deviceCapabilities.value = detectedCapabilities
@@ -2100,7 +2101,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     isInitializing = false,
                     isCpuFallback = true
                 )
-                Log.w(TAG, "Vulkan is unavailable or failed verification; Kotlin CPU remains active.")
+                ArgusDiagnosticBridge.warning(TAG, "Vulkan is unavailable or failed verification; Kotlin CPU remains active.")
             }
             runtimeIntact
         } catch (error: LinkageError) {
@@ -2127,7 +2128,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 isInitializing = false,
                 isCpuFallback = true
             )
-            Log.w(TAG, "Native Vulkan library loading was blocked.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Native Vulkan library loading was blocked.", error)
             false
         } catch (error: OutOfMemoryError) {
             releaseNativeRuntimeAfterFailure(nativeLibraryLoaded)
@@ -2140,7 +2141,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 isInitializing = false,
                 isCpuFallback = true
             )
-            Log.w(TAG, "Vulkan initialization exceeded the available memory budget; keeping CPU fallback.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Vulkan initialization exceeded the available memory budget; keeping CPU fallback.", error)
             false
         } catch (error: RuntimeException) {
             releaseNativeRuntimeAfterFailure(nativeLibraryLoaded)
@@ -2153,7 +2154,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 isInitializing = false,
                 isCpuFallback = true
             )
-            Log.w(TAG, "Native Vulkan initialization failed.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Native Vulkan initialization failed.", error)
             false
         }
     }
@@ -2406,13 +2407,13 @@ internal object VulkanTrainingBackend : ComputeBackend {
             return verify(normalWeights, transpose = false) &&
                 verify(transposedWeights, transpose = true)
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident activation-linear self-check entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident activation-linear self-check entry point is unavailable.", error)
             return false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident activation-linear self-check failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident activation-linear self-check failed.", error)
             return false
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident activation-linear self-check exceeded available memory.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident activation-linear self-check exceeded available memory.", error)
             return false
         } finally {
             if (outputHandle != 0L) runCatching { nativeReleaseTensor(outputHandle) }
@@ -2546,13 +2547,13 @@ internal object VulkanTrainingBackend : ComputeBackend {
             return verifyOrientation(transposeWeights = false) &&
                 verifyOrientation(transposeWeights = true)
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident activation batch self-check entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident activation batch self-check entry point is unavailable.", error)
             return false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident activation batch self-check failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident activation batch self-check failed.", error)
             return false
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident activation batch self-check exceeded available memory.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident activation batch self-check exceeded available memory.", error)
             return false
         } finally {
             for (handle in weightHandles) {
@@ -2577,17 +2578,17 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 gate.nativeHandle, up.nativeHandle, output.nativeHandle, rows, columns
             )
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident Vulkan SwiGLU JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident Vulkan SwiGLU JNI entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident Vulkan SwiGLU dispatch failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident Vulkan SwiGLU dispatch failed.", error)
             false
         }
         if (!applied) {
             residentSwiGluReady = false
             _runtimeStatus.value =
                 "Vulkan runtime verified — resident SwiGLU dispatch failed; this operation uses Kotlin fallback"
-            Log.w(TAG, "Resident Vulkan SwiGLU dispatch failed; Kotlin activation fallback remains active.")
+            ArgusDiagnosticBridge.warning(TAG, "Resident Vulkan SwiGLU dispatch failed; Kotlin activation fallback remains active.")
         }
         return applied
     }
@@ -2616,10 +2617,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 columns
             )
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident residual LayerNorm JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident residual LayerNorm JNI entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident residual LayerNorm dispatch failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident residual LayerNorm dispatch failed.", error)
             false
         }
         if (!applied) {
@@ -2701,10 +2702,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 headDimension
             )
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident Vulkan attention JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident Vulkan attention JNI entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident Vulkan attention graph dispatch failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident Vulkan attention graph dispatch failed.", error)
             false
         }
         if (applied) {
@@ -2715,7 +2716,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             _currentBackend = "Kotlin CPU (Resident attention + LayerNorm fallback)"
             _runtimeStatus.value =
                 "Vulkan runtime verified — resident attention/LayerNorm dispatch failed; this path uses Kotlin fallback"
-            Log.w(TAG, "Resident Vulkan attention/LayerNorm dispatch failed; M3B–M3E fall back to Kotlin.")
+            ArgusDiagnosticBridge.warning(TAG, "Resident Vulkan attention/LayerNorm dispatch failed; M3B–M3E fall back to Kotlin.")
         }
         return applied
     }
@@ -2899,13 +2900,13 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 approximatelyEqual(decodeFloatArray(actualProjectedBytes), expectedProjectedValues, 2e-4f) &&
                 approximatelyEqual(decodeFloatArray(actualNormalizedBytes), expectedNormalizedValues, 2e-4f)
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident attention self-check JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident attention self-check JNI entry point is unavailable.", error)
             return false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident attention self-check failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident attention self-check failed.", error)
             return false
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident attention self-check exceeded available memory.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident attention self-check exceeded available memory.", error)
             return false
         } finally {
             if (outputWeightHandle != 0L) runCatching { nativeReleaseTensor(outputWeightHandle) }
@@ -3002,11 +3003,11 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     approximatelyEqual(expectedNormalized, decodeFloatArray(normalizedBytes), 1.0e-4f)
             }
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident residual LayerNorm self-check JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident residual LayerNorm self-check JNI entry point is unavailable.", error)
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident residual LayerNorm numerical self-check failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident residual LayerNorm numerical self-check failed.", error)
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident residual LayerNorm self-check exceeded available memory.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident residual LayerNorm self-check exceeded available memory.", error)
         } finally {
             if (normalizedHandle != 0L &&
                 !runCatching { nativeReleaseTensor(normalizedHandle) }.getOrDefault(false)) {
@@ -3026,7 +3027,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             }
         }
         if (!cleanupSucceeded) {
-            Log.w(TAG, "Resident residual LayerNorm self-check could not release every temporary tensor.")
+            ArgusDiagnosticBridge.warning(TAG, "Resident residual LayerNorm self-check could not release every temporary tensor.")
             runCatching { nativeClearTensorArena() }
         }
         return operationSucceeded && cleanupSucceeded
@@ -3060,17 +3061,17 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 !nativeDownloadTensor(outputHandle, outputBytes)) return false
             verified = approximatelyEqual(expected, decodeFloatArray(outputBytes), 1.0e-4f)
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident SwiGLU self-check entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident SwiGLU self-check entry point is unavailable.", error)
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident SwiGLU self-check failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident SwiGLU self-check failed.", error)
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident SwiGLU self-check exceeded available memory.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident SwiGLU self-check exceeded available memory.", error)
         } finally {
             if (outputHandle != 0L && !runCatching { nativeReleaseTensor(outputHandle) }.getOrDefault(false)) cleanupSucceeded = false
             if (upHandle != 0L && !runCatching { nativeReleaseTensor(upHandle) }.getOrDefault(false)) cleanupSucceeded = false
             if (gateHandle != 0L && !runCatching { nativeReleaseTensor(gateHandle) }.getOrDefault(false)) cleanupSucceeded = false
         }
-        if (!cleanupSucceeded) Log.w(TAG, "Resident SwiGLU self-check could not release every temporary tensor.")
+        if (!cleanupSucceeded) ArgusDiagnosticBridge.warning(TAG, "Resident SwiGLU self-check could not release every temporary tensor.")
         return verified && cleanupSucceeded
     }
 
@@ -3193,17 +3194,17 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 }
                 val values = decodeFloatArray(outputBytes[index])
                 if (values.any { !it.isFinite() } || values.size != outputs[index].size) {
-                    Log.w(TAG, "Resident backward kernel returned invalid FP32 output.")
+                    ArgusDiagnosticBridge.warning(TAG, "Resident backward kernel returned invalid FP32 output.")
                     return false
                 }
                 stagedOutputs[index] = values
             }
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident backward JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident backward JNI entry point is unavailable.", error)
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident backward dispatch failed validation or execution.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident backward dispatch failed validation or execution.", error)
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident backward workspace exceeded the available activation budget.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident backward workspace exceeded the available activation budget.", error)
         } finally {
             for (allocation in temporary.asReversed()) {
                 if (!runCatching { releaseGpuTensor(allocation) }.getOrDefault(false)) {
@@ -3213,10 +3214,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
         }
 
         if (!cleanupSucceeded) {
-            Log.w(TAG, "Resident backward dispatch could not release every temporary tensor.")
+            ArgusDiagnosticBridge.warning(TAG, "Resident backward dispatch could not release every temporary tensor.")
             runCatching { destroyNativeRuntime() }
                 .onFailure { error ->
-                    Log.e(TAG, "Failed to tear down Vulkan after a backward workspace leak.", error)
+                    ArgusDiagnosticBridge.error(TAG, "Failed to tear down Vulkan after a backward workspace leak.", error)
                 }
             return false
         }
@@ -3280,13 +3281,13 @@ internal object VulkanTrainingBackend : ComputeBackend {
             committed = true
             return accumulator
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident gradient accumulator JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident gradient accumulator JNI entry point is unavailable.", error)
             return null
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident gradient accumulator exceeded the available memory budget.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident gradient accumulator exceeded the available memory budget.", error)
             return null
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident gradient accumulator allocation failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident gradient accumulator allocation failed.", error)
             return null
         } finally {
             if (!committed) {
@@ -3304,7 +3305,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     cleanupSucceeded = false
                 }
                 if (!cleanupSucceeded && isRuntimeAvailable) {
-                    Log.e(TAG, "Partial gradient accumulator cleanup failed; disabling the optional Vulkan runtime.")
+                    ArgusDiagnosticBridge.error(TAG, "Partial gradient accumulator cleanup failed; disabling the optional Vulkan runtime.")
                     runCatching { destroyNativeRuntime() }
                 }
             }
@@ -3351,13 +3352,13 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 updated
             }
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident gradient-accumulation JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident gradient-accumulation JNI entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident gradient accumulation failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident gradient accumulation failed.", error)
             false
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident gradient accumulation exceeded available memory.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident gradient accumulation exceeded available memory.", error)
             false
         }
 
@@ -3383,13 +3384,13 @@ internal object VulkanTrainingBackend : ComputeBackend {
             copyGradientTensors(values, destinationTensors, accumulator.tensorSizes)
             true
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident gradient accumulator download JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident gradient accumulator download JNI entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident gradient accumulator recovery failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident gradient accumulator recovery failed.", error)
             false
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident gradient accumulator recovery exceeded available memory.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident gradient accumulator recovery exceeded available memory.", error)
             false
         }
     }
@@ -3399,10 +3400,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
         accumulator: VulkanResidentGradientAccumulator
     ) {
         if (!releaseResidentGradientAccumulator(accumulator) && isRuntimeAvailable) {
-            Log.w(TAG, "Resident gradient accumulator cleanup failed; disabling the optional Vulkan runtime.")
+            ArgusDiagnosticBridge.warning(TAG, "Resident gradient accumulator cleanup failed; disabling the optional Vulkan runtime.")
             runCatching { destroyNativeRuntime() }
                 .onFailure { error ->
-                    Log.e(TAG, "Vulkan teardown after accumulator cleanup failure failed.", error)
+                    ArgusDiagnosticBridge.error(TAG, "Vulkan teardown after accumulator cleanup failure failed.", error)
                 }
             accumulator.activeReleased = true
             accumulator.spareReleased = true
@@ -3506,11 +3507,11 @@ internal object VulkanTrainingBackend : ComputeBackend {
             }
             completed = true
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident gradient finalization JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident gradient finalization JNI entry point is unavailable.", error)
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident gradient finalization failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident gradient finalization failed.", error)
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident gradient finalization exceeded available memory.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident gradient finalization exceeded available memory.", error)
         } finally {
             val partialToRelease = partial
             if (partialToRelease != null &&
@@ -3568,7 +3569,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 }
             }
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Could not flatten gradient tensors for Vulkan accumulation.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Could not flatten gradient tensors for Vulkan accumulation.", error)
             null
         }
     }
@@ -3918,11 +3919,11 @@ internal object VulkanTrainingBackend : ComputeBackend {
             }
             verified = true
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident AdamW JNI self-check entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident AdamW JNI self-check entry point is unavailable.", error)
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident AdamW numerical self-check failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident AdamW numerical self-check failed.", error)
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident AdamW self-check exceeded the available memory budget.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident AdamW self-check exceeded the available memory budget.", error)
         } finally {
             var cleanupSucceeded = true
             val temporary = ArrayList<VulkanTensorAllocation>(
@@ -3946,7 +3947,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             }
             if (!cleanupSucceeded) {
                 verified = false
-                Log.e(TAG, "Resident AdamW self-check could not release all temporary tensors.")
+                ArgusDiagnosticBridge.error(TAG, "Resident AdamW self-check could not release all temporary tensors.")
                 val arenaCleared = runCatching { nativeClearTensorArena() }.getOrDefault(false)
                 if (arenaCleared) {
                     tensorResidencyRegistry.invalidate(releaseAllocations = false)
@@ -3954,10 +3955,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     optimizerStateResidencyRegistry.invalidate(releaseAllocations = false)
                     refreshTensorArenaMetrics()
                 } else {
-                    Log.e(TAG, "Vulkan arena cleanup failed after the resident AdamW self-check.")
+                    ArgusDiagnosticBridge.error(TAG, "Vulkan arena cleanup failed after the resident AdamW self-check.")
                     runCatching { destroyNativeRuntime() }
                         .onFailure { error ->
-                            Log.e(TAG, "Vulkan teardown after AdamW self-check cleanup failure failed.", error)
+                            ArgusDiagnosticBridge.error(TAG, "Vulkan teardown after AdamW self-check cleanup failure failed.", error)
                         }
                 }
             }
@@ -4237,19 +4238,19 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     approximatelyEqual(output[1], expected[1], 4.0e-4f)
             }
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident gradient accumulator self-check JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident gradient accumulator self-check JNI entry point is unavailable.", error)
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident gradient accumulator numerical self-check failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident gradient accumulator numerical self-check failed.", error)
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident gradient accumulator self-check exceeded available memory.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident gradient accumulator self-check exceeded available memory.", error)
         } finally {
             cleanupSucceeded = accumulator.released ||
                 releaseResidentGradientAccumulator(accumulator)
             if (!cleanupSucceeded && isRuntimeAvailable) {
-                Log.e(TAG, "Resident gradient accumulator self-check could not release all Vulkan buffers.")
+                ArgusDiagnosticBridge.error(TAG, "Resident gradient accumulator self-check could not release all Vulkan buffers.")
                 runCatching { destroyNativeRuntime() }
                     .onFailure { error ->
-                        Log.e(TAG, "Vulkan teardown after gradient self-check cleanup failure failed.", error)
+                        ArgusDiagnosticBridge.error(TAG, "Vulkan teardown after gradient self-check cleanup failure failed.", error)
                     }
             }
         }
@@ -4512,13 +4513,13 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     transposeWeights = transposeWeights
                 ) && approximatelyEqual(actual, expected, 1e-3f)
             } catch (error: LinkageError) {
-                Log.e(TAG, "Persistent batched FP16 Vulkan self-check entry point is unavailable.", error)
+                ArgusDiagnosticBridge.error(TAG, "Persistent batched FP16 Vulkan self-check entry point is unavailable.", error)
                 return false
             } catch (error: RuntimeException) {
-                Log.e(TAG, "Persistent batched FP16 Vulkan self-check failed.", error)
+                ArgusDiagnosticBridge.error(TAG, "Persistent batched FP16 Vulkan self-check failed.", error)
                 return false
             } catch (error: OutOfMemoryError) {
-                Log.w(TAG, "Persistent batched FP16 Vulkan self-check exceeded available memory.", error)
+                ArgusDiagnosticBridge.warning(TAG, "Persistent batched FP16 Vulkan self-check exceeded available memory.", error)
                 return false
             } finally {
                 for (handle in handles) {
@@ -4567,13 +4568,13 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     transposeWeights = transposeWeights
                 ) && approximatelyEqual(actual, expected, 1e-3f)
             } catch (error: LinkageError) {
-                Log.e(TAG, "Persistent single-matrix FP16 Vulkan self-check entry point is unavailable.", error)
+                ArgusDiagnosticBridge.error(TAG, "Persistent single-matrix FP16 Vulkan self-check entry point is unavailable.", error)
                 return false
             } catch (error: RuntimeException) {
-                Log.e(TAG, "Persistent single-matrix FP16 Vulkan self-check failed.", error)
+                ArgusDiagnosticBridge.error(TAG, "Persistent single-matrix FP16 Vulkan self-check failed.", error)
                 return false
             } catch (error: OutOfMemoryError) {
-                Log.w(TAG, "Persistent single-matrix FP16 Vulkan self-check exceeded available memory.", error)
+                ArgusDiagnosticBridge.warning(TAG, "Persistent single-matrix FP16 Vulkan self-check exceeded available memory.", error)
                 return false
             } finally {
                 if (handle != 0L) {
@@ -4648,17 +4649,17 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 transposeWeights
             )
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident Vulkan linear JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident Vulkan linear JNI entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident Vulkan linear dispatch failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident Vulkan linear dispatch failed.", error)
             false
         }
         if (applied) {
             refreshGpuPerformanceMetrics()
         } else {
             residentActivationLinearReady = false
-            Log.w(TAG, "Resident activation-linear dispatch failed; this M3 path is disabled for this runtime.")
+            ArgusDiagnosticBridge.warning(TAG, "Resident activation-linear dispatch failed; this M3 path is disabled for this runtime.")
         }
         return applied
     }
@@ -4721,17 +4722,17 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 transposeWeights
             )
         } catch (error: LinkageError) {
-            Log.e(TAG, "Resident Vulkan batched-linear JNI entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident Vulkan batched-linear JNI entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident Vulkan batched-linear dispatch failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident Vulkan batched-linear dispatch failed.", error)
             false
         }
         if (applied) {
             refreshGpuPerformanceMetrics()
         } else {
             residentActivationLinearReady = false
-            Log.w(TAG, "Resident Vulkan batched-linear dispatch failed; this resident M3 path is disabled for this runtime.")
+            ArgusDiagnosticBridge.warning(TAG, "Resident Vulkan batched-linear dispatch failed; this resident M3 path is disabled for this runtime.")
         }
         return applied
     }
@@ -4785,7 +4786,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             flattenedInput = FloatArray(inputElements.toInt())
             flattenedOutput = FloatArray(outputElements.toInt())
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Not enough heap memory to stage a persistent-weight Vulkan linear operation.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Not enough heap memory to stage a persistent-weight Vulkan linear operation.", error)
             return false
         }
         for (row in inputRows.indices) {
@@ -4812,10 +4813,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 transposeWeights = transposeWeights
             )
         } catch (error: LinkageError) {
-            Log.e(TAG, "Persistent-weight Vulkan FP16 entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Persistent-weight Vulkan FP16 entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Persistent-weight Vulkan FP16 dispatch failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Persistent-weight Vulkan FP16 dispatch failed.", error)
             false
         }
 
@@ -4823,7 +4824,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             fp16DisabledAfterRuntimeFailure = true
             fp16RuntimeReady = false
             invalidateTensorResidency(releaseAllocations = true)
-            Log.w(TAG, "Persistent-weight FP16 dispatch failed; using the Kotlin CPU path.")
+            ArgusDiagnosticBridge.warning(TAG, "Persistent-weight FP16 dispatch failed; using the Kotlin CPU path.")
             return false
         }
 
@@ -4933,7 +4934,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             flattenedInput = FloatArray(inputElementsLong.toInt())
             flattenedOutput = FloatArray(outputElementsLong.toInt())
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Not enough heap memory to stage FP16 batched linear activations.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Not enough heap memory to stage FP16 batched linear activations.", error)
             return false
         }
 
@@ -4973,10 +4974,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 transposeWeights = transposeWeights
             )
         } catch (error: LinkageError) {
-            Log.e(TAG, "Persistent batched FP16 Vulkan entry point is unavailable.", error)
+            ArgusDiagnosticBridge.error(TAG, "Persistent batched FP16 Vulkan entry point is unavailable.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Persistent batched FP16 Vulkan dispatch failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Persistent batched FP16 Vulkan dispatch failed.", error)
             false
         }
 
@@ -5109,7 +5110,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             flattenedWeights = FloatArray(weightElementCountLong.toInt())
             flattenedOutput = FloatArray(outputElementCountLong.toInt())
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Not enough heap memory to stage a Vulkan batched-linear operation.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Not enough heap memory to stage a Vulkan batched-linear operation.", error)
             return false
         }
 
@@ -5147,10 +5148,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 transposeWeights = transposeWeights
             )
         } catch (error: LinkageError) {
-            Log.e(TAG, "Vulkan batched-linear entry point is unavailable; disabling the backend.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan batched-linear entry point is unavailable; disabling the backend.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Vulkan batched-linear dispatch failed; disabling the backend.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan batched-linear dispatch failed; disabling the backend.", error)
             false
         }
 
@@ -5160,9 +5161,9 @@ internal object VulkanTrainingBackend : ComputeBackend {
             _currentBackend = "Kotlin CPU"
             runCatching { destroyNativeRuntime() }
                 .onFailure { error ->
-                    Log.w(TAG, "Failed to release Vulkan after a batched-linear dispatch failure.", error)
+                    ArgusDiagnosticBridge.warning(TAG, "Failed to release Vulkan after a batched-linear dispatch failure.", error)
                 }
-            Log.w(TAG, "Vulkan batched-linear dispatch was not completed; using the Kotlin CPU path.")
+            ArgusDiagnosticBridge.warning(TAG, "Vulkan batched-linear dispatch was not completed; using the Kotlin CPU path.")
             return false
         }
 
@@ -5404,14 +5405,14 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 val allocation = allocateGpuTensor(totalGradientBytes) ?: return false
                 gradientAllocation = allocation
                 if (!uploadGpuTensor(allocation, encodeFloatArray(flattenedGradients))) {
-                    Log.w(TAG, "Resident AdamW could not upload staged gradient values.")
+                    ArgusDiagnosticBridge.warning(TAG, "Resident AdamW could not upload staged gradient values.")
                     return false
                 }
                 ownsGradientAllocation = true
                 allocation
             } else {
                 if (residentGradient.byteCount < totalGradientBytes) {
-                    Log.w(TAG, "The resident M4 gradient tensor is smaller than the AdamW inventory.")
+                    ArgusDiagnosticBridge.warning(TAG, "The resident M4 gradient tensor is smaller than the AdamW inventory.")
                     return false
                 }
                 ownsGradientAllocation = false
@@ -5420,7 +5421,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             val statusTensor = allocateGpuTensor(Int.SIZE_BYTES.toLong()) ?: return false
             statusAllocation = statusTensor
             if (!uploadGpuTensor(statusTensor, ByteArray(Int.SIZE_BYTES))) {
-                Log.w(TAG, "Resident AdamW could not initialize its validation flag.")
+                ArgusDiagnosticBridge.warning(TAG, "Resident AdamW could not initialize its validation flag.")
                 return false
             }
 
@@ -5461,10 +5462,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     statusHandle = statusTensor.nativeHandle
                 )
             } catch (error: LinkageError) {
-                Log.e(TAG, "Resident AdamW JNI entry point is unavailable.", error)
+                ArgusDiagnosticBridge.error(TAG, "Resident AdamW JNI entry point is unavailable.", error)
                 false
             } catch (error: RuntimeException) {
-                Log.e(TAG, "Resident AdamW dispatch failed.", error)
+                ArgusDiagnosticBridge.error(TAG, "Resident AdamW dispatch failed.", error)
                 false
             }
             if (!dispatched) {
@@ -5478,7 +5479,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             val statusBytes = ByteArray(Int.SIZE_BYTES)
             if (!downloadGpuTensor(statusTensor, statusBytes)) {
                 teardownRequired = true
-                Log.e(TAG, "Resident AdamW transaction status could not be read back.")
+                ArgusDiagnosticBridge.error(TAG, "Resident AdamW transaction status could not be read back.")
                 return false
             }
             val transactionStatus = ByteBuffer.wrap(statusBytes)
@@ -5487,7 +5488,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             if (transactionStatus != 0) {
                 // The validation phase rejected the step. Active weights and moments
                 // were not written; previous GPU updates may still leave host mirrors stale.
-                Log.e(TAG, "Resident AdamW rejected a non-finite or out-of-range update.")
+                ArgusDiagnosticBridge.error(TAG, "Resident AdamW rejected a non-finite or out-of-range update.")
                 return false
             }
 
@@ -5529,7 +5530,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     candidateMomentAllocations
                 )) {
                 teardownRequired = true
-                Log.e(TAG, "Resident AdamW candidate parameter/moment registry preflight failed.")
+                ArgusDiagnosticBridge.error(TAG, "Resident AdamW candidate parameter/moment registry preflight failed.")
                 return false
             }
 
@@ -5539,7 +5540,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     candidateParameterAllocations
                 )) {
                 teardownRequired = true
-                Log.e(TAG, "Resident AdamW could not atomically publish candidate FP16 parameters.")
+                ArgusDiagnosticBridge.error(TAG, "Resident AdamW could not atomically publish candidate FP16 parameters.")
                 return false
             }
             candidateParametersCommitted = true
@@ -5584,7 +5585,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             runCatching { refreshGpuPerformanceMetrics() }
             return true
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Resident AdamW exceeded the available host memory budget.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Resident AdamW exceeded the available host memory budget.", error)
             if (deviceCommitCompleted || candidateMomentsCommitted) {
                 teardownRequired = true
                 return true
@@ -5592,7 +5593,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
             if (dispatchAttempted) teardownRequired = true
             return false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Resident AdamW transaction failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "Resident AdamW transaction failed.", error)
             if (partialRegistryPublicationFailure) throw error
             if (deviceCommitCompleted || candidateMomentsCommitted) {
                 teardownRequired = true
@@ -5653,7 +5654,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 } else {
                     runCatching { destroyNativeRuntime() }
                         .onFailure { error ->
-                            Log.e(TAG, "Vulkan teardown after a failed resident AdamW transaction failed.", error)
+                            ArgusDiagnosticBridge.error(TAG, "Vulkan teardown after a failed resident AdamW transaction failed.", error)
                         }
                 }
             }
@@ -5889,10 +5890,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
             }
             true
         } catch (error: OutOfMemoryError) {
-            Log.w(TAG, "Not enough heap memory to stage FP16 parameters for Vulkan AdamW; retaining CPU fallback.", error)
+            ArgusDiagnosticBridge.warning(TAG, "Not enough heap memory to stage FP16 parameters for Vulkan AdamW; retaining CPU fallback.", error)
             false
         } catch (error: IllegalArgumentException) {
-            Log.e(TAG, "Vulkan AdamW returned invalid staged tensors; retaining CPU fallback.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan AdamW returned invalid staged tensors; retaining CPU fallback.", error)
             false
         }
     }
@@ -5971,10 +5972,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 gradientClipFactor = gradientClipFactor
             )
         } catch (error: LinkageError) {
-            Log.e(TAG, "Vulkan optimizer entry point is unavailable; disabling the backend.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan optimizer entry point is unavailable; disabling the backend.", error)
             false
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Vulkan optimizer dispatch failed; disabling the backend.", error)
+            ArgusDiagnosticBridge.error(TAG, "Vulkan optimizer dispatch failed; disabling the backend.", error)
             false
         }
 
@@ -5996,9 +5997,9 @@ internal object VulkanTrainingBackend : ComputeBackend {
         _currentBackend = "Kotlin CPU"
         runCatching { destroyNativeRuntime() }
             .onFailure { error ->
-                Log.w(TAG, "Failed to release the Vulkan runtime after a dispatch failure.", error)
+                ArgusDiagnosticBridge.warning(TAG, "Failed to release the Vulkan runtime after a dispatch failure.", error)
             }
-        Log.w(TAG, "Vulkan AdamW dispatch was not completed; using the Kotlin CPU optimizer.")
+        ArgusDiagnosticBridge.warning(TAG, "Vulkan AdamW dispatch was not completed; using the Kotlin CPU optimizer.")
         return false
     }
 
