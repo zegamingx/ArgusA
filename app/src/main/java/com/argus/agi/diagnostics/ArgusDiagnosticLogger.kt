@@ -311,9 +311,10 @@ class ArgusDiagnosticLogger(context: Context) {
             }
             .replace(Regex("(?i)Bearer\\s+[^\\s,;]+"), "Bearer [REDACTED]")
             .replace(
-                Regex("(?i)(content|text|prompt|dataset|query|input|body|payload)\\s*[:=]\\s*([^\\r\\n]+)"),
-                "$1=[REDACTED]"
-            )
+                Regex("(?i)(content|text|prompt|dataset|query|input|body|payload)\\s*[:=]\\s*([^\\r\\n]+)")
+            ) { match ->
+                "${match.groupValues[1]}=[REDACTED]"
+            }
             .replace(Regex("'[^']{16,}'"), "'[REDACTED]'")
             .replace(Regex("\"[^\"]{16,}\""), "\"[REDACTED]\"")
             .replace(
