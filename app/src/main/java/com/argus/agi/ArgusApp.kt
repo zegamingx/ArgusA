@@ -154,6 +154,9 @@ class ArgusApp : Application() {
     private val _runtimeDiagnostics = MutableStateFlow<String?>(null)
     val runtimeDiagnostics: StateFlow<String?> = _runtimeDiagnostics.asStateFlow()
 
+    private val _sharedDiagnosticsReady = MutableStateFlow(false)
+    val sharedDiagnosticsReady: StateFlow<Boolean> = _sharedDiagnosticsReady.asStateFlow()
+
     private val diagnosticsPreviewLock = Any()
     private val diagnosticLogger: ArgusDiagnosticLogger by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         ArgusDiagnosticLogger(this)
@@ -185,6 +188,7 @@ class ArgusApp : Application() {
 
         _instance = this
         diagnosticLogger.initialize()
+        _sharedDiagnosticsReady.value = diagnosticLogger.isSharedDirectoryReady()
         capturePreviousProcessExit()
         installUncaughtExceptionHandler()
         createNotificationChannel()
@@ -256,8 +260,14 @@ class ArgusApp : Application() {
     fun isSharedDiagnosticsDirectoryReady(): Boolean =
         diagnosticLogger.isSharedDirectoryReady()
 
-    fun refreshSharedDiagnosticsStorage(): Boolean =
-        diagnosticLogger.synchronizeSharedStorage()
+    fun refreshSharedDiagnosticsStorage() {
+        applicationScope.launch(Dispatchers.IO) {
+            val ready = runCatching {
+                diagnosticLogger.synchronizeSharedStorage()
+            }.getOrDefault(false)
+            _sharedDiagnosticsReady.value = ready
+        }
+    }
 
     fun sharedDiagnosticsDirectoryPath(): String =
         diagnosticLogger.sharedDirectoryPath()
