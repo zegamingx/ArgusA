@@ -476,8 +476,7 @@ class ArgusNeuralEngine private constructor(
             currentNamedParameterTensors()
         )
         if (!synchronized) {
-            Log.w(
-                TAG,
+            ArgusDiagnosticBridge.warning(TAG,
                 "Complete FP16 model residency was not established after $reason; " +
                     "the verified FP32 Vulkan path or Kotlin CPU fallback remains active."
             )
@@ -3509,8 +3508,7 @@ class ArgusNeuralEngine private constructor(
             runCatching {
                 synchronizeVulkanModelTensorResidency("Vulkan AdamW parameter update")
             }.onFailure { error ->
-                Log.w(
-                    TAG,
+                ArgusDiagnosticBridge.warning(TAG,
                     "AdamW committed successfully, but model-residency telemetry/reconciliation needs retry.",
                     error
                 )
@@ -3600,8 +3598,7 @@ class ArgusNeuralEngine private constructor(
         runCatching {
             synchronizeVulkanModelTensorResidency("Kotlin AdamW fallback parameter update")
         }.onFailure { error ->
-            Log.w(
-                TAG,
+            ArgusDiagnosticBridge.warning(TAG,
                 "CPU AdamW committed successfully, but Vulkan model-residency reconciliation needs retry.",
                 error
             )
