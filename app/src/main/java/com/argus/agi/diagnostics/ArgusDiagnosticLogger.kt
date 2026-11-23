@@ -109,23 +109,26 @@ class ArgusDiagnosticLogger(context: Context) {
         immediate: Boolean = false
     ) {
         val entry = createEntry(subsystem, severity, message, throwable)
-        val writeAction: () -> Unit = {
+        val privateWriteAction: () -> Unit = {
             synchronized(lock) {
                 ensureDirectory(privateDirectory)
                 appendEntryLocked(File(privateDirectory, subsystem.fileName), entry)
-                if (hasSharedStorageAccess()) {
-                    runCatching {
-                        ensureDirectory(sharedDirectory())
-                        appendEntryLocked(File(sharedDirectory(), subsystem.fileName), entry)
-                    }.onFailure { error ->
-                        Log.w(TAG, "Could not mirror a diagnostic entry to shared storage.", error)
-                    }
+            }
+        }
+        val writeAction: () -> Unit = {
+            privateWriteAction()
+            if (hasSharedStorageAccess()) {
+                synchronized(lock) {
+                    ensureDirectory(sharedDirectory())
+                    appendEntryLocked(File(sharedDirectory(), subsystem.fileName), entry)
                 }
             }
         }
 
         if (immediate) {
-            runCatching(writeAction).onFailure { error ->
+            // Never block an uncaught-exception handler on removable/shared storage.
+            // The next normal app startup will mirror the durable private record.
+            runCatching(privateWriteAction).onFailure { error ->
                 Log.e(TAG, "Could not persist an immediate diagnostic entry.", error)
             }
         } else {
