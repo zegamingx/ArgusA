@@ -177,9 +177,10 @@ class TrainingManager internal constructor(
         message
             .replace(Regex("'[^']*'"), "'[REDACTED]'")
             .replace(
-                Regex("(?i)(documentId|itemId|sourceUrl|fileName)=\\S+"),
-                "$1=[REDACTED]"
-            )
+                Regex("(?i)(documentId|itemId|sourceUrl|fileName)=\\S+")
+            ) { match ->
+                "${match.groupValues[1]}=[REDACTED]"
+            }
 
     private fun logError(message: String, throwable: Throwable? = null) {
         Log.e(TAG, message, throwable)
