@@ -1,5 +1,7 @@
 package com.argus.agi.service
 
+import com.argus.agi.diagnostics.ArgusDiagnosticBridge
+
 import android.accessibilityservice.AccessibilityService
 import android.content.Intent
 import android.os.Build
@@ -199,7 +201,7 @@ class ArgusAccessibilityService : AccessibilityService() {
                         }
                     } catch (error: Exception) {
                         worldModel.clearScreenContext(rootPackage)
-                        Log.e(TAG, "Screen perception dispatch failed.", error)
+                        ArgusDiagnosticBridge.error(TAG, "Screen perception dispatch failed.", error)
                     }
                 }
             } finally {
