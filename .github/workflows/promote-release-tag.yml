@@ -50,7 +50,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_OLD_TAG: a0cde666f0c5302ffca8a5a52fff2748b3256012
+          EXPECTED_OLD_TAG: 9c953bf9bfb50ce9a8709171ad4a912e1e762d02
         run: |
           set -euo pipefail
 
@@ -137,7 +137,7 @@ jobs:
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "X-GitHub-Api-Version: 2026-03-10" \
-            --data '{"ref":"Release"}' \
+            --data '{"ref":"Release","inputs":{"release_channel":"Release"}}' \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/argus-installable-release.yml/dispatches")"
 
           if [[ "$http_status" != "200" ]]; then
