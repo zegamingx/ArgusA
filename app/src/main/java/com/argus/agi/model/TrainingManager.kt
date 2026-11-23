@@ -1055,29 +1055,24 @@ class TrainingManager internal constructor(
                             var lineNumber = 0
                             while (true) {
                                 currentCoroutineContext().ensureActive()
-                                val line = readBoundedJsonLine(stagedReader, MAX_STREAMED_JSON_VALUE_CHARACTERS) ?: break
+                                val line = stagedReader.readLine() ?: break
                                 lineNumber++
                                 val record = line.removePrefix("\uFEFF").trim()
                                 if (record.isEmpty()) continue
-                                require(record.length <= MAX_STREAMED_JSON_VALUE_CHARACTERS) {
-                                    "JSONL record $lineNumber exceeds the per-record safety limit of " +
-                                        "$MAX_STREAMED_JSON_VALUE_CHARACTERS characters."
-                                }
                                 require(record.startsWith('{')) {
                                     "Invalid JSONL record at line $lineNumber: expected a JSON object."
                                 }
-                                val validRecord = runCatching { org.json.JSONObject(record) }.isSuccess
-                                require(validRecord) {
-                                    "Malformed JSONL record at line $lineNumber: expected one complete JSON object."
+                                val processed = try {
+                                    TextModalityProcessor.processStrictJsonObjectLine(
+                                        rawText = record,
+                                        documentTitle = title
+                                    )
+                                } catch (error: org.json.JSONException) {
+                                    throw IllegalArgumentException(
+                                        "Malformed JSONL record at line $lineNumber: expected one complete JSON object.",
+                                        error
+                                    )
                                 }
-
-                                val processed = TextModalityProcessor.process(
-                                    rawText = record,
-                                    documentTitle = title,
-                                    chunkSize = chunkSize,
-                                    overlap = overlap,
-                                    tokenizer = neuralEngine.tokenizer
-                                )
                                 for (chunk in processed) writeChunk(chunkOutput, chunk.content)
                                 publishImportProgress(
                                     stage = StreamedImportStage.TOKENIZING_CHUNKS,
@@ -1470,40 +1465,6 @@ class TrainingManager internal constructor(
         Log.d(TAG, "Streamed $emittedChunks token-safe chunks for '$title' ($modality).")
     }
 
-
-    private fun readBoundedJsonLine(
-        reader: BufferedReader,
-        maximumCharacters: Int
-    ): String? {
-        require(maximumCharacters > 0) { "maximumCharacters must be positive." }
-        val line = StringBuilder(minOf(maximumCharacters, 4_096))
-        var hasContent = false
-
-        while (true) {
-            val next = reader.read()
-            if (next < 0) return if (hasContent) line.toString() else null
-
-            when (next.toChar()) {
-                '\n' -> return line.toString()
-                '\r' -> {
-                    reader.mark(1)
-                    val following = reader.read()
-                    if (following >= 0 && following.toChar() != '\n') reader.reset()
-                    return line.toString()
-                }
-                else -> {
-                    if (line.length >= maximumCharacters) {
-                        throw IllegalArgumentException(
-                            "A streamed JSONL record exceeds $maximumCharacters UTF-16 characters. " +
-                                "Split the record at a complete JSON object boundary."
-                        )
-                    }
-                    line.append(next.toChar())
-                    hasContent = true
-                }
-            }
-        }
-    }
 
     /**
      * Rehydrates a bounded UTF-16BE spool in fixed-size blocks. Reading code units rather
