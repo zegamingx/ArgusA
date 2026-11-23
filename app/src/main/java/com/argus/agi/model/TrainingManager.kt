@@ -216,9 +216,6 @@ class TrainingManager internal constructor(
         private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
         private const val MAX_PERSISTED_CORPUS_CHUNK_CHARACTERS = 8 * 1024
         private const val MAX_STREAMED_JSON_VALUE_CHARACTERS = 256 * 1024
-        private const val JSONL_RECORD_HEAP_BYTES_PER_CHARACTER = 64L
-        private const val MIN_JSONL_RECORD_HEAP_BUDGET_BYTES =
-            JSONL_RECORD_HEAP_BYTES_PER_CHARACTER * 4_096L
         private const val QUEUE_PREFETCH_LIMIT = 64
         private const val MAX_IN_MEMORY_QUEUE_ITEMS = 128
         private const val CORPUS_WRITE_BATCH_SIZE = 128
@@ -704,6 +701,25 @@ class TrainingManager internal constructor(
         barrier.await()
     }
 
+    /**
+     * Establishes a FIFO persistence barrier while holding queueLock, so the returned
+     * generation describes every enqueue/clear operation ordered before that barrier.
+     * Startup uses the generation to reject a Room snapshot invalidated by clearQueue().
+     */
+    private suspend fun awaitQueuePersistenceIdleAndCaptureGeneration(): Long {
+        val barrier = CompletableDeferred<Unit>()
+        val generation = synchronized(queueLock) {
+            check(
+                persistenceOperations.trySend(QueuePersistenceOperation.Barrier(barrier)).isSuccess
+            ) {
+                "Training queue persistence is not accepting startup barriers."
+            }
+            queueGeneration
+        }
+        barrier.await()
+        return generation
+    }
+
     // =====================================================================
     // Enqueue API
     // =====================================================================
@@ -907,7 +923,7 @@ class TrainingManager internal constructor(
         strictJsonLines: Boolean = false
     ): Pair<Int, Long> {
         if (closed) return Pair(0, 0L)
-        streamedImportStartup.await()
+        awaitTrainingWorkerReady()
         require(chunkSize > 0) { "chunkSize must be positive." }
         require(overlap >= 0 && overlap < chunkSize) {
             "overlap must be between zero and chunkSize - 1."
@@ -1061,29 +1077,24 @@ class TrainingManager internal constructor(
                             var lineNumber = 0
                             while (true) {
                                 currentCoroutineContext().ensureActive()
-                                val recordCharacterBudget = maximumJsonlRecordCharacters()
-                                val line = readBoundedJsonLine(
-                                    reader = stagedReader,
-                                    maximumCharacters = recordCharacterBudget
-                                ) ?: break
+                                val line = stagedReader.readLine() ?: break
                                 lineNumber++
                                 val record = line.removePrefix("\uFEFF").trim()
                                 if (record.isEmpty()) continue
-                                require(record.startsWith('{')) {
-                                    "Invalid JSONL record at line $lineNumber: expected a JSON object."
+                                require(record.startsWith('{') && record.endsWith('}')) {
+                                    "Invalid JSONL record at line $lineNumber: expected one complete JSON object."
                                 }
-                                val validRecord = runCatching { org.json.JSONObject(record) }.isSuccess
-                                require(validRecord) {
-                                    "Malformed JSONL record at line $lineNumber: expected one complete JSON object."
+                                val processed = try {
+                                    TextModalityProcessor.processStrictJsonObjectLine(
+                                        rawText = record,
+                                        documentTitle = title
+                                    )
+                                } catch (error: org.json.JSONException) {
+                                    throw IllegalArgumentException(
+                                        "Malformed JSONL record at line $lineNumber: expected one complete JSON object.",
+                                        error
+                                    )
                                 }
-
-                                val processed = TextModalityProcessor.process(
-                                    rawText = record,
-                                    documentTitle = title,
-                                    chunkSize = chunkSize,
-                                    overlap = overlap,
-                                    tokenizer = neuralEngine.tokenizer
-                                )
                                 for (chunk in processed) writeChunk(chunkOutput, chunk.content)
                                 publishImportProgress(
                                     stage = StreamedImportStage.TOKENIZING_CHUNKS,
@@ -1201,7 +1212,7 @@ class TrainingManager internal constructor(
                 totalChunks = chunkCount
             )
 
-            // Persist corpus text in batches bounded by both row count and total character count.
+            // Persist corpus text in batches bounded by row count and total character count.
             val corpusBatch = ArrayList<CorpusChunkEntity>(CORPUS_WRITE_BATCH_SIZE)
             var corpusBatchCharacters = 0L
             DataInputStream(BufferedInputStream(FileInputStream(chunkStagingFile))).use { input ->
@@ -1486,64 +1497,6 @@ class TrainingManager internal constructor(
         Log.d(TAG, "Streamed $emittedChunks token-safe chunks for '$title' ($modality).")
     }
 
-
-    /**
-     * One JSONL object is an atomic training sample. Its in-memory allowance is derived
-     * from currently free app heap rather than a fixed per-record character ceiling.
-     * A conservative 1/64 ratio reserves headroom for the source line, JSON object graph,
-     * canonical text, and modality-processing intermediates.
-     */
-    private fun maximumJsonlRecordCharacters(): Int {
-        val memory = captureTrainingMemorySnapshot()
-        val availableHeapBytes = if (memory.isSystemLowMemory) {
-            memory.availableHeapBytes / 2L
-        } else {
-            memory.availableHeapBytes
-        }
-        require(availableHeapBytes >= MIN_JSONL_RECORD_HEAP_BUDGET_BYTES) {
-            "Not enough free app heap to safely parse a JSONL record. " +
-                "Pause training or free memory, then retry the import."
-        }
-        val characterBudget = availableHeapBytes / JSONL_RECORD_HEAP_BYTES_PER_CHARACTER
-        return characterBudget
-            .coerceAtMost((Int.MAX_VALUE - 8).toLong())
-            .toInt()
-    }
-
-    private fun readBoundedJsonLine(
-        reader: BufferedReader,
-        maximumCharacters: Int
-    ): String? {
-        require(maximumCharacters > 0) { "maximumCharacters must be positive." }
-        val line = StringBuilder(minOf(maximumCharacters, 4_096))
-        var hasContent = false
-
-        while (true) {
-            val next = reader.read()
-            if (next < 0) return if (hasContent) line.toString() else null
-
-            when (next.toChar()) {
-                '\n' -> return line.toString()
-                '\r' -> {
-                    reader.mark(1)
-                    val following = reader.read()
-                    if (following >= 0 && following.toChar() != '\n') reader.reset()
-                    return line.toString()
-                }
-                else -> {
-                    if (line.length >= maximumCharacters) {
-                        throw IllegalArgumentException(
-                            "A JSONL record exceeds the current memory-safe budget of " +
-                                "$maximumCharacters UTF-16 code units. Each JSONL object remains atomic; " +
-                                "the importer will not split it into unrelated training samples."
-                        )
-                    }
-                    line.append(next.toChar())
-                    hasContent = true
-                }
-            }
-        }
-    }
 
     /**
      * Rehydrates a bounded UTF-16BE spool in fixed-size blocks. Reading code units rather
@@ -3137,20 +3090,36 @@ class TrainingManager internal constructor(
                         }
                     }
 
-                    val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
-                    val pending = repository.getPendingQueueSnapshot(QUEUE_PREFETCH_LIMIT)
-                    val databaseIds = (committed + pending).mapTo(HashSet()) { it.id }
-                    val inMemoryItems = synchronized(queueLock) {
-                        _nextQueue.value.filterNot { item -> item.id in databaseIds }
-                    }
-                    val restoredItems = committed.sortedBy { it.timestamp } +
-                        pending.sortedBy { it.timestamp } +
-                        inMemoryItems.map { item -> item.copy(status = TrainingStatus.QUEUED) }
-                    synchronized(queueLock) {
-                        _nextQueue.value = restoredItems.distinctBy(TrainingData::id)
-                        restoredItems.maxOfOrNull { it.timestamp }?.let { latest ->
-                            lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
+                    // Capture a persistence barrier and queue generation atomically with
+                    // respect to enqueue/clear operations. A clear that races the Room
+                    // snapshot invalidates it, so startup retries rather than restoring
+                    // stale pending rows into the in-memory queue.
+                    while (true) {
+                        val startupQueueGeneration =
+                            awaitQueuePersistenceIdleAndCaptureGeneration()
+                        val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                        val pending = repository.getPendingQueueSnapshot(QUEUE_PREFETCH_LIMIT)
+                        val applied = synchronized(queueLock) {
+                            if (queueGeneration != startupQueueGeneration) {
+                                false
+                            } else {
+                                val databaseIds = (committed + pending).mapTo(HashSet()) { it.id }
+                                val inMemoryItems = _nextQueue.value.filterNot { item ->
+                                    item.id in databaseIds
+                                }
+                                val restoredItems = committed.sortedBy { it.timestamp } +
+                                    pending.sortedBy { it.timestamp } +
+                                    inMemoryItems.map { item ->
+                                        item.copy(status = TrainingStatus.QUEUED)
+                                    }
+                                _nextQueue.value = restoredItems.distinctBy(TrainingData::id)
+                                restoredItems.maxOfOrNull { it.timestamp }?.let { latest ->
+                                    lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
+                                }
+                                true
+                            }
                         }
+                        if (applied) break
                     }
                 }
                 val hasRestoredCommittedItems = repository
