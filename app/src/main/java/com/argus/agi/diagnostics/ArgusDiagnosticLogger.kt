@@ -77,10 +77,12 @@ class ArgusDiagnosticLogger(context: Context) {
         runCatching { Environment.isExternalStorageManager() }.getOrDefault(false)
 
     fun isSharedDirectoryReady(): Boolean =
-        hasSharedStorageAccess() && sharedDirectory().isDirectory
+        runCatching { hasSharedStorageAccess() && sharedDirectory().isDirectory }
+            .getOrDefault(false)
 
     fun sharedDirectoryPath(): String =
-        sharedDirectory().absolutePath
+        runCatching { sharedDirectory().absolutePath }
+            .getOrDefault("/storage/emulated/0/.Argus/logs")
 
     fun privateDirectoryPath(): String =
         privateDirectory.absolutePath
@@ -108,7 +110,12 @@ class ArgusDiagnosticLogger(context: Context) {
         throwable: Throwable? = null,
         immediate: Boolean = false
     ) {
-        val entry = createEntry(subsystem, severity, message, throwable)
+        val entry = runCatching {
+            createEntry(subsystem, severity, message, throwable)
+        }.getOrElse { error ->
+            Log.w(TAG, "Could not construct a diagnostic entry.", error)
+            return
+        }
         val privateWriteAction: () -> Unit = {
             synchronized(lock) {
                 ensureDirectory(privateDirectory)
