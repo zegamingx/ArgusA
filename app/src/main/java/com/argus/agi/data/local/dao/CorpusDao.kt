@@ -17,6 +17,17 @@ data class TokenizerCorpusSample(
     val content: String
 )
 
+/**
+ * Small metadata projection used to reconstruct a large retained training chunk safely.
+ */
+data class CorpusChunkMetadata(
+    val id: String,
+    val documentId: String,
+    val chunkIndex: Int,
+    val characterCount: Int,
+    val contentCodePointCount: Int
+)
+
 @Dao
 interface CorpusDao {
 
@@ -118,8 +129,33 @@ interface CorpusDao {
     @Query("UPDATE corpus_documents SET status = 'READY' WHERE id = :documentId AND status = 'IMPORTING'")
     suspend fun completeStreamedImport(documentId: String): Int
 
-    @Query("SELECT * FROM corpus_chunks WHERE documentId = :documentId AND chunkIndex = :chunkIndex LIMIT 1")
-    suspend fun getChunk(documentId: String, chunkIndex: Int): CorpusChunkEntity?
+    @Query(
+        """
+        SELECT id, documentId, chunkIndex, characterCount,
+               length(content) AS contentCodePointCount
+        FROM corpus_chunks
+        WHERE documentId = :documentId AND chunkIndex = :chunkIndex
+        LIMIT 1
+        """
+    )
+    suspend fun getChunkMetadata(
+        documentId: String,
+        chunkIndex: Int
+    ): CorpusChunkMetadata?
+
+    @Query(
+        """
+        SELECT substr(content, :startCodePoint, :maxCodePoints)
+        FROM corpus_chunks
+        WHERE id = :chunkId
+        LIMIT 1
+        """
+    )
+    suspend fun getChunkContentSegment(
+        chunkId: String,
+        startCodePoint: Int,
+        maxCodePoints: Int
+    ): String?
 
 
     @Query("SELECT * FROM corpus_documents WHERE contentFingerprint = :fingerprint LIMIT 1")
