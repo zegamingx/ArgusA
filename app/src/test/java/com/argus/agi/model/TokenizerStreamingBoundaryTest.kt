@@ -183,6 +183,50 @@ class TokenizerStreamingBoundaryTest {
     }
 
     @Test
+    fun oversizedUnbrokenPreTokensAreSplitIntoBoundedChunks() {
+        val tokenizer = tokenizer()
+        val sample = "a".repeat(24_000)
+        val chunks = ArrayList<TokenizerTextChunk>()
+
+        tokenizer.forEachSafeTextChunk(
+            reader = FragmentingReader(sample, 17),
+            maxTokensPerChunk = 512,
+            maxCharactersPerChunk = 2_048,
+            action = chunks::add
+        )
+
+        assertTrue("An oversized pre-token must be split across bounded rows.", chunks.size > 1)
+        assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+        for (chunk in chunks) {
+            assertTrue("A persisted chunk exceeded its character budget.", chunk.text.length <= 2_048)
+            assertArrayEquals(tokenizer.encodeToIds(chunk.text), chunk.tokenIds)
+        }
+    }
+
+    @Test
+    fun oversizedUnicodePreTokensNeverSplitSurrogatePairs() {
+        val tokenizer = tokenizer()
+        val sample = "😀".repeat(6_000)
+        val chunks = ArrayList<TokenizerTextChunk>()
+
+        tokenizer.forEachSafeTextChunk(
+            reader = FragmentingReader(sample, 7),
+            maxTokensPerChunk = 512,
+            maxCharactersPerChunk = 2_048,
+            action = chunks::add
+        )
+
+        assertEquals(sample, chunks.joinToString(separator = "") { it.text })
+        assertTrue(chunks.size > 1)
+        for (chunk in chunks) {
+            assertTrue(chunk.text.length <= 2_048)
+            assertTrue(chunk.text.first().isLowSurrogate().not())
+            assertTrue(chunk.text.last().isHighSurrogate().not())
+            assertArrayEquals(tokenizer.encodeToIds(chunk.text), chunk.tokenIds)
+        }
+    }
+
+    @Test
     fun overlapIsAppliedOnlyAtSafePreTokenBoundaries() {
         val tokenizer = tokenizer()
         val sample = "one two three four five six seven eight nine ten"
