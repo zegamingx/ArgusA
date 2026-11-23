@@ -544,7 +544,7 @@ class TrainingManager internal constructor(
             if (closed) return
 
             val previousWorker = workerJob
-            if (previousWorker?.isActive == true && !streamedImportStartup.isCompletedExceptionally) {
+            if (previousWorker?.isActive == true && !streamedImportStartup.isCancelled) {
                 return
             }
 
