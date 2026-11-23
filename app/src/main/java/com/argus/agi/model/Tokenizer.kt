@@ -1355,7 +1355,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
                         if (
                             nextTokenCount > overlapTokens.toLong() ||
                             nextTokenCount + encoded.size.toLong() > maxTokensPerChunk.toLong() ||
-                            nextCharacterCount + sourceText.length.toLong() >
+                            nextCharacterCount + encodingText.length.toLong() >
                             maxCharactersPerChunk.toLong()
                         ) {
                             break
