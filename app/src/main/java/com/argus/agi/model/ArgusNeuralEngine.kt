@@ -4,6 +4,7 @@ import android.content.Context
 import com.argus.agi.backend.ComputeBackend
 import com.argus.agi.backend.ComputeBackendKind
 import android.util.Log
+import com.argus.agi.diagnostics.ArgusDiagnosticBridge
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.currentCoroutineContext
@@ -1051,7 +1052,7 @@ class ArgusNeuralEngine private constructor(
 
         if (result.tokensAdded > 0 || result.mergeCount > result.previousMergeCount) {
             if (!saveCheckpoint()) {
-                Log.w(TAG, "Tokenizer vocabulary changed but the updated checkpoint could not be saved.")
+                ArgusDiagnosticBridge.warning(TAG, "Tokenizer vocabulary changed but the updated checkpoint could not be saved.")
             }
         }
         return result
@@ -1813,7 +1814,7 @@ class ArgusNeuralEngine private constructor(
 
         if (autoCheckpoint && shouldSaveCheckpoint) {
             runCatching { saveCheckpoint() }
-                .onFailure { Log.e(TAG, "Auto-checkpoint save failed", it) }
+                .onFailure { ArgusDiagnosticBridge.error(TAG, "Auto-checkpoint save failed", it) }
         }
         return result
     }
@@ -1916,7 +1917,7 @@ class ArgusNeuralEngine private constructor(
 
         if (autoCheckpoint && shouldSaveCheckpoint) {
             runCatching { saveCheckpoint() }
-                .onFailure { Log.e(TAG, "Auto-checkpoint save failed", it) }
+                .onFailure { ArgusDiagnosticBridge.error(TAG, "Auto-checkpoint save failed", it) }
         }
         return result
     }
@@ -4213,11 +4214,11 @@ class ArgusNeuralEngine private constructor(
             }
             if (!verified) {
                 checkpointRestoreBlocked = true
-                Log.e(TAG, "ARG6 checkpoint read-back verification failed.")
+                ArgusDiagnosticBridge.error(TAG, "ARG6 checkpoint read-back verification failed.")
             }
             verified
         } catch (t: Throwable) {
-            Log.e(TAG, "Checkpoint save failed", t)
+            ArgusDiagnosticBridge.error(TAG, "Checkpoint save failed", t)
             false
         }
     }
@@ -4318,7 +4319,7 @@ class ArgusNeuralEngine private constructor(
             }
             true
         } catch (error: Exception) {
-            Log.e(TAG, "ARG6 checkpoint read-back verification failed.", error)
+            ArgusDiagnosticBridge.error(TAG, "ARG6 checkpoint read-back verification failed.", error)
             false
         }
     }
@@ -4994,7 +4995,7 @@ class ArgusNeuralEngine private constructor(
             }
             true
         } catch (e: Exception) {
-            Log.e(TAG, "Checkpoint load failed", e)
+            ArgusDiagnosticBridge.error(TAG, "Checkpoint load failed", e)
             false
         }
     }
@@ -5042,12 +5043,12 @@ class ArgusNeuralEngine private constructor(
                 ModelCheckpointFormat.ARG6 -> loadArg6Checkpoint(file)
                 ModelCheckpointFormat.ARG5 -> loadArg5Checkpoint(file)
                 null -> {
-                    Log.w(TAG, "Pre-release checkpoint format is unsupported by the current clean-break model.")
+                    ArgusDiagnosticBridge.warning(TAG, "Pre-release checkpoint format is unsupported by the current clean-break model.")
                     false
                 }
             }
         } catch (exception: Exception) {
-            Log.e(TAG, "Checkpoint header read failed", exception)
+            ArgusDiagnosticBridge.error(TAG, "Checkpoint header read failed", exception)
             false
         }
 
