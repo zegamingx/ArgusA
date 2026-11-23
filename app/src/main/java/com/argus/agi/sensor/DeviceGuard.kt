@@ -1,5 +1,7 @@
 package com.argus.agi.sensor
 
+import com.argus.agi.diagnostics.ArgusDiagnosticBridge
+
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -76,7 +78,7 @@ class DeviceGuard(private val context: Context) {
                     Log.d(TAG, "Android OS Thermal status changed: $status")
                     refreshState()
                 }
-            }.onFailure { Log.w(TAG, "Failed to register the thermal status listener", it) }
+            }.onFailure { ArgusDiagnosticBridge.warning(TAG, "Failed to register the thermal status listener", it) }
         }
     }
 
