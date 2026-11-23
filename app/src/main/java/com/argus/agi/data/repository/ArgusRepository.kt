@@ -606,7 +606,20 @@ class ArgusRepository(
 
     suspend fun getCorpusChunks(documentId: String): List<CorpusChunkEntity> =
         withContext(Dispatchers.IO) {
-            corpusDao.getChunks(documentId)
+            val chunks = ArrayList<CorpusChunkEntity>()
+            var afterChunkIndex = 0
+            while (true) {
+                val metadata = corpusDao.getNextChunkMetadata(
+                    documentId = documentId,
+                    afterChunkIndex = afterChunkIndex
+                ) ?: break
+                check(metadata.chunkIndex > afterChunkIndex) {
+                    "Corpus chunk metadata query did not advance its cursor."
+                }
+                chunks += readCorpusChunk(metadata)
+                afterChunkIndex = metadata.chunkIndex
+            }
+            chunks
         }
 
     suspend fun getCorpusChunk(documentId: String, chunkIndex: Int): CorpusChunkEntity? =
@@ -614,43 +627,49 @@ class ArgusRepository(
             require(chunkIndex > 0) { "Corpus chunk index must be positive." }
             val metadata = corpusDao.getChunkMetadata(documentId, chunkIndex)
                 ?: return@withContext null
-            require(metadata.characterCount >= 0) {
-                "Corpus chunk ${metadata.id} has an invalid UTF-16 character count."
-            }
-
-            val content = StringBuilder(
-                minOf(metadata.characterCount, 64 * 1024)
-            )
-            var nextCodePoint = 1
-            while (true) {
-                val segment = corpusDao.getChunkContentSegment(
-                    chunkId = metadata.id,
-                    startCodePoint = nextCodePoint,
-                    maxCodePoints = MAX_CORPUS_CHUNK_READ_CODE_POINTS
-                )
-                if (segment.isNullOrEmpty()) break
-
-                val segmentCodePoints = segment.codePointCount(0, segment.length)
-                require(segmentCodePoints in 1..MAX_CORPUS_CHUNK_READ_CODE_POINTS) {
-                    "Corpus chunk ${metadata.id} returned an invalid text segment."
-                }
-                content.append(segment)
-                nextCodePoint = Math.addExact(nextCodePoint, segmentCodePoints)
-            }
-            check(content.length == metadata.characterCount) {
-                "Corpus chunk ${metadata.id} was not fully reconstructed: " +
-                    "expected ${metadata.characterCount} UTF-16 code units, " +
-                    "received ${content.length}."
-            }
-
-            CorpusChunkEntity(
-                id = metadata.id,
-                documentId = metadata.documentId,
-                chunkIndex = metadata.chunkIndex,
-                content = content.toString(),
-                characterCount = metadata.characterCount
-            )
+            readCorpusChunk(metadata)
         }
+
+    private suspend fun readCorpusChunk(
+        metadata: CorpusChunkMetadata
+    ): CorpusChunkEntity {
+        require(metadata.characterCount >= 0) {
+            "Corpus chunk ${metadata.id} has an invalid UTF-16 character count."
+        }
+
+        val content = StringBuilder(
+            minOf(metadata.characterCount, 64 * 1024)
+        )
+        var nextCodePoint = 1
+        while (true) {
+            val segment = corpusDao.getChunkContentSegment(
+                chunkId = metadata.id,
+                startCodePoint = nextCodePoint,
+                maxCodePoints = MAX_CORPUS_CHUNK_READ_CODE_POINTS
+            )
+            if (segment.isNullOrEmpty()) break
+
+            val segmentCodePoints = segment.codePointCount(0, segment.length)
+            require(segmentCodePoints in 1..MAX_CORPUS_CHUNK_READ_CODE_POINTS) {
+                "Corpus chunk ${metadata.id} returned an invalid text segment."
+            }
+            content.append(segment)
+            nextCodePoint = Math.addExact(nextCodePoint, segmentCodePoints)
+        }
+        check(content.length == metadata.characterCount) {
+            "Corpus chunk ${metadata.id} was not fully reconstructed: " +
+                "expected ${metadata.characterCount} UTF-16 code units, " +
+                "received ${content.length}."
+        }
+
+        return CorpusChunkEntity(
+            id = metadata.id,
+            documentId = metadata.documentId,
+            chunkIndex = metadata.chunkIndex,
+            content = content.toString(),
+            characterCount = metadata.characterCount
+        )
+    }
 
 
     suspend fun getNextTokenizerCorpusSample(
