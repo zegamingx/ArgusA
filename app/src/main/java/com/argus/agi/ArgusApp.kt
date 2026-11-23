@@ -29,7 +29,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -470,7 +469,7 @@ class ArgusApp : Application() {
                     runCatching { recordRuntimeDiagnostic(message) }
                 } catch (error: LinkageError) {
                     val message = "Core initialization failed at " + initializationStage +
-                        ": " + error.javaClass.simpleName + ": " + (error.message ?: "No message")
+                        ": " + error.javaClass.simpleName
                     Log.e(TAG, message, error)
                     recordDiagnostic(message, throwable = error)
                     _coreInitializationState.value = ArgusCoreInitializationState.Failed(message)
