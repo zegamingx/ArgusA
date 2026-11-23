@@ -1464,7 +1464,7 @@ Where applicable:
 
 Build Verification
 
-- Clean assembly succeeds.
+- The protected `Release`-tag production assembly succeeds after non-packaging validation.
 - Host unit tests succeed.
 - Android lint succeeds or all existing exceptions are documented.
 - Native compilation succeeds for configured targets.
