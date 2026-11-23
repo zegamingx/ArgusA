@@ -1107,6 +1107,71 @@ object TextModalityProcessor {
     }
 
     /**
+     * Parses and formats one already-delimited JSONL object without building a second
+     * JSON object tree. JSONL record length is governed by available memory and JVM
+     * string capacity, not by a fixed importer-specific character ceiling.
+     */
+    internal fun processStrictJsonObjectLine(
+        rawText: String,
+        documentTitle: String
+    ): List<ProcessedChunk> {
+        val trimmed = rawText.removePrefix("\uFEFF").trim()
+        require(trimmed.startsWith('{') && trimmed.endsWith('}')) {
+            "Expected one complete JSON object."
+        }
+
+        val record = JSONObject(trimmed)
+        val trainingRecord = formatTrainingRecord(record)
+        if (trainingRecord != null) {
+            val (modality, content) = trainingRecord
+            if (content.isBlank()) return emptyList()
+            return listOf(
+                ProcessedChunk(
+                    content = content,
+                    modality = modality,
+                    segmentTitle = "$documentTitle [Record 1/1]",
+                    tokenHint = if (modality == TextModality.REASONING) {
+                        "Atomic instruction, reasoning, and final answer"
+                    } else {
+                        "Atomic conversation or instruction record"
+                    }
+                )
+            )
+        }
+
+        val content = formatStructuredJsonObject(record)
+        if (content.isBlank()) return emptyList()
+        return listOf(
+            ProcessedChunk(
+                content = content,
+                modality = TextModality.STRUCTURED_DATA,
+                segmentTitle = "$documentTitle [Struktur 1/1]",
+                tokenHint = "Complete structured record"
+            )
+        )
+    }
+
+    private fun formatStructuredJsonObject(obj: JSONObject): String = when {
+        obj.has("kata") && obj.has("kata_dasar") -> {
+            val kata = firstNonBlankPayload(obj, listOf("kata"))
+            val dasar = firstNonBlankPayload(obj, listOf("kata_dasar"))
+            val sumber = firstNonBlankPayload(obj, listOf("sumber"))
+            val extra = if (sumber.isNotBlank()) " [sumber: $sumber]" else ""
+            Tokenizer.escapeLiteralControlTokens("Kata: $kata -> Kata dasar: $dasar$extra")
+        }
+        else -> {
+            val pairs = mutableListOf<String>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                if (obj.isNull(key)) continue
+                pairs += "$key: ${obj.opt(key)}"
+            }
+            Tokenizer.escapeLiteralControlTokens(pairs.joinToString(" | "))
+        }
+    }
+
+    /**
      * Formats JSONL instruction-tuning examples. Reasoning examples are serialized as
      * USER -> ASSISTANT/THINK -> THINK_END -> ASSISTANT/final answer -> EOS.
      * Existing no-reasoning records retain their previous serialization.
@@ -1117,25 +1182,7 @@ object TextModalityProcessor {
 
         val formatted = runCatching {
             val obj = JSONObject(trimmed)
-            formatTrainingRecord(obj)?.second ?: when {
-                obj.has("kata") && obj.has("kata_dasar") -> {
-                    val kata = firstNonBlankPayload(obj, listOf("kata"))
-                    val dasar = firstNonBlankPayload(obj, listOf("kata_dasar"))
-                    val sumber = firstNonBlankPayload(obj, listOf("sumber"))
-                    val extra = if (sumber.isNotBlank()) " [sumber: $sumber]" else ""
-                    Tokenizer.escapeLiteralControlTokens("Kata: $kata -> Kata dasar: $dasar$extra")
-                }
-                else -> {
-                    val pairs = mutableListOf<String>()
-                    val keys = obj.keys()
-                    while (keys.hasNext()) {
-                        val key = keys.next()
-                        if (obj.isNull(key)) continue
-                        pairs += "$key: ${obj.opt(key)}"
-                    }
-                    Tokenizer.escapeLiteralControlTokens(pairs.joinToString(" | "))
-                }
-            }
+            formatTrainingRecord(obj)?.second ?: formatStructuredJsonObject(obj)
         }.getOrNull()
         return formatted ?: line
     }
