@@ -4,9 +4,13 @@ import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.net.Uri
+import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -138,7 +142,7 @@ class MainActivity : ComponentActivity() {
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = "Previous process exit captured",
+                                    text = "Diagnostics captured",
                                     color = Color.White,
                                     style = androidx.compose.material3.MaterialTheme.typography.labelLarge
                                 )
@@ -207,13 +211,37 @@ fun MainScreen(viewModel: ArgusViewModel) {
     var currentScreen by rememberSaveable { mutableStateOf(ArgusScreen.CHAT) }
     var hasRequestedNotificationPermission by rememberSaveable { mutableStateOf(false) }
 
-    var showScreenPrivacyDisclosure by rememberSaveable { mutableStateOf(false) }
+    val argusApp = remember(context) {
+        context.applicationContext as ArgusApp
+    }
     val screenPrivacyPreferences = remember(context) {
         context.getSharedPreferences("argus_screen_privacy", Context.MODE_PRIVATE)
     }
-    LaunchedEffect(screenPrivacyPreferences) {
-        if (!screenPrivacyPreferences.getBoolean("first_run_disclosure_acknowledged", false)) {
-            showScreenPrivacyDisclosure = true
+    var showScreenPrivacyDisclosure by rememberSaveable {
+        mutableStateOf(
+            !screenPrivacyPreferences.getBoolean("first_run_disclosure_acknowledged", false)
+        )
+    }
+    val diagnosticsPreferences = remember(context) {
+        context.getSharedPreferences("argus_diagnostics_storage", Context.MODE_PRIVATE)
+    }
+    var showDiagnosticsAccessDialog by rememberSaveable {
+        mutableStateOf(
+            !showScreenPrivacyDisclosure &&
+                !diagnosticsPreferences.getBoolean("shared_log_access_prompt_seen", false) &&
+                !argusApp.hasSharedDiagnosticsAccess()
+        )
+    }
+
+    fun finishScreenPrivacyDisclosure() {
+        screenPrivacyPreferences.edit()
+            .putBoolean("first_run_disclosure_acknowledged", true)
+            .apply()
+        showScreenPrivacyDisclosure = false
+        if (!diagnosticsPreferences.getBoolean("shared_log_access_prompt_seen", false) &&
+            !argusApp.hasSharedDiagnosticsAccess()
+        ) {
+            showDiagnosticsAccessDialog = true
         }
     }
 
@@ -251,10 +279,7 @@ fun MainScreen(viewModel: ArgusViewModel) {
             confirmButton = {
                 TextButton(
                     onClick = {
-                        screenPrivacyPreferences.edit()
-                            .putBoolean("first_run_disclosure_acknowledged", true)
-                            .apply()
-                        showScreenPrivacyDisclosure = false
+                        finishScreenPrivacyDisclosure()
                     }
                 ) {
                     Text("Understood")
@@ -263,13 +288,70 @@ fun MainScreen(viewModel: ArgusViewModel) {
             dismissButton = {
                 TextButton(
                     onClick = {
-                        screenPrivacyPreferences.edit()
-                            .putBoolean("first_run_disclosure_acknowledged", true)
-                            .apply()
-                        showScreenPrivacyDisclosure = false
+                        finishScreenPrivacyDisclosure()
                     }
                 ) {
                     Text("Not now")
+                }
+            }
+        )
+    }
+
+    if (showDiagnosticsAccessDialog) {
+        AlertDialog(
+            onDismissRequest = { },
+            title = {
+                Text(
+                    text = "Create the .Argus diagnostics folder",
+                    fontWeight = FontWeight.SemiBold
+                )
+            },
+            text = {
+                Text(
+                    text = "ARGUS can keep warning and error logs in Internal Storage/.Argus/logs so you can inspect training, Vulkan, recovery, and application failures after restarting the app. Android requires the separate All files access setting to create a folder directly beside Download, Documents, and DCIM. ARGUS writes only its own diagnostic files there; it does not scan your other folders. Chat messages, dataset contents, and personal memories are excluded from these logs. If you skip this, private diagnostic logging continues inside the app."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        diagnosticsPreferences.edit()
+                            .putBoolean("shared_log_access_prompt_seen", true)
+                            .apply()
+                        showDiagnosticsAccessDialog = false
+                        val appSpecificSettings = Intent(
+                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:${context.packageName}")
+                        )
+                        try {
+                            context.startActivity(appSpecificSettings)
+                        } catch (_: Exception) {
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                )
+                            }.onFailure {
+                                Toast.makeText(
+                                    context,
+                                    "Open Android Settings > Special app access > All files access for ARGUS.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                    }
+                ) {
+                    Text("Open access settings")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        diagnosticsPreferences.edit()
+                            .putBoolean("shared_log_access_prompt_seen", true)
+                            .apply()
+                        showDiagnosticsAccessDialog = false
+                    }
+                ) {
+                    Text("Use private logs")
                 }
             }
         )
@@ -295,12 +377,13 @@ fun MainScreen(viewModel: ArgusViewModel) {
         }
     }
 
-    // Lifecycle-aware permission re-evaluation on resume (e.g. after user changes settings)
+    // Refresh notification and shared diagnostic-folder access after returning from Android settings.
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val status = ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
             viewModel.onNotificationPermissionResult(status == PackageManager.PERMISSION_GRANTED)
         }
+        argusApp.refreshSharedDiagnosticsStorage()
     }
 
     val imeInsets = WindowInsets.ime
