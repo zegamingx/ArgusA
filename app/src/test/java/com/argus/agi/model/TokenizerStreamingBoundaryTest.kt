@@ -275,11 +275,12 @@ class TokenizerStreamingBoundaryTest {
         assertTrue(chunks.size > 1)
         for (chunk in chunks) {
             val persistedText = Tokenizer.escapeLiteralControlTokens(chunk.text)
+            assertEquals(persistedText, chunk.encodedText)
             assertTrue(
                 "Escaped control tokens exceeded the persisted row character limit.",
                 persistedText.length <= 128
             )
-            assertArrayEquals(tokenizer.encodeToIds(persistedText), chunk.tokenIds)
+            assertArrayEquals(tokenizer.encodeToIds(chunk.encodedText), chunk.tokenIds)
         }
     }
 
@@ -301,8 +302,9 @@ class TokenizerStreamingBoundaryTest {
         assertTrue(chunks.size > 1)
         for (chunk in chunks) {
             val persistedText = Tokenizer.escapeLiteralControlTokens(chunk.text)
+            assertEquals(persistedText, chunk.encodedText)
             assertTrue(persistedText.length <= 126)
-            assertArrayEquals(tokenizer.encodeToIds(persistedText), chunk.tokenIds)
+            assertArrayEquals(tokenizer.encodeToIds(chunk.encodedText), chunk.tokenIds)
         }
     }
 
