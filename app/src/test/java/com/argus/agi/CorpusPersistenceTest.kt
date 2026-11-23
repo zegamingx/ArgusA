@@ -283,6 +283,10 @@ class CorpusPersistenceTest {
             manager.awaitQueuePersistenceIdle()
             manager.clearQueue()
             manager.awaitQueuePersistenceIdle()
+            assertTrue(
+                "Clearing pending document work must also clear the in-memory queue.",
+                manager.nextQueue.value.isEmpty()
+            )
 
             val trainingDocuments = repository.getTrainingCorpusDocuments()
             assertEquals(3, trainingDocuments.size)
@@ -362,6 +366,10 @@ class CorpusPersistenceTest {
             manager.clearQueue()
             manager.awaitQueuePersistenceIdle()
             assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            assertTrue(
+                "Clearing replay work must also clear the in-memory queue.",
+                manager.nextQueue.value.isEmpty()
+            )
 
             val repeatedRun = manager.scheduleCorpusReplay(
                 seed = 42L,
