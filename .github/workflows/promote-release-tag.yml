@@ -24,12 +24,26 @@ jobs:
       actions: write
       contents: write
 
+    environment:
+      name: argus-release
+
     steps:
       - name: Checkout current main with tag-write credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: true
+
+      - name: Validate protected production signing identity before moving Release
+        shell: bash
+        env:
+          ARGUS_RELEASE_KEYSTORE_BASE64: ${{ secrets.ARGUS_RELEASE_KEYSTORE_BASE64 }}
+          ARGUS_RELEASE_STORE_PASSWORD: ${{ secrets.ARGUS_RELEASE_STORE_PASSWORD }}
+          ARGUS_RELEASE_KEY_PASSWORD: ${{ secrets.ARGUS_RELEASE_KEY_PASSWORD }}
+          ARGUS_RELEASE_KEY_ALIAS: argus-release-2026
+        run: |
+          set -euo pipefail
+          bash tools/security/verify-release-keystore.sh
 
       - name: Verify one-time tag promotion preconditions
         shell: bash
