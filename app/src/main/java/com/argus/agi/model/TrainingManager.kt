@@ -1201,7 +1201,7 @@ class TrainingManager internal constructor(
                 totalChunks = chunkCount
             )
 
-            // Persist corpus text in fixed-size Room batches.
+            // Persist corpus text in batches bounded by both row count and total character count.
             val corpusBatch = ArrayList<CorpusChunkEntity>(CORPUS_WRITE_BATCH_SIZE)
             var corpusBatchCharacters = 0L
             DataInputStream(BufferedInputStream(FileInputStream(chunkStagingFile))).use { input ->
