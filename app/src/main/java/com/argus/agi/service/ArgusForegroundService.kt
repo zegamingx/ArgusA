@@ -1,5 +1,7 @@
 package com.argus.agi.service
 
+import com.argus.agi.diagnostics.ArgusDiagnosticBridge
+
 import android.app.Notification
 import android.app.PendingIntent
 import android.app.Service
@@ -63,10 +65,8 @@ class ArgusForegroundService : Service() {
                 try {
                     startForegroundCompat()
                 } catch (error: Exception) {
-                    val message = "Foreground service promotion failed: " +
-                        error.javaClass.simpleName + ": " + (error.message ?: "No message")
-                    Log.e(TAG, message, error)
-                    (application as? ArgusApp)?.recordRuntimeDiagnostic(message)
+                    val message = "Foreground service promotion failed: " + error.javaClass.simpleName
+                    ArgusDiagnosticBridge.error(TAG, message, error)
                     stopSelfResult(startId)
                     return START_NOT_STICKY
                 }
@@ -77,10 +77,10 @@ class ArgusForegroundService : Service() {
                         runCatching {
                             ArgusApp.trainingManager.togglePauseTraining()
                         }.onFailure { error ->
-                            Log.e(TAG, "Could not toggle training from the foreground notification.", error)
+                            ArgusDiagnosticBridge.error(TAG, "Could not toggle training from the foreground notification.", error)
                         }
                     } else {
-                        Log.w(TAG, "Ignored notification training action while the core runtime is not ready.")
+                        ArgusDiagnosticBridge.warning(TAG, "Ignored notification training action while the core runtime is not ready.")
                     }
                 }
             }

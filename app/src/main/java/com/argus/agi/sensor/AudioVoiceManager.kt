@@ -1,5 +1,7 @@
 package com.argus.agi.sensor
 
+import com.argus.agi.diagnostics.ArgusDiagnosticBridge
+
 import android.content.Context
 import android.content.Intent
 import android.media.AudioFormat
@@ -85,7 +87,7 @@ class AudioVoiceManager(
         try {
             tts = TextToSpeech(context.applicationContext, this)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize TextToSpeech", e)
+            ArgusDiagnosticBridge.error(TAG, "Failed to initialize TextToSpeech", e)
         }
     }
 
@@ -115,8 +117,7 @@ class AudioVoiceManager(
 
                 override fun onError(utteranceId: String?, errorCode: Int) {
                     _isSpeaking.value = false
-                    Log.w(
-                        TAG,
+                    ArgusDiagnosticBridge.warning(TAG,
                         "TextToSpeech utterance '$utteranceId' failed with error code $errorCode."
                     )
                 }
@@ -124,7 +125,7 @@ class AudioVoiceManager(
             _isTtsReady.value = true
             Log.i(TAG, "TTS on-device siap digunakan.")
         } else {
-            Log.w(TAG, "TextToSpeech initialization failed with status code: $status")
+            ArgusDiagnosticBridge.warning(TAG, "TextToSpeech initialization failed with status code: $status")
             _isTtsReady.value = false
         }
     }
@@ -238,7 +239,7 @@ class AudioVoiceManager(
                     speechRecognizer?.cancel()
                     speechRecognizer?.destroy()
                 } catch (e: Exception) {
-                    Log.w(TAG, "Error cleaning previous SpeechRecognizer", e)
+                    ArgusDiagnosticBridge.warning(TAG, "Error cleaning previous SpeechRecognizer", e)
                 }
                 speechRecognizer = null
 
@@ -262,7 +263,7 @@ class AudioVoiceManager(
                     }
                     override fun onError(error: Int) {
                         _isListening.value = false
-                        Log.w(TAG, "SpeechRecognizer onError: $error (preferOffline=$preferOffline, isFallback=$isFallback)")
+                        ArgusDiagnosticBridge.warning(TAG, "SpeechRecognizer onError: $error (preferOffline=$preferOffline, isFallback=$isFallback)")
 
                         // Kode 11 (ERROR_SERVER_DISCONNECTED / model offline belum terpasang) atau Kode 4 / 14:
                         // Otomatis fallback ke pengenal standar perangkat tanpa paksaan offline model
@@ -322,7 +323,7 @@ class AudioVoiceManager(
 
                 recognizer.startListening(intent)
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to start speech recognition", e)
+                ArgusDiagnosticBridge.error(TAG, "Failed to start speech recognition", e)
                 _isListening.value = false
                 onError("Failed to activate the microphone: ${e.message}")
             }
@@ -335,7 +336,7 @@ class AudioVoiceManager(
                 speechRecognizer?.stopListening()
                 speechRecognizer?.cancel()
             } catch (e: Exception) {
-                Log.w(TAG, "stopListening exception", e)
+                ArgusDiagnosticBridge.warning(TAG, "stopListening exception", e)
             } finally {
                 _isListening.value = false
             }
@@ -394,9 +395,9 @@ class AudioVoiceManager(
                     kotlinx.coroutines.delay(500)
                 }
             } catch (e: SecurityException) {
-                Log.w(TAG, "AudioRecord permission is unavailable for acoustic monitoring", e)
+                ArgusDiagnosticBridge.warning(TAG, "AudioRecord permission is unavailable for acoustic monitoring", e)
             } catch (e: Exception) {
-                Log.e(TAG, "Acoustic monitoring error", e)
+                ArgusDiagnosticBridge.error(TAG, "Acoustic monitoring error", e)
             } finally {
                 runCatching {
                     recorder?.stop()
@@ -421,13 +422,13 @@ class AudioVoiceManager(
             tts?.shutdown()
             tts = null
         } catch (e: Exception) {
-            Log.w(TAG, "Error shutting down TTS", e)
+            ArgusDiagnosticBridge.warning(TAG, "Error shutting down TTS", e)
         }
         try {
             speechRecognizer?.destroy()
             speechRecognizer = null
         } catch (e: Exception) {
-            Log.w(TAG, "Error destroying speech recognizer", e)
+            ArgusDiagnosticBridge.warning(TAG, "Error destroying speech recognizer", e)
         }
     }
 }

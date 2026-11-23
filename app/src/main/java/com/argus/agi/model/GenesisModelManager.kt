@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.StatFs
 import android.util.Log
+import com.argus.agi.diagnostics.ArgusDiagnosticBridge
 import com.argus.agi.sensor.DeviceGuard
 import com.argus.agi.sensor.SystemHardwareInfo
 import kotlinx.coroutines.CancellationException
@@ -189,7 +190,7 @@ class GenesisModelManager(
             try {
                 runGenesis(hardwareInfo, trainingManager)
             } catch (t: Throwable) {
-                Log.e(TAG, "Genesis failed during stage ${_lifecycleState.value.stage}", t)
+                ArgusDiagnosticBridge.error(TAG, "Genesis failed during stage ${_lifecycleState.value.stage}", t)
                 _lifecycleState.update {
                     it.copy(
                         stage = GenesisLifecycleStage.FAILED,
@@ -401,7 +402,7 @@ class GenesisModelManager(
                 if (dataGb > 0L) dataGb else 8L // Fallback for JVM/Robolectric test harness
             }
         } catch (e: Exception) {
-            Log.w(TAG, "StatFs failed; using the 8 GB fallback for this environment.", e)
+            ArgusDiagnosticBridge.warning(TAG, "StatFs failed; using the 8 GB fallback for this environment.", e)
             8L
         }
     }
@@ -436,7 +437,7 @@ class GenesisModelManager(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                Log.w(TAG, "Failed to restore Genesis seed '$title'", error)
+                ArgusDiagnosticBridge.warning(TAG, "Failed to restore Genesis seed '$title'", error)
                 0
             }
             scheduledChunks += queuedChunks
@@ -475,8 +476,7 @@ class GenesisModelManager(
                     )
                 }
             }
-            Log.w(
-                TAG,
+            ArgusDiagnosticBridge.warning(TAG,
                 "Stored Genesis identity was invalidated because no compatible checkpoint was restored or verified."
             )
             return null
