@@ -67,7 +67,6 @@ class ArgusDiagnosticLogger(context: Context) {
             synchronized(lock) {
                 ensureDirectory(privateDirectory)
                 migrateLegacyDiagnosticsLocked()
-                synchronizeSharedStorageLocked()
             }
         }.onFailure { error ->
             Log.w(TAG, "Could not initialize persistent diagnostic storage.", error)
@@ -75,7 +74,7 @@ class ArgusDiagnosticLogger(context: Context) {
     }
 
     fun hasSharedStorageAccess(): Boolean =
-        Environment.isExternalStorageManager()
+        runCatching { Environment.isExternalStorageManager() }.getOrDefault(false)
 
     fun isSharedDirectoryReady(): Boolean =
         hasSharedStorageAccess() && sharedDirectory().isDirectory
