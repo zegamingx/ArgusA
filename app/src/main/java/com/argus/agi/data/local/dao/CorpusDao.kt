@@ -9,6 +9,14 @@ import com.argus.agi.data.local.entity.CorpusDocumentEntity
 import com.argus.agi.data.local.entity.CorpusSourceEntity
 import kotlinx.coroutines.flow.Flow
 
+/**
+ * Bounded projection used by tokenizer preparation. Never hydrate the complete corpus row.
+ */
+data class TokenizerCorpusSample(
+    val chunkIndex: Int,
+    val content: String
+)
+
 @Dao
 interface CorpusDao {
 
@@ -144,10 +152,19 @@ interface CorpusDao {
     suspend fun getChunks(documentId: String): List<CorpusChunkEntity>
 
     @Query(
-        "SELECT content FROM corpus_chunks WHERE documentId = :documentId " +
-            "ORDER BY chunkIndex ASC LIMIT :limit"
+        """
+        SELECT chunkIndex, substr(content, 1, :maxCharacters) AS content
+        FROM corpus_chunks
+        WHERE documentId = :documentId AND chunkIndex > :afterChunkIndex
+        ORDER BY chunkIndex ASC
+        LIMIT 1
+        """
     )
-    suspend fun getTokenizerCorpusSample(documentId: String, limit: Int): List<String>
+    suspend fun getNextTokenizerCorpusSample(
+        documentId: String,
+        afterChunkIndex: Int,
+        maxCharacters: Int
+    ): TokenizerCorpusSample?
 
     @Query(
         "UPDATE corpus_documents SET status = :status, " +
