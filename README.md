@@ -99,12 +99,14 @@ must match SHA-256
 Restrict the Environment deployment rule to the approved `Release` tag; add
 required reviewers if the repository's release policy requires approval.
 
-The `Argus Installable Release` workflow runs after relevant changes reach
-`main`. It performs release lint and unit tests, builds the native release
-variant, aligns native libraries for 16 KiB pages, signs the APK, verifies the
-signature and pinned certificate fingerprint, and uploads the installable
-`ARGUS.apk` artifact. The PR validation workflow never receives signing
-secrets and does not publish unsigned APKs.
+The `Argus Production Release` workflow runs only for the approved `Release`
+tag. Before Gradle starts, it verifies that the tag points to the exact current
+`main` commit and validates the protected keystore format, both passwords,
+private-key alias, and pinned Argus 2026 certificate. It performs release lint
+and unit tests, exactly one `assembleRelease`, 16 KiB ZIP alignment, signing,
+and APK verification, then publishes one `ARGUS.apk` with its checksum and
+build manifest. Routine CI and PR validation never assemble or upload an APK
+and never receive production signing secrets.
 
 Use `tools/security/sign-release.ps1` for local Windows signing or
 `tools/security/sign-release.sh` for Linux/CI signing. Both helpers verify the
