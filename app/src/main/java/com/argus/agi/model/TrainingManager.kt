@@ -698,6 +698,25 @@ class TrainingManager internal constructor(
         barrier.await()
     }
 
+    /**
+     * Establishes a FIFO persistence barrier while holding queueLock, so the returned
+     * generation describes every enqueue/clear operation ordered before that barrier.
+     * Startup uses the generation to reject a Room snapshot invalidated by clearQueue().
+     */
+    private suspend fun awaitQueuePersistenceIdleAndCaptureGeneration(): Long {
+        val barrier = CompletableDeferred<Unit>()
+        val generation = synchronized(queueLock) {
+            check(
+                persistenceOperations.trySend(QueuePersistenceOperation.Barrier(barrier)).isSuccess
+            ) {
+                "Training queue persistence is not accepting startup barriers."
+            }
+            queueGeneration
+        }
+        barrier.await()
+        return generation
+    }
+
     // =====================================================================
     // Enqueue API
     // =====================================================================
@@ -3058,20 +3077,36 @@ class TrainingManager internal constructor(
                         }
                     }
 
-                    val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
-                    val pending = repository.getPendingQueueSnapshot(QUEUE_PREFETCH_LIMIT)
-                    val databaseIds = (committed + pending).mapTo(HashSet()) { it.id }
-                    val inMemoryItems = synchronized(queueLock) {
-                        _nextQueue.value.filterNot { item -> item.id in databaseIds }
-                    }
-                    val restoredItems = committed.sortedBy { it.timestamp } +
-                        pending.sortedBy { it.timestamp } +
-                        inMemoryItems.map { item -> item.copy(status = TrainingStatus.QUEUED) }
-                    synchronized(queueLock) {
-                        _nextQueue.value = restoredItems.distinctBy(TrainingData::id)
-                        restoredItems.maxOfOrNull { it.timestamp }?.let { latest ->
-                            lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
+                    // Capture a persistence barrier and queue generation atomically with
+                    // respect to enqueue/clear operations. A clear that races the Room
+                    // snapshot invalidates it, so startup retries rather than restoring
+                    // stale pending rows into the in-memory queue.
+                    while (true) {
+                        val startupQueueGeneration =
+                            awaitQueuePersistenceIdleAndCaptureGeneration()
+                        val committed = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                        val pending = repository.getPendingQueueSnapshot(QUEUE_PREFETCH_LIMIT)
+                        val applied = synchronized(queueLock) {
+                            if (queueGeneration != startupQueueGeneration) {
+                                false
+                            } else {
+                                val databaseIds = (committed + pending).mapTo(HashSet()) { it.id }
+                                val inMemoryItems = _nextQueue.value.filterNot { item ->
+                                    item.id in databaseIds
+                                }
+                                val restoredItems = committed.sortedBy { it.timestamp } +
+                                    pending.sortedBy { it.timestamp } +
+                                    inMemoryItems.map { item ->
+                                        item.copy(status = TrainingStatus.QUEUED)
+                                    }
+                                _nextQueue.value = restoredItems.distinctBy(TrainingData::id)
+                                restoredItems.maxOfOrNull { it.timestamp }?.let { latest ->
+                                    lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
+                                }
+                                true
+                            }
                         }
+                        if (applied) break
                     }
                 }
                 val hasRestoredCommittedItems = repository
