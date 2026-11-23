@@ -46,7 +46,7 @@ class ArgusRepository(
     private companion object {
         const val SCREEN_SOURCE_PATTERN = "Screen%"
         const val LEGACY_SCREEN_SOURCE_PATTERN = "Screen (%"
-        const val MAX_CORPUS_CHUNK_READ_CODE_POINTS = 32 * 1024
+        const val MAX_CORPUS_CHUNK_READ_CODE_POINTS = 128 * 1024
     }
 
     // =========================================================================
