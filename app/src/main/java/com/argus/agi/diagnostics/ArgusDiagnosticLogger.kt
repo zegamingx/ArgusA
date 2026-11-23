@@ -260,10 +260,10 @@ class ArgusDiagnosticLogger(context: Context) {
     ): String {
         val sanitizedMessage = sanitize(message).take(MAX_MESSAGE_CHARS)
         val sanitizedStack = throwable
-            ?.let { sanitize(it.stackTraceToString()).take(MAX_STACK_TRACE_CHARS) }
+            ?.let(::stackTraceFrames)
             .orEmpty()
+            .take(MAX_STACK_TRACE_CHARS)
         val errorType = throwable?.javaClass?.name.orEmpty()
-        val errorMessage = throwable?.message?.let(::sanitize).orEmpty()
 
         return buildString {
             append('{')
@@ -276,9 +276,31 @@ class ArgusDiagnosticLogger(context: Context) {
             append("\"thread\":").append(json(sanitize(Thread.currentThread().name))).append(',')
             append("\"message\":").append(json(sanitizedMessage)).append(',')
             append("\"errorType\":").append(json(errorType)).append(',')
-            append("\"errorMessage\":").append(json(errorMessage)).append(',')
             append("\"stackTrace\":").append(json(sanitizedStack))
             append('}')
+        }
+    }
+
+    private fun stackTraceFrames(throwable: Throwable): String = buildString {
+        val visited = HashSet<Throwable>()
+        var current: Throwable? = throwable
+        var causeDepth = 0
+        while (current != null && visited.add(current) && causeDepth < 8) {
+            appendLine(current.javaClass.name)
+            current.stackTrace.take(40).forEach { frame ->
+                append("  at ")
+                    .append(frame.className)
+                    .append('.')
+                    .append(frame.methodName)
+                    .append('(')
+                    .append(frame.fileName ?: "Unknown Source")
+                    .append(':')
+                    .append(frame.lineNumber)
+                    .appendLine(')')
+            }
+            current = current.cause
+            if (current != null) appendLine("Caused by:")
+            causeDepth++
         }
     }
 
@@ -288,6 +310,12 @@ class ArgusDiagnosticLogger(context: Context) {
                 "${it.groupValues[1]}=[REDACTED]"
             }
             .replace(Regex("(?i)Bearer\\s+[^\\s,;]+"), "Bearer [REDACTED]")
+            .replace(
+                Regex("(?i)(content|text|prompt|dataset|query|input|body|payload)\\s*[:=]\\s*([^\\r\\n]+)"),
+                "$1=[REDACTED]"
+            )
+            .replace(Regex("'[^']{16,}'"), "'[REDACTED]'")
+            .replace(Regex("\"[^\"]{16,}\""), "\"[REDACTED]\"")
             .replace(
                 Regex("/(?:storage/emulated/0|data/user/0|data/data)/[^\\s\"']+"),
                 "[PRIVATE_PATH]"
