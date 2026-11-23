@@ -51,7 +51,7 @@ data class TokenizerConfig(
     companion object {
         const val CURRENT_SCHEMA_VERSION = 2
         const val DEFAULT_MAX_VOCAB_SIZE = 2_048
-        const val DEFAULT_MAX_TOKEN_LENGTH = 32
+        const val DEFAULT_MAX_TOKEN_LENGTH = 64
         const val MINIMUM_VOCAB_SIZE = 288
         const val MINIMUM_TOKEN_LENGTH = 18
         const val MAX_SUPPORTED_VOCAB_SIZE = 1_000_000
@@ -1267,9 +1267,8 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
      * pre-token or a reserved control token. One immutable tokenizer generation is
      * used for the entire pass, even if BPE training publishes a new state concurrently.
      *
-     * A normal pre-token stays intact. An exceptionally long pre-token is split only at
-     * Unicode code-point boundaries so persisted corpus rows remain bounded. Reserved
-     * control tokens are always kept whole. The caller owns the Reader.
+     * An indivisible pre-token may exceed maxTokensPerChunk; it is kept intact rather
+     * than split and assigned different BPE IDs. The caller owns the Reader.
      */
     fun forEachSafeTextChunk(
         reader: Reader,
