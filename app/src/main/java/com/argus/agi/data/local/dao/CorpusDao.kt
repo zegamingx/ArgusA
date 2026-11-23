@@ -24,8 +24,7 @@ data class CorpusChunkMetadata(
     val id: String,
     val documentId: String,
     val chunkIndex: Int,
-    val characterCount: Int,
-    val contentCodePointCount: Int
+    val characterCount: Int
 )
 
 @Dao
@@ -131,8 +130,7 @@ interface CorpusDao {
 
     @Query(
         """
-        SELECT id, documentId, chunkIndex, characterCount,
-               length(content) AS contentCodePointCount
+        SELECT id, documentId, chunkIndex, characterCount
         FROM corpus_chunks
         WHERE documentId = :documentId AND chunkIndex = :chunkIndex
         LIMIT 1
