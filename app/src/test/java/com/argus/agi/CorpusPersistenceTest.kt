@@ -283,6 +283,10 @@ class CorpusPersistenceTest {
             manager.awaitQueuePersistenceIdle()
             manager.clearQueue()
             manager.awaitQueuePersistenceIdle()
+            assertTrue(
+                "Clearing pending document work must also clear the in-memory queue.",
+                manager.nextQueue.value.isEmpty()
+            )
 
             val trainingDocuments = repository.getTrainingCorpusDocuments()
             assertEquals(3, trainingDocuments.size)
@@ -362,6 +366,10 @@ class CorpusPersistenceTest {
             manager.clearQueue()
             manager.awaitQueuePersistenceIdle()
             assertTrue(repository.getPendingQueueSnapshot().isEmpty())
+            assertTrue(
+                "Clearing replay work must also clear the in-memory queue.",
+                manager.nextQueue.value.isEmpty()
+            )
 
             val repeatedRun = manager.scheduleCorpusReplay(
                 seed = 42L,
@@ -613,7 +621,7 @@ class CorpusPersistenceTest {
     }
 
     @Test
-    fun streamedJsonlAcceptsRecordAboveLegacy256KiBLimitWithinHeapBudget() = runTest {
+    fun streamedJsonlAcceptsRecordAbove256KiAndPersistsItAtomically() = runTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val database = Room.inMemoryDatabaseBuilder(
             context,
@@ -633,27 +641,39 @@ class CorpusPersistenceTest {
 
         try {
             manager.pauseTraining()
-            val response = "x".repeat(256 * 1024 + 1)
-            val oversizedRecord =
-                """{"instruction":"prompt","response":"$response"}"""
+            val response = "Large response payload retained without a fixed record cap. ".repeat(6_000)
+            val largeRecord =
+                """{"instruction":"Preserve this complete large training sample.","response":"$response"}"""
+            assertTrue(
+                "The fixture must exceed the removed 256 Ki UTF-16 record ceiling.",
+                largeRecord.length > 256 * 1024
+            )
+
             val result = manager.enqueueDocumentStream(
-                source = "JSONL adaptive record-size regression",
+                source = "JSONL large-record regression",
                 title = "Large JSONL record",
-                reader = StringReader(oversizedRecord),
+                reader = StringReader(largeRecord),
                 chunkSize = 512,
                 overlap = 0,
                 strictJsonLines = true
             )
 
-            assertEquals(oversizedRecord.length.toLong(), result.second)
-            assertTrue(
-                "The complete JSONL record must remain one atomic training item.",
-                result.first > 0
-            )
+            assertEquals(largeRecord.length.toLong(), result.second)
+            assertEquals("One JSONL object must remain one atomic training chunk.", 1, result.first)
             val document = repository.getTrainingCorpusDocuments(limit = 1).single()
-            assertEquals(1, document.chunkCount)
-            assertTrue(repository.getCorpusChunk(document.id, 1)?.content?.contains(response) == true)
+            val storedChunk = repository.getCorpusChunks(document.id).single()
+            assertTrue(
+                "The full response payload must survive canonicalization and persistence.",
+                storedChunk.content.contains(response)
+            )
+            assertEquals(largeRecord.length, document.characterCount)
             assertEquals(1, repository.getPendingQueueSnapshot().size)
+            assertTrue(
+                "The temporary spool must be deleted after successful persistence.",
+                context.cacheDir.listFiles().orEmpty().none { file ->
+                    file.name.startsWith("argus-ingest-")
+                }
+            )
         } finally {
             manager.close()
             database.close()
