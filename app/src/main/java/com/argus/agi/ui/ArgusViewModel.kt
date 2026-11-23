@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
+import com.argus.agi.diagnostics.ArgusDiagnosticBridge
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.argus.agi.ArgusApp
@@ -268,7 +269,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     init {
         runCatching { ArgusForegroundService.startService(application) }
             .onFailure { error ->
-                Log.e(TAG, "Failed to start foreground service", error)
+                ArgusDiagnosticBridge.error(TAG, "Failed to start foreground service", error)
                 ArgusApp.instance.recordRuntimeDiagnostic(
                     "Foreground service request failed: " +
                         error.javaClass.simpleName + ": " + (error.message ?: "No message") +
@@ -283,7 +284,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             }
             val savedMessages = historyResult.getOrDefault(emptyList())
             historyResult.exceptionOrNull()?.let { error ->
-                Log.e(TAG, "Failed to restore local chat history", error)
+                ArgusDiagnosticBridge.error(TAG, "Failed to restore local chat history", error)
             }
 
             withContext(Dispatchers.Main) {
@@ -303,7 +304,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Exception) {
-                    Log.e(TAG, "Genesis lifecycle failed", error)
+                    ArgusDiagnosticBridge.error(TAG, "Genesis lifecycle failed", error)
                     null
                 }
 
@@ -349,7 +350,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             runCatching { hardwareProfile.getHardwareInfo() }
                 .onSuccess { info -> _hardwareInfo.value = info }
                 .onFailure { error ->
-                    Log.w(TAG, "Device memory snapshot refresh failed", error)
+                    ArgusDiagnosticBridge.warning(TAG, "Device memory snapshot refresh failed", error)
                 }
         }
     }
@@ -368,7 +369,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 )
             } catch (e: Exception) {
-                Log.e(TAG, "Hardware refresh failed", e)
+                ArgusDiagnosticBridge.error(TAG, "Hardware refresh failed", e)
             }
         }
     }
@@ -383,7 +384,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     _hardwareInfo.value, trainingManager
                 )
             }.onFailure { e ->
-                Log.e(TAG, "Genesis retry failed", e)
+                ArgusDiagnosticBridge.error(TAG, "Genesis retry failed", e)
             }
         }
     }
@@ -411,7 +412,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 _benchmarkState.value = neuralEngine.runBenchmark(iterations = 12)
             } catch (e: Exception) {
-                Log.e(TAG, "Benchmark failed", e)
+                ArgusDiagnosticBridge.error(TAG, "Benchmark failed", e)
                 appendMessage(
                     ChatMessage(
                         isUser = false,
@@ -462,7 +463,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                Log.e(TAG, "Failed to queue a user-approved conversation sample.", error)
+                ArgusDiagnosticBridge.error(TAG, "Failed to queue a user-approved conversation sample.", error)
                 0
             }
 
@@ -562,7 +563,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (e: Exception) {
-                    Log.e(TAG, "Generation failed", e)
+                    ArgusDiagnosticBridge.error(TAG, "Generation failed", e)
                     "The local model is busy or encountered an error (${e.javaClass.simpleName}). " +
                             "Please try again shortly."
                 }
@@ -593,7 +594,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (error: Exception) {
-                        Log.w(TAG, "Model-requested web search failed", error)
+                        ArgusDiagnosticBridge.warning(TAG, "Model-requested web search failed", error)
                         emptyList()
                     }
 
@@ -830,7 +831,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "importFileContent failed", e)
+                ArgusDiagnosticBridge.error(TAG, "importFileContent failed", e)
                 withContext(Dispatchers.Main) {
                     appendMessage(
                         ChatMessage(
@@ -897,7 +898,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                Log.e(TAG, "GRPO JSONL import or training failed.", error)
+                ArgusDiagnosticBridge.error(TAG, "GRPO JSONL import or training failed.", error)
                 withContext(Dispatchers.Main) {
                     appendMessage(
                         ChatMessage(
@@ -1072,7 +1073,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "importImageContent failed", e)
+                ArgusDiagnosticBridge.error(TAG, "importImageContent failed", e)
                 withContext(Dispatchers.Main) {
                     appendMessage(
                         ChatMessage(
@@ -1188,7 +1189,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             )
 
                             if (unsafePath) {
-                                Log.w(TAG, "Skipped suspicious ZIP entry: " + normalizedName)
+                                ArgusDiagnosticBridge.warning(TAG, "Skipped suspicious ZIP entry: " + normalizedName)
                             } else if (!entry.isDirectory && isSupported) {
                                 val entryTitle = normalizedName.substringAfterLast('/')
                                 val source = "zip_file|archive=" +
@@ -1281,12 +1282,12 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                                         }
                                         else -> {
                                             failedFiles++
-                                            Log.w(TAG, "No importable text was found in " + normalizedName)
+                                            ArgusDiagnosticBridge.warning(TAG, "No importable text was found in " + normalizedName)
                                         }
                                     }
                                 }.onFailure { error ->
                                     failedFiles++
-                                    Log.w(TAG, "Failed to process ZIP entry " + normalizedName, error)
+                                    ArgusDiagnosticBridge.warning(TAG, "Failed to process ZIP entry " + normalizedName, error)
                                 }
                             }
 
@@ -1362,7 +1363,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             } catch (error: Exception) {
-                Log.e(TAG, "importZipContent failed", error)
+                ArgusDiagnosticBridge.error(TAG, "importZipContent failed", error)
                 withContext(Dispatchers.Main) {
                     appendMessage(
                         ChatMessage(
@@ -1469,7 +1470,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "importVideoContent failed", e)
+                ArgusDiagnosticBridge.error(TAG, "importVideoContent failed", e)
                 withContext(Dispatchers.Main) {
                     appendMessage(
                         ChatMessage(
@@ -1522,7 +1523,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 _articlePreview.value = executeWebArticleExtractionSkill(result.sourceUrl)
             } catch (error: Exception) {
-                Log.w(TAG, "Article extraction failed for ${result.sourceUrl}", error)
+                ArgusDiagnosticBridge.warning(TAG, "Article extraction failed for ${result.sourceUrl}", error)
                 _articleExtractionError.value = error.message ?: "The article could not be extracted."
             } finally {
                 _isExtractingArticle.value = false
@@ -1600,7 +1601,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
                             "This article is already in the local corpus. No new training copy was created."
                     }
                 }.onFailure { error ->
-                    Log.e(TAG, "Failed to queue reviewed web article", error)
+                    ArgusDiagnosticBridge.error(TAG, "Failed to queue reviewed web article", error)
                     _articleQueueStatus.value = error.message ?: "The article could not be added to the queue."
                 }
             }
@@ -1625,7 +1626,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 _searchResults.value = executeWebSearchSkill(normalizedQuery)
             } catch (error: Exception) {
-                Log.e(TAG, "searchWebDirectly failed", error)
+                ArgusDiagnosticBridge.error(TAG, "searchWebDirectly failed", error)
                 appendMessage(
                     ChatMessage(
                         isUser = false,
@@ -1682,7 +1683,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                Log.e(TAG, "Could not clear screen-derived local data.", error)
+                ArgusDiagnosticBridge.error(TAG, "Could not clear screen-derived local data.", error)
                 withContext(Dispatchers.Main) {
                     _screenDataClearMessage.value =
                         "Screen access remains disabled. Data cleanup was not completed: " +
@@ -1736,7 +1737,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 _installedApps.value = excludedAppsManager.getInstalledApps()
             } catch (e: Exception) {
-                Log.e(TAG, "loadInstalledApps failed", e)
+                ArgusDiagnosticBridge.error(TAG, "loadInstalledApps failed", e)
             }
         }
     }
