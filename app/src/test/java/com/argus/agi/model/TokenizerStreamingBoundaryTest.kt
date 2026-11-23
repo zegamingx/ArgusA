@@ -261,7 +261,7 @@ class TokenizerStreamingBoundaryTest {
         tokenizer.forEachSafeTextChunk(
             reader = FragmentingReader(sample, 7),
             maxTokensPerChunk = 256,
-            overlapTokens = 64,
+            overlapTokens = 200,
             allowSpecialTokens = false,
             maxCharactersPerChunk = 126,
             action = chunks::add
