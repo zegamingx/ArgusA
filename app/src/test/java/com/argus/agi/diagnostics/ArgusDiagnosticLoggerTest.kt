@@ -92,6 +92,31 @@ class ArgusDiagnosticLoggerTest {
     }
 
     @Test
+    fun throwableMessagesAreExcludedWhileStackFramesRemainUseful() {
+        val sensitiveFailure = IllegalStateException(
+            "dataset=private-user-corpus secret-prompt-value"
+        )
+
+        logger.record(
+            subsystem = ArgusDiagnosticSubsystem.TRAINING,
+            severity = ArgusDiagnosticSeverity.ERROR,
+            message = "Training checkpoint restore failed.",
+            throwable = sensitiveFailure,
+            immediate = true
+        )
+
+        val logFile = File(privateLogDirectory, ArgusDiagnosticSubsystem.TRAINING.fileName)
+        val savedLog = logFile.readText()
+        val entry = org.json.JSONObject(savedLog.trim())
+
+        assertTrue(entry.getString("message").contains("Training checkpoint restore failed"))
+        assertTrue(entry.getString("errorType").contains("IllegalStateException"))
+        assertTrue(entry.getString("stackTrace").contains("ArgusDiagnosticLoggerTest"))
+        assertFalse(savedLog.contains("private-user-corpus"))
+        assertFalse(savedLog.contains("secret-prompt-value"))
+    }
+
+    @Test
     fun readsRecentSubsystemEntriesFromPrivateStorage() {
         logger.record(
             subsystem = ArgusDiagnosticSubsystem.RECOVERY,
