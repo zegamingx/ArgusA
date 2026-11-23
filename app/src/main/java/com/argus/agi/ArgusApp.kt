@@ -188,6 +188,9 @@ class ArgusApp : Application() {
         _instance = this
         diagnosticLogger.initialize()
         _sharedDiagnosticsReady.value = diagnosticLogger.isSharedDirectoryReady()
+        if (diagnosticLogger.hasSharedStorageAccess()) {
+            refreshSharedDiagnosticsStorage()
+        }
         capturePreviousProcessExit()
         installUncaughtExceptionHandler()
         createNotificationChannel()
