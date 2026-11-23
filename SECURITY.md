@@ -22,7 +22,7 @@ The replacement offline Argus 2026 identity is pinned for clean installations
 and future updates signed with the same key:
 
 - Alias: `argus-release-2026`
-- Certificate SHA-256: `40969E172BC0F8CB18ED2DDF274CAF3D3DB1456EDAEAF03939C0C0511797E64E`
+- Certificate SHA-256: `D4D24FEDCDC3395ADA6B89ACDE861CE3523560D35EDEB7DA48709C8CE4F63CAA`
 - It is not a signing-certificate lineage successor to the exposed v1.0.13
   identity. Existing installations signed by the old certificate cannot be
   updated with this signer. Back up local app data before changing identity.

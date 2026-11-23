@@ -6,7 +6,7 @@ umask 077
 # The private key is supplied by a protected GitHub Environment secret and is
 # written only to a short-lived, permission-restricted runner temp directory.
 
-readonly EXPECTED_CERT_SHA256="40969E172BC0F8CB18ED2DDF274CAF3D3DB1456EDAEAF03939C0C0511797E64E"
+readonly EXPECTED_CERT_SHA256="D4D24FEDCDC3395ADA6B89ACDE861CE3523560D35EDEB7DA48709C8CE4F63CAA"
 readonly MINIMUM_ANDROID_API="34"
 readonly EXPECTED_APPLICATION_ID="com.argus.agi"
 readonly DEFAULT_KEY_ALIAS="argus-release-2026"

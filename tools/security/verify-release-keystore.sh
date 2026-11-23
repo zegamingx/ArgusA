@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly EXPECTED_CERT_SHA256="40969E172BC0F8CB18ED2DDF274CAF3D3DB1456EDAEAF03939C0C0511797E64E"
+readonly EXPECTED_CERT_SHA256="D4D24FEDCDC3395ADA6B89ACDE861CE3523560D35EDEB7DA48709C8CE4F63CAA"
 readonly DEFAULT_KEY_ALIAS="argus-release-2026"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,7 +64,7 @@ public final class ArgusKeystorePreflight {
             if (certificate == null) throw new IllegalStateException("The private key has no certificate.");
             String fingerprint = HexFormat.of().withUpperCase()
                 .formatHex(MessageDigest.getInstance("SHA-256").digest(certificate.getEncoded()));
-            String expected = "40969E172BC0F8CB18ED2DDF274CAF3D3DB1456EDAEAF03939C0C0511797E64E";
+            String expected = "D4D24FEDCDC3395ADA6B89ACDE861CE3523560D35EDEB7DA48709C8CE4F63CAA";
             if (!expected.equals(fingerprint)) {
                 throw new IllegalStateException("The configured private key does not match the pinned Argus 2026 certificate.");
             }
