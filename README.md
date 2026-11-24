@@ -185,11 +185,11 @@ Argus selects one of four native model families from installed RAM, the current 
 | Model family | Family parameter band | Default training batch | Tier vocabulary capacity |
 | --- | ---: | ---: | ---: |
 | Argus Compact | 1M–1.4M | 1 | 1,024 |
-| Argus Balanced | 1.4M–1.9M | 2 | 2,048 |
-| Argus Performance | 1.9M–4.8M | 4 | 4,096 |
-| Argus Flagship | 4.8M–7M | 8 | 8,192 |
+| Argus Balanced | 1.4M–1.9M | 1 | 2,048 |
+| Argus Performance | 1.9M–4.8M | 1 | 4,096 |
+| Argus Flagship | 4.8M–7M | 1 | 8,192 |
 
-The family band is an architecture target capped at the 7M executable parameter ceiling (`MINIMUM_EXECUTABLE_PARAMETER_BUDGET = 1,122,304`), not a guarantee that every device reaches the tier's upper boundary; Neural Core reports the family ceiling and actual active parameter count separately. The active model shape is selected from tier-specific dimensions (`d_model` 128–256, `d_ff` 384–1,024, 4–8 attention heads, 1–32 layers, context 64–192, and LoRA rank 4 or 8), then capped by a conservative memory budget. The budget uses at most 45% of the app heap and 25% of currently available system RAM; only 55% of that smaller budget is assigned to the 18-byte-per-parameter accumulated training-state floor (2-byte FP16 parameters + 4-byte FP32 gradients + 8-byte FP32 AdamW moments + 4-byte FP32 accumulation buffer). Remaining memory is reserved for activations, attention scratch, tokenizer expansion, checkpoint buffers, and allocator overhead.
+The family band is an architecture target capped at the 7M executable parameter ceiling (`MINIMUM_EXECUTABLE_PARAMETER_BUDGET = 1,122,304`), not a guarantee that every device reaches the tier's upper boundary; Neural Core reports the family ceiling and actual active parameter count separately. The active model shape is selected from tier-specific dimensions (`d_model` 128–256, `d_ff` parameter-matched for SwiGLU at 8/3 × `d_model` rounded up to a multiple of 64 — 384, 512, or 704 — 4–8 attention heads, 1–32 layers, context 64–192, and LoRA rank 4 or 8), then capped by a conservative memory budget. The budget uses at most 45% of the app heap and 25% of currently available system RAM; only 55% of that smaller budget is assigned to the 18-byte-per-parameter accumulated training-state floor (2-byte FP16 parameters + 4-byte FP32 gradients + 8-byte FP32 AdamW moments + 4-byte FP32 accumulation buffer). Remaining memory is reserved for activations, attention scratch, tokenizer expansion, checkpoint buffers, and allocator overhead.
 
 `ArgusArchitectureConfig` and `InferenceMemoryEstimator` still support planning descriptions for much larger architectures independently of active training. The active Android training runtime rejects shapes that exceed JVM array limits or the measured app-heap budget.
 

@@ -48,7 +48,7 @@ data class BenchmarkResult(
 data class EngineConfig(
     val dModel: Int = 128,
     val nHeads: Int = 4,
-    val dFf: Int = 512,
+    val dFf: Int = 384,
     val maxSeqLen: Int = 128,
     val loraRank: Int = 4,
     val layerCount: Int = 1,
@@ -187,9 +187,24 @@ data class EngineConfig(
         )
 
         /**
+         * SwiGLU parameter-matched feed-forward size. A GELU FFN reaches its
+         * reference parameter count with two projections at 4 * d_model; SwiGLU
+         * has three projections (gate, up, down), so the matched width is
+         * (2/3) * 4 * d_model = 8/3 * d_model, rounded up to a multiple of 64
+         * for tensor alignment. The parameter budget this frees is spent by the
+         * shape selector on additional layers instead of an over-wide FFN.
+         */
+        private fun swigluFeedForwardSize(hiddenSize: Int): Int {
+            val matched = (8L * hiddenSize + 2L) / 3L
+            return ((matched + 63L) / 64L * 64L).toInt()
+        }
+
+        /**
          * Selects a real device-tier architecture using its configured vocabulary.
-         * Balanced is fixed at d_model 128, d_ff 512, four heads, context 128,
-         * and vocabulary capacity 2,048.
+         * Hidden size and head count are fixed per tier; the SwiGLU feed-forward
+         * size is parameter-matched from the hidden size (see
+         * [swigluFeedForwardSize]): d_model 128 -> d_ff 384, 192 -> 512,
+         * 256 -> 704.
          */
         private fun selectExecutableShape(
             targetParameters: Long,
@@ -197,14 +212,14 @@ data class EngineConfig(
         ): ExecutableShape {
             val candidates = ArrayList<ExecutableShape>()
             val dimensions = when (tier) {
-                ArgusDeviceModelTier.COMPACT -> Triple(128, 384, 4)
-                ArgusDeviceModelTier.BALANCED -> Triple(128, 512, 4)
-                ArgusDeviceModelTier.PERFORMANCE -> Triple(192, 768, 8)
-                ArgusDeviceModelTier.FLAGSHIP -> Triple(256, 1_024, 8)
+                ArgusDeviceModelTier.COMPACT -> Pair(128, 4)
+                ArgusDeviceModelTier.BALANCED -> Pair(128, 4)
+                ArgusDeviceModelTier.PERFORMANCE -> Pair(192, 8)
+                ArgusDeviceModelTier.FLAGSHIP -> Pair(256, 8)
             }
             val hidden = dimensions.first
-            val feedForward = dimensions.second
-            val heads = dimensions.third
+            val feedForward = swigluFeedForwardSize(hidden)
+            val heads = dimensions.second
             val rank = if (
                 tier == ArgusDeviceModelTier.PERFORMANCE ||
                 tier == ArgusDeviceModelTier.FLAGSHIP
