@@ -84,6 +84,42 @@ class VulkanDeviceCapabilitiesTest {
     }
 
     @Test
+    fun parsesUint32MaxWorkGroupCountsFromMaliDevices() {
+        // Regression: Mali-G57 (Infinix X6725C) reports maxComputeWorkGroupCount
+        // as UINT32_MAX (4294967295) on every axis and a deviceId above
+        // Int.MAX_VALUE. optInt truncated those to negative values, the
+        // core-field validation then rejected the whole payload, and Vulkan
+        // capability parsing failed on device. The values must clamp to
+        // Int.MAX_VALUE ("effectively unlimited" / opaque identifier).
+        val capabilities = VulkanDeviceCapabilities.fromJson(
+            """
+            {
+              "deviceName": "Mali-G57",
+              "deviceId": 2428727312,
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 3,
+              "apiVersionPatch": 278,
+              "maxComputeWorkGroupInvocations": 512,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 64,
+              "maxComputeWorkGroupCountX": 4294967295,
+              "maxComputeWorkGroupCountY": 4294967295,
+              "maxComputeWorkGroupCountZ": 4294967295,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 2147483648
+            }
+            """
+        )
+
+        assertEquals(Int.MAX_VALUE, capabilities.maxComputeWorkGroupCountX)
+        assertEquals(Int.MAX_VALUE, capabilities.maxComputeWorkGroupCountY)
+        assertEquals(Int.MAX_VALUE, capabilities.maxComputeWorkGroupCountZ)
+        assertEquals(Int.MAX_VALUE, capabilities.deviceId)
+        assertEquals(2147483648L, capabilities.maxStorageBufferRangeBytes)
+    }
+
+    @Test
     fun rejectsCapabilityPayloadWithBlankDeviceName() {
         val failure = runCatching {
             VulkanDeviceCapabilities.fromJson(
