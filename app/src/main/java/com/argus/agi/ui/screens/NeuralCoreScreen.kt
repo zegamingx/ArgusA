@@ -455,6 +455,17 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                                 )
                             }
                         }
+                        TextButton(
+                            onClick = { viewModel.stopBackgroundService() },
+                            modifier = Modifier.testTag("stop_background_service_button")
+                        ) {
+                            Text(
+                                text = "Stop background service",
+                                color = ArgusWarning,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
+                        }
                         Spacer(modifier = Modifier.height(10.dp))
                         Text(
                             text = "Architecture: Argus Transformer · ${modelConfig.layerCount} layers · dModel=${modelConfig.dModel} · Heads=${modelConfig.nHeads} · FFN=${modelConfig.dFf} · Context=${modelConfig.maxSeqLen} · LoRA rank=${modelConfig.loraRank}",

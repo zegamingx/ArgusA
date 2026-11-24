@@ -392,8 +392,32 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     fun markGenesisBootSeen() { genesisModelManager.markBootAnimationSeen() }
 
     fun setForceTrainingOverride(enabled: Boolean) = deviceGuard.setForceTrainingOverride(enabled)
-    fun triggerImmediateTrainingStep() = trainingManager.triggerImmediateTrainingStep()
-    fun toggleTrainingPause() = trainingManager.togglePauseTraining()
+    fun triggerImmediateTrainingStep() {
+        trainingManager.triggerImmediateTrainingStep()
+        onTrainingExplicitlyStarted()
+    }
+
+    fun toggleTrainingPause() {
+        trainingManager.togglePauseTraining()
+        if (!trainingManager.isTrainingPaused.value) {
+            // The user explicitly resumed training from the UI: any earlier decision to
+            // stop the background service no longer applies.
+            onTrainingExplicitlyStarted()
+        }
+    }
+
+    fun stopBackgroundService() {
+        ArgusForegroundService.requestStop(getApplication())
+    }
+
+    private fun onTrainingExplicitlyStarted() {
+        val context = getApplication<Application>()
+        ArgusForegroundService.clearUserStopped(context)
+        runCatching { ArgusForegroundService.startService(context) }
+            .onFailure { error ->
+                ArgusDiagnosticBridge.error(TAG, "Failed to start foreground service after training was started from the UI", error)
+            }
+    }
     fun runConversationalValidation() = trainingManager.runConversationalValidation()
     fun retryConversationalValidation() = trainingManager.retryConversationalValidation()
 

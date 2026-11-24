@@ -15,6 +15,7 @@ import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.WorldModel
 import com.argus.agi.sensor.DeviceGuard
 import com.argus.agi.service.ArgusForegroundService
+import com.argus.agi.service.ForegroundTrainingPresentation
 import java.io.StringReader
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -43,18 +44,59 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun foregroundTrainingServiceSelectsOnlyTheSupportedRuntimeType() {
-        assertEquals(
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-            ArgusForegroundService.foregroundServiceTypeForApi(33)
-        )
+    fun foregroundTrainingServiceUsesSpecialUseTypeOnly() {
+        // minSdk is 34, where specialUse exists; there is no dataSync variant.
         assertEquals(
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
-            ArgusForegroundService.foregroundServiceTypeForApi(34)
+            ArgusForegroundService.foregroundServiceType
+        )
+    }
+
+    @Test
+    fun foregroundServiceUserStopLatchPersistsAndClears() {
+        ArgusForegroundService.clearUserStopped(context)
+        assertFalse(ArgusForegroundService.isUserStopped(context))
+
+        ArgusForegroundService.setUserStopped(context)
+        assertTrue(ArgusForegroundService.isUserStopped(context))
+
+        ArgusForegroundService.clearUserStopped(context)
+        assertFalse(ArgusForegroundService.isUserStopped(context))
+    }
+
+    @Test
+    fun foregroundNotificationPresentationReflectsTrainingState() {
+        assertEquals(
+            ForegroundTrainingPresentation.PAUSED,
+            ArgusForegroundService.presentationFor(
+                isPaused = true,
+                hasActiveWork = true,
+                hasQueuedWork = true
+            )
         )
         assertEquals(
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
-            ArgusForegroundService.foregroundServiceTypeForApi(35)
+            ForegroundTrainingPresentation.ACTIVE,
+            ArgusForegroundService.presentationFor(
+                isPaused = false,
+                hasActiveWork = true,
+                hasQueuedWork = false
+            )
+        )
+        assertEquals(
+            ForegroundTrainingPresentation.ACTIVE,
+            ArgusForegroundService.presentationFor(
+                isPaused = false,
+                hasActiveWork = false,
+                hasQueuedWork = true
+            )
+        )
+        assertEquals(
+            ForegroundTrainingPresentation.IDLE,
+            ArgusForegroundService.presentationFor(
+                isPaused = false,
+                hasActiveWork = false,
+                hasQueuedWork = false
+            )
         )
     }
 

@@ -9,9 +9,7 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.VIBRATE" />
@@ -64,14 +62,14 @@
         </activity>
 
         <!--
-            dataSync is selected only on API 29-33, where specialUse is unavailable.
-            API 34+ activates specialUse alone for the ongoing local compute workload.
+            minSdk is 34, where specialUse is available, so it is the only type used
+            for the ongoing local compute workload.
         -->
         <service
             android:name=".service.ArgusForegroundService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="dataSync|specialUse">
+            android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="On-device local neural model training and real-time sensory perception" />
