@@ -211,6 +211,26 @@ interface CorpusDao {
         maxCharacters: Int
     ): TokenizerCorpusSample?
 
+
+
+    /**
+     * Reads a deterministic subset of corpus chunks for bounded-memory tokenizer
+     * training. The caller supplies ascending chunk indices spread across a document.
+     */
+    @Query(
+        """
+        SELECT chunkIndex, substr(content, 1, :maxCharacters) AS content
+        FROM corpus_chunks
+        WHERE documentId = :documentId AND chunkIndex IN (:chunkIndices)
+        ORDER BY chunkIndex ASC
+        """
+    )
+    suspend fun getTokenizerCorpusSamples(
+        documentId: String,
+        chunkIndices: List<Int>,
+        maxCharacters: Int
+    ): List<TokenizerCorpusSample>
+
     @Query(
         "UPDATE corpus_documents SET status = :status, " +
             "lastTrainedAtEpochMs = :trainedAtEpochMs, " +

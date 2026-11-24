@@ -361,6 +361,12 @@ class ArgusNeuralEngine private constructor(
     @Volatile
     private var checkpointOptimizerConfigurationFingerprint: String? = null
 
+    @Volatile
+    private var persistedTokenizerArtifactFingerprint: String? = null
+
+    /** Serializes checkpoint verification and tokenizer sidecar publication. */
+    private val checkpointSaveLock = Any()
+
     /**
      * True only after an existing checkpoint has been fully restored or a new
      * checkpoint has been atomically written and verified on local storage.
@@ -1029,16 +1035,23 @@ class ArgusNeuralEngine private constructor(
             val previousVocabularySize = tokenizer.vocabSize
             val usesLearnedBpe = config.tokenizerConfig.algorithm.usesBpeMerges
             val previousMergeCount = if (usesLearnedBpe) tokenizer.mergeCount else 0
-            val mergeBudget = when {
-                dModel < 64 -> 32
-                dModel < 96 -> 64
-                else -> 96
+            // BPE merge rules are bounded by the serialized tokenizer format, not
+            // by dModel or a per-call 64/96 rule constant. A merged byte sequence
+            // can already exist in the vocabulary, so count remaining merge slots
+            // separately from missing vocabulary entries.
+            val mergeBudget = (
+                config.tokenizerConfig.maxVocabularySize -
+                    TokenizerConfig.MINIMUM_VOCAB_SIZE - previousMergeCount
+            ).coerceAtLeast(0)
+            val updatedVocabularySize = if (mergeBudget == 0) {
+                previousVocabularySize
+            } else {
+                tokenizer.trainBpe(
+                    corpus = corpus,
+                    maxNewMerges = mergeBudget,
+                    onProgress = onProgress
+                )
             }
-            val updatedVocabularySize = tokenizer.trainBpe(
-                corpus = corpus,
-                maxNewMerges = mergeBudget,
-                onProgress = onProgress
-            )
             ensureVocabCapacity(updatedVocabularySize)
             TokenizerTrainingResult(
                 previousVocabularySize = previousVocabularySize,
@@ -4188,9 +4201,9 @@ class ArgusNeuralEngine private constructor(
     // =====================================================================
     // Checkpoint (ARG6 streaming writer; ARG5/ARG6 readers)
     // =====================================================================
-    fun saveCheckpoint(): Boolean {
-        return try {
-            synchronized(modelLock) {
+    fun saveCheckpoint(): Boolean = synchronized(checkpointSaveLock) {
+        try {
+            val tokenizerArtifact = synchronized(modelLock) {
                 check(!checkpointRestoreBlocked) {
                     "An existing checkpoint could not be restored; refusing to overwrite it without explicit recovery."
                 }
@@ -4198,6 +4211,18 @@ class ArgusNeuralEngine private constructor(
                     "Model or optimizer state could not be recovered before checkpoint serialization."
                 }
                 writeArg6Checkpoint()
+                // Avoid serializing and rewriting tokenizer.json for every optimizer
+                // checkpoint when the tokenizer generation has not changed.
+                val fingerprint = tokenizer.snapshotFingerprint()
+                val artifactFile = File(context.filesDir, "tokenizer.json")
+                if (
+                    artifactFile.isFile &&
+                    persistedTokenizerArtifactFingerprint == fingerprint
+                ) {
+                    null
+                } else {
+                    tokenizer.exportTokenizerJson() to fingerprint
+                }
             }
             val file = File(context.filesDir, "argus_model_weights.bin")
             checkpointStateVerified = false
@@ -4212,11 +4237,54 @@ class ArgusNeuralEngine private constructor(
             if (!verified) {
                 checkpointRestoreBlocked = true
                 ArgusDiagnosticBridge.error(TAG, "ARG6 checkpoint read-back verification failed.")
+            } else {
+                try {
+                    if (tokenizerArtifact != null) {
+                        persistTokenizerJsonArtifact(
+                            serialized = tokenizerArtifact.first,
+                            fingerprint = tokenizerArtifact.second
+                        )
+                    }
+                } catch (artifactError: Exception) {
+                    // ARG6 remains self-contained and verified. The JSON sidecar can
+                    // be regenerated from the checkpoint on the next successful save/load.
+                    ArgusDiagnosticBridge.warning(
+                        TAG,
+                        "The tokenizer.json sidecar could not be synchronized with ARG6.",
+                        artifactError
+                    )
+                }
             }
             verified
         } catch (t: Throwable) {
             ArgusDiagnosticBridge.error(TAG, "Checkpoint save failed", t)
             false
+        }
+    }
+
+
+    /**
+     * Atomically mirrors the checkpoint's tokenizer generation to a standalone
+     * tokenizer.json artifact. The ARG6 checkpoint remains authoritative.
+     */
+    private fun persistTokenizerJsonArtifact(serialized: String, fingerprint: String) {
+        val target = File(context.filesDir, "tokenizer.json")
+        val temporary = File(context.filesDir, "tokenizer.json.tmp")
+        try {
+            FileOutputStream(temporary).use { output ->
+                output.write(serialized.toByteArray(Charsets.UTF_8))
+                output.fd.sync()
+            }
+            Files.move(
+                temporary.toPath(),
+                target.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE
+            )
+            persistedTokenizerArtifactFingerprint = fingerprint
+        } catch (error: Throwable) {
+            temporary.delete()
+            throw error
         }
     }
 
@@ -5052,6 +5120,23 @@ class ArgusNeuralEngine private constructor(
         synchronized(modelLock) {
             checkpointStateVerified = restored
             if (restored) checkpointRestoreBlocked = false
+        }
+        if (restored) {
+            val tokenizerArtifact = synchronized(modelLock) {
+                tokenizer.exportTokenizerJson() to tokenizer.snapshotFingerprint()
+            }
+            try {
+                persistTokenizerJsonArtifact(
+                    serialized = tokenizerArtifact.first,
+                    fingerprint = tokenizerArtifact.second
+                )
+            } catch (artifactError: Exception) {
+                ArgusDiagnosticBridge.warning(
+                    TAG,
+                    "A verified checkpoint was restored, but tokenizer.json could not be regenerated.",
+                    artifactError
+                )
+            }
         }
         return restored
     }

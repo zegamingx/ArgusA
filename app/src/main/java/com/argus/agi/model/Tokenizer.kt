@@ -16,6 +16,8 @@ import java.util.ArrayDeque
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicReferenceArray
 import java.util.PriorityQueue
+import org.json.JSONArray
+import org.json.JSONObject
 
 enum class ArgusTokenizerAlgorithm(val checkpointId: Int) {
     BYTE_LEVEL_BPE_V1(1);
@@ -175,7 +177,9 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         const val CURRENT_SNAPSHOT_FORMAT_VERSION = 1
         private const val SNAPSHOT_DIGEST_BYTES = 32
         private const val MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
-        private const val DEFAULT_MAX_MERGES_PER_TRAINING_PASS = 64
+        private const val MAX_TOKENIZER_JSON_BYTES = 64 * 1024 * 1024
+        private const val TOKENIZER_JSON_FORMAT = "argus-tokenizer-json"
+        private const val TOKENIZER_JSON_VERSION = 1
         private const val MAX_ENCODE_CACHE_ENTRIES = 128
         private const val MAX_CACHEABLE_TEXT_LENGTH = 2_048
         private const val MAX_CACHEABLE_TOKEN_IDS = 4_096
@@ -637,13 +641,20 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
     fun trainBpe(
         corpus: List<String>,
         targetVocabSize: Int = config.maxVocabularySize,
-        maxNewMerges: Int = DEFAULT_MAX_MERGES_PER_TRAINING_PASS,
+        maxNewMerges: Int = config.maxVocabularySize,
         onProgress: (TokenizerTrainingProgress) -> Unit = {}
     ): Int {
         require(maxNewMerges > 0) { "maxNewMerges must be positive." }
         val current = state
         val target = minOf(targetVocabSize, config.maxVocabularySize)
-        val requestedMerges = if (current.nextId < target) maxNewMerges else 0
+        val remainingMergeCapacity = (
+            config.maxVocabularySize - BASE_VOCABULARY_SIZE - current.merges.size
+        ).coerceAtLeast(0)
+        val requestedMerges = if (current.nextId < target) {
+            minOf(maxNewMerges, remainingMergeCapacity)
+        } else {
+            0
+        }
         var lastFraction = 0f
         var learnedMerges = 0
         var currentVocabularySize = current.nextId
@@ -669,7 +680,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
             )
         }
 
-        if (current.nextId >= target || corpus.isEmpty()) {
+        if (current.nextId >= target || corpus.isEmpty() || requestedMerges == 0) {
             report(
                 stage = TokenizerTrainingStage.COMPLETED,
                 fraction = 1f,
@@ -829,7 +840,7 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
         )
 
         val wordScanReportInterval = maxOf(16L, totalWords / 8L)
-        while (candidate.nextId < target && learnedMerges < maxNewMerges) {
+        while (candidate.nextId < target && learnedMerges < requestedMerges) {
             val pairCounts = HashMap<MergePair, Long>()
             var scannedWords = 0L
             for ((word, frequency) in wordFrequencies) {
@@ -1644,6 +1655,202 @@ class Tokenizer(val config: TokenizerConfig = TokenizerConfig()) {
 
         flushBytes()
         return output.toString()
+    }
+
+
+    /**
+     * Exports a self-contained Argus tokenizer artifact.
+     *
+     * The JSON is independent of Room and model checkpoints. The checkpoint
+     * remains the authoritative model/tokenizer pairing; this file is a portable
+     * tokenizer representation that can be validated independently.
+     */
+    @Synchronized
+    fun exportTokenizerJson(): String {
+        val vocabulary = exportVocab()
+        val merges = exportMerges()
+        val vocabularyJson = JSONObject()
+        for ((token, id) in vocabulary) vocabularyJson.put(token, id)
+
+        val mergesJson = JSONArray()
+        for ((rank, pair) in merges.withIndex()) {
+            mergesJson.put(
+                JSONObject()
+                    .put("rank", rank)
+                    .put("left", pair.first)
+                    .put("right", pair.second)
+            )
+        }
+
+        val specialTokensJson = JSONArray()
+        for ((token, id) in SPECIAL_IDS.entries.sortedBy { entry -> entry.value }) {
+            specialTokensJson.put(
+                JSONObject()
+                    .put("id", id)
+                    .put("content", token)
+                    .put("single_word", false)
+                    .put("lstrip", false)
+                    .put("rstrip", false)
+                    .put("normalized", false)
+                    .put("special", true)
+            )
+        }
+
+        val modelJson = JSONObject()
+            .put("type", "BPE")
+            .put("dropout", JSONObject.NULL)
+            .put("unk_token", UNK_TOKEN)
+            .put("continuing_subword_prefix", JSONObject.NULL)
+            .put("end_of_word_suffix", JSONObject.NULL)
+            .put("fuse_unk", false)
+            .put("vocab", vocabularyJson)
+            .put("merges", mergesJson)
+
+        val argusMetadata = JSONObject()
+            .put("schema_version", config.schemaVersion)
+            .put("algorithm", config.algorithm.name)
+            .put("max_vocabulary_size", config.maxVocabularySize)
+            .put("max_token_length", config.maxTokenLength)
+            .put("byte_symbol_encoding", "identity-byte-char-u0000-u00ff")
+            .put("snapshot_fingerprint", snapshotFingerprint())
+
+        return JSONObject()
+            .put("format", TOKENIZER_JSON_FORMAT)
+            .put("version", TOKENIZER_JSON_VERSION)
+            .put("normalizer", JSONObject.NULL)
+            .put(
+                "pre_tokenizer",
+                JSONObject()
+                    .put("type", "ArgusByteLevelPreTokenizer")
+                    .put("version", 1)
+            )
+            .put("post_processor", JSONObject.NULL)
+            .put(
+                "decoder",
+                JSONObject()
+                    .put("type", "ArgusByteLevelDecoder")
+                    .put("version", 1)
+            )
+            .put("added_tokens", specialTokensJson)
+            .put("model", modelJson)
+            .put("argus", argusMetadata)
+            .toString(2)
+    }
+
+    /**
+     * Validates and loads a complete Argus tokenizer JSON artifact atomically.
+     * The active tokenizer is replaced only after every ID, merge rank and
+     * fingerprint has been validated against a temporary candidate.
+     */
+    @Synchronized
+    fun loadTokenizerJson(serialized: String) {
+        require(serialized.toByteArray(StandardCharsets.UTF_8).size <= MAX_TOKENIZER_JSON_BYTES) {
+            "Tokenizer JSON exceeds the supported maximum size."
+        }
+        val root = JSONObject(serialized)
+        require(root.getString("format") == TOKENIZER_JSON_FORMAT) {
+            "Tokenizer JSON format is not supported by Argus."
+        }
+        require(root.getInt("version") == TOKENIZER_JSON_VERSION) {
+            "Tokenizer JSON version is not supported."
+        }
+
+        val preTokenizer = root.getJSONObject("pre_tokenizer")
+        require(
+            preTokenizer.getString("type") == "ArgusByteLevelPreTokenizer" &&
+                preTokenizer.getInt("version") == 1
+        ) {
+            "Tokenizer JSON pre-tokenizer is incompatible with BYTE_LEVEL_BPE_V1."
+        }
+        val decoder = root.getJSONObject("decoder")
+        require(
+            decoder.getString("type") == "ArgusByteLevelDecoder" &&
+                decoder.getInt("version") == 1
+        ) {
+            "Tokenizer JSON decoder is incompatible with BYTE_LEVEL_BPE_V1."
+        }
+
+        val metadata = root.getJSONObject("argus")
+        require(metadata.getInt("schema_version") == config.schemaVersion) {
+            "Tokenizer JSON schema does not match the active configuration."
+        }
+        require(metadata.getString("algorithm") == config.algorithm.name) {
+            "Tokenizer JSON algorithm does not match the active configuration."
+        }
+        require(metadata.getInt("max_vocabulary_size") == config.maxVocabularySize) {
+            "Tokenizer JSON vocabulary capacity does not match the active configuration."
+        }
+        require(metadata.getInt("max_token_length") == config.maxTokenLength) {
+            "Tokenizer JSON maximum token length does not match the active configuration."
+        }
+        require(metadata.getString("byte_symbol_encoding") == "identity-byte-char-u0000-u00ff") {
+            "Tokenizer JSON byte-symbol encoding is unsupported."
+        }
+
+        val addedTokens = root.getJSONArray("added_tokens")
+        require(addedTokens.length() == SPECIAL_IDS.size) {
+            "Tokenizer JSON special-token manifest is incomplete."
+        }
+        val importedSpecialTokens = HashMap<String, Int>(addedTokens.length())
+        for (index in 0 until addedTokens.length()) {
+            val entry = addedTokens.getJSONObject(index)
+            require(entry.optBoolean("special", false)) {
+                "Tokenizer JSON control tokens must be marked as special."
+            }
+            val token = entry.getString("content")
+            require(importedSpecialTokens.put(token, entry.getInt("id")) == null) {
+                "Tokenizer JSON contains duplicate special tokens."
+            }
+        }
+        require(importedSpecialTokens == SPECIAL_IDS) {
+            "Tokenizer JSON special-token IDs do not match the canonical Argus manifest."
+        }
+
+        val model = root.getJSONObject("model")
+        require(model.getString("type") == "BPE") {
+            "Tokenizer JSON model type must be BPE."
+        }
+        require(model.getString("unk_token") == UNK_TOKEN) {
+            "Tokenizer JSON unknown-token configuration is incompatible."
+        }
+
+        val vocabularyJson = model.getJSONObject("vocab")
+        require(vocabularyJson.length() in BASE_VOCABULARY_SIZE..config.maxVocabularySize) {
+            "Tokenizer JSON vocabulary count is outside the configured capacity."
+        }
+        val vocabulary = ArrayList<Pair<String, Int>>(vocabularyJson.length())
+        val vocabularyKeys = vocabularyJson.keys()
+        while (vocabularyKeys.hasNext()) {
+            val token = vocabularyKeys.next()
+            vocabulary += token to vocabularyJson.getInt(token)
+        }
+        vocabulary.sortBy { entry -> entry.second }
+
+        val mergesJson = model.getJSONArray("merges")
+        require(mergesJson.length() <= config.maxVocabularySize - BASE_VOCABULARY_SIZE) {
+            "Tokenizer JSON merge count exceeds the configured vocabulary range."
+        }
+        val merges = ArrayList<Pair<String, String>>(mergesJson.length())
+        for (index in 0 until mergesJson.length()) {
+            val entry = mergesJson.getJSONObject(index)
+            require(entry.getInt("rank") == index) {
+                "Tokenizer JSON merge ranks must be contiguous and ordered."
+            }
+            merges += entry.getString("left") to entry.getString("right")
+        }
+
+        val candidate = Tokenizer(config)
+        candidate.importVocab(vocabulary)
+        candidate.importMerges(merges)
+        val expectedFingerprint = metadata.getString("snapshot_fingerprint")
+        require(expectedFingerprint.matches(Regex("[0-9a-f]{64}"))) {
+            "Tokenizer JSON snapshot fingerprint is malformed."
+        }
+        require(candidate.snapshotFingerprint() == expectedFingerprint) {
+            "Tokenizer JSON fingerprint does not match its vocabulary and merge rules."
+        }
+
+        state = candidate.state
     }
 
     fun saveSnapshot(): ByteArray {
