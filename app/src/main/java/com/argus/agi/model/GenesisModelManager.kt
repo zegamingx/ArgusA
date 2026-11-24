@@ -479,9 +479,14 @@ class GenesisModelManager(
                         "The stale Genesis identity could not be invalidated because its checkpoint was not verified."
                     )
                 }
+                val checkpointFailure = if (neuralEngine.isCheckpointRestoreBlocked) {
+                    "an existing checkpoint was found but could not be restored"
+                } else {
+                    "the model checkpoint file is missing"
+                }
                 ArgusDiagnosticBridge.warning(
                     TAG,
-                    "Stored Genesis identity was invalidated because no compatible checkpoint was restored or verified."
+                    "Stored Genesis identity was invalidated because $checkpointFailure."
                 )
             }
             return null
