@@ -340,7 +340,7 @@ class GenesisModelManager(
 
         logs += "Forward validation completed without an optimizer update: initial loss = " +
                 String.format(Locale.US, "%.4f", sanityLoss)
-        logs += "Checkpoint 'argus_model_weights.bin' (ARG4 format) was verified in local storage."
+        logs += "Checkpoint 'argus_model_weights.bin' (ARG6 format) was verified in local storage."
         logs += "Model origin identity committed: $originId"
         throttleStage()
 
@@ -461,7 +461,11 @@ class GenesisModelManager(
 
     private fun loadIdentity(): GenesisIdentity? {
         if (!neuralEngine.isCheckpointStateVerified) {
-            if (prefs.contains(KEY_ORIGIN_ID)) {
+            // Only report a stale identity when one actually existed. This method is
+            // called during construction and again by UI/lifecycle readers; logging
+            // unconditionally produced duplicate warnings after the first removal.
+            val hadStoredIdentity = prefs.contains(KEY_ORIGIN_ID)
+            if (hadStoredIdentity) {
                 val invalidated = prefs.edit()
                     .remove(KEY_ORIGIN_ID)
                     .remove(KEY_BIRTH_TS)
@@ -475,10 +479,16 @@ class GenesisModelManager(
                         "The stale Genesis identity could not be invalidated because its checkpoint was not verified."
                     )
                 }
+                val checkpointFailure = if (neuralEngine.isCheckpointRestoreBlocked) {
+                    "an existing checkpoint was found but could not be restored"
+                } else {
+                    "the model checkpoint file is missing"
+                }
+                ArgusDiagnosticBridge.warning(
+                    TAG,
+                    "Stored Genesis identity was invalidated because $checkpointFailure."
+                )
             }
-            ArgusDiagnosticBridge.warning(TAG,
-                "Stored Genesis identity was invalidated because no compatible checkpoint was restored or verified."
-            )
             return null
         }
 

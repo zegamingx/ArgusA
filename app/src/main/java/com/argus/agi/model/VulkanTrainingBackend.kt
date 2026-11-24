@@ -3855,9 +3855,13 @@ internal object VulkanTrainingBackend : ComputeBackend {
             }
 
             // Invalid input must not mutate active parameters, source moments, or candidates.
-            val invalidGradients = flattenedGradients.copyOf()
-            invalidGradients[0] = Float.NaN
-            if (!uploadGpuTensor(gradientTensor, encodeFloatArray(invalidGradients)) ||
+            // Bypass the finite-value encoder only for this negative native-kernel test:
+            // the GPU kernel, not the host staging helper, must reject the NaN payload.
+            val invalidGradientBytes = gradientBytes.copyOf()
+            ByteBuffer.wrap(invalidGradientBytes)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .putFloat(0, Float.NaN)
+            if (!uploadGpuTensor(gradientTensor, invalidGradientBytes) ||
                 !uploadGpuTensor(statusTensor, ByteArray(Int.SIZE_BYTES))) {
                 return false
             }
