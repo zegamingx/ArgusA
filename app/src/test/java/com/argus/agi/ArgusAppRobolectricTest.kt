@@ -14,8 +14,10 @@ import com.argus.agi.model.TokenizerConfig
 import com.argus.agi.model.TrainingManager
 import com.argus.agi.model.WorldModel
 import com.argus.agi.sensor.DeviceGuard
+import android.os.PowerManager
 import com.argus.agi.service.ArgusForegroundService
 import com.argus.agi.service.ForegroundTrainingPresentation
+import com.argus.agi.service.TrainingWakeLock
 import java.io.StringReader
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -98,6 +100,60 @@ class ArgusAppRobolectricTest {
                 hasQueuedWork = false
             )
         )
+    }
+
+    private fun newTrainingWakeLock(): TrainingWakeLock {
+        val powerManager =
+            context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        val lock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            ArgusForegroundService.WAKE_LOCK_TAG
+        )
+        return TrainingWakeLock(lock)
+    }
+
+    @Test
+    fun trainingWakeLockIsHeldOnlyWhileTrainingIsActive() {
+        val holder = newTrainingWakeLock()
+        assertFalse("WakeLock must start released", holder.isHeld)
+
+        // ACTIVE: acquire. A duplicate ACTIVE emission must not double-acquire
+        // or fail (the holder is the single transition point).
+        holder.update(trainingActive = true)
+        assertTrue("WakeLock must be held while training is ACTIVE", holder.isHeld)
+        holder.update(trainingActive = true)
+        assertTrue(holder.isHeld)
+
+        // PAUSED: release. A duplicate release must be a safe no-op.
+        holder.update(trainingActive = false)
+        assertFalse("WakeLock must be released when training pauses", holder.isHeld)
+        holder.update(trainingActive = false)
+        assertFalse(holder.isHeld)
+
+        // ACTIVE again, then IDLE (also update(false)): release.
+        holder.update(trainingActive = true)
+        assertTrue(holder.isHeld)
+        holder.update(trainingActive = false)
+        assertFalse("WakeLock must be released when training goes idle", holder.isHeld)
+    }
+
+    @Test
+    fun trainingWakeLockRenewalAndTeardownRelease() {
+        val holder = newTrainingWakeLock()
+
+        holder.update(trainingActive = true)
+        assertTrue(holder.isHeld)
+
+        // Renewal while ACTIVE keeps the hold (fresh timeout) instead of
+        // dropping or stacking acquires.
+        holder.renew()
+        assertTrue("Renewal must keep the WakeLock held", holder.isHeld)
+
+        // Unconditional teardown release (ACTION_STOP / onDestroy path).
+        holder.release()
+        assertFalse("Teardown must release the WakeLock", holder.isHeld)
+        holder.release()
+        assertFalse(holder.isHeld)
     }
 
     @Test

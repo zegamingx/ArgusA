@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.argus.agi.ArgusApp
 import com.argus.agi.ArgusCoreInitializationState
@@ -20,9 +21,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
@@ -37,6 +40,94 @@ internal enum class ForegroundTrainingPresentation {
     IDLE
 }
 
+/**
+ * Owns the partial WakeLock that keeps the CPU awake while training is actually
+ * running in the background (owner requirement: background training must not be
+ * throttled to a stop by Doze when the screen is off).
+ *
+ * The lock is held ONLY in the ACTIVE presentation state — never merely because
+ * the foreground service exists — so an idle or paused Argus does not drain the
+ * battery (AGENTS.md §13). All transitions go through [update]/[renew]/[release],
+ * which are synchronized and check `isHeld` first: duplicate state emissions can
+ * neither double-acquire nor over-release. The underlying lock is not reference
+ * counted, so the held state is a single boolean owned by this holder.
+ *
+ * Acquisition uses a bounded timeout ([ACQUIRE_TIMEOUT_MS]) as a safety net: if
+ * the service is killed mid-hold the system reclaims the lock instead of it
+ * leaking forever. While training stays ACTIVE the service periodically calls
+ * [renew] well before the timeout expires, so a long run never loses the lock.
+ *
+ * Any acquisition failure is reported through [onFailure] and swallowed:
+ * training continues without the lock (degraded, logged), never crashes.
+ */
+internal class TrainingWakeLock(
+    private val wakeLock: PowerManager.WakeLock?,
+    private val onFailure: (String, Throwable?) -> Unit = { _, _ -> }
+) {
+
+    init {
+        wakeLock?.setReferenceCounted(false)
+    }
+
+    val isHeld: Boolean
+        get() = wakeLock?.isHeld == true
+
+    /** Single transition point driven by the training-state collector. */
+    @Synchronized
+    fun update(trainingActive: Boolean) {
+        if (trainingActive) {
+            acquireLocked()
+        } else {
+            releaseLocked()
+        }
+    }
+
+    /**
+     * Extends the hold while training remains ACTIVE: releases and re-acquires
+     * with a fresh timeout (or acquires outright if the previous hold already
+     * timed out), so the bounded timeout never cuts a long run short.
+     */
+    @Synchronized
+    fun renew() {
+        if (isHeld) {
+            releaseLocked()
+        }
+        acquireLocked()
+    }
+
+    /** Unconditional release for service teardown. Safe to call when not held. */
+    @Synchronized
+    fun release() {
+        releaseLocked()
+    }
+
+    private fun acquireLocked() {
+        val lock = wakeLock ?: return
+        if (lock.isHeld) return
+        runCatching { lock.acquire(ACQUIRE_TIMEOUT_MS) }
+            .onFailure { error ->
+                onFailure("Could not acquire the training WakeLock; training continues without it.", error)
+            }
+    }
+
+    private fun releaseLocked() {
+        val lock = wakeLock ?: return
+        if (!lock.isHeld) return
+        runCatching { lock.release() }
+            .onFailure { error ->
+                onFailure("Could not release the training WakeLock.", error)
+            }
+    }
+
+    companion object {
+        /** Bounded hold; renewed by the service while training stays ACTIVE. */
+        const val ACQUIRE_TIMEOUT_MS: Long = 10 * 60 * 1000L
+
+        /** Renewal cadence: comfortably before [ACQUIRE_TIMEOUT_MS] expires. */
+        const val RENEWAL_INTERVAL_MS: Long = 5 * 60 * 1000L
+    }
+}
+
 class ArgusForegroundService : Service() {
 
     companion object {
@@ -46,6 +137,9 @@ class ArgusForegroundService : Service() {
         const val ACTION_TOGGLE_PAUSE = "com.argus.agi.TOGGLE_PAUSE"
 
         private const val TAG = "ArgusForegroundService"
+
+        /** Partial WakeLock tag; held only while training is ACTIVE. */
+        internal const val WAKE_LOCK_TAG = "Argus:TrainingWakeLock"
 
         // The user-stop latch lives in the app's existing SharedPreferences pattern so an
         // explicit "stop the background service" choice survives process death and is
@@ -133,6 +227,35 @@ class ArgusForegroundService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var trainingObservationJob: Job? = null
+    private var wakeLockRenewalJob: Job? = null
+
+    /**
+     * Created on the first training-state emission, i.e. always after foreground
+     * promotion, so WakeLock setup can never delay promotion. A null underlying
+     * lock (no PowerManager, or creation failure) degrades to logged no-ops
+     * inside [TrainingWakeLock].
+     */
+    @Volatile
+    private var trainingWakeLock: TrainingWakeLock? = null
+
+    private fun obtainTrainingWakeLock(): TrainingWakeLock =
+        trainingWakeLock ?: synchronized(this) {
+            trainingWakeLock ?: run {
+                val lock = runCatching {
+                    getSystemService(PowerManager::class.java)
+                        ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+                }.onFailure { error ->
+                    ArgusDiagnosticBridge.error(TAG, "Could not create the training WakeLock; training continues without it.", error)
+                }.getOrNull()
+                TrainingWakeLock(lock) { message, error ->
+                    if (error != null) {
+                        ArgusDiagnosticBridge.error(TAG, message, error)
+                    } else {
+                        ArgusDiagnosticBridge.warning(TAG, message)
+                    }
+                }.also { trainingWakeLock = it }
+            }
+        }
 
     @Volatile
     private var presentation: ForegroundTrainingPresentation =
@@ -146,6 +269,7 @@ class ArgusForegroundService : Service() {
             // before tearing the service down, so the stop is real and stays stopped.
             setUserStopped(this)
             pauseTrainingIfRunning(this)
+            trainingWakeLock?.release()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
@@ -187,7 +311,10 @@ class ArgusForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        // Cancel the scope first so the renewal loop cannot re-acquire, then
+        // release unconditionally: the lock must never outlive the service.
         serviceScope.cancel()
+        trainingWakeLock?.release()
         super.onDestroy()
     }
 
@@ -224,6 +351,7 @@ class ArgusForegroundService : Service() {
                 .distinctUntilChanged()
                 .collect { updated ->
                     presentation = updated
+                    updateWakeLockForPresentation(updated)
                     runCatching {
                         getSystemService(NotificationManager::class.java)
                             ?.notify(NOTIFICATION_ID, buildNotification())
@@ -231,6 +359,34 @@ class ArgusForegroundService : Service() {
                         ArgusDiagnosticBridge.error(TAG, "Could not refresh the foreground notification for the new training state.", error)
                     }
                 }
+        }
+    }
+
+    /**
+     * Drives the training WakeLock from the same presentation state as the
+     * notification: held only while ACTIVE. While ACTIVE, a renewal loop in the
+     * service scope re-acquires the lock every [TrainingWakeLock.RENEWAL_INTERVAL_MS]
+     * so the bounded acquire timeout never cuts a long training run short; the
+     * loop is cancelled (and the lock released) on the first non-ACTIVE state.
+     */
+    private fun updateWakeLockForPresentation(state: ForegroundTrainingPresentation) {
+        val holder = obtainTrainingWakeLock()
+        if (state == ForegroundTrainingPresentation.ACTIVE) {
+            holder.update(trainingActive = true)
+            if (wakeLockRenewalJob?.isActive != true) {
+                wakeLockRenewalJob = serviceScope.launch {
+                    while (isActive) {
+                        delay(TrainingWakeLock.RENEWAL_INTERVAL_MS)
+                        if (presentation == ForegroundTrainingPresentation.ACTIVE) {
+                            holder.renew()
+                        }
+                    }
+                }
+            }
+        } else {
+            wakeLockRenewalJob?.cancel()
+            wakeLockRenewalJob = null
+            holder.update(trainingActive = false)
         }
     }
 
