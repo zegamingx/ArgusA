@@ -1129,7 +1129,7 @@ class TrainingManager internal constructor(
                                         ?.let { "U+%04X".format(it.code) }
                                         ?: "empty"
                                     "Invalid JSONL record at line $lineNumber: expected one complete JSON object; " +
-                                        "record length=\${record.length}, first character=$firstCharacter."
+                                        "record length=${record.length}, first character=$firstCharacter."
                                 }
                                 val processed = try {
                                     TextModalityProcessor.processStrictJsonObjectLine(
@@ -1143,7 +1143,7 @@ class TrainingManager internal constructor(
                                         ?: error.javaClass.simpleName
                                     throw IllegalArgumentException(
                                         "Malformed JSONL object at line $lineNumber " +
-                                            "(record length=\${record.length}): $parserDetail",
+                                            "(record length=${record.length}): $parserDetail",
                                         error
                                     )
                                 }
