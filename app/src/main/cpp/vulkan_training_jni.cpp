@@ -35,6 +35,22 @@ namespace {
 
 constexpr char kLogTag[] = "ArgusVulkan";
 constexpr uint32_t kLocalWorkGroupSize = 64;
+// Bounded fence wait for submitAndWait(): a hung or lost GPU must not block
+// forever while holding gRuntimeMutex (which would also block nativeDestroy).
+constexpr uint64_t kFenceWaitTimeoutNs = 10'000'000'000ull;  // 10 seconds
+// Workgroup geometry of the linear-family shaders (local_size 16x8) and the
+// per-shader shared-memory footprints, validated against the queried device
+// limits during initializeRuntime(). Shared sizes are derived from the
+// shader tile declarations: linear FP32 tiles are (8*16 + 16*16) floats,
+// the FP16 tiles are the same shapes in float16_t, and the attention /
+// backward reduction arrays hold 64 floats.
+constexpr uint32_t kLinearWorkGroupSizeX = 16;
+constexpr uint32_t kLinearWorkGroupSizeY = 8;
+constexpr uint32_t kLinearWorkGroupInvocations =
+    kLinearWorkGroupSizeX * kLinearWorkGroupSizeY;
+constexpr uint32_t kLinearSharedMemoryBytes = 1536;
+constexpr uint32_t kLinearFp16SharedMemoryBytes = 768;
+constexpr uint32_t kResidentReductionSharedMemoryBytes = 256;
 
 struct AdamwPushConstants {
     uint32_t totalElementCount;
@@ -208,6 +224,12 @@ struct VulkanRuntime {
     PFN_vkGetPhysicalDeviceMemoryProperties2 getPhysicalDeviceMemoryProperties2 = nullptr;
 #endif
     VkDevice device = VK_NULL_HANDLE;
+    // Set on VK_ERROR_DEVICE_LOST and on a fence-wait timeout (after a timeout
+    // the in-flight submission state is unknown, so the runtime is treated as
+    // unusable the same way). While set, submission paths fail fast instead of
+    // submitting to a dead device. Cleared only by destroyRuntime(), which
+    // resets the whole struct; nativeInitialize destroys before re-creating.
+    bool deviceLost = false;
     VkQueue computeQueue = VK_NULL_HANDLE;
     uint32_t queueFamilyIndex = 0;
     uint32_t computeQueueTimestampValidBits = 0;
@@ -236,6 +258,9 @@ struct VulkanRuntime {
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
     VkDescriptorSet tensorArenaDescriptorSet = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    // In-memory only (no on-disk persistence): lets the driver reuse shader
+    // compilation results across the pipelines created during this init.
+    VkPipelineCache pipelineCache = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipeline linearPipeline = VK_NULL_HANDLE;
     VkPipeline fp16LinearPipeline = VK_NULL_HANDLE;
@@ -365,6 +390,20 @@ void logError(const char* message, VkResult result = VK_SUCCESS) {
     }
 }
 
+// Records a terminal device loss so later submission paths fail fast.
+// Safe to call with any VkResult; only VK_ERROR_DEVICE_LOST has an effect.
+void markDeviceLost(VkResult result) {
+    if (result == VK_ERROR_DEVICE_LOST && !gRuntime.deviceLost) {
+        gRuntime.deviceLost = true;
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            kLogTag,
+            "Vulkan device lost; further GPU submissions will fail fast until "
+            "the runtime is destroyed and reinitialised."
+        );
+    }
+}
+
 bool hasDeviceExtension(
     const std::vector<VkExtensionProperties>& extensions,
     const char* extensionName
@@ -442,20 +481,37 @@ std::string formatUuid(const uint8_t* uuid) {
     return formatted;
 }
 
-uint32_t calculateDispatchGroupCount(uint64_t requiredGroupCount) {
+struct DispatchGroupCount {
+    uint32_t groupCount = 0;
+    // True when the required count exceeded maxComputeWorkGroupCount[0] and
+    // groupCount was clamped down to that device limit.
+    bool clamped = false;
+};
+
+// Returns the dispatchable group count plus an explicit clamped indication.
+// Only grid-stride shaders — ones that loop with a stride derived from
+// gl_NumWorkGroups (adamw, adamw_resident, the linear tile shaders, and the
+// attention stages) — may proceed with a clamped count, because their loop
+// still covers every element/tile. A caller whose shader does NOT stride
+// must treat clamped == true as failure; dispatching the clamped count there
+// would silently compute only a prefix of the work.
+DispatchGroupCount calculateDispatchGroupCount(uint64_t requiredGroupCount) {
     const uint32_t deviceGroupLimit = gRuntime.maxComputeWorkGroupCountX;
     if (requiredGroupCount == 0u || deviceGroupLimit == 0u) {
-        return 0u;
+        return {};
     }
 
-    return static_cast<uint32_t>(
+    DispatchGroupCount result;
+    result.clamped = requiredGroupCount > deviceGroupLimit;
+    result.groupCount = static_cast<uint32_t>(
         std::min<uint64_t>(requiredGroupCount, deviceGroupLimit)
     );
+    return result;
 }
 
-uint32_t calculateDispatchWorkGroupCount(uint64_t invocationCount) {
+DispatchGroupCount calculateDispatchWorkGroupCount(uint64_t invocationCount) {
     if (invocationCount == 0u) {
-        return 0u;
+        return {};
     }
 
     const uint64_t requiredGroups =
@@ -492,7 +548,11 @@ void destroyStorageBuffer() {
 
 void destroyRuntime() {
     if (gRuntime.device != VK_NULL_HANDLE) {
-        vkDeviceWaitIdle(gRuntime.device);
+        // Never wait-idle on a lost device: the wait would fail (or hang on a
+        // wedged driver) and the resources below can be destroyed regardless.
+        if (!gRuntime.deviceLost) {
+            vkDeviceWaitIdle(gRuntime.device);
+        }
         destroyTensorArena();
         destroyStorageBuffer();
 
@@ -519,6 +579,11 @@ void destroyRuntime() {
         }
         if (gRuntime.pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(gRuntime.device, gRuntime.pipeline, nullptr);
+        }
+        // The cache must outlive every pipeline created from it, and be
+        // destroyed before the device.
+        if (gRuntime.pipelineCache != VK_NULL_HANDLE) {
+            vkDestroyPipelineCache(gRuntime.device, gRuntime.pipelineCache, nullptr);
         }
         if (gRuntime.pipelineLayout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(gRuntime.device, gRuntime.pipelineLayout, nullptr);
@@ -638,7 +703,7 @@ bool hasMemoryBudgetHeadroom(uint32_t memoryTypeIndex, VkDeviceSize requiredByte
 }
 
 bool createStorageBuffer(VkDeviceSize requiredBytes) {
-    if (gRuntime.device == VK_NULL_HANDLE ||
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE ||
         !gRuntime.memoryPropertiesAvailable ||
         gRuntime.memoryProperties.memoryTypeCount == 0u ||
         requiredBytes == 0 ||
@@ -832,6 +897,13 @@ bool ensureStorageBuffer(VkDeviceSize requiredBytes) {
 }
 
 bool submitAndWait(const char* operation) {
+    // Fail fast on a device already known to be lost (or whose submission
+    // state became unknown after a fence timeout): never submit to it again.
+    // destroyRuntime()/nativeInitialize() remain usable and clear the flag.
+    if (gRuntime.deviceLost) {
+        logError("Vulkan submission refused: the device was previously lost or a fence wait timed out.");
+        return false;
+    }
     if (gRuntime.device == VK_NULL_HANDLE ||
         gRuntime.computeQueue == VK_NULL_HANDLE ||
         gRuntime.submissionFence == VK_NULL_HANDLE ||
@@ -846,6 +918,7 @@ bool submitAndWait(const char* operation) {
         &gRuntime.submissionFence
     );
     if (result != VK_SUCCESS) {
+        markDeviceLost(result);
         logError(operation, result);
         return false;
     }
@@ -867,6 +940,7 @@ bool submitAndWait(const char* operation) {
         gRuntime.submissionFence
     );
     if (result != VK_SUCCESS) {
+        markDeviceLost(result);
         logError(operation, result);
         return false;
     }
@@ -876,13 +950,45 @@ bool submitAndWait(const char* operation) {
         1,
         &gRuntime.submissionFence,
         VK_TRUE,
-        std::numeric_limits<uint64_t>::max()
+        kFenceWaitTimeoutNs
     );
+    if (result == VK_TIMEOUT) {
+        // The submission may still be in flight, so the command buffer, fence
+        // and mapped resources can no longer be reused safely. Poison the
+        // runtime exactly like a device loss: callers fail, later submissions
+        // fail fast, and only destroy/reinitialise recovers. Do NOT attempt a
+        // vkQueueWaitIdle recovery here — on a genuinely hung GPU that wait
+        // is unbounded and would reintroduce the infinite block this timeout
+        // exists to prevent.
+        gRuntime.deviceLost = true;
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            kLogTag,
+            "%s Vulkan fence wait timed out after %llu ns; treating the "
+            "runtime as device-lost.",
+            operation,
+            static_cast<unsigned long long>(kFenceWaitTimeoutNs)
+        );
+        return false;
+    }
+    if (result == VK_ERROR_DEVICE_LOST) {
+        markDeviceLost(result);
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            kLogTag,
+            "%s Vulkan device was lost while waiting for the submission fence.",
+            operation
+        );
+        return false;
+    }
     if (result != VK_SUCCESS) {
         logError(operation, result);
-        // Error-only recovery before caller releases or reuses mapped resources.
+        // Error-only recovery before caller releases or reuses mapped
+        // resources. Only reached for non-device-lost failures; never
+        // wait-idle on a lost device.
         const VkResult recoveryResult = vkQueueWaitIdle(gRuntime.computeQueue);
         if (recoveryResult != VK_SUCCESS) {
+            markDeviceLost(recoveryResult);
             logError("Vulkan queue-idle recovery after fence failure also failed.", recoveryResult);
         }
         return false;
@@ -1028,7 +1134,7 @@ bool createArenaBacking(
     buffer = VK_NULL_HANDLE;
     memory = VK_NULL_HANDLE;
     deviceLocal = false;
-    if (gRuntime.device == VK_NULL_HANDLE || !gRuntime.memoryPropertiesAvailable) return false;
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE || !gRuntime.memoryPropertiesAvailable) return false;
 
     VkBufferCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -1197,6 +1303,7 @@ bool growTensorArena(VkDeviceSize additionalBytes) {
     if (gRuntime.tensorArenaBuffer != VK_NULL_HANDLE) {
         const VkResult idle = vkDeviceWaitIdle(gRuntime.device);
         if (idle != VK_SUCCESS) {
+            markDeviceLost(idle);
             vkDestroyBuffer(gRuntime.device, nextBuffer, nullptr);
             vkFreeMemory(gRuntime.device, nextMemory, nullptr);
             logError("Vulkan device did not become idle before preserving tensor data.", idle);
@@ -2363,6 +2470,22 @@ bool initializeRuntime() {
     gRuntime.maxComputeWorkGroupCountX =
         gRuntime.physicalDeviceProperties.limits.maxComputeWorkGroupCount[0];
 
+    // In-memory pipeline cache shared by every compute pipeline created
+    // below, so the driver does not re-pay full shader compilation per
+    // pipeline on every init. Intentionally not persisted to disk.
+    VkPipelineCacheCreateInfo pipelineCacheInfo{};
+    pipelineCacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    result = vkCreatePipelineCache(
+        gRuntime.device,
+        &pipelineCacheInfo,
+        nullptr,
+        &gRuntime.pipelineCache
+    );
+    if (result != VK_SUCCESS) {
+        logError("Vulkan pipeline-cache creation failed.", result);
+        return false;
+    }
+
     VkCommandPoolCreateInfo commandPoolInfo{};
     commandPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -2460,11 +2583,73 @@ bool initializeRuntime() {
         std::max({
             sizeof(AdamwPushConstants),
             sizeof(LinearPushConstants),
+            sizeof(ResidentLinearPushConstants),
             sizeof(ResidentAttentionPushConstants),
+            sizeof(ResidentSwiGluPushConstants),
             sizeof(ResidentBackwardPushConstants),
             sizeof(ResidentAdamwPushConstants)
         })
     );
+
+    // Validate the shader requirements against the queried device limits
+    // instead of assuming they fit: on a device below these values the
+    // pipelines below would be invalid, so fail init (Kotlin falls back to
+    // CPU) rather than proceeding.
+    const VkPhysicalDeviceLimits& deviceLimits =
+        gRuntime.physicalDeviceProperties.limits;
+    if (pushConstantRange.size > deviceLimits.maxPushConstantsSize) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kLogTag,
+            "Vulkan push-constant requirement %u exceeds device limit "
+            "maxPushConstantsSize=%u.",
+            pushConstantRange.size, deviceLimits.maxPushConstantsSize
+        );
+        return false;
+    }
+    if (kLocalWorkGroupSize > deviceLimits.maxComputeWorkGroupSize[0] ||
+        kLocalWorkGroupSize > deviceLimits.maxComputeWorkGroupInvocations) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kLogTag,
+            "Vulkan 1D workgroup requirement %u exceeds device limits "
+            "maxComputeWorkGroupSize[0]=%u, maxComputeWorkGroupInvocations=%u.",
+            kLocalWorkGroupSize, deviceLimits.maxComputeWorkGroupSize[0],
+            deviceLimits.maxComputeWorkGroupInvocations
+        );
+        return false;
+    }
+    if (kLinearWorkGroupSizeX > deviceLimits.maxComputeWorkGroupSize[0] ||
+        kLinearWorkGroupSizeY > deviceLimits.maxComputeWorkGroupSize[1] ||
+        kLinearWorkGroupInvocations >
+            deviceLimits.maxComputeWorkGroupInvocations) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kLogTag,
+            "Vulkan linear workgroup requirement %ux%u (%u invocations) "
+            "exceeds device limits maxComputeWorkGroupSize=[%u,%u], "
+            "maxComputeWorkGroupInvocations=%u.",
+            kLinearWorkGroupSizeX, kLinearWorkGroupSizeY,
+            kLinearWorkGroupInvocations,
+            deviceLimits.maxComputeWorkGroupSize[0],
+            deviceLimits.maxComputeWorkGroupSize[1],
+            deviceLimits.maxComputeWorkGroupInvocations
+        );
+        return false;
+    }
+    if (kLinearSharedMemoryBytes > deviceLimits.maxComputeSharedMemorySize ||
+        kLinearFp16SharedMemoryBytes >
+            deviceLimits.maxComputeSharedMemorySize ||
+        kResidentReductionSharedMemoryBytes >
+            deviceLimits.maxComputeSharedMemorySize) {
+        __android_log_print(
+            ANDROID_LOG_ERROR, kLogTag,
+            "Vulkan shared-memory requirements (linear FP32 %u B, linear "
+            "FP16 %u B, resident reduction %u B) exceed device limit "
+            "maxComputeSharedMemorySize=%u.",
+            kLinearSharedMemoryBytes, kLinearFp16SharedMemoryBytes,
+            kResidentReductionSharedMemoryBytes,
+            deviceLimits.maxComputeSharedMemorySize
+        );
+        return false;
+    }
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -2515,7 +2700,7 @@ bool initializeRuntime() {
 
     result = vkCreateComputePipelines(
         gRuntime.device,
-        VK_NULL_HANDLE,
+        gRuntime.pipelineCache,
         1,
         &pipelineInfo,
         nullptr,
@@ -2560,7 +2745,7 @@ bool initializeRuntime() {
 
     result = vkCreateComputePipelines(
         gRuntime.device,
-        VK_NULL_HANDLE,
+        gRuntime.pipelineCache,
         1,
         &linearPipelineInfo,
         nullptr,
@@ -2603,7 +2788,7 @@ bool initializeRuntime() {
 
         residentResult = vkCreateComputePipelines(
             gRuntime.device,
-            VK_NULL_HANDLE,
+            gRuntime.pipelineCache,
             1u,
             &residentPipelineInfo,
             nullptr,
@@ -2644,7 +2829,7 @@ bool initializeRuntime() {
         attentionPipelineInfo.layout = gRuntime.pipelineLayout;
 
         attentionResult = vkCreateComputePipelines(
-            gRuntime.device, VK_NULL_HANDLE, 1u, &attentionPipelineInfo,
+            gRuntime.device, gRuntime.pipelineCache, 1u, &attentionPipelineInfo,
             nullptr, &gRuntime.residentAttentionPipeline
         );
     }
@@ -2678,7 +2863,7 @@ bool initializeRuntime() {
         swigluPipelineInfo.stage = swigluShaderStage;
         swigluPipelineInfo.layout = gRuntime.pipelineLayout;
         swigluResult = vkCreateComputePipelines(
-            gRuntime.device, VK_NULL_HANDLE, 1u, &swigluPipelineInfo,
+            gRuntime.device, gRuntime.pipelineCache, 1u, &swigluPipelineInfo,
             nullptr, &gRuntime.residentSwiGluPipeline
         );
     }
@@ -2712,7 +2897,7 @@ bool initializeRuntime() {
         backwardPipelineInfo.stage = backwardShaderStage;
         backwardPipelineInfo.layout = gRuntime.pipelineLayout;
         backwardResult = vkCreateComputePipelines(
-            gRuntime.device, VK_NULL_HANDLE, 1u, &backwardPipelineInfo,
+            gRuntime.device, gRuntime.pipelineCache, 1u, &backwardPipelineInfo,
             nullptr, &gRuntime.residentBackwardPipeline
         );
     }
@@ -2752,7 +2937,7 @@ bool initializeRuntime() {
         residentAdamwPipelineInfo.layout = gRuntime.pipelineLayout;
         residentAdamwResult = vkCreateComputePipelines(
             gRuntime.device,
-            VK_NULL_HANDLE,
+            gRuntime.pipelineCache,
             1u,
             &residentAdamwPipelineInfo,
             nullptr,
@@ -2799,7 +2984,7 @@ bool initializeRuntime() {
 
             fp16Result = vkCreateComputePipelines(
                 gRuntime.device,
-                VK_NULL_HANDLE,
+                gRuntime.pipelineCache,
                 1,
                 &fp16PipelineInfo,
                 nullptr,
@@ -3024,7 +3209,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
 
     if (env == nullptr ||
-        gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE ||
         parameterGroups == nullptr ||
         gradientGroups == nullptr ||
         firstMomentGroups == nullptr ||
@@ -3392,8 +3577,11 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyAdamWUpdate(
                 return JNI_FALSE;
             }
 
+            // adamw.comp grid-strides over the segment (invocationStride
+            // derived from gl_NumWorkGroups), so a clamped count still
+            // covers every element; only a zero count is a failure here.
             const uint32_t workGroupCount =
-                calculateDispatchWorkGroupCount(localCount);
+                calculateDispatchWorkGroupCount(localCount).groupCount;
             if (workGroupCount == 0u) {
                 logError("Vulkan AdamW page segment has no available work-groups.");
                 releaseGroupReferences(env, groups);
@@ -3621,7 +3809,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
 
-    if (gRuntime.device == VK_NULL_HANDLE ||
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE ||
         gRuntime.linearPipeline == VK_NULL_HANDLE ||
         inputArray == nullptr ||
         weightArray == nullptr ||
@@ -3742,7 +3930,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyLinear(
         tileRowsPerBatch *
         tileColumnsPerBatch;
     const uint32_t workGroupCount =
-        calculateDispatchGroupCount(totalTileCount);
+        calculateDispatchGroupCount(totalTileCount).groupCount;
     if (workGroupCount == 0u) {
         logError("Vulkan linear dispatch has no available output tile groups.");
         return JNI_FALSE;
@@ -3900,7 +4088,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
 
-    if (gRuntime.device == VK_NULL_HANDLE ||
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE ||
         !gRuntime.supportsFp16Compute ||
         gRuntime.fp16LinearPipeline == VK_NULL_HANDLE ||
         inputArray == nullptr ||
@@ -4078,7 +4266,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16Linear(
         tileRowsPerBatch *
         tileColumnsPerBatch;
     const uint32_t workGroupCount =
-        calculateDispatchGroupCount(totalTileCount);
+        calculateDispatchGroupCount(totalTileCount).groupCount;
     if (workGroupCount == 0u) {
         logError("Vulkan FP16 linear dispatch has no available output tile groups.");
         return JNI_FALSE;
@@ -4239,7 +4427,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
     jboolean transposeWeights
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
-    if (gRuntime.device == VK_NULL_HANDLE ||
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE ||
         !gRuntime.supportsFp16Compute ||
         gRuntime.fp16LinearPipeline == VK_NULL_HANDLE ||
         gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
@@ -4361,7 +4549,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyFp16LinearWithArena(
         return JNI_FALSE;
     }
     const uint64_t totalTileCount = batches * tilesPerBatch;
-    const uint32_t workGroupCount = calculateDispatchGroupCount(totalTileCount);
+    // This dispatch uses the linear_fp16 pipeline, whose shader grid-strides
+    // over tiles, so a clamped count still covers every tile.
+    const uint32_t workGroupCount =
+        calculateDispatchGroupCount(totalTileCount).groupCount;
     if (workGroupCount == 0u) {
         logError("Persistent batched FP16 linear dispatch has no available workgroups.");
         return JNI_FALSE;
@@ -4786,6 +4977,11 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
     JNIEnv* env,
     jobject
 ) {
+    // JNI boundary: no C++ exception may cross it (AGENTS.md §4.2). The JSON
+    // building below allocates (ostringstream/std::string/std::vector), so
+    // wrap the whole body and fall back to the same "{}" this function
+    // already returns when no device is available.
+    try {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
     if (gRuntime.physicalDevice == VK_NULL_HANDLE) {
         return env->NewStringUTF("{}");
@@ -5019,6 +5215,13 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
     json << "]}";
     const std::string payload = json.str();
     return env->NewStringUTF(payload.c_str());
+    } catch (const std::exception&) {
+        logError("Vulkan device-capability reporting failed with a native exception.");
+        return env->NewStringUTF("{}");
+    } catch (...) {
+        logError("Vulkan device-capability reporting failed with an unknown native exception.");
+        return env->NewStringUTF("{}");
+    }
 }
 
 
@@ -5027,6 +5230,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetGpuPerformanceMetrics(
     JNIEnv* env,
     jobject
 ) {
+    // JNI boundary: no C++ exception may cross it (AGENTS.md §4.2). On an
+    // exception return the same empty JSON object shape used for a missing
+    // capability payload.
+    try {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
     std::ostringstream json;
     json << "{"
@@ -5040,6 +5247,13 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetGpuPerformanceMetrics(
          << "}";
     const std::string payload = json.str();
     return env->NewStringUTF(payload.c_str());
+    } catch (const std::exception&) {
+        logError("Vulkan GPU performance-metrics reporting failed with a native exception.");
+        return env->NewStringUTF("{}");
+    } catch (...) {
+        logError("Vulkan GPU performance-metrics reporting failed with an unknown native exception.");
+        return env->NewStringUTF("{}");
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -5057,7 +5271,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeClearTensorArena(
     JNIEnv*, jobject
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
-    if (gRuntime.device == VK_NULL_HANDLE) return JNI_FALSE;
+    if (gRuntime.device == VK_NULL_HANDLE || gRuntime.deviceLost) return JNI_FALSE;
 
     if (gRuntime.tensorArenaBuffer == VK_NULL_HANDLE) {
         gRuntime.tensorArena.reset();
@@ -5066,6 +5280,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeClearTensorArena(
 
     const VkResult idle = vkDeviceWaitIdle(gRuntime.device);
     if (idle != VK_SUCCESS) {
+        markDeviceLost(idle);
         logError("Vulkan device did not become idle before clearing the tensor arena.", idle);
         return JNI_FALSE;
     }
@@ -5106,7 +5321,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinear(
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
 
-    if (gRuntime.device == VK_NULL_HANDLE ||
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE ||
         gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
         gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
         gRuntime.residentLinearPipeline == VK_NULL_HANDLE ||
@@ -5201,7 +5416,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinear(
         return JNI_FALSE;
     }
     const uint64_t totalTileCount = tileRows * tileColumns;
-    const uint32_t workGroupCount = calculateDispatchGroupCount(totalTileCount);
+    // linear_resident.comp grid-strides over tiles, so a clamped count still
+    // covers every tile.
+    const uint32_t workGroupCount =
+        calculateDispatchGroupCount(totalTileCount).groupCount;
     if (workGroupCount == 0u) {
         logError("Resident linear dispatch has no available workgroups.");
         return JNI_FALSE;
@@ -5330,7 +5548,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinearBatch(
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
 
     if (env == nullptr ||
-        gRuntime.device == VK_NULL_HANDLE ||
+        gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE ||
         gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
         gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
         gRuntime.residentLinearPipeline == VK_NULL_HANDLE ||
@@ -5608,7 +5826,10 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentLinearBatch(
     }
     const uint64_t totalTileCount =
         batches * tileRowsPerBatch * tileColumnsPerBatch;
-    const uint32_t workGroupCount = calculateDispatchGroupCount(totalTileCount);
+    // Same resident-linear pipeline/shader as above: tiles are grid-strided,
+    // so a clamped count still covers every tile.
+    const uint32_t workGroupCount =
+        calculateDispatchGroupCount(totalTileCount).groupCount;
     if (workGroupCount == 0u) {
         logError("Resident projection-set dispatch has no available workgroups.");
         return JNI_FALSE;
@@ -5694,7 +5915,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentSwiGlu(
     JNIEnv*, jobject, jlong gateHandle, jlong upHandle, jlong outputHandle, jint rows, jint columns
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
-    if (gRuntime.device == VK_NULL_HANDLE || gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE || gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
         gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE || gRuntime.residentSwiGluPipeline == VK_NULL_HANDLE ||
         gRuntime.commandBuffer == VK_NULL_HANDLE || gRuntime.queueSubmit2 == nullptr ||
         gRuntime.cmdPipelineBarrier2 == nullptr || gateHandle <= 0 || upHandle <= 0 || outputHandle <= 0 ||
@@ -5837,7 +6058,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
 
-    if (gRuntime.device == VK_NULL_HANDLE ||
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE ||
         gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
         gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
         gRuntime.residentAttentionPipeline == VK_NULL_HANDLE ||
@@ -6003,9 +6224,17 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentAttention(
         return JNI_FALSE;
     }
 
-    const uint32_t scoreGroups = calculateDispatchWorkGroupCount(scoreElements);
-    const uint32_t softmaxGroups = calculateDispatchWorkGroupCount(heads * sequence);
-    const uint32_t activationGroups = calculateDispatchWorkGroupCount(activationElements);
+    // Attention operations 0-3 (score, softmax, attention-value, output
+    // projection) all grid-stride over their elements/rows in the shader, so
+    // clamped counts still cover the full tensors. Operation 4 (layer norm)
+    // is NOT grid-stride — it maps one workgroup per row — so it does not use
+    // this helper and is validated unclamped against the device limit below.
+    const uint32_t scoreGroups =
+        calculateDispatchWorkGroupCount(scoreElements).groupCount;
+    const uint32_t softmaxGroups =
+        calculateDispatchWorkGroupCount(heads * sequence).groupCount;
+    const uint32_t activationGroups =
+        calculateDispatchWorkGroupCount(activationElements).groupCount;
     const uint32_t layerNormGroups = static_cast<uint32_t>(sequence);
     if (scoreGroups == 0u || softmaxGroups == 0u || activationGroups == 0u ||
         layerNormGroups == 0u ||
@@ -6167,7 +6396,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentResidualLayerNor
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
 
-    if (gRuntime.device == VK_NULL_HANDLE ||
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE ||
         gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
         gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
         gRuntime.residentAttentionPipeline == VK_NULL_HANDLE ||
@@ -6391,7 +6620,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeRunResidentBackward(
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
 
-    if (gRuntime.device == VK_NULL_HANDLE ||
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE ||
         gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
         gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
         gRuntime.residentBackwardPipeline == VK_NULL_HANDLE ||
@@ -6772,7 +7001,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeAllocateTensor(
     JNIEnv*, jobject, jlong byteCount
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
-    if (gRuntime.device == VK_NULL_HANDLE || byteCount <= 0) return 0;
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE || byteCount <= 0) return 0;
     return allocateArenaTensor(static_cast<VkDeviceSize>(byteCount));
 }
 
@@ -6781,7 +7010,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeUploadTensor(
     JNIEnv* env, jobject, jlong tensorHandle, jbyteArray source
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
-    if (gRuntime.device == VK_NULL_HANDLE || gRuntime.tensorArenaBuffer == VK_NULL_HANDLE) {
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE || gRuntime.tensorArenaBuffer == VK_NULL_HANDLE) {
         return JNI_FALSE;
     }
     TensorArenaAllocation* allocation = findArenaAllocation(tensorHandle);
@@ -6794,7 +7023,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeDownloadTensor(
     JNIEnv* env, jobject, jlong tensorHandle, jbyteArray destination
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
-    if (gRuntime.device == VK_NULL_HANDLE || gRuntime.tensorArenaBuffer == VK_NULL_HANDLE) {
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE || gRuntime.tensorArenaBuffer == VK_NULL_HANDLE) {
         return JNI_FALSE;
     }
     TensorArenaAllocation* allocation = findArenaAllocation(tensorHandle);
@@ -6853,7 +7082,7 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
 ) {
     std::lock_guard<std::mutex> lock(gRuntimeMutex);
 
-    if (gRuntime.device == VK_NULL_HANDLE ||
+    if (gRuntime.deviceLost || gRuntime.device == VK_NULL_HANDLE ||
         gRuntime.tensorArenaBuffer == VK_NULL_HANDLE ||
         gRuntime.tensorArenaDescriptorSet == VK_NULL_HANDLE ||
         gRuntime.residentAdamwPipeline == VK_NULL_HANDLE ||
@@ -7304,8 +7533,11 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeApplyResidentAdamWUpdate(
             candidateSecondMomentAllocations[groupIndex]->offset / sizeof(uint32_t);
         const uint64_t requiredGroups =
             1u + (pairCount - 1u) / kLocalWorkGroupSize;
+        // adamw_resident.comp grid-strides over pairs (invocationStride
+        // derived from gl_NumWorkGroups), so a clamped count still covers
+        // every pair; only a zero count is a failure here.
         const uint32_t dispatchGroups =
-            calculateDispatchGroupCount(requiredGroups);
+            calculateDispatchGroupCount(requiredGroups).groupCount;
         if (dispatchGroups == 0u ||
             parameterOffsetWords > kMaximumShaderIndex ||
             candidateParameterOffsetWords > kMaximumShaderIndex ||
