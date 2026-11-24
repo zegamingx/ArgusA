@@ -115,7 +115,9 @@ class VulkanDeviceCapabilitiesTest {
         assertEquals(Int.MAX_VALUE, capabilities.maxComputeWorkGroupCountX)
         assertEquals(Int.MAX_VALUE, capabilities.maxComputeWorkGroupCountY)
         assertEquals(Int.MAX_VALUE, capabilities.maxComputeWorkGroupCountZ)
-        assertEquals(Int.MAX_VALUE, capabilities.deviceId)
+        // deviceId is an opaque bit-pattern identifier, not a numeric limit:
+        // its bits must survive intact (rendered as hex identity).
+        assertEquals("90910010", capabilities.deviceId.toUInt().toString(16))
         assertEquals(2147483648L, capabilities.maxStorageBufferRangeBytes)
     }
 
