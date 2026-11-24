@@ -96,6 +96,19 @@ class VulkanDeviceProfileMapperTest {
         val profile = VulkanDeviceCapabilities.fromJson(
             """
             {
+              "deviceName": "Mali-G57",
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 3,
+              "apiVersionPatch": 278,
+              "maxComputeWorkGroupInvocations": 512,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 64,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 134217728,
               "memoryHeapCount": 2,
               "memoryBudgetExtensionEnabled": true,
               "memoryBudgetQueryAvailable": true,
@@ -117,6 +130,19 @@ class VulkanDeviceProfileMapperTest {
         val profile = VulkanDeviceCapabilities.fromJson(
             """
             {
+              "deviceName": "Mali-G57",
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 3,
+              "apiVersionPatch": 278,
+              "maxComputeWorkGroupInvocations": 512,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 64,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 134217728,
               "memoryHeapCount": 1,
               "memoryBudgetExtensionSupported": true,
               "memoryBudgetExtensionEnabled": false,

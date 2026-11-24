@@ -25,7 +25,7 @@ float reduceSharedSum(float value) {
     uint lane = gl_LocalInvocationID.x;
     reductionValues[lane] = value;
     barrier();
-    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+    for (uint stride = gl_WorkGroupSize.x >> 1u; stride > 0u; stride >>= 1u) {
         if (lane < stride) {
             reductionValues[lane] += reductionValues[lane + stride];
         }
@@ -38,7 +38,7 @@ float reduceSharedMax(float value) {
     uint lane = gl_LocalInvocationID.x;
     reductionValues[lane] = value;
     barrier();
-    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+    for (uint stride = gl_WorkGroupSize.x >> 1u; stride > 0u; stride >>= 1u) {
         if (lane < stride) {
             reductionValues[lane] = max(reductionValues[lane], reductionValues[lane + stride]);
         }

@@ -44,11 +44,90 @@ class VulkanDeviceCapabilitiesTest {
 
 
     @Test
+    fun rejectsPartialCapabilityPayloadMissingCoreFields() {
+        val nameOnly = runCatching {
+            VulkanDeviceCapabilities.fromJson("""{ "deviceName": "Mali-G57" }""")
+        }.exceptionOrNull()
+        assertTrue(nameOnly is IllegalArgumentException)
+
+        val empty = runCatching {
+            VulkanDeviceCapabilities.fromJson("{}")
+        }.exceptionOrNull()
+        assertTrue(empty is IllegalArgumentException)
+    }
+
+    @Test
+    fun rejectsCapabilityPayloadWithZeroCoreLimits() {
+        val failure = runCatching {
+            VulkanDeviceCapabilities.fromJson(
+                """
+                {
+                  "deviceName": "Mali-G57",
+                  "apiVersionMajor": 1,
+                  "apiVersionMinor": 3,
+                  "apiVersionPatch": 278,
+                  "maxComputeWorkGroupInvocations": 512,
+                  "maxComputeWorkGroupSizeX": 512,
+                  "maxComputeWorkGroupSizeY": 512,
+                  "maxComputeWorkGroupSizeZ": 64,
+                  "maxComputeWorkGroupCountX": 65535,
+                  "maxComputeWorkGroupCountY": 65535,
+                  "maxComputeWorkGroupCountZ": 65535,
+                  "maxComputeSharedMemoryBytes": 32768,
+                  "maxStorageBufferRangeBytes": 0
+                }
+                """
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+    }
+
+    @Test
+    fun rejectsCapabilityPayloadWithBlankDeviceName() {
+        val failure = runCatching {
+            VulkanDeviceCapabilities.fromJson(
+                """
+                {
+                  "deviceName": " ",
+                  "apiVersionMajor": 1,
+                  "apiVersionMinor": 3,
+                  "apiVersionPatch": 278,
+                  "maxComputeWorkGroupInvocations": 512,
+                  "maxComputeWorkGroupSizeX": 512,
+                  "maxComputeWorkGroupSizeY": 512,
+                  "maxComputeWorkGroupSizeZ": 64,
+                  "maxComputeWorkGroupCountX": 65535,
+                  "maxComputeWorkGroupCountY": 65535,
+                  "maxComputeWorkGroupCountZ": 65535,
+                  "maxComputeSharedMemoryBytes": 32768,
+                  "maxStorageBufferRangeBytes": 134217728
+                }
+                """
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+    }
+
+    @Test
     fun memoryBudgetRemainsOptionalWhenExtensionIsUnavailable() {
         val capabilities = VulkanDeviceCapabilities.fromJson(
             """
             {
               "deviceName": "Mali-G57",
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 3,
+              "apiVersionPatch": 278,
+              "maxComputeWorkGroupInvocations": 512,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 64,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 134217728,
               "memoryPropertiesAvailable": true,
               "memoryHeapCount": 1,
               "memoryTypeCount": 2,
@@ -180,6 +259,15 @@ class VulkanDeviceCapabilitiesTest {
               "apiVersionMajor": 1,
               "apiVersionMinor": 4,
               "apiVersionPatch": 351,
+              "maxComputeWorkGroupInvocations": 512,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 64,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 134217728,
               "cooperativeMatrixExtension": true,
               "cooperativeMatrix": true,
               "cooperativeMatrixSupportedStages": 32,
@@ -212,6 +300,18 @@ class VulkanDeviceCapabilitiesTest {
             """
             {
               "deviceName": "Unknown",
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 3,
+              "apiVersionPatch": 278,
+              "maxComputeWorkGroupInvocations": 512,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 64,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 134217728,
               "cooperativeMatrix": true,
               "cooperativeMatrixSupportedStages": 16,
               "cooperativeMatrixTypes": [
@@ -241,6 +341,16 @@ class VulkanDeviceCapabilitiesTest {
               "deviceName": "Mali-G57",
               "apiVersionMajor": 1,
               "apiVersionMinor": 2,
+              "apiVersionPatch": 278,
+              "maxComputeWorkGroupInvocations": 512,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 64,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 134217728,
               "effectiveApiVersionMajor": 1,
               "effectiveApiVersionMinor": 2,
               "subgroupSize": 16,
@@ -290,6 +400,18 @@ class VulkanDeviceCapabilitiesTest {
             """
             {
               "deviceName": "Unknown",
+              "apiVersionMajor": 1,
+              "apiVersionMinor": 3,
+              "apiVersionPatch": 278,
+              "maxComputeWorkGroupInvocations": 512,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 64,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
+              "maxComputeSharedMemoryBytes": 32768,
+              "maxStorageBufferRangeBytes": 134217728,
               "subgroupSize": 16,
               "subgroupSupportedStages": 32,
               "computeQueueTimestampValidBits": 0,
@@ -317,6 +439,12 @@ class VulkanDeviceCapabilitiesTest {
               "driverName": "ARM Proprietary",
               "driverInfo": "v1.r49p1",
               "maxComputeWorkGroupInvocations": 512,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 64,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
               "maxComputeSharedMemoryBytes": 32768,
               "maxStorageBufferRangeBytes": 2147483648,
               "subgroupSize": 16,
@@ -343,6 +471,12 @@ class VulkanDeviceCapabilitiesTest {
               "driverName": "Qualcomm Technologies Inc. Adreno Vulkan Driver",
               "driverInfo": "Driver Build 72c15dcb23",
               "maxComputeWorkGroupInvocations": 1024,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 64,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
               "maxComputeSharedMemoryBytes": 32768,
               "maxStorageBufferRangeBytes": 2147483647,
               "subgroupSize": 64,
@@ -371,6 +505,12 @@ class VulkanDeviceCapabilitiesTest {
               "driverName": "Samsung Proprietary driver",
               "driverInfo": "SPAL Driver version 25.3.3",
               "maxComputeWorkGroupInvocations": 1024,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 64,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
               "maxComputeSharedMemoryBytes": 32768,
               "maxStorageBufferRangeBytes": 4294967295,
               "subgroupSize": 64,
@@ -395,6 +535,12 @@ class VulkanDeviceCapabilitiesTest {
               "driverName": "ARM Proprietary",
               "driverInfo": "v1.r49p1",
               "maxComputeWorkGroupInvocations": 1024,
+              "maxComputeWorkGroupSizeX": 512,
+              "maxComputeWorkGroupSizeY": 512,
+              "maxComputeWorkGroupSizeZ": 64,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
               "maxComputeSharedMemoryBytes": 32768,
               "maxStorageBufferRangeBytes": 2147483648,
               "subgroupSize": 16,
@@ -468,6 +614,9 @@ class VulkanDeviceCapabilitiesTest {
               "maxComputeWorkGroupSizeX": 512,
               "maxComputeWorkGroupSizeY": 512,
               "maxComputeWorkGroupSizeZ": 512,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
               "maxComputeSharedMemoryBytes": 32768,
               "maxStorageBufferRangeBytes": 2147483648,
               "subgroupSize": 16,
@@ -585,6 +734,9 @@ class VulkanDeviceCapabilitiesTest {
               "maxComputeWorkGroupSizeX": 1024,
               "maxComputeWorkGroupSizeY": 1024,
               "maxComputeWorkGroupSizeZ": 1024,
+              "maxComputeWorkGroupCountX": 65535,
+              "maxComputeWorkGroupCountY": 65535,
+              "maxComputeWorkGroupCountZ": 65535,
               "maxComputeSharedMemoryBytes": 32768,
               "maxStorageBufferRangeBytes": 2147483648,
               "subgroupSize": 16,

@@ -59,6 +59,15 @@ class ArgusDeviceModelPolicyTest {
     }
 
     @Test
+    fun heapByteConversionOverflowFailsAsIllegalArgumentInsteadOfArithmetic() {
+        val failure = runCatching {
+            ArgusDeviceModelPolicy.select(12, Long.MAX_VALUE, 1.0f, 8)
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+    }
+
+    @Test
     fun rejectsDeviceMemoryBudgetsBelowTheMinimumExecutableModel() {
         val failure = runCatching {
             ArgusDeviceModelPolicy.select(2, 64L, 0.1f, 4)
