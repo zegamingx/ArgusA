@@ -145,4 +145,65 @@ class CorpusTokenizerSamplingTest {
             database.close()
         }
     }
+
+    @Test
+    fun tokenizerSamplesAreDistributedFromFirstToLastChunk() = runTest {
+        val context: Context = ApplicationProvider.getApplicationContext()
+        val database = Room.inMemoryDatabaseBuilder(
+            context,
+            ArgusDatabase::class.java
+        ).allowMainThreadQueries().build()
+
+        try {
+            val documentId = "stratified-tokenizer-sampling"
+            val chunkCount = 21
+            val document = CorpusDocumentEntity(
+                id = documentId,
+                contentFingerprint = "stratified-tokenizer-sampling-fingerprint",
+                fingerprintAlgorithm = "SHA-256",
+                source = "Tokenizer sampling regression test",
+                title = "Distributed chunks",
+                language = "en",
+                canonicalUrl = null,
+                characterCount = chunkCount * 128,
+                chunkCount = chunkCount,
+                datasetSplit = "TRAIN",
+                validationText = null,
+                plannedEpochs = 1,
+                rightsStatus = "UNVERIFIED",
+                status = "READY",
+                createdAtEpochMs = 2L,
+                lastTrainedAtEpochMs = null,
+                completedPassCount = 0
+            )
+            assertTrue(database.corpusDao().insertDocument(document) > 0L)
+            database.corpusDao().insertChunks(
+                (1..chunkCount).map { index ->
+                    val content = "chunk-$index-" + "x".repeat(100)
+                    CorpusChunkEntity(
+                        id = "$documentId:$index",
+                        documentId = documentId,
+                        chunkIndex = index,
+                        content = content,
+                        characterCount = content.length
+                    )
+                }
+            )
+
+            val result = ArgusRepository(context, database).getTokenizerCorpusSamples(
+                documentId = documentId,
+                maxSampleChunks = 5,
+                maxCharactersPerChunk = 64
+            )
+
+            assertEquals(chunkCount, result.totalChunkCount)
+            assertEquals(listOf(1, 6, 11, 16, 21), result.samples.map { it.chunkIndex })
+            assertTrue(result.samples.all { sample -> sample.content.length <= 64 })
+            assertTrue(result.samples.first().content.startsWith("chunk-1-"))
+            assertTrue(result.samples.last().content.startsWith("chunk-21-"))
+        } finally {
+            database.close()
+        }
+    }
+
 }

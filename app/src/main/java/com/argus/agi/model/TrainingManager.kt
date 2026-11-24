@@ -252,12 +252,10 @@ class TrainingManager internal constructor(
         const val MAX_CORPUS_REPLAY_DOCUMENTS = 500
         const val MAX_DEFAULT_CORPUS_REPLAY_CHUNKS = 4_096
         const val MAX_CORPUS_REPLAY_CHUNKS = 50_000
-        private const val MAX_TOKENIZER_SAMPLE_CHUNKS = 256
-        // Matches MAX_PERSISTED_CORPUS_CHUNK_CHARACTERS below and the
-        // repository's 8,192-character projection limit, so one persisted
-        // corpus chunk is sampled whole instead of being cut in half.
-        private const val MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS = 8 * 1024
-        private const val MAX_TOKENIZER_SAMPLE_CHARACTERS = 64 * 1024
+        private const val MAX_TOKENIZER_SAMPLE_CHUNKS = 512
+        // Stratified samples cover the complete document while keeping the BPE
+        // frequency table within a predictable memory budget (about 1 MiB text).
+        private const val MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS = 2 * 1024
         private const val MAX_PERSISTED_CORPUS_CHUNK_CHARACTERS = 8 * 1024
         private const val MAX_STREAMED_JSON_VALUE_CHARACTERS = 256 * 1024
         private const val QUEUE_PREFETCH_LIMIT = 64
@@ -3920,48 +3918,44 @@ class TrainingManager internal constructor(
         )
 
         try {
-            var remainingCharacters = MAX_TOKENIZER_SAMPLE_CHARACTERS
-            var afterChunkIndex = 0
+            val corpusSample = ArrayList<String>(MAX_TOKENIZER_SAMPLE_CHUNKS)
             var sampledChunks = 0
-            val corpusSample = ArrayList<String>(
-                minOf(MAX_TOKENIZER_SAMPLE_CHUNKS, 16)
-            )
+            var totalCorpusChunks = 0
             val activeRepository = repo
 
-            while (
-                activeRepository != null &&
-                remainingCharacters > 0 &&
-                sampledChunks < MAX_TOKENIZER_SAMPLE_CHUNKS
-            ) {
+            if (activeRepository != null) {
                 currentCoroutineContext().ensureActive()
-                val sample = activeRepository.getNextTokenizerCorpusSample(
+                val sampling = activeRepository.getTokenizerCorpusSamples(
                     documentId = documentId,
-                    afterChunkIndex = afterChunkIndex,
-                    maxCharacters = minOf(
-                        MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS,
-                        remainingCharacters
+                    maxSampleChunks = MAX_TOKENIZER_SAMPLE_CHUNKS,
+                    maxCharactersPerChunk = MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS
+                )
+                totalCorpusChunks = sampling.totalChunkCount
+                for (sample in sampling.samples) {
+                    currentCoroutineContext().ensureActive()
+                    if (sample.content.isNotBlank()) {
+                        corpusSample.add(sample.content)
+                        sampledChunks++
+                    }
+                }
+                _tokenizerTrainingProgress.value = TokenizerTrainingStatus(
+                    documentTitle = documentTitle,
+                    progress = TokenizerTrainingProgress(
+                        stage = TokenizerTrainingStage.PREPARING_CORPUS,
+                        fraction = 0.35f,
+                        processedItems = sampling.samples.size.toLong(),
+                        totalItems = sampling.totalChunkCount.toLong(),
+                        learnedMerges = 0,
+                        targetMerges = 0,
+                        vocabularySize = neuralEngine.tokenizer.vocabSize
                     )
-                ) ?: break
-
-                check(sample.chunkIndex > afterChunkIndex) {
-                    "Tokenizer corpus query did not advance its chunk cursor."
-                }
-                afterChunkIndex = sample.chunkIndex
-                sampledChunks = Math.addExact(sampledChunks, 1)
-
-                if (sample.content.isNotBlank()) {
-                    corpusSample.add(sample.content)
-                }
-                remainingCharacters -= sample.content.length
+                )
             }
 
             if (corpusSample.isEmpty() && item.content.isNotBlank()) {
                 corpusSample.add(
                     item.content.take(
-                        minOf(
-                            MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS,
-                            MAX_TOKENIZER_SAMPLE_CHARACTERS
-                        )
+                        MAX_TOKENIZER_SAMPLE_CHUNK_CHARACTERS
                     )
                 )
             }
@@ -3983,7 +3977,8 @@ class TrainingManager internal constructor(
                 TAG,
                 "Tokenizer corpus prepared for '$documentTitle': " +
                     "${update.previousVocabularySize} -> ${update.vocabularySize} tokens, " +
-                    "${update.mergeCount - update.previousMergeCount} new merges."
+                    "${update.mergeCount - update.previousMergeCount} new merges; " +
+                    "sampled $sampledChunks of $totalCorpusChunks corpus chunks across the document."
             )
         } catch (cancelled: CancellationException) {
             preparedTokenizerDocuments.remove(documentId)

@@ -23,6 +23,11 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
+data class TokenizerCorpusSamplingResult(
+    val totalChunkCount: Int,
+    val samples: List<TokenizerCorpusSample>
+)
+
 data class ScreenDataDeletionResult(
     val trainingItemsDeleted: Int,
     val corpusDocumentsDeleted: Int,
@@ -702,6 +707,65 @@ class ArgusRepository(
             endExclusive--
         }
         sample.copy(content = sample.content.substring(0, endExclusive))
+    }
+
+
+
+    /**
+     * Selects evenly spaced chunks from the full document range. This removes the
+     * old prefix-only bias while bounding the tokenizer's in-memory training sample.
+     */
+    suspend fun getTokenizerCorpusSamples(
+        documentId: String,
+        maxSampleChunks: Int,
+        maxCharactersPerChunk: Int
+    ): TokenizerCorpusSamplingResult = withContext(Dispatchers.IO) {
+        require(maxSampleChunks in 1..512) {
+            "Tokenizer sample chunk count must be between 1 and 512."
+        }
+        require(maxCharactersPerChunk in 1..8_192) {
+            "Tokenizer sample chunk length must be between 1 and 8,192 characters."
+        }
+
+        val document = corpusDao.getDocument(documentId)
+            ?: return@withContext TokenizerCorpusSamplingResult(0, emptyList())
+        val totalChunks = document.chunkCount.coerceAtLeast(0)
+        if (totalChunks == 0) {
+            return@withContext TokenizerCorpusSamplingResult(0, emptyList())
+        }
+
+        val sampleCount = minOf(totalChunks, maxSampleChunks)
+        val chunkIndices = buildList(sampleCount) {
+            if (sampleCount == 1) {
+                add(1)
+            } else {
+                for (sampleIndex in 0 until sampleCount) {
+                    val offset = sampleIndex.toLong() * (totalChunks - 1L) /
+                        (sampleCount - 1L)
+                    add(Math.addExact(offset, 1L).toInt())
+                }
+            }
+        }.distinct()
+
+        val samples = corpusDao.getTokenizerCorpusSamples(
+            documentId = documentId,
+            chunkIndices = chunkIndices,
+            maxCharacters = maxCharactersPerChunk
+        ).map { sample ->
+            val content = sample.content
+            if (content.length <= maxCharactersPerChunk) {
+                sample
+            } else {
+                var endExclusive = maxCharactersPerChunk
+                if (content[endExclusive - 1].isHighSurrogate()) endExclusive--
+                sample.copy(content = content.substring(0, endExclusive))
+            }
+        }
+
+        TokenizerCorpusSamplingResult(
+            totalChunkCount = totalChunks,
+            samples = samples
+        )
     }
 
     suspend fun getCorpusSources(documentId: String): List<CorpusSourceEntity> =
