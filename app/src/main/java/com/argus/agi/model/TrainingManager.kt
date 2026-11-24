@@ -1125,7 +1125,11 @@ class TrainingManager internal constructor(
                                 val record = line.removePrefix("\uFEFF").trim()
                                 if (record.isEmpty()) continue
                                 require(record.startsWith('{') && record.endsWith('}')) {
-                                    "Invalid JSONL record at line $lineNumber: expected one complete JSON object."
+                                    val firstCharacter = record.firstOrNull()
+                                        ?.let { "U+%04X".format(it.code) }
+                                        ?: "empty"
+                                    "Invalid JSONL record at line $lineNumber: expected one complete JSON object; " +
+                                        "record length=\${record.length}, first character=$firstCharacter."
                                 }
                                 val processed = try {
                                     TextModalityProcessor.processStrictJsonObjectLine(
@@ -1133,8 +1137,13 @@ class TrainingManager internal constructor(
                                         documentTitle = title
                                     )
                                 } catch (error: org.json.JSONException) {
+                                    val parserDetail = error.message
+                                        ?.takeIf { it.isNotBlank() }
+                                        ?.take(240)
+                                        ?: error.javaClass.simpleName
                                     throw IllegalArgumentException(
-                                        "Malformed JSONL record at line $lineNumber: expected one complete JSON object.",
+                                        "Malformed JSONL object at line $lineNumber " +
+                                            "(record length=\${record.length}): $parserDetail",
                                         error
                                     )
                                 }
