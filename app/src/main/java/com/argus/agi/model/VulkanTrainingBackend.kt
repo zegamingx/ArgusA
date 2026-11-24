@@ -302,8 +302,9 @@ data class VulkanDeviceCapabilities(
          * optInt would truncate them (UINT32_MAX became -1, which the core-field
          * validation below then rejected, breaking capability parsing entirely
          * on devices such as Mali-G57 that report UINT32_MAX work-group counts).
-         * Clamping to Int.MAX_VALUE preserves the meaning: effectively
-         * unlimited / an opaque identifier.
+         * Clamping to Int.MAX_VALUE preserves the meaning of a numeric limit:
+         * effectively unlimited. (Opaque identifiers such as deviceId are not
+         * read through this helper; their bits are preserved as-is.)
          */
         private fun org.json.JSONObject.optUint32Clamped(name: String): Int =
             optLong(name).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
@@ -335,7 +336,10 @@ data class VulkanDeviceCapabilities(
             val capabilities = VulkanDeviceCapabilities(
                 deviceName = json.optString("deviceName", "Unknown Vulkan GPU"),
                 vendorId = json.optInt("vendorId"),
-                deviceId = json.optUint32Clamped("deviceId"),
+                // deviceId is an opaque identifier whose bits are the identity
+                // (rendered as hex via toUInt); preserve the low 32 bits exactly
+                // instead of clamping like the numeric limits below.
+                deviceId = json.optLong("deviceId").toInt(),
                 deviceType = json.optInt("deviceType"),
                 apiVersionMajor = json.optInt("apiVersionMajor"),
                 apiVersionMinor = json.optInt("apiVersionMinor"),

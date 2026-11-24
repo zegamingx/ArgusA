@@ -172,7 +172,7 @@ class ArgusAppRobolectricTest {
             cpuCores = 6
         )
         assertEquals(ArgusDeviceModelTier.BALANCED, balanced.modelTier)
-        assertEquals(2, balanced.trainingBatchSize)
+        assertEquals(1, balanced.trainingBatchSize)
 
         val performance = EngineConfig.forDevice(
             totalRamGb = 8,
@@ -180,7 +180,7 @@ class ArgusAppRobolectricTest {
             cpuCores = 8
         )
         assertEquals(ArgusDeviceModelTier.PERFORMANCE, performance.modelTier)
-        assertEquals(4, performance.trainingBatchSize)
+        assertEquals(1, performance.trainingBatchSize)
 
         val flagship = EngineConfig.forDevice(
             totalRamGb = 12,
@@ -188,7 +188,7 @@ class ArgusAppRobolectricTest {
             cpuCores = 8
         )
         assertEquals(ArgusDeviceModelTier.FLAGSHIP, flagship.modelTier)
-        assertEquals(8, flagship.trainingBatchSize)
+        assertEquals(1, flagship.trainingBatchSize)
 
         val memoryConstrainedFlagship = EngineConfig.forDevice(
             totalRamGb = 12,
@@ -197,7 +197,7 @@ class ArgusAppRobolectricTest {
             cpuCores = 8
         )
         assertEquals(ArgusDeviceModelTier.PERFORMANCE, memoryConstrainedFlagship.modelTier)
-        assertEquals(4, memoryConstrainedFlagship.trainingBatchSize)
+        assertEquals(1, memoryConstrainedFlagship.trainingBatchSize)
 
         listOf(compact, balanced, performance, flagship, memoryConstrainedFlagship).forEach { config ->
             val architecture = ArgusArchitectureConfig(
