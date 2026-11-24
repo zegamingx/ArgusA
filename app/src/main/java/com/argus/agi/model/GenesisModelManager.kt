@@ -340,7 +340,7 @@ class GenesisModelManager(
 
         logs += "Forward validation completed without an optimizer update: initial loss = " +
                 String.format(Locale.US, "%.4f", sanityLoss)
-        logs += "Checkpoint 'argus_model_weights.bin' (ARG4 format) was verified in local storage."
+        logs += "Checkpoint 'argus_model_weights.bin' (ARG6 format) was verified in local storage."
         logs += "Model origin identity committed: $originId"
         throttleStage()
 
