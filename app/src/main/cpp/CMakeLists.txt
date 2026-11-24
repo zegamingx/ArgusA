@@ -88,16 +88,22 @@ function(argus_compile_shader source_file binary_name header_name array_symbol s
 
     # Optional validation step, inserted between compilation and header
     # embedding when spirv-val is available. The per-shader target
-    # environment string ("vulkan1.0", "vulkan1.2") is accepted verbatim by
-    # spirv-val's --target-env, so it matches the glslc environment exactly.
-    # A non-zero spirv-val exit status fails this custom command, and with
-    # it the build. Expands to nothing when spirv-val was not found.
+    # environment value ("vulkan1.0", "vulkan1.2") is the same for glslc
+    # and spirv-val, but the argument SYNTAX differs: glslc accepts the
+    # joined "--target-env=<env>" form, while the spirv-val build bundled
+    # with the NDK only accepts "--target-env" and the value as two
+    # separate arguments — the joined form makes it print its usage text
+    # and exit 1 without validating anything (this failed the production
+    # build of PR #70). A non-zero spirv-val exit status fails this custom
+    # command, and with it the build. Expands to nothing when spirv-val
+    # was not found.
     set(shader_validation_command)
     if(ARGUS_SPIRV_VAL)
         set(shader_validation_command
             COMMAND
                 "${ARGUS_SPIRV_VAL}"
-                "--target-env=${shader_target_environment}"
+                "--target-env"
+                "${shader_target_environment}"
                 "${shader_binary}"
         )
     endif()
