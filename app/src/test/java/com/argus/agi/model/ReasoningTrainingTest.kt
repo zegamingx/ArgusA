@@ -139,6 +139,65 @@ class ReasoningTrainingTest {
     }
 
     @Test
+    fun plainTextOnlyJsonlRecordsRemainPlainTextAcrossImportPaths() {
+        val texts = listOf(
+            "Kecerdasan Buatan dan Transformasi Teknologi.",
+            "Menurut peneliti, 'AI' perlu diuji dengan prinsip \"aman dan transparan\"."
+        )
+        val jsonlRecords = texts.map { text ->
+            JSONObject().put("text", text).toString()
+        }
+        val jsonl = jsonlRecords.joinToString("\n")
+
+        val formattedRecords = requireNotNull(
+            TextModalityProcessor.formatTrainingDatasetRecords(jsonl)
+        )
+        assertEquals(texts, formattedRecords)
+
+        val processedRecords = TextModalityProcessor.process(
+            rawText = jsonl,
+            documentTitle = "Plain-text corpus",
+            chunkSize = 512,
+            overlap = 0
+        )
+        assertEquals(2, processedRecords.size)
+        assertEquals(
+            listOf(TextModality.GENERAL_PROSE, TextModality.GENERAL_PROSE),
+            processedRecords.map { it.modality }
+        )
+        assertEquals(texts, processedRecords.map { it.content })
+        assertTrue(processedRecords.all { it.tokenHint == "Plain-text corpus record" })
+
+        val strictRecord = TextModalityProcessor.processStrictJsonObjectLine(
+            rawText = jsonlRecords.first(),
+            documentTitle = "Plain-text JSONL"
+        ).single()
+        assertEquals(TextModality.GENERAL_PROSE, strictRecord.modality)
+        assertEquals(texts.first(), strictRecord.content)
+        assertEquals("Plain-text corpus record", strictRecord.tokenHint)
+        assertEquals(
+            texts.first(),
+            TextModalityProcessor.formatStructuredLineIfJson(jsonlRecords.first())
+        )
+    }
+
+    @Test
+    fun strictJsonlKeepsLegacyLexicalRecordsStructured() {
+        val raw = JSONObject()
+            .put("kata", "berjalan")
+            .put("kata_dasar", "jalan")
+            .toString()
+
+        val processed = TextModalityProcessor.processStrictJsonObjectLine(
+            rawText = raw,
+            documentTitle = "Lexical data"
+        ).single()
+
+        assertEquals(TextModality.STRUCTURED_DATA, processed.modality)
+        assertEquals("Kata: berjalan -> Kata dasar: jalan", processed.content)
+    }
+
+    @Test
     fun malformedTextWrappedReasoningDoesNotPassStructuredTrainingValidation() {
         val malformed = JSONObject()
             .put(

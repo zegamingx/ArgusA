@@ -415,6 +415,31 @@ object TextModalityProcessor {
             candidate.contains("<answer>", ignoreCase = true)
     }
 
+    /**
+     * Extracts a plain-text corpus payload without converting its JSON wrapper into
+     * key/value prose. Structured SFT, reasoning, and conversation records retain
+     * precedence in formatTrainingRecord().
+     */
+    private fun extractPlainTextTrainingContent(obj: JSONObject): String? {
+        val value = obj.opt("text") as? String ?: return null
+        if (value.isBlank()) return null
+
+        // A malformed tagged-reasoning sample must not silently become plain prose.
+        // Valid tagged reasoning is handled earlier by formatTrainingRecord().
+        val answerHeader = TAGGED_TEXT_ANSWER_HEADER_PATTERN.findAll(value).lastOrNull()
+            ?: return value
+        val responseSection = value.substring(answerHeader.range.last + 1)
+        val containsReasoningMarkup =
+            TAGGED_TEXT_THINK_START_PATTERN.containsMatchIn(responseSection) ||
+                TAGGED_TEXT_THINK_END_PATTERN.containsMatchIn(responseSection) ||
+                TAGGED_TEXT_ANSWER_START_PATTERN.containsMatchIn(responseSection) ||
+                TAGGED_TEXT_ANSWER_END_PATTERN.containsMatchIn(responseSection)
+        if (containsReasoningMarkup && extractTextWrappedReasoningRecord(value) == null) {
+            return null
+        }
+        return value
+    }
+
     private fun isTrainingRecord(obj: JSONObject): Boolean {
         val hasPrompt = firstNonBlankText(
             obj,
@@ -427,7 +452,11 @@ object TextModalityProcessor {
         val hasTaggedTextReasoning = extractTextWrappedReasoningRecord(
             firstNonBlankPayload(obj, listOf("text"))
         ) != null
-        return (hasPrompt && hasAnswer) || hasTaggedTextReasoning || isConversationRecord(obj)
+        val hasPlainText = extractPlainTextTrainingContent(obj) != null
+        return (hasPrompt && hasAnswer) ||
+            hasTaggedTextReasoning ||
+            isConversationRecord(obj) ||
+            hasPlainText
     }
 
     private fun isConversationRecord(obj: JSONObject): Boolean =
@@ -456,9 +485,23 @@ object TextModalityProcessor {
         val reasoning = extractReasoningText(obj)
         val explicitInstruction = firstNonBlankPayload(obj, listOf("instruction", "prompt"))
         val question = firstNonBlankPayload(obj, listOf("question"))
+        val responseText = firstNonBlankPayload(obj, listOf("response", "completion", "answer"))
+        val hasInstructionAndAnswer =
+            (explicitInstruction.isNotBlank() || question.isNotBlank()) && responseText.isNotBlank()
+
+        // A text field is a complete corpus sample when the record does not contain
+        // a usable prompt/answer pair. Keep its payload verbatim (apart from escaping
+        // reserved control tokens) instead of serializing the JSON key as training text.
+        if (!hasInstructionAndAnswer) {
+            val plainText = extractPlainTextTrainingContent(obj)
+            if (plainText != null) {
+                return TextModality.GENERAL_PROSE to
+                    Tokenizer.escapeLiteralControlTokens(plainText)
+            }
+        }
+
         val isQuestionAnswer = explicitInstruction.isBlank() && question.isNotBlank()
         val instruction = if (isQuestionAnswer) "Tanya: $question" else explicitInstruction
-        val responseText = firstNonBlankPayload(obj, listOf("response", "completion", "answer"))
         val response = if (isQuestionAnswer) "Jawab: $responseText" else responseText
         val input = firstNonBlankPayload(obj, listOf("input"))
         val modality = if (reasoning.isNullOrBlank()) TextModality.CONVERSATION else TextModality.REASONING
@@ -819,6 +862,12 @@ object TextModalityProcessor {
      * One complete JSON source record becomes one training sample. Token-level
      * context windowing remains the responsibility of the neural training engine.
      */
+    private fun trainingRecordTokenHint(modality: TextModality): String = when (modality) {
+        TextModality.REASONING -> "Atomic instruction, reasoning, and final answer"
+        TextModality.GENERAL_PROSE -> "Plain-text corpus record"
+        else -> "Atomic conversation or instruction record"
+    }
+
     private fun processTrainingRecords(
         records: List<JSONObject>,
         documentTitle: String
@@ -828,11 +877,7 @@ object TextModalityProcessor {
             content = formatted.second,
             modality = formatted.first,
             segmentTitle = "$documentTitle [Record ${index + 1}/${records.size}]",
-            tokenHint = if (formatted.first == TextModality.REASONING) {
-                "Atomic instruction, reasoning, and final answer"
-            } else {
-                "Atomic conversation or instruction record"
-            }
+            tokenHint = trainingRecordTokenHint(formatted.first)
         )
     }
 
@@ -1130,11 +1175,7 @@ object TextModalityProcessor {
                     content = content,
                     modality = modality,
                     segmentTitle = "$documentTitle [Record 1/1]",
-                    tokenHint = if (modality == TextModality.REASONING) {
-                        "Atomic instruction, reasoning, and final answer"
-                    } else {
-                        "Atomic conversation or instruction record"
-                    }
+                    tokenHint = trainingRecordTokenHint(modality)
                 )
             )
         }
