@@ -296,6 +296,18 @@ data class VulkanDeviceCapabilities(
         private const val SUBGROUP_FEATURE_SHUFFLE_BIT = 0x00000010
         private const val SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT = 0x00000020
 
+        /**
+         * Reads an unsigned 32-bit Vulkan limit/identifier without signed
+         * truncation. org.json tokenizes values above Int.MAX_VALUE as Long and
+         * optInt would truncate them (UINT32_MAX became -1, which the core-field
+         * validation below then rejected, breaking capability parsing entirely
+         * on devices such as Mali-G57 that report UINT32_MAX work-group counts).
+         * Clamping to Int.MAX_VALUE preserves the meaning: effectively
+         * unlimited / an opaque identifier.
+         */
+        private fun org.json.JSONObject.optUint32Clamped(name: String): Int =
+            optLong(name).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+
         fun fromJson(payload: String): VulkanDeviceCapabilities {
             val json = org.json.JSONObject(payload)
             val matrixArray = json.optJSONArray("cooperativeMatrixTypes")
@@ -323,7 +335,7 @@ data class VulkanDeviceCapabilities(
             val capabilities = VulkanDeviceCapabilities(
                 deviceName = json.optString("deviceName", "Unknown Vulkan GPU"),
                 vendorId = json.optInt("vendorId"),
-                deviceId = json.optInt("deviceId"),
+                deviceId = json.optUint32Clamped("deviceId"),
                 deviceType = json.optInt("deviceType"),
                 apiVersionMajor = json.optInt("apiVersionMajor"),
                 apiVersionMinor = json.optInt("apiVersionMinor"),
@@ -339,9 +351,9 @@ data class VulkanDeviceCapabilities(
                 maxComputeWorkGroupSizeX = json.optInt("maxComputeWorkGroupSizeX"),
                 maxComputeWorkGroupSizeY = json.optInt("maxComputeWorkGroupSizeY"),
                 maxComputeWorkGroupSizeZ = json.optInt("maxComputeWorkGroupSizeZ"),
-                maxComputeWorkGroupCountX = json.optInt("maxComputeWorkGroupCountX"),
-                maxComputeWorkGroupCountY = json.optInt("maxComputeWorkGroupCountY"),
-                maxComputeWorkGroupCountZ = json.optInt("maxComputeWorkGroupCountZ"),
+                maxComputeWorkGroupCountX = json.optUint32Clamped("maxComputeWorkGroupCountX"),
+                maxComputeWorkGroupCountY = json.optUint32Clamped("maxComputeWorkGroupCountY"),
+                maxComputeWorkGroupCountZ = json.optUint32Clamped("maxComputeWorkGroupCountZ"),
                 maxComputeSharedMemoryBytes = json.optLong("maxComputeSharedMemoryBytes"),
                 maxStorageBufferRangeBytes = json.optLong("maxStorageBufferRangeBytes"),
                 subgroupSize = json.optInt("subgroupSize"),
@@ -1182,6 +1194,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     "${_optimizerStateResidencyBudgetBytes.value} bytes."
             )
         }.onFailure { error ->
+            // Stamp the attempt even on failure: a persistent parse/refresh
+            // failure must not retry (and log) on every training step. The
+            // throttle interval becomes the failure backoff.
+            lastMemoryBudgetRefreshNanos = nowNanos
             ArgusDiagnosticBridge.warning(TAG,
                 "Could not refresh Vulkan memory-budget telemetry; retaining the last verified budget.",
                 error

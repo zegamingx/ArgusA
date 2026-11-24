@@ -5115,12 +5115,18 @@ Java_com_argus_agi_model_VulkanTrainingBackend_nativeGetDeviceCapabilities(
          << properties.limits.maxComputeWorkGroupSize[1] << ","
          << "\"maxComputeWorkGroupSizeZ\":"
          << properties.limits.maxComputeWorkGroupSize[2] << ","
+         // Mali GPUs report UINT32_MAX work-group counts ("no limit"). Clamp to
+         // INT32_MAX so the JSON stays inside the signed range every consumer
+         // parses; the Kotlin parser also clamps defensively on its side.
          << "\"maxComputeWorkGroupCountX\":"
-         << properties.limits.maxComputeWorkGroupCount[0] << ","
+         << std::min(properties.limits.maxComputeWorkGroupCount[0],
+                     static_cast<uint32_t>(INT32_MAX)) << ","
          << "\"maxComputeWorkGroupCountY\":"
-         << properties.limits.maxComputeWorkGroupCount[1] << ","
+         << std::min(properties.limits.maxComputeWorkGroupCount[1],
+                     static_cast<uint32_t>(INT32_MAX)) << ","
          << "\"maxComputeWorkGroupCountZ\":"
-         << properties.limits.maxComputeWorkGroupCount[2] << ","
+         << std::min(properties.limits.maxComputeWorkGroupCount[2],
+                     static_cast<uint32_t>(INT32_MAX)) << ","
          << "\"maxComputeSharedMemoryBytes\":"
          << properties.limits.maxComputeSharedMemorySize << ","
          << "\"maxStorageBufferRangeBytes\":"
