@@ -76,7 +76,14 @@ object ArgusDeviceModelPolicy {
         val availableBytes = (safeAvailableRamGb.toDouble() * GIB)
             .coerceAtMost(Long.MAX_VALUE.toDouble())
             .toLong()
-        val heapBytes = Math.multiplyExact(maxHeapMb, MIB)
+        val heapBytes = try {
+            Math.multiplyExact(maxHeapMb, MIB)
+        } catch (overflow: ArithmeticException) {
+            throw IllegalArgumentException(
+                "App heap size is too large to express in bytes: $maxHeapMb MiB.",
+                overflow
+            )
+        }
 
         val heapTrainingBudget = (heapBytes.toDouble() * HEAP_BUDGET_FRACTION).toLong()
         val systemTrainingBudget =

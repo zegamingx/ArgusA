@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import java.io.File
+import kotlin.math.roundToInt
 
 data class SystemHardwareInfo(
     val socManufacturer: String,
@@ -26,6 +27,30 @@ data class SystemHardwareInfo(
 )
 
 class HardwareProfile(private val context: Context) {
+
+    companion object {
+        private const val BYTES_PER_GIB = 1024.0 * 1024.0 * 1024.0
+        private const val FALLBACK_TOTAL_RAM_GB = 8
+
+        /**
+         * Converts the kernel-reported total memory to whole GiB.
+         *
+         * [android.app.ActivityManager.MemoryInfo.totalMem] excludes memory reserved by
+         * firmware, the kernel and the GPU, so a device sold with 8 GB of RAM typically
+         * reports only ~7.5 GiB. Truncating that value misclassifies the device one
+         * capacity class below its marketed capacity, so the value is rounded to the
+         * nearest GiB instead. This figure is a capacity class used for model-tier
+         * selection and display only: every memory-safety budget in the policy and the
+         * backend is computed from raw available-memory bytes and the app heap, never
+         * from this rounded value, so rounding cannot inflate a safety budget.
+         */
+        internal fun totalRamGbFromBytes(totalMemBytes: Long): Int =
+            if (totalMemBytes > 0L) {
+                (totalMemBytes / BYTES_PER_GIB).roundToInt().coerceAtLeast(1)
+            } else {
+                FALLBACK_TOTAL_RAM_GB // Fallback aman
+            }
+    }
 
     fun getHardwareInfo(): SystemHardwareInfo {
         val pm = context.packageManager
@@ -69,11 +94,7 @@ class HardwareProfile(private val context: Context) {
         val actManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
         actManager?.getMemoryInfo(memInfo)
 
-        val totalRamGb = if (memInfo.totalMem > 0) {
-            (memInfo.totalMem / (1024.0 * 1024.0 * 1024.0)).toInt().coerceAtLeast(1)
-        } else {
-            8 // Fallback aman
-        }
+        val totalRamGb = totalRamGbFromBytes(memInfo.totalMem)
 
         // availMem adalah memori sistem yang bebas; kurangi threshold agar lebih realistis untuk aplikasi
         val availableForApp = (memInfo.availMem - memInfo.threshold).coerceAtLeast(0L)

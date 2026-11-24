@@ -320,7 +320,7 @@ data class VulkanDeviceCapabilities(
                 }
             }
 
-            return VulkanDeviceCapabilities(
+            val capabilities = VulkanDeviceCapabilities(
                 deviceName = json.optString("deviceName", "Unknown Vulkan GPU"),
                 vendorId = json.optInt("vendorId"),
                 deviceId = json.optInt("deviceId"),
@@ -473,6 +473,49 @@ data class VulkanDeviceCapabilities(
                     List(array.length()) { index -> array.optInt(index) }
                 } ?: emptyList()
             )
+
+            // A partial payload must fail instead of zero-filling a plausible-looking
+            // capability object: downstream code treats a zero limit as "no limit", so
+            // silently accepting missing core identity/limit fields is undiagnosable.
+            // Optional feature/extension fields keep their opt* defaults. Both call
+            // sites parse inside runCatching, so throwing here surfaces as "capability
+            // metadata unavailable" and retains the last verified state.
+            val missingCoreFields = buildList {
+                if (!json.has("deviceName") || capabilities.deviceName.isBlank()) {
+                    add("deviceName")
+                }
+                if (!json.has("apiVersionMajor") || !json.has("apiVersionMinor") ||
+                    !json.has("apiVersionPatch") || capabilities.apiVersionMajor < 1
+                ) {
+                    add("apiVersion")
+                }
+                if (capabilities.maxComputeWorkGroupInvocations <= 0) {
+                    add("maxComputeWorkGroupInvocations")
+                }
+                if (capabilities.maxComputeWorkGroupSizeX <= 0 ||
+                    capabilities.maxComputeWorkGroupSizeY <= 0 ||
+                    capabilities.maxComputeWorkGroupSizeZ <= 0
+                ) {
+                    add("maxComputeWorkGroupSize")
+                }
+                if (capabilities.maxComputeWorkGroupCountX <= 0 ||
+                    capabilities.maxComputeWorkGroupCountY <= 0 ||
+                    capabilities.maxComputeWorkGroupCountZ <= 0
+                ) {
+                    add("maxComputeWorkGroupCount")
+                }
+                if (capabilities.maxComputeSharedMemoryBytes <= 0L) {
+                    add("maxComputeSharedMemoryBytes")
+                }
+                if (capabilities.maxStorageBufferRangeBytes <= 0L) {
+                    add("maxStorageBufferRangeBytes")
+                }
+            }
+            require(missingCoreFields.isEmpty()) {
+                "Vulkan device capability payload is missing or has invalid core fields: " +
+                    missingCoreFields.joinToString(", ")
+            }
+            return capabilities
         }
     }
 }
@@ -661,6 +704,17 @@ internal object VulkanTrainingBackend : ComputeBackend {
         get() = activationTensorRegistry
 
     private var lastModelParameterInventory: List<VulkanModelParameterTensor> = emptyList()
+
+    /**
+     * Live resident gradient accumulators. Their arena allocations are owned by no
+     * residency registry, so they are tracked here to let residency invalidation and
+     * runtime teardown release or retire them together with the three registries.
+     * Every access happens under the backend monitor (all accumulator entry points and
+     * every invalidateTensorResidency call site are @Synchronized on this singleton).
+     */
+    private val liveResidentGradientAccumulators =
+        mutableSetOf<VulkanResidentGradientAccumulator>()
+
     private var residencySuspended = false
     private var residencyBlockedAfterFailure = false
     private var residencyRebuildPending = false
@@ -681,13 +735,26 @@ internal object VulkanTrainingBackend : ComputeBackend {
         val activationsReleased = activationTensorRegistry.invalidate(releaseAllocations)
         val optimizerStatesReleased =
             optimizerStateResidencyRegistry.invalidate(releaseAllocations)
-        val released = modelReleased && activationsReleased && optimizerStatesReleased
+        // The resident gradient accumulator holds arena allocations outside every
+        // registry, so it must be discarded with them. This point is only reached after
+        // the mirror-synchronization guard above has verified host recovery of model
+        // and optimizer state; the accumulator itself is gradient scratch for the
+        // current accumulation window, is never mirrored or checkpointed separately,
+        // and any caller still holding it observes a clean `released` failure on its
+        // next accumulate/finalize/download call instead of dispatching on arena
+        // handles that invalidation has already freed.
+        val gradientsReleased =
+            discardTrackedResidentGradientAccumulators(releaseAllocations)
+        val released = modelReleased && activationsReleased && optimizerStatesReleased &&
+            gradientsReleased
         if (!released && releaseAllocations && nativeReady) {
             val arenaCleared = runCatching { nativeClearTensorArena() }.getOrDefault(false)
             if (arenaCleared) {
                 tensorResidencyRegistry.invalidate(releaseAllocations = false)
                 activationTensorRegistry.invalidate(releaseAllocations = false)
                 optimizerStateResidencyRegistry.invalidate(releaseAllocations = false)
+                // The arena clear freed every remaining accumulator allocation.
+                discardTrackedResidentGradientAccumulators(releaseAllocations = false)
                 refreshTensorArenaMetrics()
                 return true
             }
@@ -3264,6 +3331,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 }
             )
             committed = true
+            liveResidentGradientAccumulators.add(accumulator)
             return accumulator
         } catch (error: LinkageError) {
             ArgusDiagnosticBridge.error(TAG, "Resident gradient accumulator JNI entry point is unavailable.", error)
@@ -3384,18 +3452,23 @@ internal object VulkanTrainingBackend : ComputeBackend {
     internal fun discardResidentGradientAccumulator(
         accumulator: VulkanResidentGradientAccumulator
     ) {
-        if (!releaseResidentGradientAccumulator(accumulator) && isRuntimeAvailable) {
+        if (releaseResidentGradientAccumulator(accumulator)) return
+        if (isRuntimeAvailable) {
             ArgusDiagnosticBridge.warning(TAG, "Resident gradient accumulator cleanup failed; disabling the optional Vulkan runtime.")
             runCatching { destroyNativeRuntime() }
                 .onFailure { error ->
                     ArgusDiagnosticBridge.error(TAG, "Vulkan teardown after accumulator cleanup failure failed.", error)
                 }
-            accumulator.activeReleased = true
-            accumulator.spareReleased = true
-            accumulator.stagingReleased = true
-            accumulator.pendingReleaseAllocations.clear()
-            accumulator.released = true
+        } else {
+            ArgusDiagnosticBridge.warning(TAG,
+                "Resident gradient accumulator cleanup could not run while the Vulkan runtime is unavailable; retiring its bookkeeping."
+            )
         }
+        // The native allocations are either destroyed with the runtime above or belong
+        // to a runtime that is no longer reachable, so the accumulator must never be
+        // reused or retried: always retire it in bookkeeping, even when the native
+        // release could not run.
+        markResidentGradientAccumulatorReleased(accumulator)
     }
 
     @Synchronized
@@ -3591,10 +3664,54 @@ internal object VulkanTrainingBackend : ComputeBackend {
         }
     }
 
+    /**
+     * Retires an accumulator in bookkeeping without touching native memory. Only valid
+     * when its arena allocations are already gone (arena cleared, runtime destroyed or
+     * unavailable); the `released` guards then fail any later use cleanly.
+     */
+    private fun markResidentGradientAccumulatorReleased(
+        accumulator: VulkanResidentGradientAccumulator
+    ) {
+        accumulator.activeReleased = true
+        accumulator.spareReleased = true
+        accumulator.stagingReleased = true
+        accumulator.pendingReleaseAllocations.clear()
+        accumulator.released = true
+        liveResidentGradientAccumulators.remove(accumulator)
+    }
+
+    /**
+     * Discards every tracked resident gradient accumulator alongside the residency
+     * registries. With [releaseAllocations] each allocation is released natively and a
+     * failure is reported so the caller can escalate to an arena clear or teardown;
+     * without it the native allocations are already gone and only the bookkeeping is
+     * retired.
+     */
+    private fun discardTrackedResidentGradientAccumulators(
+        releaseAllocations: Boolean
+    ): Boolean {
+        if (liveResidentGradientAccumulators.isEmpty()) return true
+        var allReleased = true
+        val snapshot = liveResidentGradientAccumulators.toList()
+        for (accumulator in snapshot) {
+            if (releaseAllocations) {
+                if (!releaseResidentGradientAccumulator(accumulator)) {
+                    allReleased = false
+                }
+            } else {
+                markResidentGradientAccumulatorReleased(accumulator)
+            }
+        }
+        return allReleased
+    }
+
     private fun releaseResidentGradientAccumulator(
         accumulator: VulkanResidentGradientAccumulator
     ): Boolean {
-        if (accumulator.released) return true
+        if (accumulator.released) {
+            liveResidentGradientAccumulators.remove(accumulator)
+            return true
+        }
 
         while (accumulator.pendingReleaseAllocations.isNotEmpty()) {
             val pending = accumulator.pendingReleaseAllocations.first()
@@ -3616,6 +3733,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
         }
 
         accumulator.released = true
+        liveResidentGradientAccumulators.remove(accumulator)
         return true
     }
 
@@ -4648,6 +4766,9 @@ internal object VulkanTrainingBackend : ComputeBackend {
             refreshGpuPerformanceMetrics()
         } else {
             residentActivationLinearReady = false
+            _currentBackend = "Kotlin CPU (Resident linear fallback)"
+            _runtimeStatus.value =
+                "Vulkan runtime verified — resident linear dispatch failed; this path uses Kotlin fallback"
             ArgusDiagnosticBridge.warning(TAG, "Resident activation-linear dispatch failed; this M3 path is disabled for this runtime.")
         }
         return applied
@@ -4721,6 +4842,9 @@ internal object VulkanTrainingBackend : ComputeBackend {
             refreshGpuPerformanceMetrics()
         } else {
             residentActivationLinearReady = false
+            _currentBackend = "Kotlin CPU (Resident batched linear fallback)"
+            _runtimeStatus.value =
+                "Vulkan runtime verified — resident batched-linear dispatch failed; this path uses Kotlin fallback"
             ArgusDiagnosticBridge.warning(TAG, "Resident Vulkan batched-linear dispatch failed; this resident M3 path is disabled for this runtime.")
         }
         return applied
@@ -4813,6 +4937,9 @@ internal object VulkanTrainingBackend : ComputeBackend {
             fp16DisabledAfterRuntimeFailure = true
             fp16RuntimeReady = false
             invalidateTensorResidency(releaseAllocations = true)
+            _currentBackend = "Kotlin CPU (FP16 linear fallback)"
+            _runtimeStatus.value =
+                "Vulkan runtime verified — FP16 linear dispatch failed; this path uses Kotlin fallback"
             ArgusDiagnosticBridge.warning(TAG, "Persistent-weight FP16 dispatch failed; using the Kotlin CPU path.")
             return false
         }
@@ -4974,6 +5101,9 @@ internal object VulkanTrainingBackend : ComputeBackend {
             fp16DisabledAfterRuntimeFailure = true
             fp16RuntimeReady = false
             invalidateTensorResidency(releaseAllocations = true)
+            _currentBackend = "Kotlin CPU (FP16 batched linear fallback)"
+            _runtimeStatus.value =
+                "Vulkan runtime verified — FP16 batched linear dispatch failed; this path uses Kotlin fallback"
             ArgusDiagnosticBridge.warning(TAG,
                 "Persistent batched FP16 dispatch failed; retaining the verified FP32 Vulkan/CPU fallback."
             )
