@@ -51,6 +51,28 @@ if(NOT ARGUS_GLSLC)
     )
 endif()
 
+# SPIR-V validation (audit M12): locate spirv-val in the same NDK
+# shader-tools directories as glslc, falling back to PATH. Unlike glslc it
+# is optional: when present, every generated .spv is validated during the
+# build and invalid SPIR-V fails the build; when absent, warn loudly and
+# continue so environments without the tool do not break (AGENTS.md §6.4:
+# "Use SPIR-V validation tools when available").
+find_program(
+    ARGUS_SPIRV_VAL
+    NAMES spirv-val spirv-val.exe
+    HINTS ${ARGUS_SHADER_TOOL_DIRS}
+)
+
+if(NOT ARGUS_SPIRV_VAL)
+    message(WARNING
+        "spirv-val was not found in ${ARGUS_NDK_ROOT}/shader-tools or on "
+        "PATH. SPIR-V validation is SKIPPED for this build; shader "
+        "correctness is then checked by glslc alone. Install spirv-val "
+        "(NDK shader-tools or the Vulkan SDK) to enable build-time "
+        "SPIR-V validation."
+    )
+endif()
+
 set(ARGUS_SPIRV_EMBED_SCRIPT
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv_header.cmake"
 )
@@ -63,6 +85,22 @@ function(argus_compile_shader source_file binary_name header_name array_symbol s
 
     set(shader_binary "${CMAKE_CURRENT_BINARY_DIR}/${binary_name}")
     set(shader_header "${CMAKE_CURRENT_BINARY_DIR}/${header_name}")
+
+    # Optional validation step, inserted between compilation and header
+    # embedding when spirv-val is available. The per-shader target
+    # environment string ("vulkan1.0", "vulkan1.2") is accepted verbatim by
+    # spirv-val's --target-env, so it matches the glslc environment exactly.
+    # A non-zero spirv-val exit status fails this custom command, and with
+    # it the build. Expands to nothing when spirv-val was not found.
+    set(shader_validation_command)
+    if(ARGUS_SPIRV_VAL)
+        set(shader_validation_command
+            COMMAND
+                "${ARGUS_SPIRV_VAL}"
+                "--target-env=${shader_target_environment}"
+                "${shader_binary}"
+        )
+    endif()
 
     # Model shader compilation as a proper build rule. Unchanged shaders are
     # not recompiled on every CMake configure, and incremental builds only
@@ -77,6 +115,7 @@ function(argus_compile_shader source_file binary_name header_name array_symbol s
             -O
             "${source_file}"
             -o "${shader_binary}"
+        ${shader_validation_command}
         COMMAND
             "${CMAKE_COMMAND}"
             "-DINPUT_FILE=${shader_binary}"

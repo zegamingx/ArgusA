@@ -1,7 +1,8 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
-// Match the FP32 8x16 output tile while retaining FP16 multiplication.
+// Match the FP32 8x16 output tile; tiles are held in FP16, but operands
+// are widened to FP32 before multiplication (see the accumulation loop).
 // shaderFloat16 permits 16-bit values in Workgroup storage; the storage
 // buffer remains packed uint32 and does not require 16-bit SSBO support.
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
@@ -125,10 +126,10 @@ void main() {
             barrier();
 
             for (uint k = 0u; k < TILE_K; ++k) {
-                // Keep the product in binary16, then accumulate in binary32.
-                accumulated += float(
-                    inputTile[localRow][k] * weightTile[k][localColumn]
-                );
+                // Widen operands to FP32 before the multiply so products
+                // accumulate at FP32 precision, matching the resident kernels.
+                accumulated += float(inputTile[localRow][k]) *
+                    float(weightTile[k][localColumn]);
             }
 
             barrier();
