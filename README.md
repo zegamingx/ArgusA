@@ -64,53 +64,6 @@ and verifies the APK, and publishes one `ARGUS.apk` with its checksum and
 build manifest. No debug APK, unsigned APK, or additional Actions APK artifact
 is published.
 
-## GitHub releases and installable builds
-
-The signing identity used by the distributed Argus v1.0.13 APK was previously
-stored in an unencrypted GitHub Release asset. Treat that historical private
-key as compromised and do not use it for new APKs.
-
-The replacement Argus 2026 identity is used for clean installs and all future
-updates signed with that same key:
-
-- Alias: `argus-release-2026`
-- Certificate SHA-256: `D4D24FEDCDC3395ADA6B89ACDE861CE3523560D35EDEB7DA48709C8CE4F63CAA`
-- It is not a signing-certificate lineage successor to the exposed v1.0.13
-  identity. An APK signed with this key cannot update an older installation
-  signed by the exposed certificate. Back up app data before changing signing
-  identity or package installation.
-
-The active Argus 2026 private keystore and passwords must remain offline or
-inside protected GitHub Environment secrets. Do not substitute an archived
-or retired keystore, commit private key material, or upload it as a build
-artifact. The preflight accepts normal Base64 or one additional Base64 wrapper,
-but only when the final bytes have a recognized Java keystore header. Configure these Environment secrets under
-**Settings → Environments → argus-release**:
-
-- `ARGUS_RELEASE_KEYSTORE_BASE64`: base64 encoding of the currently approved
-  Argus 2026 private keystore. The release workflow detects whether it is JKS
-  or PKCS#12; the file extension does not determine its format.
-- `ARGUS_RELEASE_STORE_PASSWORD`: keystore password.
-- `ARGUS_RELEASE_KEY_PASSWORD`: private-key password.
-
-The private-key alias is pinned to `argus-release-2026`, and the certificate
-must match SHA-256
-`D4D24FEDCDC3395ADA6B89ACDE861CE3523560D35EDEB7DA48709C8CE4F63CAA`.
-Restrict the Environment deployment rule to the approved `Release` tag; add
-required reviewers if the repository's release policy requires approval.
-
-The `Argus Production Release` workflow runs only for the approved `Release`
-tag. Before Gradle starts, it verifies that the tag points to the exact current
-`main` commit and validates the protected keystore format, both passwords,
-private-key alias, and pinned Argus 2026 certificate. It performs release lint
-and unit tests, exactly one `assembleRelease`, 16 KiB ZIP alignment, signing,
-and APK verification, then publishes one `ARGUS.apk` with its checksum and
-build manifest. Routine CI and PR validation never assemble or upload an APK
-and never receive production signing secrets.
-
-Use `tools/security/sign-release.ps1` for local Windows signing or
-`tools/security/sign-release.sh` for Linux/CI signing. Both helpers verify the
-expected Argus 2026 certificate before publishing their output.
 
 ## Runtime crash diagnostics
 
