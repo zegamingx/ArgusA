@@ -59,4 +59,27 @@ class VulkanTrainingBackendSafetyTest {
             assertArrayEquals(outputBefore[index], output[index], 0.0f)
         }
     }
+
+    @Test
+    fun automaticRecoveryStaysIdleWhenTheRuntimeWasNeverVerified() {
+        // Robolectric has no Vulkan driver, so the runtime can never complete
+        // verification in this process: automatic recovery (§5.2) must treat the
+        // CPU path as the device-capability fallback, never release an attempt,
+        // and never mutate backend state as a side effect of being asked.
+        assertFalse(VulkanTrainingBackend.hasVerifiedRuntimeThisSession)
+        val attemptedBefore = VulkanTrainingBackend.hasAttemptedInitialization
+        val runtimeBefore = VulkanTrainingBackend.isRuntimeAvailable
+        val backendBefore = VulkanTrainingBackend.currentBackend
+
+        for (now in longArrayOf(0L, 5_000L, 65_000L, 3_600_000L)) {
+            assertEquals(
+                VulkanRuntimeRecoveryPolicy.Decision.NOT_NEEDED,
+                VulkanTrainingBackend.automaticRecoveryDecision(now)
+            )
+        }
+
+        assertEquals(attemptedBefore, VulkanTrainingBackend.hasAttemptedInitialization)
+        assertEquals(runtimeBefore, VulkanTrainingBackend.isRuntimeAvailable)
+        assertEquals(backendBefore, VulkanTrainingBackend.currentBackend)
+    }
 }

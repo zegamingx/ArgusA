@@ -735,6 +735,17 @@ internal object VulkanTrainingBackend : ComputeBackend {
     private var residencyBlockedAfterFailure = false
     private var residencyRebuildPending = false
     private var runtimeRestartPending = false
+
+    /**
+     * Session fact for the §5.2 recovery policy: Vulkan completed initialization
+     * and kernel verification at least once in this process. Only a runtime that
+     * was verified and then latched off by a dispatch failure is a recovery case;
+     * a runtime that never verified is the device-capability CPU fallback.
+     */
+    @Volatile
+    private var runtimeVerifiedThisSession = false
+
+    private val runtimeRecoveryPolicy = VulkanRuntimeRecoveryPolicy()
     private var residentGradientRecoveryPending = false
     private var modelParameterMirrorReliable = true
     private var optimizerStateMirrorReliable = true
@@ -799,6 +810,14 @@ internal object VulkanTrainingBackend : ComputeBackend {
      */
     val isRuntimeAvailable: Boolean
         get() = nativeReady && !disabledAfterRuntimeFailure
+
+    /** True once Vulkan completed initialization and kernel verification in this process. */
+    internal val hasVerifiedRuntimeThisSession: Boolean
+        get() = runtimeVerifiedThisSession
+
+    /** True when a runtime dispatch failure has latched Vulkan (or its FP16 path) off. */
+    internal val hasLatchedRuntimeFailure: Boolean
+        get() = disabledAfterRuntimeFailure || fp16DisabledAfterRuntimeFailure
 
     override val isReady: Boolean
         get() = isRuntimeAvailable
@@ -1347,6 +1366,66 @@ internal object VulkanTrainingBackend : ComputeBackend {
         return false
     }
 
+    /**
+     * §5.2 automatic-recovery gate: decides whether a recovery attempt for a
+     * latched runtime failure may start at [nowMillis]. Healthy runtimes and
+     * runtimes that never verified on this device are never recovery cases, so
+     * evaluating this on every training step is side-effect free in steady state.
+     */
+    @Synchronized
+    internal fun automaticRecoveryDecision(
+        nowMillis: Long
+    ): VulkanRuntimeRecoveryPolicy.Decision =
+        runtimeRecoveryPolicy.evaluate(
+            nowMillis = nowMillis,
+            failureLatched = hasLatchedRuntimeFailure,
+            runtimeVerified = runtimeVerifiedThisSession
+        )
+
+    /** Records that an automatic recovery attempt is starting, for diagnostics. */
+    @Synchronized
+    internal fun onAutomaticRecoveryAttemptStarted() {
+        ArgusDiagnosticBridge.warning(TAG,
+            "Automatic Vulkan recovery attempt " +
+                "${runtimeRecoveryPolicy.currentAttemptNumber()} of " +
+                "${runtimeRecoveryPolicy.maxAttemptsPerEpisode}: reinitializing the " +
+                "Vulkan runtime after a latched dispatch failure. Kotlin CPU remains " +
+                "the controlled fallback until recovery succeeds."
+        )
+    }
+
+    /**
+     * Records the outcome of an automatic recovery attempt. The fail-fast latches
+     * are only cleared by the reset/initialization path the caller ran; this
+     * method accounts for the attempt in the recovery policy and keeps the
+     * diagnostic record and the user-visible status honest about which backend
+     * is primary.
+     */
+    @Synchronized
+    internal fun recordAutomaticRecoveryOutcome(nowMillis: Long, succeeded: Boolean) {
+        val attemptNumber = runtimeRecoveryPolicy.currentAttemptNumber()
+        runtimeRecoveryPolicy.recordAttemptOutcome(nowMillis, succeeded)
+        if (succeeded) {
+            ArgusDiagnosticBridge.warning(TAG,
+                "Automatic Vulkan recovery succeeded on attempt $attemptNumber; " +
+                    "Vulkan is the primary training backend again."
+            )
+        } else if (runtimeRecoveryPolicy.isExhausted) {
+            _runtimeStatus.value =
+                "Kotlin CPU fallback — Vulkan recovery attempts failed; retrying after a cooldown"
+            ArgusDiagnosticBridge.warning(TAG,
+                "Automatic Vulkan recovery attempt $attemptNumber failed and the " +
+                    "recovery episode is exhausted; Kotlin CPU remains the controlled " +
+                    "fallback and recovery will be retried after a cooldown."
+            )
+        } else {
+            ArgusDiagnosticBridge.warning(TAG,
+                "Automatic Vulkan recovery attempt $attemptNumber failed; Kotlin CPU " +
+                    "remains the controlled fallback until the next scheduled attempt."
+            )
+        }
+    }
+
     /** Re-enable a single full-inventory rebuild after the app returns to the foreground. */
     @Synchronized
     fun resumeModelTensorResidencyAfterForeground() {
@@ -1361,6 +1440,30 @@ internal object VulkanTrainingBackend : ComputeBackend {
             residencyBlockedAfterFailure = false
             residencyRebuildPending = lastModelParameterInventory.isNotEmpty()
             return
+        }
+        if (hasLatchedRuntimeFailure && runtimeVerifiedThisSession) {
+            // A dispatch failure latched the verified runtime off while the app
+            // was in the background. Foreground return is a bounded recovery
+            // point (§5.2): rebuild through the same reset/initialization path
+            // as a pending runtime restart, gated by the recovery policy's
+            // backoff, instead of leaving Kotlin CPU as the permanent backend.
+            val nowMillis = System.currentTimeMillis()
+            if (automaticRecoveryDecision(nowMillis) ==
+                VulkanRuntimeRecoveryPolicy.Decision.ATTEMPT
+            ) {
+                onAutomaticRecoveryAttemptStarted()
+                resetRuntimeForRetry()
+                val recovered = initializeAfterModelReady()
+                recordAutomaticRecoveryOutcome(nowMillis, recovered)
+                if (!recovered) {
+                    residencySuspended = true
+                    return
+                }
+                residencySuspended = false
+                residencyBlockedAfterFailure = false
+                residencyRebuildPending = lastModelParameterInventory.isNotEmpty()
+                return
+            }
         }
         if (!residencySuspended) return
         refreshModelTensorResidencyBudget(force = true)
@@ -2142,6 +2245,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
 
             nativeReady = runtimeIntact
             if (runtimeIntact) {
+                runtimeVerifiedThisSession = true
                 refreshGpuPerformanceMetrics()
                 _currentBackend = "Kotlin CPU"
                 _runtimeStatus.value = when {

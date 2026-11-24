@@ -3234,6 +3234,13 @@ class TrainingManager internal constructor(
                 }.first { canContinue -> canContinue }
                 if (closed) break
 
+                // AGENTS.md §5.2: if a dispatch failure latched the verified
+                // Vulkan runtime off, Kotlin CPU is only a controlled recovery
+                // fallback — attempt the policy-bounded automatic recovery
+                // between training items so CPU does not silently become the
+                // permanent primary backend on a compatible device.
+                neuralEngine.attemptAutomaticVulkanRecovery()
+
                 workerExecutionMutex.lock()
                 try {
                     val hasCommittedFinalization = _nextQueue.value.any {

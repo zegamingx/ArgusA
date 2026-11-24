@@ -488,6 +488,32 @@ class ArgusNeuralEngine private constructor(
         computeBackend.resetForRetry()
     }
 
+    /**
+     * Automatic, bounded Vulkan recovery for an active training session
+     * (AGENTS.md §5.2): when a dispatch failure has latched the verified Vulkan
+     * runtime off, rebuild it through the normal reset/initialization path —
+     * which re-synchronizes model tensor residency from the authoritative host
+     * state — once the recovery policy's backoff releases an attempt. Model
+     * parameters, optimizer state, and training progress live on the host and
+     * are never reset by a backend transition. Returns true only when an
+     * attempt ran and the runtime is verified again.
+     */
+    internal fun attemptAutomaticVulkanRecovery(
+        nowMillis: Long = System.currentTimeMillis()
+    ): Boolean {
+        if (computeBackend !== VulkanTrainingBackend) return false
+        if (VulkanTrainingBackend.automaticRecoveryDecision(nowMillis) !=
+            VulkanRuntimeRecoveryPolicy.Decision.ATTEMPT
+        ) {
+            return false
+        }
+        VulkanTrainingBackend.onAutomaticRecoveryAttemptStarted()
+        resetOptionalVulkanRuntimeForRetry()
+        val recovered = initializeOptionalVulkanRuntime()
+        VulkanTrainingBackend.recordAutomaticRecoveryOutcome(nowMillis, recovered)
+        return recovered
+    }
+
     private fun synchronizeVulkanModelTensorResidency(reason: String) {
         if (!VulkanTrainingBackend.isFp16ComputeAvailable &&
             !VulkanTrainingBackend.isResidentActivationLinearAvailable) {
