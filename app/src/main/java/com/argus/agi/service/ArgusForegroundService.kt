@@ -42,6 +42,29 @@ internal enum class ForegroundTrainingPresentation {
 }
 
 /**
+ * Chunk progress of the document currently being trained, mirrored into the
+ * foreground-service notification so background progress is visible without
+ * opening the app — and a stalled count is just as visible. Values come
+ * straight from TrainingManager's active-document state (AGENTS.md §14):
+ * real training state only, never an estimate.
+ */
+internal data class ForegroundTrainingProgress(
+    val completedChunks: Int,
+    val totalChunks: Int
+) {
+    val percent: Int
+        get() = if (totalChunks > 0) {
+            (completedChunks.coerceIn(0, totalChunks) * 100) / totalChunks
+        } else {
+            0
+        }
+
+    /** Same wording as the in-app training header: "2311 of 10000 chunks (23%)". */
+    val summary: String
+        get() = "$completedChunks of $totalChunks chunks ($percent%)"
+}
+
+/**
  * Owns the partial WakeLock that keeps the CPU awake while training is actually
  * running in the background (owner requirement: background training must not be
  * throttled to a stop by Doze when the screen is off).
@@ -262,6 +285,15 @@ class ArgusForegroundService : Service() {
     private var presentation: ForegroundTrainingPresentation =
         ForegroundTrainingPresentation.STARTING
 
+    @Volatile
+    private var progress: ForegroundTrainingProgress? = null
+
+    /** One notification refresh unit: re-post only when presentation or progress moves. */
+    private data class NotificationSnapshot(
+        val presentation: ForegroundTrainingPresentation,
+        val progress: ForegroundTrainingProgress?
+    )
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -342,9 +374,14 @@ class ArgusForegroundService : Service() {
     }
 
     /**
-     * Observes the real training state and keeps the notification honest: its text and
-     * the pause/resume action label follow TrainingManager instead of a static string.
-     * Runs on the service scope after promotion; never blocks onStartCommand.
+     * Observes the real training state and keeps the notification honest and live:
+     * its text and the pause/resume action label follow TrainingManager instead of
+     * a static string, and while a document is being trained the notification also
+     * carries that document's chunk progress (text + determinate progress bar),
+     * re-posted every time a chunk completes. Because the snapshot is
+     * distinct-until-changed, an idle or paused Argus never spams the shade, and a
+     * background stall is directly visible as a frozen count. Runs on the service
+     * scope after promotion; never blocks onStartCommand.
      */
     private fun startObservingTrainingState() {
         if (trainingObservationJob?.isActive == true) return
@@ -361,16 +398,27 @@ class ArgusForegroundService : Service() {
                 trainingManager.activeDocument,
                 trainingManager.nextQueue
             ) { isPaused, currentItem, activeDocument, queue ->
-                presentationFor(
-                    isPaused = isPaused,
-                    hasActiveWork = currentItem != null || activeDocument != null,
-                    hasQueuedWork = queue.isNotEmpty()
+                NotificationSnapshot(
+                    presentation = presentationFor(
+                        isPaused = isPaused,
+                        hasActiveWork = currentItem != null || activeDocument != null,
+                        hasQueuedWork = queue.isNotEmpty()
+                    ),
+                    progress = activeDocument
+                        ?.takeIf { it.totalChunks > 0 }
+                        ?.let { document ->
+                            ForegroundTrainingProgress(
+                                completedChunks = document.completedChunks,
+                                totalChunks = document.totalChunks
+                            )
+                        }
                 )
             }
                 .distinctUntilChanged()
-                .collect { updated ->
-                    presentation = updated
-                    updateWakeLockForPresentation(updated)
+                .collect { snapshot ->
+                    presentation = snapshot.presentation
+                    progress = snapshot.progress
+                    updateWakeLockForPresentation(snapshot.presentation)
                     runCatching {
                         getSystemService(NotificationManager::class.java)
                             ?.notify(NOTIFICATION_ID, buildNotification())
@@ -445,13 +493,15 @@ class ArgusForegroundService : Service() {
         )
 
         val currentPresentation = presentation
+        val currentProgress = progress
+        val progressSuffix = currentProgress?.let { " • ${it.summary}" } ?: ""
         val contentText = when (currentPresentation) {
             ForegroundTrainingPresentation.STARTING ->
                 "On-device compute service is starting"
             ForegroundTrainingPresentation.ACTIVE ->
-                "Training in progress"
+                "Training in progress$progressSuffix"
             ForegroundTrainingPresentation.PAUSED ->
-                "Training paused"
+                "Training paused$progressSuffix"
             ForegroundTrainingPresentation.IDLE ->
                 "Neural core ready — training idle"
         }
@@ -460,15 +510,26 @@ class ArgusForegroundService : Service() {
             else -> "Pause training"
         }
 
-        return NotificationCompat.Builder(this, ArgusApp.CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, ArgusApp.CHANNEL_ID)
             .setContentTitle("A.R.G.U.S Neural Core")
             .setContentText(contentText)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(contentText))
             .setSmallIcon(R.drawable.ic_argus_logo)
             .setContentIntent(openAppPendingIntent)
             .setOngoing(true)
             .addAction(0, toggleLabel, togglePendingIntent)
             .addAction(0, "Stop", stopPendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
+        if (currentProgress != null &&
+            (currentPresentation == ForegroundTrainingPresentation.ACTIVE ||
+                currentPresentation == ForegroundTrainingPresentation.PAUSED)
+        ) {
+            builder.setProgress(
+                currentProgress.totalChunks,
+                currentProgress.completedChunks.coerceIn(0, currentProgress.totalChunks),
+                false
+            )
+        }
+        return builder.build()
     }
 }

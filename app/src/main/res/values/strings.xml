@@ -1,4 +1,5 @@
 <resources>
     <string name="app_name">A.R.G.U.S</string>
+    <string name="foreground_service_description">Keeps on-device neural model training running in the background and shows its live progress.</string>
     <string name="accessibility_service_description">A.R.G.U.S screen text perception is off by default. When enabled, it reads accessible text and content descriptions only from the active app window and only from apps you explicitly allow. Screen-derived local training and user-requested accessibility clicks require separate opt-ins. Known sensitive app categories are blocked using best-effort matching; detection is not exhaustive.</string>
 </resources>
