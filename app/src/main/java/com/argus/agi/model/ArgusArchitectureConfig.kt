@@ -36,7 +36,7 @@ data class ArgusArchitectureConfig(
     val attentionKind: ArgusAttentionKind = ArgusAttentionKind.CAUSAL_MULTI_HEAD,
     val feedForwardKind: ArgusFeedForwardKind = ArgusFeedForwardKind.SWIGLU,
     val positionEncodingKind: ArgusPositionEncodingKind =
-        ArgusPositionEncodingKind.FIXED_SINUSOIDAL_TABLE,
+        ArgusPositionEncodingKind.ROTARY,
     val normalizationKind: ArgusNormalizationKind = ArgusNormalizationKind.LAYER_NORM,
     val tokenEmbeddingsAreTied: Boolean = false
 ) {
@@ -75,7 +75,7 @@ data class ArgusArchitectureConfig(
 
     companion object {
         const val CURRENT_SCHEMA_VERSION = 1
-        const val DEFAULT_ARCHITECTURE_ID = "argus.transformer.swiglu.v1"
+        const val DEFAULT_ARCHITECTURE_ID = "argus.transformer.swiglu.rope.v2"
         const val MINIMUM_VOCABULARY_SIZE = 9
     }
 }
@@ -95,14 +95,17 @@ fun EngineConfig.toArgusArchitectureConfig(
     feedForwardSize = dFf,
     vocabularySize = vocabularySize,
     contextLength = maxSeqLen,
-    adapterRank = loraRank
+    adapterRank = loraRank,
+    positionEncodingKind = positionEncoding
 )
 
 /**
  * Logical parameter and resident-buffer accounting for an Argus architecture.
  *
- * Position tables are resident tensors but are not trainable parameters in the
- * current fixed-sinusoidal implementation.
+ * The retired fixed-sinusoidal architecture kept a resident position table
+ * that was not a trainable parameter. The current rotary architecture has no
+ * position table at all: position enters only through the rotation applied to
+ * attention queries and keys, so its fixed position buffer count is zero.
  */
 data class ArgusParameterBreakdown(
     val tokenEmbeddingParameters: Long,

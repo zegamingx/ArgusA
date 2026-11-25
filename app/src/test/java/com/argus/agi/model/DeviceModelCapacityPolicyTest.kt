@@ -97,6 +97,9 @@ class InferenceMemoryEstimatorTest {
 
     @Test
     fun derivesWeightKvAndFixedPositionMemoryFromArgusArchitecture() {
+        // Explicitly the retired sinusoidal architecture: this fixture verifies
+        // the fixed position buffer derivation, which is zero under the
+        // current rotary default.
         val architecture = ArgusArchitectureConfig(
             layerCount = 2,
             hiddenSize = 32,
@@ -104,7 +107,8 @@ class InferenceMemoryEstimatorTest {
             feedForwardSize = 64,
             vocabularySize = 128,
             contextLength = 32,
-            adapterRank = 2
+            adapterRank = 2,
+            positionEncodingKind = ArgusPositionEncodingKind.FIXED_SINUSOIDAL_TABLE
         )
         val estimate = InferenceMemoryEstimator.estimate(
             architecture = architecture,

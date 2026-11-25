@@ -298,7 +298,7 @@ class GenesisModelManager(
         publish(GenesisLifecycleStage.INITIALIZING_PARAMETERS,
             "Initializing model weights locally (Xavier / He normal); no pretrained weights are downloaded...")
 
-        logs += "Parameters initialized locally with Xavier/Glorot initialization and sinusoidal positional vectors."
+        logs += "Parameters initialized locally with Xavier/Glorot initialization; position is carried by rotary embeddings on attention queries and keys, with no positional weight table."
         logs += "LoRA A uses Gaussian initialization; LoRA B starts at zero for stability."
         logs += "Integrity check: no model weights downloaded; the model identity is created locally."
         throttleStage()

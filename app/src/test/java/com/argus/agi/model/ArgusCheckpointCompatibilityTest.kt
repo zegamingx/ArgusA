@@ -77,6 +77,13 @@ class ArgusCheckpointCompatibilityTest {
 
             val header = ByteBuffer.wrap(checkpointBytes).order(ByteOrder.LITTLE_ENDIAN)
             val architectureIdLength = header.getInt(16)
+            val persistedArchitectureId = String(
+                checkpointBytes,
+                96,
+                architectureIdLength,
+                Charsets.UTF_8
+            )
+            assertEquals("argus.transformer.swiglu.rope.v2", persistedArchitectureId)
             val fingerprintOffset = 96 + architectureIdLength
             val persistedFingerprint = checkpointBytes.copyOfRange(
                 fingerprintOffset,
@@ -229,6 +236,36 @@ class ArgusCheckpointCompatibilityTest {
     }
 
     @Test
+    fun arg6LoaderRejectsPreRopeArchitectureIdUnderCleanBreak() {
+        val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
+        val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
+
+        try {
+            checkpoint.delete()
+            val config = smallEngineConfig(
+                TokenizerConfig(maxVocabularySize = 512, maxTokenLength = 32)
+            )
+            val original = ArgusNeuralEngine.createBlocking(context, config)
+            assertTrue(original.saveCheckpoint())
+
+            // Rebind the otherwise valid, checksum-consistent payload to the
+            // retired sinusoidal architecture ID. Under the Section 8.0 clean
+            // break the loader must refuse it at the architecture-ID gate
+            // instead of interpreting its tensors with the rotary layout.
+            rewritePersistedArchitectureId(checkpoint, "argus.transformer.swiglu.v1")
+
+            val restored = ArgusNeuralEngine.createBlocking(context, config)
+            val rejectedBytes = checkpoint.readBytes()
+            assertFalse(restored.loadCheckpointIfExists())
+            assertFalse(restored.isCheckpointStateVerified)
+            assertTrue(restored.isCheckpointRestoreBlocked)
+            assertArrayEquals(rejectedBytes, checkpoint.readBytes())
+        } finally {
+            restoreCheckpoint(checkpoint, previousCheckpoint)
+        }
+    }
+
+    @Test
     fun preReleaseArg3AndArg4CheckpointsAreRejectedWithoutMigration() {
         val checkpoint = File(context.filesDir, CHECKPOINT_FILE_NAME)
         val previousCheckpoint = checkpoint.takeIf(File::isFile)?.readBytes()
@@ -364,6 +401,34 @@ class ArgusCheckpointCompatibilityTest {
         }
         legacyHeader.putInt(88, checksum.value.toInt())
         file.writeBytes(arg5Bytes)
+    }
+
+    private fun rewritePersistedArchitectureId(file: File, replacementId: String) {
+        val originalBytes = file.readBytes()
+        val header = ByteBuffer.wrap(originalBytes).order(ByteOrder.LITTLE_ENDIAN)
+        val currentIdLength = header.getInt(16)
+        val replacementBytes = replacementId.toByteArray(Charsets.UTF_8)
+
+        val payload = ByteArray(
+            originalBytes.size - 96 - currentIdLength + replacementBytes.size
+        )
+        replacementBytes.copyInto(payload, 0)
+        originalBytes.copyInto(
+            payload,
+            replacementBytes.size,
+            96 + currentIdLength,
+            originalBytes.size
+        )
+
+        val rewritten = ByteArray(96 + payload.size)
+        originalBytes.copyInto(rewritten, 0, 0, 96)
+        payload.copyInto(rewritten, 96)
+        val rewrittenHeader = ByteBuffer.wrap(rewritten).order(ByteOrder.LITTLE_ENDIAN)
+        rewrittenHeader.putInt(16, replacementBytes.size)
+        rewrittenHeader.putLong(80, payload.size.toLong())
+        val checksum = CRC32().apply { update(payload) }
+        rewrittenHeader.putInt(88, checksum.value.toInt())
+        file.writeBytes(rewritten)
     }
 
     private fun restoreCheckpoint(file: File, previous: ByteArray?) {
