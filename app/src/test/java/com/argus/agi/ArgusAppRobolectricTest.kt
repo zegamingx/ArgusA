@@ -17,6 +17,7 @@ import com.argus.agi.sensor.DeviceGuard
 import android.os.PowerManager
 import com.argus.agi.service.ArgusForegroundService
 import com.argus.agi.service.ForegroundTrainingPresentation
+import com.argus.agi.service.ForegroundTrainingProgress
 import com.argus.agi.service.TrainingWakeLock
 import java.io.StringReader
 import java.nio.ByteBuffer
@@ -99,6 +100,38 @@ class ArgusAppRobolectricTest {
                 hasActiveWork = false,
                 hasQueuedWork = false
             )
+        )
+    }
+
+    @Test
+    fun foregroundNotificationProgressMatchesActiveDocumentCounts() {
+        val progress = ForegroundTrainingProgress(
+            completedChunks = 2311,
+            totalChunks = 10000
+        )
+        assertEquals(23, progress.percent)
+        assertEquals("2311 of 10000 chunks (23%)", progress.summary)
+    }
+
+    @Test
+    fun foregroundNotificationProgressHandlesEdgeCounts() {
+        assertEquals(
+            0,
+            ForegroundTrainingProgress(completedChunks = 0, totalChunks = 0).percent
+        )
+        assertEquals(
+            "0 of 0 chunks (0%)",
+            ForegroundTrainingProgress(completedChunks = 0, totalChunks = 0).summary
+        )
+        // A count past the total (transient state while a document rolls over)
+        // must clamp the percentage instead of reporting more than 100%.
+        assertEquals(
+            100,
+            ForegroundTrainingProgress(completedChunks = 12, totalChunks = 10).percent
+        )
+        assertEquals(
+            100,
+            ForegroundTrainingProgress(completedChunks = 10, totalChunks = 10).percent
         )
     }
 
