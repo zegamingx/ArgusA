@@ -57,10 +57,15 @@ data class EngineConfig(
     val modelTier: ArgusDeviceModelTier = ArgusDeviceModelTier.COMPACT,
     val trainingBatchSize: Int = modelTier.defaultTrainingBatchSize,
     val gradientAccumulationEnabled: Boolean = true,
-    val initialVocabularyCapacity: Int = tokenizerConfig.maxVocabularySize
+    val initialVocabularyCapacity: Int = tokenizerConfig.maxVocabularySize,
+    val positionEncoding: ArgusPositionEncodingKind = ArgusPositionEncodingKind.ROTARY
 ) {
     init {
         require(dModel > 0) { "dModel must be positive." }
+        require(positionEncoding == ArgusPositionEncodingKind.ROTARY) {
+            "The executable engine implements rotary position embeddings only; " +
+                "the fixed sinusoidal table belongs to the retired v1 architecture."
+        }
         require(nHeads > 0 && dModel % nHeads == 0) {
             "nHeads must be positive and divide dModel evenly."
         }
@@ -92,22 +97,22 @@ data class EngineConfig(
             feedForwardSize = dFf,
             vocabularySize = initialVocabularyCapacity,
             contextLength = maxSeqLen,
-            adapterRank = loraRank
+            adapterRank = loraRank,
+            positionEncodingKind = positionEncoding
         )
-        val parameterCount = ArgusArchitectureParameterEstimator
+        val parameterBreakdown = ArgusArchitectureParameterEstimator
             .estimate(estimatedArchitecture)
-            .totalTrainableParameters
+        val parameterCount = parameterBreakdown.totalTrainableParameters
         val trainingFloorBytes = if (gradientAccumulationEnabled) {
             TrainingMemoryPlanner.minimumAccumulatedTrainingStateBytes(parameterCount)
         } else {
             TrainingMemoryPlanner.minimumTrainingStateBytes(parameterCount)
         }
-        val positionElements = Math.multiplyExact(maxSeqLen.toLong(), hidden)
-        require(positionElements <= Int.MAX_VALUE.toLong()) {
-            "Position tensor dimensions exceed JVM array limits."
-        }
+        // Rotary embeddings keep no resident position table, so the estimator
+        // reports zero fixed position elements for the current architecture
+        // and no heap is reserved for one.
         val positionBufferBytes = Math.multiplyExact(
-            positionElements,
+            parameterBreakdown.fixedPositionBufferElements,
             Float.SIZE_BYTES.toLong()
         )
         val attentionScratchBytes = Math.multiplyExact(
@@ -225,10 +230,10 @@ data class EngineConfig(
                 tier == ArgusDeviceModelTier.FLAGSHIP
             ) 8 else 4
             val contextLength = when (tier) {
-                ArgusDeviceModelTier.COMPACT -> 64
-                ArgusDeviceModelTier.BALANCED -> 128
-                ArgusDeviceModelTier.PERFORMANCE -> 160
-                ArgusDeviceModelTier.FLAGSHIP -> 192
+                ArgusDeviceModelTier.COMPACT -> 128
+                ArgusDeviceModelTier.BALANCED -> 256
+                ArgusDeviceModelTier.PERFORMANCE -> 320
+                ArgusDeviceModelTier.FLAGSHIP -> 384
             }
 
             for (layers in 1..32) {
@@ -239,7 +244,8 @@ data class EngineConfig(
                     feedForwardSize = feedForward,
                     vocabularySize = tier.vocabularyCapacity,
                     contextLength = contextLength,
-                    adapterRank = rank
+                    adapterRank = rank,
+                    positionEncodingKind = ArgusPositionEncodingKind.ROTARY
                 )
                 val parameterCount = ArgusArchitectureParameterEstimator
                     .estimate(architecture)
@@ -488,6 +494,32 @@ class ArgusNeuralEngine private constructor(
         computeBackend.resetForRetry()
     }
 
+    /**
+     * Automatic, bounded Vulkan recovery for an active training session
+     * (AGENTS.md §5.2): when a dispatch failure has latched the verified Vulkan
+     * runtime off, rebuild it through the normal reset/initialization path —
+     * which re-synchronizes model tensor residency from the authoritative host
+     * state — once the recovery policy's backoff releases an attempt. Model
+     * parameters, optimizer state, and training progress live on the host and
+     * are never reset by a backend transition. Returns true only when an
+     * attempt ran and the runtime is verified again.
+     */
+    internal fun attemptAutomaticVulkanRecovery(
+        nowMillis: Long = System.currentTimeMillis()
+    ): Boolean {
+        if (computeBackend !== VulkanTrainingBackend) return false
+        if (VulkanTrainingBackend.automaticRecoveryDecision(nowMillis) !=
+            VulkanRuntimeRecoveryPolicy.Decision.ATTEMPT
+        ) {
+            return false
+        }
+        VulkanTrainingBackend.onAutomaticRecoveryAttemptStarted()
+        resetOptionalVulkanRuntimeForRetry()
+        val recovered = initializeOptionalVulkanRuntime()
+        VulkanTrainingBackend.recordAutomaticRecoveryOutcome(nowMillis, recovered)
+        return recovered
+    }
+
     private fun synchronizeVulkanModelTensorResidency(reason: String) {
         if (!VulkanTrainingBackend.isFp16ComputeAvailable &&
             !VulkanTrainingBackend.isResidentActivationLinearAvailable) {
@@ -511,8 +543,9 @@ class ArgusNeuralEngine private constructor(
     private var vocabCap = max(tokenizer.vocabSize + 32, config.initialVocabularyCapacity)
 
     // Embeddings and trainable weights use FP16; activations and optimizer state remain FP32.
+    // Position is not stored: rotary embeddings rotate attention queries and
+    // keys in place, so the retired fixed sinusoidal table no longer exists.
     private var wEmbed = Float16ParameterArray(vocabCap * dModel)
-    private val wPos = FloatArray(maxSeqLen * dModel)
 
     // LM Output Head
     private var wHead = Float16ParameterArray(vocabCap * dModel)
@@ -752,7 +785,8 @@ class ArgusNeuralEngine private constructor(
                         feedForwardSize = saved.dFf,
                         vocabularySize = saved.initialVocabularyCapacity,
                         contextLength = saved.maxSeqLen,
-                        adapterRank = saved.loraRank
+                        adapterRank = saved.loraRank,
+                        positionEncodingKind = saved.positionEncoding
                     )
                 ).totalTrainableParameters
             }
@@ -765,7 +799,8 @@ class ArgusNeuralEngine private constructor(
                         feedForwardSize = selected.dFf,
                         vocabularySize = selected.initialVocabularyCapacity,
                         contextLength = selected.maxSeqLen,
-                        adapterRank = selected.loraRank
+                        adapterRank = selected.loraRank,
+                        positionEncodingKind = selected.positionEncoding
                     )
                 ).totalTrainableParameters
             }
@@ -956,20 +991,11 @@ class ArgusNeuralEngine private constructor(
     }
 
     // =====================================================================
-    // Weight Initialization (Xavier / He Normal & Sinusoids)
+    // Weight Initialization (Xavier / He Normal)
     // =====================================================================
     private fun initializeWeights() {
         val stdEmbed = 1.0f / sqrt(dModel.toFloat())
         for (i in wEmbed.indices) wEmbed[i] = (Random.nextFloat() * 2f - 1f) * stdEmbed
-
-        for (pos in 0 until maxSeqLen) {
-            for (i in 0 until dModel) {
-                val freq = 1.0 / Math.pow(10000.0, (2 * (i / 2)).toDouble() / dModel)
-                val raw = if (i % 2 == 0) Math.sin(pos * freq).toFloat()
-                else Math.cos(pos * freq).toFloat()
-                wPos[pos * dModel + i] = raw * 0.2f
-            }
-        }
 
         val stdAttn = 1.0f / sqrt(dModel.toFloat())
         val stdLora = 1.0f / sqrt(loraRank.toFloat())
@@ -1015,9 +1041,11 @@ class ArgusNeuralEngine private constructor(
         get() = ArgusArchitectureParameterEstimator.estimate(architectureConfig)
 
     /**
-     * Preserves the historical resident-tensor element count, including the
-     * fixed sinusoidal position table. Use countTrainableParameters() when a
-     * strict trainable-weight count is required.
+     * Resident-tensor element count. The rotary architecture keeps no
+     * position table, so this equals the trainable count; the estimator still
+     * reports a separate fixed position buffer for the retired sinusoidal
+     * architecture. Use countTrainableParameters() when a strict
+     * trainable-weight count is required.
      */
     fun countTotalParameters(): Long =
         parameterBreakdown.totalResidentModelElements
@@ -1204,16 +1232,21 @@ class ArgusNeuralEngine private constructor(
             // Prefill: K,V untuk semua posisi prompt dan aktivasi multi-layer
             for (pos in 0 until initialLen) {
                 generationContext.ensureActive()
-                computeTokenEmbedAndPos(currentTokens[pos], pos, embedScale, hidden)
+                computeTokenEmbedding(currentTokens[pos], embedScale, hidden)
                 for (layer in 0 until layerCount) {
                     generationContext.ensureActive()
                     val b = blocks[layer]
                     computeLinear(hidden, b.wK, dModel, dModel, k)
+                    // Keys enter the cache already rotated for their position;
+                    // queries are rotated for the current position, matching
+                    // the training forward pass exactly.
+                    RotaryPositionEncoding.rotateRowInPlace(k, nHeads, headDim, pos)
                     System.arraycopy(k, 0, kCache[layer], pos * dModel, dModel)
                     computeLinearWithLora(hidden, b.wV, b.loraVa, b.loraVb, dModel, dModel, loraRank, loraMid, v)
                     System.arraycopy(v, 0, vCache[layer], pos * dModel, dModel)
 
                     computeLinearWithLora(hidden, b.wQ, b.loraQa, b.loraQb, dModel, dModel, loraRank, loraMid, q)
+                    RotaryPositionEncoding.rotateRowInPlace(q, nHeads, headDim, pos)
 
                     attnOut.fill(0f)
                     val seqSoFar = pos + 1
@@ -1275,19 +1308,21 @@ class ArgusNeuralEngine private constructor(
                 if (currentPos >= maxSeqLen - 1) break
 
                 val lastTok = currentTokens[currentPos]
-                computeTokenEmbedAndPos(lastTok, currentPos, embedScale, hidden)
+                computeTokenEmbedding(lastTok, embedScale, hidden)
 
                 for (layer in 0 until layerCount) {
                     generationContext.ensureActive()
                     val b = blocks[layer]
                     if (step > 0) {
                         computeLinear(hidden, b.wK, dModel, dModel, k)
+                        RotaryPositionEncoding.rotateRowInPlace(k, nHeads, headDim, currentPos)
                         System.arraycopy(k, 0, kCache[layer], currentPos * dModel, dModel)
                         computeLinearWithLora(hidden, b.wV, b.loraVa, b.loraVb, dModel, dModel, loraRank, loraMid, v)
                         System.arraycopy(v, 0, vCache[layer], currentPos * dModel, dModel)
                     }
 
                     computeLinearWithLora(hidden, b.wQ, b.loraQa, b.loraQb, dModel, dModel, loraRank, loraMid, q)
+                    RotaryPositionEncoding.rotateRowInPlace(q, nHeads, headDim, currentPos)
 
                     attnOut.fill(0f)
                     val seqSoFar = currentPos + 1
@@ -2167,7 +2202,7 @@ class ArgusNeuralEngine private constructor(
         val logits = Array(seqLen) { FloatArray(currentVocab) }
 
         for (t in 0 until seqLen) {
-            computeTokenEmbedAndPos(seq[t], t, embedScale, x[t])
+            computeTokenEmbedding(seq[t], embedScale, x[t])
         }
 
         class LayerForward(seqLen: Int, dModel: Int, dFf: Int, loraRank: Int, nHeads: Int) {
@@ -2209,6 +2244,12 @@ class ArgusNeuralEngine private constructor(
                 addLoraProjection(layerInput[t], b.loraVa, b.loraVb, dModel, dModel, loraRank, lf.mV[t], lf.v[t])
             }
 
+            // Rotary position embedding: rotate queries and keys in place, per
+            // head and position, before any attention path consumes them. The
+            // resident Vulkan graph packs these same host rows into its arena,
+            // so the GPU and Kotlin paths score identical rotated vectors.
+            RotaryPositionEncoding.rotateRowsInPlace(lf.q, nHeads, headDim)
+            RotaryPositionEncoding.rotateRowsInPlace(lf.k, nHeads, headDim)
 
             val residentAttentionCompleted = VulkanTrainingBackend.tryApplyResidentAttention(
                 queryRows = lf.q,
@@ -2829,6 +2870,14 @@ class ArgusNeuralEngine private constructor(
                     System.arraycopy(dValueByHead[head][time], 0, dV[time], headOffset, headDim)
                 }
             }
+
+            // The score gradients above are derivatives with respect to the
+            // rotated queries and keys. Rotary rotation is orthogonal, so its
+            // exact adjoint is the inverse rotation: applying it to dQ and dK
+            // yields the gradients for the unrotated projections that feed the
+            // Q/K weight gradients and the layer-input gradient below.
+            RotaryPositionEncoding.rotateRowsInPlace(dQ, nHeads, headDim, inverse = true)
+            RotaryPositionEncoding.rotateRowsInPlace(dK, nHeads, headDim, inverse = true)
 
             val inputRowsForGradient = Array(attentionBackwardRows) { row -> layerInput[row] }
             val transposedInputRows = transposeRows(inputRowsForGradient)
@@ -3705,10 +3754,14 @@ class ArgusNeuralEngine private constructor(
         }
     }
 
-    private fun computeTokenEmbedAndPos(tokenId: Int, pos: Int, scale: Float, out: FloatArray) {
+    /**
+     * Writes the scaled token embedding for [tokenId]. No position signal is
+     * added here: rotary embeddings carry position exclusively through the
+     * rotation of attention queries and keys.
+     */
+    private fun computeTokenEmbedding(tokenId: Int, scale: Float, out: FloatArray) {
         val embOffset = if (tokenId in 0 until vocabCap) tokenId * dModel else 0
-        val posOffset = (pos % maxSeqLen) * dModel
-        for (d in 0 until dModel) out[d] = wEmbed[embOffset + d] * scale + wPos[posOffset + d]
+        for (d in 0 until dModel) out[d] = wEmbed[embOffset + d] * scale
     }
 
     private fun computeLinear(

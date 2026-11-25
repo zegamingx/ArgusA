@@ -165,6 +165,7 @@ class ArgusAppRobolectricTest {
         )
         assertEquals(ArgusDeviceModelTier.COMPACT, compact.modelTier)
         assertEquals(1, compact.trainingBatchSize)
+        assertEquals(128, compact.maxSeqLen)
 
         val balanced = EngineConfig.forDevice(
             totalRamGb = 6,
@@ -173,6 +174,7 @@ class ArgusAppRobolectricTest {
         )
         assertEquals(ArgusDeviceModelTier.BALANCED, balanced.modelTier)
         assertEquals(1, balanced.trainingBatchSize)
+        assertEquals(256, balanced.maxSeqLen)
 
         val performance = EngineConfig.forDevice(
             totalRamGb = 8,
@@ -181,6 +183,7 @@ class ArgusAppRobolectricTest {
         )
         assertEquals(ArgusDeviceModelTier.PERFORMANCE, performance.modelTier)
         assertEquals(1, performance.trainingBatchSize)
+        assertEquals(320, performance.maxSeqLen)
 
         val flagship = EngineConfig.forDevice(
             totalRamGb = 12,
@@ -189,6 +192,7 @@ class ArgusAppRobolectricTest {
         )
         assertEquals(ArgusDeviceModelTier.FLAGSHIP, flagship.modelTier)
         assertEquals(1, flagship.trainingBatchSize)
+        assertEquals(384, flagship.maxSeqLen)
 
         val memoryConstrainedFlagship = EngineConfig.forDevice(
             totalRamGb = 12,
@@ -198,6 +202,7 @@ class ArgusAppRobolectricTest {
         )
         assertEquals(ArgusDeviceModelTier.PERFORMANCE, memoryConstrainedFlagship.modelTier)
         assertEquals(1, memoryConstrainedFlagship.trainingBatchSize)
+        assertEquals(320, memoryConstrainedFlagship.maxSeqLen)
 
         listOf(compact, balanced, performance, flagship, memoryConstrainedFlagship).forEach { config ->
             val architecture = ArgusArchitectureConfig(
@@ -240,7 +245,7 @@ class ArgusAppRobolectricTest {
             assertEquals(128, resolved.dModel)
             assertEquals(4, resolved.nHeads)
             assertEquals(384, resolved.dFf)
-            assertEquals(64, resolved.maxSeqLen)
+            assertEquals(128, resolved.maxSeqLen)
             assertEquals(4, resolved.loraRank)
             assertEquals(1_024, resolved.initialVocabularyCapacity)
             assertEquals(

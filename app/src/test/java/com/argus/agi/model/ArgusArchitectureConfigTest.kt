@@ -15,7 +15,8 @@ class ArgusArchitectureConfigTest {
             feedForwardSize = 32,
             vocabularySize = 256,
             contextLength = 16,
-            adapterRank = 2
+            adapterRank = 2,
+            positionEncodingKind = ArgusPositionEncodingKind.FIXED_SINUSOIDAL_TABLE
         )
 
         val estimate = ArgusArchitectureParameterEstimator.estimate(config)
@@ -65,6 +66,33 @@ class ArgusArchitectureConfigTest {
         )
 
         assertEquals(0L, estimate.fixedPositionBufferElements)
+    }
+
+    @Test
+    fun defaultArchitectureContractIsTheRotaryV2Lineage() {
+        val config = ArgusArchitectureConfig(
+            layerCount = 1,
+            hiddenSize = 16,
+            attentionHeadCount = 4,
+            feedForwardSize = 32,
+            vocabularySize = 256,
+            contextLength = 16,
+            adapterRank = 2
+        )
+
+        assertEquals("argus.transformer.swiglu.rope.v2", config.architectureId)
+        assertEquals(
+            "argus.transformer.swiglu.rope.v2",
+            ArgusArchitectureConfig.DEFAULT_ARCHITECTURE_ID
+        )
+        assertEquals(ArgusPositionEncodingKind.ROTARY, config.positionEncodingKind)
+
+        val estimate = ArgusArchitectureParameterEstimator.estimate(config)
+        assertEquals(0L, estimate.fixedPositionBufferElements)
+        assertEquals(
+            estimate.totalTrainableParameters,
+            estimate.totalResidentModelElements
+        )
     }
 
     @Test
