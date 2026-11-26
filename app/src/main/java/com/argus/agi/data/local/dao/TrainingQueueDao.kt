@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import com.argus.agi.data.local.entity.TrainingItemEntity
 import kotlinx.coroutines.flow.Flow
 
@@ -96,8 +97,25 @@ interface TrainingQueueDao {
     @Query("DELETE FROM training_items WHERE source LIKE :sourcePattern")
     suspend fun deleteItemsBySourcePattern(sourcePattern: String): Int
 
+    @Query("SELECT status FROM training_items WHERE id = :id LIMIT 1")
+    suspend fun getTrainingItemStatus(id: String): String?
+
     @Query("UPDATE training_items SET status = 'TRAINING' WHERE id = :id AND status = 'QUEUED'")
-    suspend fun markTrainingStarted(id: String): Int
+    suspend fun markQueuedTrainingStarted(id: String): Int
+
+    /**
+     * The Room update may commit even when cancellation prevents the caller from
+     * observing its successful return. Treat an already-TRAINING row as a durable
+     * acknowledgement so the in-memory queue retry cannot become permanently stuck.
+     * Keep the read and QUEUED -> TRAINING write in one transaction.
+     */
+    @Transaction
+    suspend fun markTrainingStarted(id: String): Boolean =
+        when (getTrainingItemStatus(id)) {
+            "TRAINING" -> true
+            "QUEUED" -> markQueuedTrainingStarted(id) == 1
+            else -> false
+        }
 
     /**
      * TrainingManager reconciles its checksummed optimizer-commit journal against the
