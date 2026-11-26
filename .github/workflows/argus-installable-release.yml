@@ -196,13 +196,25 @@ jobs:
 
           "${aapt}" dump xmltree "${apk_path}" AndroidManifest.xml > "${manifest_dump}"
 
-          grep -Fq 'ArgusForegroundService' "${manifest_dump}"
-          grep -Eq 'android:foregroundServiceType\([^)]*\)=(\(type [^)]*\))?0x0*800([[:space:]]|$)' "${manifest_dump}"
-          grep -Fq '="android.permission.FOREGROUND_SERVICE"' "${manifest_dump}"
-          grep -Fq '="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"' "${manifest_dump}"
-          grep -Fq 'android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE' "${manifest_dump}"
+          require_manifest_entry() {
+            local description="$1"
+            local pattern="$2"
+            if ! grep -Eq -- "$pattern" "${manifest_dump}"; then
+              echo "::error::Packaged AndroidManifest.xml is missing ${description}."
+              echo "::group::Packaged AndroidManifest.xml dump"
+              cat "${manifest_dump}"
+              echo "::endgroup::"
+              exit 1
+            fi
+          }
 
-          echo "Verified packaged ArgusForegroundService: specialUse (0x00000800), base/type permissions, and subtype property."
+          require_manifest_entry "ArgusForegroundService declaration" 'ArgusForegroundService'
+          require_manifest_entry "specialUse foreground service type" 'android:foregroundServiceType\([^)]*\)=\(type specialUse\)|android:foregroundServiceType\([^)]*\)=0x0*40000000([[:space:]]|$)|android:foregroundServiceType\([^)]*\)=1073741824([[:space:]]|$)'
+          require_manifest_entry "FOREGROUND_SERVICE permission" '="android.permission.FOREGROUND_SERVICE"'
+          require_manifest_entry "FOREGROUND_SERVICE_SPECIAL_USE permission" '="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"'
+          require_manifest_entry "PROPERTY_SPECIAL_USE_FGS_SUBTYPE property" 'android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE'
+
+          echo "Verified packaged ArgusForegroundService: specialUse (0x40000000), base/type permissions, and subtype property."
 
       - name: Sign and cryptographically verify the production APK
         shell: bash
