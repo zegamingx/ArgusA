@@ -323,6 +323,14 @@ class ArgusForegroundService : Service() {
         val progress: ForegroundTrainingProgress?
     )
 
+    /** State from the four training-manager flows, before applying device safety. */
+    private data class TrainingObservation(
+        val isPaused: Boolean,
+        val hasActiveWork: Boolean,
+        val hasQueuedWork: Boolean,
+        val progress: ForegroundTrainingProgress?
+    )
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -426,20 +434,16 @@ class ArgusForegroundService : Service() {
             }
             if (!ArgusApp.isTrainingManagerInitialized()) return@launch
             val trainingManager = ArgusApp.trainingManager
-            combine(
+            val trainingObservation = combine(
                 trainingManager.isTrainingPaused,
                 trainingManager.currentTrainingItem,
                 trainingManager.activeDocument,
-                trainingManager.nextQueue,
-                app.deviceGuard.safetyState
-            ) { isPaused, currentItem, activeDocument, queue, safetyState ->
-                NotificationSnapshot(
-                    presentation = presentationFor(
-                        isPaused = isPaused,
-                        hasActiveWork = currentItem != null || activeDocument != null,
-                        hasQueuedWork = queue.isNotEmpty(),
-                        isSafeToTrain = safetyState.isSafeToTrain
-                    ),
+                trainingManager.nextQueue
+            ) { isPaused, currentItem, activeDocument, queue ->
+                TrainingObservation(
+                    isPaused = isPaused,
+                    hasActiveWork = currentItem != null || activeDocument != null,
+                    hasQueuedWork = queue.isNotEmpty(),
                     progress = activeDocument
                         ?.takeIf { it.totalChunks > 0 }
                         ?.let { document ->
@@ -448,6 +452,21 @@ class ArgusForegroundService : Service() {
                                 totalChunks = document.totalChunks
                             )
                         }
+                )
+            }
+
+            // Keep the four-flow training projection separate from device safety.
+            // The typed binary combine avoids the Kotlin 2.4.21 inference failure
+            // reported for the five-flow overload (cannot infer T5).
+            combine(trainingObservation, app.deviceGuard.safetyState) { observation, safetyState ->
+                NotificationSnapshot(
+                    presentation = presentationFor(
+                        isPaused = observation.isPaused,
+                        hasActiveWork = observation.hasActiveWork,
+                        hasQueuedWork = observation.hasQueuedWork,
+                        isSafeToTrain = safetyState.isSafeToTrain
+                    ),
+                    progress = observation.progress
                 )
             }
                 .distinctUntilChanged()
