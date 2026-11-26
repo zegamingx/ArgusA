@@ -190,7 +190,7 @@ class ArgusForegroundService : Service() {
             val requiredType = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             check((declaredType and requiredType) == requiredType) {
                 "Merged manifest does not declare specialUse for ArgusForegroundService: " +
-                    "declaredTypeMask=0x\${Integer.toHexString(declaredType)}."
+                    "declaredTypeMask=0x${Integer.toHexString(declaredType)}."
             }
             return requiredType
         }
@@ -339,16 +339,16 @@ class ArgusForegroundService : Service() {
             startForegroundCompat()
         } catch (error: Exception) {
             val declaredMask = declaredForegroundServiceType
-                ?.let { "0x\${Integer.toHexString(it)}" }
+                ?.let { "0x${Integer.toHexString(it)}" }
                 ?: "unavailable"
             val detail = error.message
                 ?.takeIf { it.isNotBlank() }
                 ?.let { "; detail=$it" }
                 .orEmpty()
             val message =
-                "Foreground service promotion failed: \${error.javaClass.simpleName}; " +
+                "Foreground service promotion failed: ${error.javaClass.simpleName}; " +
                     "manifestTypeMask=$declaredMask; " +
-                    "requestedTypeMask=0x\${Integer.toHexString(foregroundServiceType)}" +
+                    "requestedTypeMask=0x${Integer.toHexString(foregroundServiceType)}" +
                     detail
             ArgusDiagnosticBridge.error(TAG, message, error)
             stopSelfResult(startId)

@@ -191,16 +191,16 @@ jobs:
         run: |
           set -euo pipefail
           apk_path="app/build/outputs/apk/release/app-release-unsigned.apk"
-          manifest_dump="\${RUNNER_TEMP}/argus-release-manifest.xmltree"
-          aapt="\${ANDROID_HOME}/build-tools/37.0.0/aapt"
+          manifest_dump="${RUNNER_TEMP}/argus-release-manifest.xmltree"
+          aapt="${ANDROID_HOME}/build-tools/37.0.0/aapt"
 
-          "\${aapt}" dump xmltree "\${apk_path}" AndroidManifest.xml > "\${manifest_dump}"
+          "${aapt}" dump xmltree "${apk_path}" AndroidManifest.xml > "${manifest_dump}"
 
-          grep -Fq 'com.argus.agi.service.ArgusForegroundService' "\${manifest_dump}"
-          grep -Eq 'android:foregroundServiceType\\([^)]*\\)=0x40000000([[:space:]]|$)' "\${manifest_dump}"
-          grep -Fq 'android.permission.FOREGROUND_SERVICE' "\${manifest_dump}"
-          grep -Fq 'android.permission.FOREGROUND_SERVICE_SPECIAL_USE' "\${manifest_dump}"
-          grep -Fq 'android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE' "\${manifest_dump}"
+          grep -Fq 'com.argus.agi.service.ArgusForegroundService' "${manifest_dump}"
+          grep -Eq 'android:foregroundServiceType\([^)]*\)=0x40000000([[:space:]]|$)' "${manifest_dump}"
+          grep -Fq 'android.permission.FOREGROUND_SERVICE' "${manifest_dump}"
+          grep -Fq 'android.permission.FOREGROUND_SERVICE_SPECIAL_USE' "${manifest_dump}"
+          grep -Fq 'android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE' "${manifest_dump}"
 
           echo "Verified packaged ArgusForegroundService: specialUse type, base/type permissions, and subtype property."
 
