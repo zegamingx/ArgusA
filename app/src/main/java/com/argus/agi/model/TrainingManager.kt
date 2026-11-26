@@ -155,6 +155,21 @@ data class ValidationCorpusEvaluation(
     val reasoningPerplexity: Float = Float.NaN
 )
 
+/**
+ * Memory-pressure trimming is allowed only at a quiescent training boundary.
+ * The caller must hold workerExecutionMutex while checking this policy.
+ */
+internal fun shouldReleaseVulkanResidencyForMemoryPressure(
+    managerClosed: Boolean,
+    hasCurrentItem: Boolean,
+    hasActiveDocument: Boolean,
+    hasQueuedWork: Boolean
+): Boolean =
+    !managerClosed &&
+        !hasCurrentItem &&
+        !hasActiveDocument &&
+        !hasQueuedWork
+
 class TrainingManager internal constructor(
     context: Context,
     private val neuralEngine: ArgusNeuralEngine,
@@ -455,6 +470,28 @@ class TrainingManager internal constructor(
         startTrainingWorker()
     }
 
+    /**
+     * Release rebuildable GPU residency only while the worker is at an idle boundary.
+     * Serializing with the worker prevents a memory-trim callback from clearing
+     * Vulkan allocations during an optimizer transaction. A newly queued batch
+     * restores residency through the worker's pre-batch recovery path.
+     */
+    internal suspend fun releaseVulkanTensorResidencyForMemoryPressureIfIdle(): Boolean {
+        workerExecutionMutex.lock()
+        try {
+            val canRelease = shouldReleaseVulkanResidencyForMemoryPressure(
+                managerClosed = closed,
+                hasCurrentItem = _currentTrainingItem.value != null,
+                hasActiveDocument = _activeDocument.value != null,
+                hasQueuedWork = _nextQueue.value.isNotEmpty()
+            )
+            if (!canRelease) return false
+            return neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()
+        } finally {
+            workerExecutionMutex.unlock()
+        }
+    }
+
     private fun createGrpoRuntimeConfiguration(requestedGroupSize: Int): RuntimeConfiguration {
         require(requestedGroupSize in 2..8)
         deviceGuard.refreshState()
@@ -538,6 +575,12 @@ class TrainingManager internal constructor(
                     _currentTrainingItem.value == null
             ) {
                 "GRPO requires an idle SFT queue. Finish or clear queued SFT work before starting policy optimization."
+            }
+
+            // GRPO uses the same Vulkan arena as SFT. It must be able to
+            // restore background-released residency without an Activity callback.
+            if (!neuralEngine.vulkanModelTensorResidencyReady.value) {
+                neuralEngine.resumeVulkanTensorResidencyAfterForeground()
             }
 
             return GrpoTrainer(neuralEngine).train(
@@ -3384,6 +3427,13 @@ class TrainingManager internal constructor(
                         updateActiveDocumentEntering(activeItems.first())
 
                         try {
+                            // Background memory pressure can invalidate the rebuildable Vulkan
+                            // tensor arena while this Application-scoped worker remains active.
+                            // Restore it here rather than relying on an Activity resume callback.
+                            if (!neuralEngine.vulkanModelTensorResidencyReady.value) {
+                                neuralEngine.resumeVulkanTensorResidencyAfterForeground()
+                            }
+
                             if (!processBatch(activeItems, runtimeConfiguration.effectiveContextLength)) {
                                 validationRunHadFailures = true
                             } else {

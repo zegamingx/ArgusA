@@ -492,21 +492,24 @@ class ArgusApp : Application() {
     }
 
     override fun onTrimMemory(level: Int) {
-    super.onTrimMemory(level)
-    if (level < ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) return
-    val engine = if (_neuralEngine.isInitialized()) _neuralEngine.value else return
-    val previousTrim = residencyTrimJob
-    residencyTrimJob = applicationScope.launch(Dispatchers.IO) {
-        previousTrim?.join()
-        val released = engine.releaseVulkanTensorResidencyForMemoryPressure()
-        if (released) {
-            Log.i(
-                TAG,
-                "Persistent Vulkan model residency released after memory-trim callback (level=$level)."
-            )
+        super.onTrimMemory(level)
+        if (level < ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) return
+        if (_coreInitializationState.value !is ArgusCoreInitializationState.Ready) return
+        if (!isTrainingManagerInitialized()) return
+
+        val manager = trainingManager
+        val previousTrim = residencyTrimJob
+        residencyTrimJob = applicationScope.launch(Dispatchers.IO) {
+            previousTrim?.join()
+            val released = manager.releaseVulkanTensorResidencyForMemoryPressureIfIdle()
+            if (released) {
+                Log.i(
+                    TAG,
+                    "Released idle Vulkan tensor residency after memory-trim callback (level=$level)."
+                )
+            }
         }
     }
-}
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return

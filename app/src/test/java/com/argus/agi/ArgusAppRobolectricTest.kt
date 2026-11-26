@@ -12,6 +12,7 @@ import com.argus.agi.model.ArgusTokenizerAlgorithm
 import com.argus.agi.model.Tokenizer
 import com.argus.agi.model.TokenizerConfig
 import com.argus.agi.model.TrainingManager
+import com.argus.agi.model.shouldReleaseVulkanResidencyForMemoryPressure
 import com.argus.agi.model.WorldModel
 import com.argus.agi.sensor.DeviceGuard
 import android.os.PowerManager
@@ -47,11 +48,54 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun foregroundTrainingServiceUsesSpecialUseTypeOnly() {
-        // minSdk is 34, where specialUse exists; there is no dataSync variant.
+    fun foregroundTrainingServiceUsesManifestDeclaredType() {
         assertEquals(
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST,
             ArgusForegroundService.foregroundServiceType
+        )
+    }
+
+    @Test
+    fun backgroundMemoryTrimReleasesVulkanResidencyOnlyAtAnIdleWorkerBoundary() {
+        assertFalse(
+            shouldReleaseVulkanResidencyForMemoryPressure(
+                managerClosed = true,
+                hasCurrentItem = false,
+                hasActiveDocument = false,
+                hasQueuedWork = false
+            )
+        )
+        assertFalse(
+            shouldReleaseVulkanResidencyForMemoryPressure(
+                managerClosed = false,
+                hasCurrentItem = true,
+                hasActiveDocument = false,
+                hasQueuedWork = false
+            )
+        )
+        assertFalse(
+            shouldReleaseVulkanResidencyForMemoryPressure(
+                managerClosed = false,
+                hasCurrentItem = false,
+                hasActiveDocument = true,
+                hasQueuedWork = false
+            )
+        )
+        assertFalse(
+            shouldReleaseVulkanResidencyForMemoryPressure(
+                managerClosed = false,
+                hasCurrentItem = false,
+                hasActiveDocument = false,
+                hasQueuedWork = true
+            )
+        )
+        assertTrue(
+            shouldReleaseVulkanResidencyForMemoryPressure(
+                managerClosed = false,
+                hasCurrentItem = false,
+                hasActiveDocument = false,
+                hasQueuedWork = false
+            )
         )
     }
 
