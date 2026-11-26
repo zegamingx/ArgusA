@@ -463,7 +463,7 @@ class ArgusForegroundService : Service() {
             // Keep device safety as an independent collector. This avoids the
             // Kotlin 2.4.21 Flow.combine overload inference failure while preserving
             // immediate notification updates when thermal/battery safety changes.
-            latestSafetyAllowsTraining = app.deviceGuard.safetyState.value.isSafeToTrain
+            acceptSafetyState(app.deviceGuard.safetyState.value.isSafeToTrain)
             safetyObservationJob = serviceScope.launch {
                 app.deviceGuard.safetyState.collect { safetyState ->
                     acceptSafetyState(safetyState.isSafeToTrain)
