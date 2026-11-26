@@ -38,6 +38,7 @@ import kotlinx.coroutines.launch
 internal enum class ForegroundTrainingPresentation {
     STARTING,
     ACTIVE,
+    WAITING,
     PAUSED,
     IDLE
 }
@@ -198,12 +199,22 @@ class ArgusForegroundService : Service() {
         internal fun presentationFor(
             isPaused: Boolean,
             hasActiveWork: Boolean,
-            hasQueuedWork: Boolean
+            hasQueuedWork: Boolean,
+            isSafeToTrain: Boolean = true
         ): ForegroundTrainingPresentation = when {
             isPaused -> ForegroundTrainingPresentation.PAUSED
-            hasActiveWork || hasQueuedWork -> ForegroundTrainingPresentation.ACTIVE
+            hasActiveWork -> ForegroundTrainingPresentation.ACTIVE
+            hasQueuedWork && isSafeToTrain -> ForegroundTrainingPresentation.ACTIVE
+            hasQueuedWork -> ForegroundTrainingPresentation.WAITING
             else -> ForegroundTrainingPresentation.IDLE
         }
+
+        internal fun batteryOptimizationWarning(isIgnoringBatteryOptimizations: Boolean): String? =
+            if (isIgnoringBatteryOptimizations) {
+                null
+            } else {
+                "Battery optimization may interrupt screen-off training"
+            }
 
         internal fun isUserStopped(context: Context): Boolean =
             context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
@@ -419,13 +430,15 @@ class ArgusForegroundService : Service() {
                 trainingManager.isTrainingPaused,
                 trainingManager.currentTrainingItem,
                 trainingManager.activeDocument,
-                trainingManager.nextQueue
-            ) { isPaused, currentItem, activeDocument, queue ->
+                trainingManager.nextQueue,
+                app.deviceGuard.safetyState
+            ) { isPaused, currentItem, activeDocument, queue, safetyState ->
                 NotificationSnapshot(
                     presentation = presentationFor(
                         isPaused = isPaused,
                         hasActiveWork = currentItem != null || activeDocument != null,
-                        hasQueuedWork = queue.isNotEmpty()
+                        hasQueuedWork = queue.isNotEmpty(),
+                        isSafeToTrain = safetyState.isSafeToTrain
                     ),
                     progress = activeDocument
                         ?.takeIf { it.totalChunks > 0 }
@@ -518,11 +531,21 @@ class ArgusForegroundService : Service() {
         val currentPresentation = presentation
         val currentProgress = progress
         val progressSuffix = currentProgress?.let { " • ${it.summary}" } ?: ""
+        val batteryWarning = if (currentPresentation == ForegroundTrainingPresentation.ACTIVE) {
+            batteryOptimizationWarning(
+                getSystemService(PowerManager::class.java)
+                    ?.isIgnoringBatteryOptimizations(packageName) == true
+            )?.let { " • $it" }.orEmpty()
+        } else {
+            ""
+        }
         val contentText = when (currentPresentation) {
             ForegroundTrainingPresentation.STARTING ->
                 "On-device compute service is starting"
             ForegroundTrainingPresentation.ACTIVE ->
-                "Training in progress$progressSuffix"
+                "Training in progress$progressSuffix$batteryWarning"
+            ForegroundTrainingPresentation.WAITING ->
+                "Training queued — waiting for safe device conditions"
             ForegroundTrainingPresentation.PAUSED ->
                 "Training paused$progressSuffix"
             ForegroundTrainingPresentation.IDLE ->
