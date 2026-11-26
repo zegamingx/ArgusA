@@ -3384,6 +3384,13 @@ class TrainingManager internal constructor(
                         updateActiveDocumentEntering(activeItems.first())
 
                         try {
+                            // Background memory pressure can invalidate the rebuildable Vulkan
+                            // tensor arena while this Application-scoped worker remains active.
+                            // Restore it here rather than relying on an Activity resume callback.
+                            if (!neuralEngine.vulkanModelTensorResidencyReady.value) {
+                                neuralEngine.resumeVulkanTensorResidencyAfterForeground()
+                            }
+
                             if (!processBatch(activeItems, runtimeConfiguration.effectiveContextLength)) {
                                 validationRunHadFailures = true
                             } else {
