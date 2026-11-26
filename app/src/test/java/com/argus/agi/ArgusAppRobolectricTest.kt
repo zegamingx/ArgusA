@@ -73,7 +73,7 @@ class ArgusAppRobolectricTest {
         }.exceptionOrNull()
 
         assertTrue(failure is IllegalStateException)
-        assertTrue(failure.message.orEmpty().contains("specialUse"))
+        assertTrue(failure?.message.orEmpty().contains("specialUse"))
     }
 
     @Test
