@@ -2,7 +2,6 @@ package com.argus.agi.service
 
 import com.argus.agi.diagnostics.ArgusDiagnosticBridge
 
-import android.app.InvalidForegroundServiceTypeException
 import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -173,12 +172,11 @@ class ArgusForegroundService : Service() {
         private const val KEY_USER_STOPPED = "user_stopped_background_service"
 
         /**
-         * minSdk is 34, where specialUse is available, so the runtime type is
-         * unconditionally SPECIAL_USE. There is no dataSync variant: API 29-33 devices
-         * cannot install the app.
+         * Let Android apply the service types declared in AndroidManifest.xml.
+         * The manifest owns the specialUse declaration and its subtype description.
          */
         internal val foregroundServiceType: Int =
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST
 
         internal fun presentationFor(
             isPaused: Boolean,
@@ -352,25 +350,11 @@ class ArgusForegroundService : Service() {
     }
 
     private fun startForegroundCompat() {
-        val notification = buildNotification()
-        try {
-            startForeground(NOTIFICATION_ID, notification, foregroundServiceType)
-        } catch (error: InvalidForegroundServiceTypeException) {
-            // Observed on Android 15 (API 35, Infinix X6725C): the system rejects the
-            // explicit SPECIAL_USE type at promotion time even though the manifest
-            // declares specialUse, the subtype property, and the
-            // FOREGROUND_SERVICE_SPECIAL_USE permission. The manifest is the single
-            // source of truth for the type, so retry letting the system take the
-            // declared type from the manifest instead of the runtime argument. If
-            // this also fails, the exception propagates to onStartCommand, which
-            // logs it and stops the service rather than crashing the process.
-            ArgusDiagnosticBridge.warning(
-                TAG,
-                "Typed foreground promotion was rejected; retrying with the manifest-declared type.",
-                error
-            )
-            startForeground(NOTIFICATION_ID, notification)
-        }
+        startForeground(
+            NOTIFICATION_ID,
+            buildNotification(),
+            foregroundServiceType
+        )
     }
 
     /**
