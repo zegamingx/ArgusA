@@ -43,7 +43,7 @@ class HardwareProfileTest {
         )
 
         assertEquals(ArgusDeviceModelTier.PERFORMANCE, profile.tier)
-        assertEquals(1, profile.trainingBatchSize)
+        assertEquals(2, profile.trainingBatchSize)
         assertEquals(4_096, profile.tier.vocabularyCapacity)
     }
 }

@@ -194,6 +194,36 @@ class DeviceAdaptiveRuntimePolicyTest {
     }
 
     @Test
+    fun twoSampleTierUsesTwoWhenHealthyAndFallsBackToOneWhenConstrained() {
+        val healthyBatch = DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
+            configuredBatchSize = 2,
+            thermalStatus = PowerManager.THERMAL_STATUS_LIGHT,
+            availableHeapBytes = 512L * 1024L * 1024L,
+            maximumHeapBytes = 1_024L * 1024L * 1024L,
+            availableSystemMemoryBytes = 1_024L * 1024L * 1024L,
+            isCharging = true,
+            batteryPct = 80
+        )
+        assertEquals(2, healthyBatch)
+
+        val memoryLimitedBatch = DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
+            configuredBatchSize = 2,
+            thermalStatus = PowerManager.THERMAL_STATUS_LIGHT,
+            availableHeapBytes = 128L * 1024L * 1024L,
+            maximumHeapBytes = 1_024L * 1024L * 1024L,
+            availableSystemMemoryBytes = 128L * 1024L * 1024L,
+            systemLowMemory = true
+        )
+        assertEquals(1, memoryLimitedBatch)
+
+        val thermallyLimitedBatch = DeviceAdaptiveRuntimePolicy.trainingBatchLimit(
+            configuredBatchSize = 2,
+            thermalStatus = PowerManager.THERMAL_STATUS_MODERATE
+        )
+        assertEquals(1, thermallyLimitedBatch)
+    }
+
+    @Test
     fun adaptiveBatchAndContextReduceLoadForPowerSavingAndRecovery() {
         assertEquals(
             4,

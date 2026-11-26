@@ -298,7 +298,7 @@ fun SkillsAndSettingsScreen(viewModel: ArgusViewModel) {
                     AnimatedVisibility(visible = isBatteryExpanded, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                         Column {
                             Spacer(modifier = Modifier.height(10.dp))
-                            Text(text = "Allow ARGUS to ignore battery optimization for more reliable background work. Android may still apply other background execution limits.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextSecondary, lineHeight = 16.sp)
+                            Text(text = "For screen-off training, Android Doze can ignore partial WakeLocks unless ARGUS is exempt from battery optimization. Enable the exemption here for more reliable background compute. This increases battery use, and Android or the device manufacturer may still apply other limits.", style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp), color = ArgusTextSecondary, lineHeight = 16.sp)
                             if (!isIgnoringOpt) {
                                 Spacer(modifier = Modifier.height(12.dp))
                                 Button(onClick = {

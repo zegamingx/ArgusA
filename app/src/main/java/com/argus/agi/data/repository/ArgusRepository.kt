@@ -273,7 +273,7 @@ class ArgusRepository(
     }
 
     suspend fun markTrainingStarted(id: String): Boolean = withContext(Dispatchers.IO) {
-        trainingQueueDao.markTrainingStarted(id) > 0
+        trainingQueueDao.markTrainingStarted(id)
     }
 
     suspend fun getTrainingItem(id: String): TrainingData? = withContext(Dispatchers.IO) {

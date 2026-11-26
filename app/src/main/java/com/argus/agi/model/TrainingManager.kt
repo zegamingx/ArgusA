@@ -3750,8 +3750,13 @@ class TrainingManager internal constructor(
                         "Training queue persistence is unavailable.",
                         repositoryInitialization.exceptionOrNull()
                     )
-                    check(repository.markTrainingStarted(operation.itemId)) {
-                        "Training queue item '${operation.itemId}' was not marked as TRAINING in Room."
+                    if (!repository.markTrainingStarted(operation.itemId)) {
+                        val persistedStatus = repository.getTrainingItem(operation.itemId)?.status?.name
+                            ?: "MISSING"
+                        throw IllegalStateException(
+                            "Training queue item '${operation.itemId}' could not enter TRAINING in Room " +
+                                "(persisted status: $persistedStatus)."
+                        )
                     }
                 }
                 result.onFailure { error ->

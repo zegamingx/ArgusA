@@ -126,7 +126,9 @@ Native builds install the checksum-pinned CMake 4.5.0 distribution and NDK r30.
 
 ## Background training service
 
-The foreground service uses the `specialUse` type on Android 14 (API 34) and later (the app's supported `minSdk = 34` target) for the ongoing user-visible local compute workload. The manifest and service helper retain the legacy `dataSync` fallback only for Android 13 (API 33) compatibility tests, and supply the required `specialUse` subtype explanation. Google Play still reviews the declared `specialUse` use case; declaring it does not guarantee policy approval.
+The foreground service uses the `specialUse` type on Android 14 (API 34) and later (the app's supported `minSdk = 34` target) for the ongoing user-visible local compute workload and supplies the required `specialUse` subtype explanation. The service returns `START_STICKY`, observes the application-scoped training worker, displays live queue/document progress, and holds a bounded partial WakeLock while training work is active; the lock is renewed every five minutes and released when training pauses, becomes idle, or the service is destroyed. The WakeLock does not replace the foreground service and is not a guarantee against OEM process management.
+
+Android Doze ignores application WakeLocks unless the app is on the battery-optimization exemption list. The **Skills & Privacy → Battery & Background** control opens Android's exemption request/settings screen and reflects the effective system state. Enable the exemption when uninterrupted screen-off training is required; doing so increases battery use, and Android/OEM policies may still impose other limits. Foreground-service promotion and WakeLock acquisition are covered by Robolectric tests, but only an on-device screen-off/Doze run can confirm behavior for a particular Android build and OEM. Google Play still reviews the declared `specialUse` use case; declaring it does not guarantee policy approval.
 
 ## Local knowledge ingestion
 
@@ -186,8 +188,8 @@ Argus selects one of four native model families from installed RAM, the current 
 | --- | ---: | ---: | ---: |
 | Argus Compact | 1M–1.4M | 1 | 1,024 |
 | Argus Balanced | 1.4M–1.9M | 1 | 2,048 |
-| Argus Performance | 1.9M–4.8M | 1 | 4,096 |
-| Argus Flagship | 4.8M–7M | 1 | 8,192 |
+| Argus Performance | 1.9M–4.8M | 2 | 4,096 |
+| Argus Flagship | 4.8M–7M | 2 | 8,192 |
 
 The family band is an architecture target capped at the 7M executable parameter ceiling (`MINIMUM_EXECUTABLE_PARAMETER_BUDGET = 1,122,304`), not a guarantee that every device reaches the tier's upper boundary; Neural Core reports the family ceiling and actual active parameter count separately. The active model shape is selected from tier-specific dimensions (`d_model` 128–256, `d_ff` parameter-matched for SwiGLU at 8/3 × `d_model` rounded up to a multiple of 64 — 384, 512, or 704 — 4–8 attention heads, 1–32 layers, context 128–384, and LoRA rank 4 or 8), then capped by a conservative memory budget. The budget uses at most 45% of the app heap and 25% of currently available system RAM; only 55% of that smaller budget is assigned to the 18-byte-per-parameter accumulated training-state floor (2-byte FP16 parameters + 4-byte FP32 gradients + 8-byte FP32 AdamW moments + 4-byte FP32 accumulation buffer). Remaining memory is reserved for activations, attention scratch, tokenizer expansion, checkpoint buffers, and allocator overhead.
 

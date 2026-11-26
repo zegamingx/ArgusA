@@ -23,7 +23,7 @@ class ArgusDeviceModelPolicyTest {
     }
 
     @Test
-    fun selectsFourModelFamiliesWithBatchSizeOneFromDeviceCapacity() {
+    fun selectsTierSpecificBatchSizesFromDeviceCapacity() {
         val compact = ArgusDeviceModelPolicy.select(4, 256L, 0.6f, 4)
         val balanced = ArgusDeviceModelPolicy.select(6, 256L, 0.8f, 6)
         val performance = ArgusDeviceModelPolicy.select(8, 384L, 1.7f, 8)
@@ -38,11 +38,11 @@ class ArgusDeviceModelPolicyTest {
         assertEquals(2_048, balanced.tier.vocabularyCapacity)
 
         assertEquals(ArgusDeviceModelTier.PERFORMANCE, performance.tier)
-        assertEquals(1, performance.trainingBatchSize)
+        assertEquals(2, performance.trainingBatchSize)
         assertEquals(4_096, performance.tier.vocabularyCapacity)
 
         assertEquals(ArgusDeviceModelTier.FLAGSHIP, flagship.tier)
-        assertEquals(1, flagship.trainingBatchSize)
+        assertEquals(2, flagship.trainingBatchSize)
         assertEquals(8_192, flagship.tier.vocabularyCapacity)
     }
 
