@@ -107,13 +107,6 @@ class TrainingManagerPersistenceTest {
     @Test
     fun alreadyPersistedTrainingStartIsAcceptedIdempotently() = runBlocking {
         withTrainingManager { _, repository, manager ->
-            manager.pauseTraining()
-            withTimeout(10_000L) {
-                while (manager.trainingRecoveryStatus.value.phase != TrainingRecoveryPhase.READY) {
-                    delay(20L)
-                }
-            }
-
             val activeItem = TrainingData(
                 source = "persistence-test",
                 title = "Already persisted active state",
