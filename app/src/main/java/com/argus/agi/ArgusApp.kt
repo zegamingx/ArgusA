@@ -48,6 +48,26 @@ data class ArgusCoreInitializationProgress(
     val driverInfo: String = "System Vulkan capability profile pending"
 )
 
+/**
+ * Vulkan's resident tensors may be discarded only when the application core is ready
+ * and the durable training worker is explicitly paused with no active or queued work.
+ * A foreground service can keep training while its Activity is not visible.
+ */
+internal fun shouldReleaseVulkanResidencyForMemoryPressure(
+    coreReady: Boolean,
+    trainingManagerInitialized: Boolean,
+    trainingPaused: Boolean,
+    hasCurrentItem: Boolean,
+    hasActiveDocument: Boolean,
+    hasQueuedWork: Boolean
+): Boolean =
+    coreReady &&
+        trainingManagerInitialized &&
+        trainingPaused &&
+        !hasCurrentItem &&
+        !hasActiveDocument &&
+        !hasQueuedWork
+
 class ArgusApp : Application() {
 
     companion object {
@@ -492,21 +512,41 @@ class ArgusApp : Application() {
     }
 
     override fun onTrimMemory(level: Int) {
-    super.onTrimMemory(level)
-    if (level < ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) return
-    val engine = if (_neuralEngine.isInitialized()) _neuralEngine.value else return
-    val previousTrim = residencyTrimJob
-    residencyTrimJob = applicationScope.launch(Dispatchers.IO) {
-        previousTrim?.join()
-        val released = engine.releaseVulkanTensorResidencyForMemoryPressure()
-        if (released) {
+        super.onTrimMemory(level)
+        if (level < ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) return
+        if (_coreInitializationState.value !is ArgusCoreInitializationState.Ready) return
+        if (!isTrainingManagerInitialized()) return
+
+        val manager = trainingManager
+        val canReleaseResidency = shouldReleaseVulkanResidencyForMemoryPressure(
+            coreReady = true,
+            trainingManagerInitialized = true,
+            trainingPaused = manager.isTrainingPaused.value,
+            hasCurrentItem = manager.currentTrainingItem.value != null,
+            hasActiveDocument = manager.activeDocument.value != null,
+            hasQueuedWork = manager.nextQueue.value.isNotEmpty()
+        )
+        if (!canReleaseResidency) {
             Log.i(
                 TAG,
-                "Persistent Vulkan model residency released after memory-trim callback (level=$level)."
+                "Retaining Vulkan tensor residency because background training is active or queued."
             )
+            return
+        }
+
+        val engine = if (_neuralEngine.isInitialized()) _neuralEngine.value else return
+        val previousTrim = residencyTrimJob
+        residencyTrimJob = applicationScope.launch(Dispatchers.IO) {
+            previousTrim?.join()
+            val released = engine.releaseVulkanTensorResidencyForMemoryPressure()
+            if (released) {
+                Log.i(
+                    TAG,
+                    "Released idle Vulkan tensor residency after memory-trim callback (level=$level)."
+                )
+            }
         }
     }
-}
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
