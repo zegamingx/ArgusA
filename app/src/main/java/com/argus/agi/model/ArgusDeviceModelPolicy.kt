@@ -15,15 +15,14 @@ enum class ArgusDeviceModelTier(
     val defaultTrainingBatchSize: Int,
     val vocabularyCapacity: Int
 ) {
-    // Owner decision (2026-11-25): every tier trains with batch size 1. On-device
-    // learning is online by nature, and a single-sample batch keeps the memory
-    // footprint identical across tiers while the owner measures real batch-1
-    // training speed on device. Gradient accumulation remains available in the
-    // engine for callers that need a larger effective batch.
+    // Compact and Balanced retain single-sample online updates for conservative
+    // memory use. Performance and Flagship use a two-sample micro-batch; the live
+    // runtime governor may still reduce it to one when memory, battery, or thermal
+    // headroom is insufficient.
     COMPACT("Argus Compact", 1_000_000L, 1_400_000L, 1, 1_024),
     BALANCED("Argus Balanced", 1_400_000L, 1_900_000L, 1, 2_048),
-    PERFORMANCE("Argus Performance", 1_900_000L, 4_800_000L, 1, 4_096),
-    FLAGSHIP("Argus Flagship", 4_800_000L, 7_000_000L, 1, 8_192)
+    PERFORMANCE("Argus Performance", 1_900_000L, 4_800_000L, 2, 4_096),
+    FLAGSHIP("Argus Flagship", 4_800_000L, 7_000_000L, 2, 8_192)
 }
 
 data class ArgusDeviceModelProfile(
