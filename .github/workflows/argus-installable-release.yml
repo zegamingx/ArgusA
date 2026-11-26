@@ -209,7 +209,7 @@ jobs:
           }
 
           require_manifest_entry "ArgusForegroundService declaration" 'ArgusForegroundService'
-          require_manifest_entry "specialUse foreground service type" 'android:foregroundServiceType\([^)]*\)=\(type specialUse\)|android:foregroundServiceType\([^)]*\)=0x0*40000000([[:space:]]|$)|android:foregroundServiceType\([^)]*\)=1073741824([[:space:]]|$)'
+          require_manifest_entry "specialUse foreground service type" 'android:foregroundServiceType\([^)]*\)=\(type specialUse\)|android:foregroundServiceType\([^)]*\)=(\(type [^)]*\))?0x0*40000000([[:space:]]|$)|android:foregroundServiceType\([^)]*\)=1073741824([[:space:]]|$)'
           require_manifest_entry "FOREGROUND_SERVICE permission" '="android.permission.FOREGROUND_SERVICE"'
           require_manifest_entry "FOREGROUND_SERVICE_SPECIAL_USE permission" '="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"'
           require_manifest_entry "PROPERTY_SPECIAL_USE_FGS_SUBTYPE property" 'android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE'
