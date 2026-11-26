@@ -1,6 +1,8 @@
 package com.argus.agi
 
+import android.content.ComponentName
 import android.content.Context
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import androidx.test.core.app.ApplicationProvider
 import com.argus.agi.model.ArgusArchitectureConfig
@@ -48,11 +50,32 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun foregroundTrainingServiceUsesManifestDeclaredType() {
-        assertEquals(
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST,
-            ArgusForegroundService.foregroundServiceType
+    fun foregroundTrainingServiceManifestDeclaresSpecialUseType() {
+        val serviceInfo = context.packageManager.getServiceInfo(
+            ComponentName(context, ArgusForegroundService::class.java),
+            PackageManager.ComponentInfoFlags.of(0)
         )
+
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            serviceInfo.foregroundServiceType
+        )
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            ArgusForegroundService.foregroundServiceTypeFor(serviceInfo.foregroundServiceType)
+        )
+    }
+
+    @Test
+    fun foregroundTrainingServiceRejectsMissingSpecialUseManifestType() {
+        val failure = runCatching {
+            ArgusForegroundService.foregroundServiceTypeFor(
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalStateException)
+        assertTrue(failure.message.orEmpty().contains("specialUse"))
     }
 
     @Test

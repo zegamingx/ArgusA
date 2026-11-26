@@ -6,8 +6,10 @@ import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.IBinder
 import android.os.PowerManager
@@ -172,11 +174,26 @@ class ArgusForegroundService : Service() {
         private const val KEY_USER_STOPPED = "user_stopped_background_service"
 
         /**
-         * Let Android apply the service types declared in AndroidManifest.xml.
-         * The manifest owns the specialUse declaration and its subtype description.
+         * The workload is declared as specialUse in the merged application manifest.
+         * Pass the exact declared type rather than the MANIFEST sentinel so devices
+         * receive the same concrete flag that PackageManager resolved for this service.
          */
         internal val foregroundServiceType: Int =
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+
+        /**
+         * Validate the installed/merged manifest before asking ActivityManager to
+         * promote this service. This distinguishes a packaging/manifest failure
+         * from a platform rejection of a correctly declared runtime type.
+         */
+        internal fun foregroundServiceTypeFor(declaredType: Int): Int {
+            val requiredType = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            check((declaredType and requiredType) == requiredType) {
+                "Merged manifest does not declare specialUse for ArgusForegroundService: " +
+                    "declaredTypeMask=0x\${Integer.toHexString(declaredType)}."
+            }
+            return requiredType
+        }
 
         internal fun presentationFor(
             isPaused: Boolean,
@@ -251,6 +268,9 @@ class ArgusForegroundService : Service() {
     private var trainingObservationJob: Job? = null
     private var wakeLockRenewalJob: Job? = null
 
+    /** The value actually resolved from the installed package manifest. */
+    private var declaredForegroundServiceType: Int? = null
+
     /**
      * Created on the first training-state emission, i.e. always after foreground
      * promotion, so WakeLock setup can never delay promotion. A null underlying
@@ -318,7 +338,18 @@ class ArgusForegroundService : Service() {
         try {
             startForegroundCompat()
         } catch (error: Exception) {
-            val message = "Foreground service promotion failed: " + error.javaClass.simpleName
+            val declaredMask = declaredForegroundServiceType
+                ?.let { "0x\${Integer.toHexString(it)}" }
+                ?: "unavailable"
+            val detail = error.message
+                ?.takeIf { it.isNotBlank() }
+                ?.let { "; detail=$it" }
+                .orEmpty()
+            val message =
+                "Foreground service promotion failed: \${error.javaClass.simpleName}; " +
+                    "manifestTypeMask=$declaredMask; " +
+                    "requestedTypeMask=0x\${Integer.toHexString(foregroundServiceType)}" +
+                    detail
             ArgusDiagnosticBridge.error(TAG, message, error)
             stopSelfResult(startId)
             return START_NOT_STICKY
@@ -350,10 +381,18 @@ class ArgusForegroundService : Service() {
     }
 
     private fun startForegroundCompat() {
+        val serviceInfo = packageManager.getServiceInfo(
+            ComponentName(this, ArgusForegroundService::class.java),
+            PackageManager.ComponentInfoFlags.of(0)
+        )
+        val declaredType = serviceInfo.foregroundServiceType
+        declaredForegroundServiceType = declaredType
+
+        val requestedType = foregroundServiceTypeFor(declaredType)
         startForeground(
             NOTIFICATION_ID,
             buildNotification(),
-            foregroundServiceType
+            requestedType
         )
     }
 
