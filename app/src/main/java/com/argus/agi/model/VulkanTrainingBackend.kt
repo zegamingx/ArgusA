@@ -750,6 +750,9 @@ internal object VulkanTrainingBackend : ComputeBackend {
     private var modelParameterMirrorReliable = true
     private var optimizerStateMirrorReliable = true
 
+    @Volatile
+    private var checkpointRestoreAuthoritativePending = false
+
     private fun invalidateTensorResidency(releaseAllocations: Boolean): Boolean {
         if (releaseAllocations && nativeReady && !synchronizeTrainingStateMirrors()) {
             ArgusDiagnosticBridge.error(TAG,
@@ -1152,7 +1155,27 @@ internal object VulkanTrainingBackend : ComputeBackend {
         synchronizeModelParameterMirrors() && synchronizeOptimizerStateMirrors()
 
     override fun synchronizeAuthoritativeState(): Boolean =
-        synchronizeTrainingStateMirrors()
+        checkpointRestoreAuthoritativePending || synchronizeTrainingStateMirrors()
+
+    /**
+     * Called only after ArgusNeuralEngine has validated and fully restored the
+     * checkpoint payload into every host model and AdamW tensor. The next reset
+     * destroys stale Vulkan replicas instead of attempting a failed readback.
+     */
+    @Synchronized
+    override fun markCheckpointRestoredAsAuthoritative() {
+        modelParameterMirrorReliable = true
+        optimizerStateMirrorReliable = true
+        checkpointRestoreAuthoritativePending = true
+        if (nativeReady) {
+            // Prevent any caller from dispatching against the pre-restore GPU replicas.
+            // resetRuntimeForRetry() will now destroy them without a readback.
+            disabledAfterRuntimeFailure = true
+            _currentBackend = "Kotlin CPU"
+            _runtimeStatus.value =
+                "Kotlin CPU fallback — verified checkpoint restored; Vulkan rebuild pending"
+        }
+    }
 
     override fun releaseDeviceResourcesForMemoryPressure(): Boolean =
         releaseModelTensorResidencyForMemoryPressure()
@@ -2024,7 +2047,15 @@ internal object VulkanTrainingBackend : ComputeBackend {
     /** Retained Vulkan-specific entry point for internal recovery orchestration. */
     @Synchronized
     fun resetRuntimeForRetry() {
-        if (nativeReady && !synchronizeTrainingStateMirrors()) {
+        // A validated on-disk checkpoint may have replaced every host tensor after a
+        // Vulkan readback failure. In that case, syncing the stale GPU copy here would
+        // overwrite the restored baseline or block teardown again.
+        val checkpointRestoreIsAuthoritative = checkpointRestoreAuthoritativePending
+        if (
+            nativeReady &&
+            !checkpointRestoreIsAuthoritative &&
+            !synchronizeTrainingStateMirrors()
+        ) {
             ArgusDiagnosticBridge.error(TAG, "Vulkan retry was postponed because model or optimizer state could not be recovered.")
             return
         }
@@ -2038,6 +2069,7 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     ArgusDiagnosticBridge.warning(TAG, "Vulkan native cleanup during runtime retry failed.", error)
                 }
         }
+        checkpointRestoreAuthoritativePending = false
         nativeReady = false
         fp16RuntimeReady = false
         fp16DisabledAfterRuntimeFailure = false
@@ -2245,6 +2277,9 @@ internal object VulkanTrainingBackend : ComputeBackend {
 
             nativeReady = runtimeIntact
             if (runtimeIntact) {
+                // The newly initialized runtime was built after any checkpoint restore;
+                // it is now synchronized with host tensors and can resume normal readback.
+                checkpointRestoreAuthoritativePending = false
                 runtimeVerifiedThisSession = true
                 refreshGpuPerformanceMetrics()
                 _currentBackend = "Kotlin CPU"

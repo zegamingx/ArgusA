@@ -75,6 +75,22 @@ enum class TrainingStatus {
     FAILED
 }
 
+enum class TrainingRecoveryPhase {
+    IDLE,
+    RECOVERING,
+    READY,
+    BLOCKED
+}
+
+data class TrainingRecoveryStatus(
+    val phase: TrainingRecoveryPhase = TrainingRecoveryPhase.IDLE,
+    val message: String = "",
+    val detail: String? = null
+) {
+    val isRecovering: Boolean
+        get() = phase == TrainingRecoveryPhase.RECOVERING
+}
+
 data class TrainingData(
     val id: String = UUID.randomUUID().toString(),
     val source: String,
@@ -337,6 +353,10 @@ class TrainingManager internal constructor(
 
     private val _isTrainingPaused = MutableStateFlow(initiallyPaused)
     val isTrainingPaused: StateFlow<Boolean> = _isTrainingPaused.asStateFlow()
+
+    private val _trainingRecoveryStatus = MutableStateFlow(TrainingRecoveryStatus())
+    val trainingRecoveryStatus: StateFlow<TrainingRecoveryStatus> =
+        _trainingRecoveryStatus.asStateFlow()
 
     private val _totalStepsExecuted = MutableStateFlow(0)
     val totalStepsExecuted: StateFlow<Int> = _totalStepsExecuted.asStateFlow()
@@ -622,6 +642,10 @@ class TrainingManager internal constructor(
 
     fun pauseTraining() {
         _isTrainingPaused.value = true
+        publishTrainingRecoveryStatus(
+            phase = TrainingRecoveryPhase.IDLE,
+            message = "Training paused."
+        )
         wakeupSignal.trySend(Unit)
     }
 
@@ -652,7 +676,12 @@ class TrainingManager internal constructor(
             startedWorker.invokeOnCompletion { cause ->
                 if (cause != null && cause !is CancellationException && !closed) {
                     _isTrainingPaused.value = true
-                    logError( "Training worker stopped unexpectedly; Resume can restart it after durable recovery.", cause)
+                    publishTrainingRecoveryStatus(
+                        phase = TrainingRecoveryPhase.BLOCKED,
+                        message = "The training worker stopped unexpectedly.",
+                        detail = cause.message ?: "Use Retry recovery to start the worker again."
+                    )
+                    logError("Training worker stopped unexpectedly; Resume can restart it after durable recovery.", cause)
                 }
             }
             startedWorker.start()
@@ -668,20 +697,52 @@ class TrainingManager internal constructor(
         streamedImportStartup.await()
     }
 
+    private fun publishTrainingRecoveryStatus(
+        phase: TrainingRecoveryPhase,
+        message: String,
+        detail: String? = null
+    ) {
+        _trainingRecoveryStatus.value = TrainingRecoveryStatus(
+            phase = phase,
+            message = message,
+            detail = detail?.take(240)
+        )
+    }
+
     private fun resumeAfterCommittedQueueRefresh(forceTrainingOnce: Boolean = false) {
+        publishTrainingRecoveryStatus(
+            phase = TrainingRecoveryPhase.RECOVERING,
+            message = "Preparing the background training worker…"
+        )
         scope.launch {
             // Serialize recovery requests. A second explicit Resume must wait for the
             // current attempt and retry if that attempt fails; tryLock would drop it.
             trainingResumeMutex.lock()
             try {
-                if (!forceTrainingOnce && !_isTrainingPaused.value) return@launch
+                if (!forceTrainingOnce && !_isTrainingPaused.value) {
+                    publishTrainingRecoveryStatus(
+                        phase = TrainingRecoveryPhase.READY,
+                        message = "The training worker is already active."
+                    )
+                    return@launch
+                }
+
+                publishTrainingRecoveryStatus(
+                    phase = TrainingRecoveryPhase.RECOVERING,
+                    message = "Starting and verifying the training worker…"
+                )
                 awaitTrainingWorkerReady()
                 workerExecutionMutex.lock()
                 try {
                     val repository = repo
                     if (repository == null) {
                         _isTrainingPaused.value = true
-                        logError( "Cannot resume training because durable queue storage is unavailable.")
+                        publishTrainingRecoveryStatus(
+                            phase = TrainingRecoveryPhase.BLOCKED,
+                            message = "Training recovery cannot continue.",
+                            detail = "Local training queue storage is unavailable."
+                        )
+                        logError("Cannot resume training because durable queue storage is unavailable.")
                         return@launch
                     }
 
@@ -692,15 +753,39 @@ class TrainingManager internal constructor(
                     val safety = deviceGuard.safetyState.value
                     if (!safety.isSafeToTrain) {
                         _isTrainingPaused.value = true
+                        publishTrainingRecoveryStatus(
+                            phase = TrainingRecoveryPhase.BLOCKED,
+                            message = "Training is held by device safety.",
+                            detail = safety.statusMessage
+                        )
                         Log.i(TAG, "Training resume deferred by device safety: ${safety.statusMessage}")
                         return@launch
                     }
 
+                    publishTrainingRecoveryStatus(
+                        phase = TrainingRecoveryPhase.RECOVERING,
+                        message = "Waiting for queue persistence to finish…"
+                    )
                     awaitQueuePersistenceIdle()
+
+                    publishTrainingRecoveryStatus(
+                        phase = TrainingRecoveryPhase.RECOVERING,
+                        message = "Verifying and restoring the model checkpoint and optimizer…"
+                    )
                     // Recover the durable optimizer journal before returning interrupted
                     // TRAINING rows to QUEUED. Resume never races an active optimizer cycle.
                     reconcilePersistedTrainingCommit(repository)
+
+                    publishTrainingRecoveryStatus(
+                        phase = TrainingRecoveryPhase.RECOVERING,
+                        message = "Restoring interrupted training items…"
+                    )
                     repository.recoverInterruptedTrainingItems()
+
+                    publishTrainingRecoveryStatus(
+                        phase = TrainingRecoveryPhase.RECOVERING,
+                        message = "Checking Vulkan backend readiness…"
+                    )
                     neuralEngine.resumeVulkanTensorResidencyAfterForeground()
 
                     val committedItems = repository.getOptimizerCommittedTrainingItemsSnapshot()
@@ -712,9 +797,10 @@ class TrainingManager internal constructor(
                     val restoredItems = committedItems.sortedBy { it.timestamp } +
                         pendingItems.sortedBy { it.timestamp } +
                         inMemoryItems.map { item -> item.copy(status = TrainingStatus.QUEUED) }
+                    val restoredQueue = restoredItems.distinctBy(TrainingData::id)
                     synchronized(queueLock) {
-                        _nextQueue.value = restoredItems.distinctBy(TrainingData::id)
-                        restoredItems.maxOfOrNull { it.timestamp }?.let { latest ->
+                        _nextQueue.value = restoredQueue
+                        restoredQueue.maxOfOrNull { it.timestamp }?.let { latest ->
                             lastScheduledTimestamp = maxOf(lastScheduledTimestamp, latest)
                         }
                         oomRetryCounts.clear()
@@ -723,14 +809,29 @@ class TrainingManager internal constructor(
                     _activeDocument.value = null
                     _isTrainingPaused.value = false
                     wakeupSignal.trySend(Unit)
+
+                    publishTrainingRecoveryStatus(
+                        phase = TrainingRecoveryPhase.READY,
+                        message = "The training worker is active.",
+                        detail = if (restoredQueue.isEmpty()) {
+                            "The queue is empty; the worker is standing by for new data."
+                        } else {
+                            "${restoredQueue.size} queued item(s) are ready to be processed."
+                        }
+                    )
                 } finally {
                     workerExecutionMutex.unlock()
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
-                logError( "Cannot resume training until worker, checkpoint and queue recovery are complete.", error)
+                logError("Cannot resume training until worker, checkpoint and queue recovery are complete.", error)
                 _isTrainingPaused.value = true
+                publishTrainingRecoveryStatus(
+                    phase = TrainingRecoveryPhase.BLOCKED,
+                    message = "Training recovery failed. Training remains paused.",
+                    detail = error.message ?: "Check the Argus diagnostic log for the underlying failure."
+                )
             } finally {
                 trainingResumeMutex.unlock()
             }
@@ -2612,28 +2713,36 @@ class TrainingManager internal constructor(
         }
     }
 
+    /**
+     * The fully restored checkpoint is now the sole authority for model and AdamW tensors.
+     * Recreate the optional accelerator from that host state; failed Vulkan initialization
+     * is non-fatal because the verified Kotlin CPU fallback remains available.
+     */
+    private fun rebuildComputeBackendFromRestoredCheckpoint() {
+        neuralEngine.resetOptionalVulkanRuntimeForRetry()
+        if (!neuralEngine.initializeOptionalVulkanRuntime()) {
+            logWarning(
+                "Vulkan could not be reinitialized after checkpoint recovery; Kotlin CPU remains the controlled fallback."
+            )
+        }
+    }
+
     private suspend fun reconcilePersistedTrainingCommit(
         repository: com.argus.agi.data.repository.ArgusRepository
     ) {
         val snapshot = TrainingCommitJournal.read(trainingCommitJournalFile) ?: return
-        val currentOptimizerStep = neuralEngine.optimizerStep
 
         if (!snapshot.isCommitted) {
-            // A CPU update can finish mutating host tensors immediately before an OOM
-            // in its timing/reconciliation tail, while adamStep is still at baseline.
-            // Always restore the full checkpoint; optimizerStep equality alone does not
-            // prove that every parameter and AdamW moment is unchanged.
-            check(neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()) {
-                "Vulkan training state could not be released before PREPARED-batch rollback."
-            }
+            // PREPARED is written only after its complete baseline checkpoint is safe.
+            // Restore that durable state first; a failed GPU readback must not block rollback.
             check(
                 neuralEngine.loadCheckpointIfExists() &&
                     neuralEngine.optimizerStep == snapshot.baselineOptimizerStep
             ) {
-                "The prepared training batch could not be rolled back to its exact optimizer baseline."
+                "The prepared training batch could not be restored to its exact durable optimizer baseline."
             }
             requireJournalCompatibility(snapshot, "PREPARED-batch rollback")
-            neuralEngine.resumeVulkanTensorResidencyAfterForeground()
+            rebuildComputeBackendFromRestoredCheckpoint()
             TrainingCommitJournal.delete(trainingCommitJournalFile)
             activeBatchBaselineOptimizerStep = null
             activeBatchRoomCommitted = false
@@ -2641,80 +2750,112 @@ class TrainingManager internal constructor(
         }
 
         val committedOptimizerStep = requireNotNull(snapshot.committedOptimizerStep)
-        if (!TrainingCommitJournal.isExactCommittedCheckpoint(snapshot, currentOptimizerStep)) {
-            check(TrainingCommitJournal.isExactBaselineCheckpoint(snapshot, currentOptimizerStep)) {
-                "The model checkpoint optimizer step $currentOptimizerStep does not match " +
-                    "the journal baseline ${snapshot.baselineOptimizerStep} or committed " +
-                    "step $committedOptimizerStep."
-            }
-            val committedIds = repository.getOptimizerCommittedTrainingItemsSnapshot()
-                .mapTo(HashSet()) { it.id }
-            check(snapshot.entries.none { it.itemId in committedIds }) {
-                "Room marks a batch committed, but the restored checkpoint is only its baseline."
-            }
-            // COMMITTED reached disk before its model checkpoint. A restart therefore
-            // restored the baseline; reload that complete state rather than trusting only
-            // adamStep, then let Room's TRAINING rows return to QUEUED.
-            check(neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()) {
-                "Vulkan training state could not be released before committed-journal rollback."
-            }
-            check(
-                neuralEngine.loadCheckpointIfExists() &&
-                    TrainingCommitJournal.isExactBaselineCheckpoint(
-                        snapshot,
-                        neuralEngine.optimizerStep
-                    )
-            ) {
-                "The committed batch could not be rolled back to its exact saved baseline."
-            }
-            requireJournalCompatibility(snapshot, "COMMITTED-batch baseline rollback")
-            neuralEngine.resumeVulkanTensorResidencyAfterForeground()
-            TrainingCommitJournal.delete(trainingCommitJournalFile)
-            activeBatchBaselineOptimizerStep = null
-            activeBatchRoomCommitted = false
-            return
-        }
 
-        requireJournalCompatibility(snapshot, "COMMITTED-batch recovery")
-
-        // Room must never publish COMMITTED until the exact model and optimizer
-        // state represented by this journal is durably saved. A checkpoint that is
-        // ahead of the journal is an inconsistency, not a valid committed transaction.
         if (snapshot.checkpointSha256Fingerprint == null) {
-            // Older committed journals are upgraded only when both semantic identities
-            // exist; v1/v2 remain readable without manufacturing missing fingerprints.
-            check(neuralEngine.saveCheckpoint()) {
-                "The committed optimizer checkpoint could not be secured during recovery."
+            // COMMITTED is journaled before checkpoint replacement. A missing hash means
+            // the process may have stopped on either side of that boundary. Read the
+            // durable checkpoint instead of serializing possibly stale GPU mirrors.
+            check(neuralEngine.loadCheckpointIfExists()) {
+                "The committed journal has no restorable durable checkpoint."
             }
-            if (
-                snapshot.modelIdentityFingerprint != null &&
-                snapshot.optimizerConfigFingerprint != null
-            ) {
-                val checkpointFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
-                TrainingCommitJournal.writeCommitted(
-                    file = trainingCommitJournalFile,
-                    baselineOptimizerStep = snapshot.baselineOptimizerStep,
-                    committedOptimizerStep = committedOptimizerStep,
-                    entries = snapshot.entries,
-                    modelIdentityFingerprint = snapshot.modelIdentityFingerprint,
-                    optimizerConfigFingerprint = snapshot.optimizerConfigFingerprint,
-                    checkpointSha256Fingerprint = checkpointFingerprint
-                )
-                val checkpointBoundJournal = requireNotNull(
-                    TrainingCommitJournal.read(trainingCommitJournalFile)
-                ) {
-                    "The recovered checkpoint-bound journal could not be read back."
+
+            when (neuralEngine.optimizerStep) {
+                snapshot.baselineOptimizerStep -> {
+                    val committedIds = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                        .mapTo(HashSet()) { it.id }
+                    check(snapshot.entries.none { it.itemId in committedIds }) {
+                        "Room marks a batch committed, but its durable checkpoint is only the baseline."
+                    }
+                    check(
+                        TrainingCommitJournal.isExactBaselineCheckpoint(
+                            snapshot,
+                            neuralEngine.optimizerStep
+                        )
+                    ) {
+                        "The durable checkpoint does not match the committed journal baseline."
+                    }
+                    requireJournalCompatibility(snapshot, "COMMITTED-batch baseline rollback")
+                    rebuildComputeBackendFromRestoredCheckpoint()
+                    TrainingCommitJournal.delete(trainingCommitJournalFile)
+                    activeBatchBaselineOptimizerStep = null
+                    activeBatchRoomCommitted = false
+                    return
                 }
+
+                committedOptimizerStep -> {
+                    requireJournalCompatibility(snapshot, "COMMITTED-batch checkpoint recovery")
+                    // Checkpoint replacement completed before its file hash was bound.
+                    // Rebuild Vulkan from the restored host tensors, then finish that boundary.
+                    rebuildComputeBackendFromRestoredCheckpoint()
+                    if (
+                        snapshot.modelIdentityFingerprint != null &&
+                        snapshot.optimizerConfigFingerprint != null
+                    ) {
+                        val checkpointFingerprint = neuralEngine.checkpointFileSha256Fingerprint()
+                        TrainingCommitJournal.writeCommitted(
+                            file = trainingCommitJournalFile,
+                            baselineOptimizerStep = snapshot.baselineOptimizerStep,
+                            committedOptimizerStep = committedOptimizerStep,
+                            entries = snapshot.entries,
+                            modelIdentityFingerprint = snapshot.modelIdentityFingerprint,
+                            optimizerConfigFingerprint = snapshot.optimizerConfigFingerprint,
+                            checkpointSha256Fingerprint = checkpointFingerprint
+                        )
+                        val checkpointBoundJournal = requireNotNull(
+                            TrainingCommitJournal.read(trainingCommitJournalFile)
+                        ) {
+                            "The recovered checkpoint-bound journal could not be read back."
+                        }
+                        check(
+                            checkpointBoundJournal.checkpointSha256Fingerprint == checkpointFingerprint
+                        ) {
+                            "The recovered checkpoint file identity was not persisted in the journal."
+                        }
+                        requireJournalCompatibility(
+                            checkpointBoundJournal,
+                            "committed-batch recovery after checkpoint binding"
+                        )
+                    }
+                }
+
+                else -> throw IllegalStateException(
+                    "The durable checkpoint optimizer step ${neuralEngine.optimizerStep} matches neither " +
+                        "the journal baseline ${snapshot.baselineOptimizerStep} nor committed step $committedOptimizerStep."
+                )
+            }
+        } else {
+            val currentOptimizerStep = neuralEngine.optimizerStep
+            if (!TrainingCommitJournal.isExactCommittedCheckpoint(snapshot, currentOptimizerStep)) {
+                check(TrainingCommitJournal.isExactBaselineCheckpoint(snapshot, currentOptimizerStep)) {
+                    "The model checkpoint optimizer step $currentOptimizerStep does not match " +
+                        "the journal baseline ${snapshot.baselineOptimizerStep} or committed " +
+                        "step $committedOptimizerStep."
+                }
+                val committedIds = repository.getOptimizerCommittedTrainingItemsSnapshot()
+                    .mapTo(HashSet()) { it.id }
+                check(snapshot.entries.none { it.itemId in committedIds }) {
+                    "Room marks a batch committed, but the restored checkpoint is only its baseline."
+                }
+                // The baseline file is already bound to this journal. Restore it before
+                // discarding Vulkan allocations, then rebuild optional GPU residency.
                 check(
-                    checkpointBoundJournal.checkpointSha256Fingerprint == checkpointFingerprint
+                    neuralEngine.loadCheckpointIfExists() &&
+                        TrainingCommitJournal.isExactBaselineCheckpoint(
+                            snapshot,
+                            neuralEngine.optimizerStep
+                        )
                 ) {
-                    "The recovered checkpoint file identity was not persisted in the journal."
+                    "The committed batch could not be rolled back to its exact saved baseline."
                 }
-                requireJournalCompatibility(
-                    checkpointBoundJournal,
-                    "committed-batch recovery after checkpoint write"
-                )
+                requireJournalCompatibility(snapshot, "COMMITTED-batch baseline rollback")
+                rebuildComputeBackendFromRestoredCheckpoint()
+                TrainingCommitJournal.delete(trainingCommitJournalFile)
+                activeBatchBaselineOptimizerStep = null
+                activeBatchRoomCommitted = false
+                return
             }
+
+            requireJournalCompatibility(snapshot, "COMMITTED-batch recovery")
         }
 
         val committedItems = ArrayList<TrainingData>(snapshot.entries.size)
@@ -3248,8 +3389,13 @@ class TrainingManager internal constructor(
                 throw cancelled
             } catch (error: Throwable) {
                 startupGate.completeExceptionally(error)
-                logError( "Training startup recovery failed.", error)
+                logError("Training startup recovery failed.", error)
                 _isTrainingPaused.value = true
+                publishTrainingRecoveryStatus(
+                    phase = TrainingRecoveryPhase.BLOCKED,
+                    message = "Training startup recovery failed.",
+                    detail = error.message ?: "The worker could not restore its checkpoint and queue."
+                )
                 setConversationalValidationStatus(
                     ConversationValidationStatus.FAILED,
                     "Training is paused because startup checkpoint/queue recovery failed: ${error.message}"
@@ -3311,8 +3457,13 @@ class TrainingManager internal constructor(
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (error: Throwable) {
-                        logError( "Could not prepare the conversational training baseline.", error)
+                        logError("Could not prepare the conversational training baseline.", error)
                         _isTrainingPaused.value = true
+                        publishTrainingRecoveryStatus(
+                            phase = TrainingRecoveryPhase.BLOCKED,
+                            message = "Training baseline preparation failed.",
+                            detail = error.message ?: "The baseline checkpoint could not be verified."
+                        )
                         setConversationalValidationStatus(
                             ConversationValidationStatus.FAILED,
                             "Training is paused because its conversational baseline could not be secured: ${error.message}"
@@ -3471,25 +3622,27 @@ class TrainingManager internal constructor(
                                     TrainingCommitJournal.read(trainingCommitJournalFile)
                                 }.getOrNull()
                                 if (journal != null) {
-                                    val released = runCatching {
-                                        neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()
-                                    }.getOrDefault(false)
                                     val baseline = activeBatchBaselineOptimizerStep
                                         ?: journal.baselineOptimizerStep
-                                    val rolledBack = released && runCatching {
+                                    val rolledBack = runCatching {
                                         val restored = neuralEngine.loadCheckpointIfExists() &&
                                             neuralEngine.optimizerStep == baseline
                                         if (restored) {
                                             requireJournalCompatibility(journal, "failed-batch rollback")
+                                            rebuildComputeBackendFromRestoredCheckpoint()
                                         }
                                         restored
                                     }.getOrDefault(false)
                                     if (!rolledBack) {
                                         _isTrainingPaused.value = true
-                                        logError( "Training paused because the failed batch could not be rolled back to its baseline.")
+                                        publishTrainingRecoveryStatus(
+                                            phase = TrainingRecoveryPhase.BLOCKED,
+                                            message = "Batch rollback failed. Training is paused to protect the model.",
+                                            detail = "The baseline checkpoint could not be restored. Use Retry recovery after the storage or GPU issue is resolved."
+                                        )
+                                        logError("Training paused because the failed batch could not be rolled back to its baseline.")
                                     } else {
                                         TrainingCommitJournal.delete(trainingCommitJournalFile)
-                                        neuralEngine.resumeVulkanTensorResidencyAfterForeground()
                                         activeBatchBaselineOptimizerStep = null
                                         activeBatchRoomCommitted = false
                                         activeItems.forEach { item ->
