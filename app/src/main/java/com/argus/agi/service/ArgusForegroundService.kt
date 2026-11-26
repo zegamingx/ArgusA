@@ -464,9 +464,11 @@ class ArgusForegroundService : Service() {
             // Kotlin 2.4.21 Flow.combine overload inference failure while preserving
             // immediate notification updates when thermal/battery safety changes.
             acceptSafetyState(app.deviceGuard.safetyState.value.isSafeToTrain)
-            safetyObservationJob = serviceScope.launch {
-                app.deviceGuard.safetyState.collect { safetyState ->
-                    acceptSafetyState(safetyState.isSafeToTrain)
+            if (safetyObservationJob?.isActive != true) {
+                safetyObservationJob = serviceScope.launch {
+                    app.deviceGuard.safetyState.collect { safetyState ->
+                        acceptSafetyState(safetyState.isSafeToTrain)
+                    }
                 }
             }
 
