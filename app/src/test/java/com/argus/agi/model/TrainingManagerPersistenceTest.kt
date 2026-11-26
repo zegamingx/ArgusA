@@ -105,6 +105,35 @@ class TrainingManagerPersistenceTest {
     }
 
     @Test
+    fun alreadyPersistedTrainingStartIsAcceptedIdempotently() = runBlocking {
+        withTrainingManager { _, repository, manager ->
+            manager.pauseTraining()
+
+            val activeItem = TrainingData(
+                source = "persistence-test",
+                title = "Already persisted active state",
+                content = "The Room transition may have committed before its caller was cancelled.",
+                status = TrainingStatus.TRAINING
+            )
+            repository.saveTrainingItem(activeItem)
+
+            assertTrue(repository.markTrainingStarted(activeItem.id))
+            assertTrue(repository.markTrainingStarted(activeItem.id))
+            assertEquals(
+                TrainingStatus.TRAINING,
+                repository.getTrainingItem(activeItem.id)?.status
+            )
+
+            val completedItem = activeItem.copy(
+                id = "completed-persistence-test",
+                status = TrainingStatus.COMPLETED
+            )
+            repository.saveTrainingItem(completedItem)
+            assertFalse(repository.markTrainingStarted(completedItem.id))
+        }
+    }
+
+    @Test
     fun failedStartPersistenceRestoresItemWithoutTraining() = runBlocking {
         withTrainingManager { database, repository, manager ->
             manager.pauseTraining()
