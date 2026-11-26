@@ -199,10 +199,10 @@ jobs:
           require_manifest_entry() {
             local description="$1"
             local pattern="$2"
-            if ! grep -Eq -- "$pattern" "\${manifest_dump}"; then
-              echo "::error::Packaged AndroidManifest.xml is missing \${description}."
+            if ! grep -Eq -- "$pattern" "${manifest_dump}"; then
+              echo "::error::Packaged AndroidManifest.xml is missing ${description}."
               echo "::group::Packaged AndroidManifest.xml dump"
-              cat "\${manifest_dump}"
+              cat "${manifest_dump}"
               echo "::endgroup::"
               exit 1
             fi
