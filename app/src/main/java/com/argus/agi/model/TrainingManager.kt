@@ -577,6 +577,12 @@ class TrainingManager internal constructor(
                 "GRPO requires an idle SFT queue. Finish or clear queued SFT work before starting policy optimization."
             }
 
+            // GRPO uses the same Vulkan arena as SFT. It must be able to
+            // restore background-released residency without an Activity callback.
+            if (!neuralEngine.vulkanModelTensorResidencyReady.value) {
+                neuralEngine.resumeVulkanTensorResidencyAfterForeground()
+            }
+
             return GrpoTrainer(neuralEngine).train(
                 reader = reader,
                 config = config,
