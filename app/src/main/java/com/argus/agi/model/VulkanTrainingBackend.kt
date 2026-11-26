@@ -2203,14 +2203,14 @@ internal object VulkanTrainingBackend : ComputeBackend {
                     "Resident SwiGLU self-check failed; the Kotlin activation fallback remains active."
                 )
             }
-            if (verified && !residentAttentionReady) {
+            if (verified && residentActivationLinearReady && !residentAttentionReady) {
                 ArgusDiagnosticBridge.warning(TAG,
-                    "Resident causal-attention self-check failed; the existing Kotlin attention fallback remains active."
+                    "Resident causal-attention self-check failed after its activation-linear prerequisite passed; the existing Kotlin attention fallback remains active."
                 )
             }
             if (verified && !residentActivationLinearReady) {
                 ArgusDiagnosticBridge.warning(TAG,
-                    "Resident activation-linear kernel self-check failed; existing verified Vulkan/CPU paths remain active."
+                    "Resident activation-linear kernel self-check failed; resident causal-attention verification was skipped because it depends on this kernel. Existing verified Vulkan/CPU paths remain active."
                 )
             }
 
@@ -2575,9 +2575,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 val outputBytes = ByteArray(outputByteCount.toInt())
                 if (!nativeDownloadTensor(outputHandle, outputBytes)) return false
                 return approximatelyEqual(
-                    decodeFloatArray(outputBytes),
-                    expected(weights, transpose),
-                    1e-4f
+                    actual = decodeFloatArray(outputBytes),
+                    expected = expected(weights, transpose),
+                    tolerance = 1e-4f,
+                    diagnosticLabel = "Resident activation-linear self-check (transposeWeights=$transpose)"
                 )
             }
 
@@ -2715,9 +2716,10 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 )
                 if (!nativeDownloadTensor(outputHandle, outputBytes)) return false
                 return approximatelyEqual(
-                    decodeFloatArray(outputBytes),
-                    expected(transposeWeights),
-                    1e-4f
+                    actual = decodeFloatArray(outputBytes),
+                    expected = expected(transposeWeights),
+                    tolerance = 1e-4f,
+                    diagnosticLabel = "Resident activation-linear batch self-check (transposeWeights=$transposeWeights)"
                 )
             }
 
@@ -3071,10 +3073,34 @@ internal object VulkanTrainingBackend : ComputeBackend {
                 expectedProjected[row].copyInto(expectedProjectedValues, row * modelWidth)
                 expectedNormalized[row].copyInto(expectedNormalizedValues, row * modelWidth)
             }
-            return approximatelyEqual(decodeFloatArray(actualScoresBytes), expectedScoreValues, 2e-4f) &&
-                approximatelyEqual(decodeFloatArray(actualAttentionBytes), expectedAttentionValues, 2e-4f) &&
-                approximatelyEqual(decodeFloatArray(actualProjectedBytes), expectedProjectedValues, 2e-4f) &&
-                approximatelyEqual(decodeFloatArray(actualNormalizedBytes), expectedNormalizedValues, 2e-4f)
+            val scoresMatch = approximatelyEqual(
+                actual = decodeFloatArray(actualScoresBytes),
+                expected = expectedScoreValues,
+                tolerance = 2e-4f,
+                diagnosticLabel = "Resident attention causal-score self-check"
+            )
+            val attentionValuesMatch = approximatelyEqual(
+                actual = decodeFloatArray(actualAttentionBytes),
+                expected = expectedAttentionValues,
+                tolerance = 2e-4f,
+                diagnosticLabel = "Resident attention value-aggregation self-check"
+            )
+            val projectedValuesMatch = approximatelyEqual(
+                actual = decodeFloatArray(actualProjectedBytes),
+                expected = expectedProjectedValues,
+                tolerance = 2e-4f,
+                diagnosticLabel = "Resident attention output-projection self-check"
+            )
+            val normalizedValuesMatch = approximatelyEqual(
+                actual = decodeFloatArray(actualNormalizedBytes),
+                expected = expectedNormalizedValues,
+                tolerance = 2e-4f,
+                diagnosticLabel = "Resident attention LayerNorm self-check"
+            )
+            return scoresMatch &&
+                attentionValuesMatch &&
+                projectedValuesMatch &&
+                normalizedValuesMatch
         } catch (error: LinkageError) {
             ArgusDiagnosticBridge.error(TAG, "Resident attention self-check JNI entry point is unavailable.", error)
             return false
@@ -4563,14 +4589,48 @@ internal object VulkanTrainingBackend : ComputeBackend {
     private fun approximatelyEqual(
         actual: FloatArray,
         expected: FloatArray,
-        tolerance: Float
+        tolerance: Float,
+        diagnosticLabel: String? = null
     ): Boolean {
-        if (actual.size != expected.size) return false
-        for (index in actual.indices) {
-            if (!actual[index].isFinite() ||
-                kotlin.math.abs(actual[index] - expected[index]) > tolerance) {
-                return false
+        if (actual.size != expected.size) {
+            diagnosticLabel?.let { label ->
+                ArgusDiagnosticBridge.warning(
+                    TAG,
+                    "$label returned an unexpected element count: actual=${actual.size}, expected=${expected.size}."
+                )
             }
+            return false
+        }
+
+        var firstMismatchIndex = -1
+        var maximumAbsoluteError = 0f
+        for (index in actual.indices) {
+            val actualValue = actual[index]
+            val expectedValue = expected[index]
+            if (!actualValue.isFinite() || !expectedValue.isFinite()) {
+                if (firstMismatchIndex < 0) firstMismatchIndex = index
+                maximumAbsoluteError = Float.POSITIVE_INFINITY
+                continue
+            }
+
+            val absoluteError = kotlin.math.abs(actualValue - expectedValue)
+            maximumAbsoluteError = maxOf(maximumAbsoluteError, absoluteError)
+            if (firstMismatchIndex < 0 && absoluteError > tolerance) {
+                firstMismatchIndex = index
+            }
+        }
+
+        if (firstMismatchIndex >= 0) {
+            diagnosticLabel?.let { label ->
+                ArgusDiagnosticBridge.warning(
+                    TAG,
+                    "$label numerical mismatch: firstIndex=$firstMismatchIndex, " +
+                        "actual=${actual[firstMismatchIndex]}, " +
+                        "expected=${expected[firstMismatchIndex]}, " +
+                        "maxAbsoluteError=$maximumAbsoluteError, tolerance=$tolerance."
+                )
+            }
+            return false
         }
         return true
     }
