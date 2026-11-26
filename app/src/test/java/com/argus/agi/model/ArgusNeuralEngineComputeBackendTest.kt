@@ -67,6 +67,14 @@ class ArgusNeuralEngineComputeBackendTest {
             assertTrue(engine.isCheckpointStateVerified)
             assertTrue(checkpoint.isFile)
 
+            backend.synchronizeSucceeds = false
+            assertTrue(engine.loadCheckpointIfExists())
+            assertEquals(1, backend.checkpointRestoreCalls)
+            // A verified checkpoint replaces stale GPU mirrors and is sufficient
+            // to permit a subsequent checkpoint without another GPU readback.
+            assertTrue(engine.saveCheckpoint())
+            assertEquals(3, backend.synchronizeCalls)
+
             assertTrue(engine.releaseVulkanTensorResidencyForMemoryPressure())
             assertEquals(1, backend.releaseCalls)
 
@@ -75,6 +83,7 @@ class ArgusNeuralEngineComputeBackendTest {
 
             engine.resetOptionalVulkanRuntimeForRetry()
             assertEquals(1, backend.resetCalls)
+            assertEquals(3, backend.synchronizeCalls)
             assertFalse(engine.isVulkanRuntimeReady)
         } finally {
             restoreFile(checkpoint, previousCheckpoint)
@@ -110,6 +119,9 @@ class ArgusNeuralEngineComputeBackendTest {
             private set
         var resumeCalls: Int = 0
             private set
+        var checkpointRestoreCalls: Int = 0
+            private set
+        var checkpointRestoreAuthoritative: Boolean = false
         var synchronizeSucceeds: Boolean = true
 
         override fun initializeAfterModelReady(): Boolean {
@@ -120,12 +132,21 @@ class ArgusNeuralEngineComputeBackendTest {
 
         override fun resetForRetry() {
             resetCalls += 1
+            if (!checkpointRestoreAuthoritative && !synchronizeAuthoritativeState()) {
+                return
+            }
+            checkpointRestoreAuthoritative = false
             isReady = false
         }
 
         override fun synchronizeAuthoritativeState(): Boolean {
             synchronizeCalls += 1
-            return synchronizeSucceeds
+            return checkpointRestoreAuthoritative || synchronizeSucceeds
+        }
+
+        override fun markCheckpointRestoredAsAuthoritative() {
+            checkpointRestoreCalls += 1
+            checkpointRestoreAuthoritative = true
         }
 
         override fun releaseDeviceResourcesForMemoryPressure(): Boolean {

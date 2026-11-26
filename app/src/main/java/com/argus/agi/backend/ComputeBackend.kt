@@ -29,6 +29,12 @@ internal interface ComputeBackend {
 
     fun synchronizeAuthoritativeState(): Boolean
 
+    /**
+     * A fully verified durable checkpoint has replaced any stale accelerator copy.
+     * Implementations may now discard device mirrors without reading them back.
+     */
+    fun markCheckpointRestoredAsAuthoritative() = Unit
+
     fun releaseDeviceResourcesForMemoryPressure(): Boolean
 
     fun resumeDeviceResourcesAfterForeground()

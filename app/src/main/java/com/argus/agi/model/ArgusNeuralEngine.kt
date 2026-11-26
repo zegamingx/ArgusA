@@ -1113,10 +1113,15 @@ class ArgusNeuralEngine private constructor(
         return result
     }
 
-    private fun resizeVocabCapacityTo(targetCap: Int) {
+    private fun resizeVocabCapacityTo(
+        targetCap: Int,
+        restoringCheckpoint: Boolean = false
+    ) {
         if (targetCap <= 0 || targetCap == vocabCap) return
-        check(computeBackend.synchronizeAuthoritativeState()) {
-            "Model weights and optimizer moments must be recovered before vocabulary capacity changes."
+        if (!restoringCheckpoint) {
+            check(computeBackend.synchronizeAuthoritativeState()) {
+                "Model weights and optimizer moments must be recovered before vocabulary capacity changes."
+            }
         }
         requireSafeVocabularyCapacity(targetCap)
         val targetElements = Math.multiplyExact(targetCap, dModel)
@@ -1149,7 +1154,9 @@ class ArgusNeuralEngine private constructor(
         mHead = newMHead
         vHead = newVHead
         vocabCap = targetCap
-        synchronizeVulkanModelTensorResidency("vocabulary-capacity replacement")
+        if (!restoringCheckpoint) {
+            synchronizeVulkanModelTensorResidency("vocabulary-capacity replacement")
+        }
     }
 
     // =====================================================================
@@ -5106,7 +5113,10 @@ class ArgusNeuralEngine private constructor(
                 }
 
                 synchronized(modelLock) {
-                    resizeVocabCapacityTo(savedVocabCap)
+                    resizeVocabCapacityTo(
+                        targetCap = savedVocabCap,
+                        restoringCheckpoint = true
+                    )
                     tokenizer.importVocab(vocabulary)
                     if (isLearnedBpe) {
                         tokenizer.importMerges(loadedMerges)
@@ -5190,6 +5200,10 @@ class ArgusNeuralEngine private constructor(
             if (restored) checkpointRestoreBlocked = false
         }
         if (restored) {
+            // The parser verified the complete file and restored every host model
+            // and optimizer tensor. These arrays are authoritative now; stale Vulkan
+            // replicas must be destroyed rather than read back over the restored state.
+            computeBackend.markCheckpointRestoredAsAuthoritative()
             val tokenizerArtifact = synchronized(modelLock) {
                 tokenizer.exportTokenizerJson() to tokenizer.snapshotFingerprint()
             }

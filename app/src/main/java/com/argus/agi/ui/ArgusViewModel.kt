@@ -152,6 +152,7 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     val completedQueue: StateFlow<List<TrainingData>> = trainingManager.completedQueue
     val lossHistory: StateFlow<List<Float>> = trainingManager.lossHistory
     val isTrainingPaused: StateFlow<Boolean> = trainingManager.isTrainingPaused
+    val trainingRecoveryStatus = trainingManager.trainingRecoveryStatus
     val totalStepsExecuted: StateFlow<Int> = trainingManager.totalStepsExecuted
     val trainingMetrics: StateFlow<TrainingSessionMetrics> = trainingManager.trainingMetrics
     val engineConfig get() = neuralEngine.config
@@ -398,10 +399,12 @@ class ArgusViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun toggleTrainingPause() {
+        val resumeRequested = trainingManager.isTrainingPaused.value
         trainingManager.togglePauseTraining()
-        if (!trainingManager.isTrainingPaused.value) {
-            // The user explicitly resumed training from the UI: any earlier decision to
-            // stop the background service no longer applies.
+        if (resumeRequested) {
+            // Recovery is asynchronous, so isTrainingPaused remains true until worker,
+            // checkpoint and queue checks finish. Start the foreground service from the
+            // explicit Resume intent instead of waiting for that later state transition.
             onTrainingExplicitlyStarted()
         }
     }

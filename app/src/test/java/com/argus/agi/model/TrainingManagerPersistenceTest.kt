@@ -170,14 +170,26 @@ class TrainingManagerPersistenceTest {
                 }
             }
             assertEquals(1, startupAttempts.get())
+            assertEquals(
+                TrainingRecoveryPhase.BLOCKED,
+                manager.trainingRecoveryStatus.value.phase
+            )
 
             manager.resumeTraining()
             withTimeout(10_000L) {
-                while (manager.isTrainingPaused.value || startupAttempts.get() < 2) {
+                while (
+                    manager.isTrainingPaused.value ||
+                    startupAttempts.get() < 2 ||
+                    manager.trainingRecoveryStatus.value.phase != TrainingRecoveryPhase.READY
+                ) {
                     delay(20L)
                 }
             }
             assertEquals(2, startupAttempts.get())
+            assertEquals(
+                TrainingRecoveryPhase.READY,
+                manager.trainingRecoveryStatus.value.phase
+            )
 
             manager.pauseTraining()
             manager.enqueueData(

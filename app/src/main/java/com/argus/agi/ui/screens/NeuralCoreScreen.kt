@@ -72,6 +72,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
     val totalParams = viewModel.getTotalParameters()
     val adapterBytes = viewModel.getAdapterSizeBytes()
     val isPaused by viewModel.isTrainingPaused.collectAsStateWithLifecycle()
+    val trainingRecovery by viewModel.trainingRecoveryStatus.collectAsStateWithLifecycle()
     val safetyState by viewModel.safetyState.collectAsStateWithLifecycle()
     val hardwareInfo by viewModel.hardwareInfo.collectAsStateWithLifecycle()
     val inferenceCapacity = remember(hardwareInfo.availRamGb) {
@@ -102,6 +103,10 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
         isPaused
     )
     val trainingEtaLabel = when {
+        trainingRecovery.phase == com.argus.agi.model.TrainingRecoveryPhase.RECOVERING ->
+            "Recovering worker"
+        trainingRecovery.phase == com.argus.agi.model.TrainingRecoveryPhase.BLOCKED ->
+            "Recovery required"
         !safetyState.isSafeToTrain -> "Blocked by device safety"
         isPaused -> "Paused"
         trainingEtaMs == null -> "Calculating"
@@ -109,6 +114,10 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
         else -> "~${formatEta(trainingEtaMs)}"
     }
     val trainingStatusLabel = when {
+        trainingRecovery.phase == com.argus.agi.model.TrainingRecoveryPhase.RECOVERING ->
+            "RECOVERING TRAINING"
+        trainingRecovery.phase == com.argus.agi.model.TrainingRecoveryPhase.BLOCKED ->
+            "RECOVERY REQUIRED"
         !safetyState.isSafeToTrain -> "TRAINING BLOCKED"
         isPaused -> "TRAINING PAUSED"
         activeTrainingItem != null -> "TRAINING IN PROGRESS"
@@ -434,7 +443,7 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                             Spacer(modifier = Modifier.width(10.dp))
                             Button(
                                 onClick = { viewModel.toggleTrainingPause() },
-                                enabled = safetyState.isSafeToTrain,
+                                enabled = safetyState.isSafeToTrain && !trainingRecovery.isRecovering,
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = if (isPaused) ArgusSuccess else ArgusWarning,
                                     contentColor = ArgusDarkBg,
@@ -447,6 +456,9 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                                 Text(
                                     text = when {
                                         !safetyState.isSafeToTrain -> "Blocked"
+                                        trainingRecovery.isRecovering -> "Working…"
+                                        trainingRecovery.phase == com.argus.agi.model.TrainingRecoveryPhase.BLOCKED && isPaused ->
+                                            "Retry recovery"
                                         isPaused -> "Resume"
                                         else -> "Pause"
                                     },
@@ -454,6 +466,82 @@ fun NeuralCoreScreen(viewModel: ArgusViewModel) {
                                     fontSize = 12.sp
                                 )
                             }
+                        }
+                        when (trainingRecovery.phase) {
+                            com.argus.agi.model.TrainingRecoveryPhase.RECOVERING -> {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 10.dp)
+                                        .testTag("training_recovery_status"),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(18.dp),
+                                        strokeWidth = 2.dp,
+                                        color = ArgusCyanGlow
+                                    )
+                                    Text(
+                                        text = trainingRecovery.message,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = ArgusCyanGlow
+                                    )
+                                }
+                            }
+
+                            com.argus.agi.model.TrainingRecoveryPhase.BLOCKED -> {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 10.dp)
+                                        .testTag("training_recovery_status"),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        text = trainingRecovery.message,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = ArgusWarning,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    trainingRecovery.detail?.let { detail ->
+                                        Text(
+                                            text = detail,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = ArgusTextSecondary
+                                        )
+                                    }
+                                }
+                            }
+
+                            com.argus.agi.model.TrainingRecoveryPhase.READY -> {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 10.dp)
+                                        .testTag("training_recovery_status"),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        text = if (activeTrainingItem != null) {
+                                            "Training is running."
+                                        } else {
+                                            trainingRecovery.message
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = ArgusSuccess
+                                    )
+                                    trainingRecovery.detail?.let { detail ->
+                                        Text(
+                                            text = detail,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = ArgusTextSecondary
+                                        )
+                                    }
+                                }
+                            }
+
+                            com.argus.agi.model.TrainingRecoveryPhase.IDLE -> Unit
                         }
                         TextButton(
                             onClick = { viewModel.stopBackgroundService() },
