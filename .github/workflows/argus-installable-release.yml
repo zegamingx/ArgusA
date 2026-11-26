@@ -186,6 +186,24 @@ jobs:
             unzip -Z1 "${apk_path}" | grep -Fx "lib/${abi}/libargus_training.so"
           done
 
+      - name: Verify foreground-service contract in the packaged APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_path="app/build/outputs/apk/release/app-release-unsigned.apk"
+          manifest_dump="${RUNNER_TEMP}/argus-release-manifest.xmltree"
+          aapt="${ANDROID_HOME}/build-tools/37.0.0/aapt"
+
+          "${aapt}" dump xmltree "${apk_path}" AndroidManifest.xml > "${manifest_dump}"
+
+          grep -Fq 'ArgusForegroundService' "${manifest_dump}"
+          grep -Eq 'android:foregroundServiceType\([^)]*\)=(\(type [^)]*\))?0x0*800([[:space:]]|$)' "${manifest_dump}"
+          grep -Fq '="android.permission.FOREGROUND_SERVICE"' "${manifest_dump}"
+          grep -Fq '="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"' "${manifest_dump}"
+          grep -Fq 'android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE' "${manifest_dump}"
+
+          echo "Verified packaged ArgusForegroundService: specialUse (0x00000800), base/type permissions, and subtype property."
+
       - name: Sign and cryptographically verify the production APK
         shell: bash
         env:
@@ -214,6 +232,7 @@ jobs:
             echo "Signing certificate SHA-256: $(cat "${apk}.certificate-sha256")"
             echo "APK SHA-256: $(awk '{print $1}' "${apk}.sha256")"
             echo "Native ABI packaging: arm64-v8a, armeabi-v7a, x86_64"
+            echo "Foreground service: packaged specialUse type, permissions, and subtype property verified"
             echo "Signature: apksigner verified; v3 scheme valid for minSdk 34"
             echo "ZIP alignment: verified for 16 KiB native-library pages"
             echo "Production output: one APK, published as ARGUS.apk"
