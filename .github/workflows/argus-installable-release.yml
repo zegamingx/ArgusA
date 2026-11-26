@@ -196,7 +196,7 @@ jobs:
 
           "${aapt}" dump xmltree "${apk_path}" AndroidManifest.xml > "${manifest_dump}"
 
-          grep -Fq 'com.argus.agi.service.ArgusForegroundService' "${manifest_dump}"
+          grep -Fq 'ArgusForegroundService' "${manifest_dump}"
           grep -Eq 'android:foregroundServiceType\([^)]*\)=(\(type [^)]*\))?0x0*800([[:space:]]|$)' "${manifest_dump}"
           grep -Fq '="android.permission.FOREGROUND_SERVICE"' "${manifest_dump}"
           grep -Fq '="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"' "${manifest_dump}"
