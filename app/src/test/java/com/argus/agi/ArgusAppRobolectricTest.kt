@@ -47,11 +47,84 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun foregroundTrainingServiceUsesSpecialUseTypeOnly() {
-        // minSdk is 34, where specialUse exists; there is no dataSync variant.
+    fun foregroundTrainingServiceUsesManifestDeclaredType() {
         assertEquals(
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST,
             ArgusForegroundService.foregroundServiceType
+        )
+    }
+
+    @Test
+    fun backgroundMemoryTrimReleasesVulkanResidencyOnlyWhenTrainingIsPausedAndIdle() {
+        assertFalse(
+            shouldReleaseVulkanResidencyForMemoryPressure(
+                coreReady = false,
+                trainingManagerInitialized = true,
+                trainingPaused = true,
+                hasCurrentItem = false,
+                hasActiveDocument = false,
+                hasQueuedWork = false
+            )
+        )
+        assertFalse(
+            shouldReleaseVulkanResidencyForMemoryPressure(
+                coreReady = true,
+                trainingManagerInitialized = false,
+                trainingPaused = true,
+                hasCurrentItem = false,
+                hasActiveDocument = false,
+                hasQueuedWork = false
+            )
+        )
+        assertFalse(
+            shouldReleaseVulkanResidencyForMemoryPressure(
+                coreReady = true,
+                trainingManagerInitialized = true,
+                trainingPaused = false,
+                hasCurrentItem = false,
+                hasActiveDocument = false,
+                hasQueuedWork = false
+            )
+        )
+        assertFalse(
+            shouldReleaseVulkanResidencyForMemoryPressure(
+                coreReady = true,
+                trainingManagerInitialized = true,
+                trainingPaused = true,
+                hasCurrentItem = true,
+                hasActiveDocument = false,
+                hasQueuedWork = false
+            )
+        )
+        assertFalse(
+            shouldReleaseVulkanResidencyForMemoryPressure(
+                coreReady = true,
+                trainingManagerInitialized = true,
+                trainingPaused = true,
+                hasCurrentItem = false,
+                hasActiveDocument = true,
+                hasQueuedWork = false
+            )
+        )
+        assertFalse(
+            shouldReleaseVulkanResidencyForMemoryPressure(
+                coreReady = true,
+                trainingManagerInitialized = true,
+                trainingPaused = true,
+                hasCurrentItem = false,
+                hasActiveDocument = false,
+                hasQueuedWork = true
+            )
+        )
+        assertTrue(
+            shouldReleaseVulkanResidencyForMemoryPressure(
+                coreReady = true,
+                trainingManagerInitialized = true,
+                trainingPaused = true,
+                hasCurrentItem = false,
+                hasActiveDocument = false,
+                hasQueuedWork = false
+            )
         )
     }
 
