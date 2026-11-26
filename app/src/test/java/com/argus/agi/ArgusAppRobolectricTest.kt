@@ -159,11 +159,36 @@ class ArgusAppRobolectricTest {
             )
         )
         assertEquals(
+            ForegroundTrainingPresentation.WAITING,
+            ArgusForegroundService.presentationFor(
+                isPaused = false,
+                hasActiveWork = false,
+                hasQueuedWork = true,
+                isSafeToTrain = false
+            )
+        )
+        assertEquals(
             ForegroundTrainingPresentation.IDLE,
             ArgusForegroundService.presentationFor(
                 isPaused = false,
                 hasActiveWork = false,
                 hasQueuedWork = false
+            )
+        )
+    }
+
+    @Test
+    fun backgroundTrainingWarnsWhenBatteryOptimizationIsNotExempted() {
+        assertEquals(
+            "Battery optimization may interrupt screen-off training",
+            ArgusForegroundService.batteryOptimizationWarning(
+                isIgnoringBatteryOptimizations = false
+            )
+        )
+        assertEquals(
+            null,
+            ArgusForegroundService.batteryOptimizationWarning(
+                isIgnoringBatteryOptimizations = true
             )
         )
     }
