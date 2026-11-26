@@ -69,9 +69,7 @@ class ArgusAppRobolectricTest {
     @Test
     fun foregroundTrainingServiceRejectsMissingSpecialUseManifestType() {
         val failure = runCatching {
-            ArgusForegroundService.foregroundServiceTypeFor(
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE
-            )
+            ArgusForegroundService.foregroundServiceTypeFor(declaredType = 0)
         }.exceptionOrNull()
 
         assertTrue(failure is IllegalStateException)
