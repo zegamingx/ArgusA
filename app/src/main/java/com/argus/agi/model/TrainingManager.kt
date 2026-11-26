@@ -155,6 +155,21 @@ data class ValidationCorpusEvaluation(
     val reasoningPerplexity: Float = Float.NaN
 )
 
+/**
+ * Memory-pressure trimming is allowed only at a quiescent training boundary.
+ * The caller must hold workerExecutionMutex while checking this policy.
+ */
+internal fun shouldReleaseVulkanResidencyForMemoryPressure(
+    managerClosed: Boolean,
+    hasCurrentItem: Boolean,
+    hasActiveDocument: Boolean,
+    hasQueuedWork: Boolean
+): Boolean =
+    !managerClosed &&
+        !hasCurrentItem &&
+        !hasActiveDocument &&
+        !hasQueuedWork
+
 class TrainingManager internal constructor(
     context: Context,
     private val neuralEngine: ArgusNeuralEngine,
@@ -453,6 +468,28 @@ class TrainingManager internal constructor(
             )
         }
         startTrainingWorker()
+    }
+
+    /**
+     * Release rebuildable GPU residency only while the worker is at an idle boundary.
+     * Serializing with the worker prevents a memory-trim callback from clearing
+     * Vulkan allocations during an optimizer transaction. A newly queued batch
+     * restores residency through the worker's pre-batch recovery path.
+     */
+    internal suspend fun releaseVulkanTensorResidencyForMemoryPressureIfIdle(): Boolean {
+        workerExecutionMutex.lock()
+        try {
+            val canRelease = shouldReleaseVulkanResidencyForMemoryPressure(
+                managerClosed = closed,
+                hasCurrentItem = _currentTrainingItem.value != null,
+                hasActiveDocument = _activeDocument.value != null,
+                hasQueuedWork = _nextQueue.value.isNotEmpty()
+            )
+            if (!canRelease) return false
+            return neuralEngine.releaseVulkanTensorResidencyForMemoryPressure()
+        } finally {
+            workerExecutionMutex.unlock()
+        }
     }
 
     private fun createGrpoRuntimeConfiguration(requestedGroupSize: Int): RuntimeConfiguration {
