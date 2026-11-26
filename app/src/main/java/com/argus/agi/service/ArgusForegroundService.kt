@@ -25,7 +25,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -277,6 +276,7 @@ class ArgusForegroundService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var trainingObservationJob: Job? = null
+    private var safetyObservationJob: Job? = null
     private var wakeLockRenewalJob: Job? = null
 
     /** The value actually resolved from the installed package manifest. */
@@ -330,6 +330,11 @@ class ArgusForegroundService : Service() {
         val hasQueuedWork: Boolean,
         val progress: ForegroundTrainingProgress?
     )
+
+    /** Latest input values are accessed only through the synchronized update methods. */
+    private var latestTrainingObservation: TrainingObservation? = null
+    private var latestSafetyAllowsTraining: Boolean = true
+    private var lastNotificationSnapshot: NotificationSnapshot? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -455,32 +460,63 @@ class ArgusForegroundService : Service() {
                 )
             }
 
-            // Keep the four-flow training projection separate from device safety.
-            // The typed binary combine avoids the Kotlin 2.4.21 inference failure
-            // reported for the five-flow overload (cannot infer T5).
-            combine(trainingObservation, app.deviceGuard.safetyState) { observation, safetyState ->
-                NotificationSnapshot(
-                    presentation = presentationFor(
-                        isPaused = observation.isPaused,
-                        hasActiveWork = observation.hasActiveWork,
-                        hasQueuedWork = observation.hasQueuedWork,
-                        isSafeToTrain = safetyState.isSafeToTrain
-                    ),
-                    progress = observation.progress
-                )
-            }
-                .distinctUntilChanged()
-                .collect { snapshot ->
-                    presentation = snapshot.presentation
-                    progress = snapshot.progress
-                    updateWakeLockForPresentation(snapshot.presentation)
-                    runCatching {
-                        getSystemService(NotificationManager::class.java)
-                            ?.notify(NOTIFICATION_ID, buildNotification())
-                    }.onFailure { error ->
-                        ArgusDiagnosticBridge.error(TAG, "Could not refresh the foreground notification for the new training state.", error)
+            // Keep device safety as an independent collector. This avoids the
+            // Kotlin 2.4.21 Flow.combine overload inference failure while preserving
+            // immediate notification updates when thermal/battery safety changes.
+            acceptSafetyState(app.deviceGuard.safetyState.value.isSafeToTrain)
+            if (safetyObservationJob?.isActive != true) {
+                safetyObservationJob = serviceScope.launch {
+                    app.deviceGuard.safetyState.collect { safetyState ->
+                        acceptSafetyState(safetyState.isSafeToTrain)
                     }
                 }
+            }
+
+            trainingObservation.collect { observation ->
+                acceptTrainingObservation(observation)
+            }
+        }
+    }
+
+    @Synchronized
+    private fun acceptTrainingObservation(observation: TrainingObservation) {
+        latestTrainingObservation = observation
+        publishNotificationSnapshot()
+    }
+
+    @Synchronized
+    private fun acceptSafetyState(isSafeToTrain: Boolean) {
+        if (latestSafetyAllowsTraining == isSafeToTrain) return
+        latestSafetyAllowsTraining = isSafeToTrain
+        publishNotificationSnapshot()
+    }
+
+    @Synchronized
+    private fun publishNotificationSnapshot() {
+        val observation = latestTrainingObservation ?: return
+        val snapshot = NotificationSnapshot(
+            presentation = presentationFor(
+                isPaused = observation.isPaused,
+                hasActiveWork = observation.hasActiveWork,
+                hasQueuedWork = observation.hasQueuedWork,
+                isSafeToTrain = latestSafetyAllowsTraining
+            ),
+            progress = observation.progress
+        )
+        if (lastNotificationSnapshot == snapshot) return
+        lastNotificationSnapshot = snapshot
+        presentation = snapshot.presentation
+        progress = snapshot.progress
+        updateWakeLockForPresentation(snapshot.presentation)
+        runCatching {
+            getSystemService(NotificationManager::class.java)
+                ?.notify(NOTIFICATION_ID, buildNotification())
+        }.onFailure { error ->
+            ArgusDiagnosticBridge.error(
+                TAG,
+                "Could not refresh the foreground notification for the new training state.",
+                error
+            )
         }
     }
 
