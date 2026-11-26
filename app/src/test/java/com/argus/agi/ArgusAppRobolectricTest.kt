@@ -12,6 +12,7 @@ import com.argus.agi.model.ArgusTokenizerAlgorithm
 import com.argus.agi.model.Tokenizer
 import com.argus.agi.model.TokenizerConfig
 import com.argus.agi.model.TrainingManager
+import com.argus.agi.model.shouldReleaseVulkanResidencyForMemoryPressure
 import com.argus.agi.model.WorldModel
 import com.argus.agi.sensor.DeviceGuard
 import android.os.PowerManager
@@ -55,12 +56,10 @@ class ArgusAppRobolectricTest {
     }
 
     @Test
-    fun backgroundMemoryTrimReleasesVulkanResidencyOnlyWhenTrainingIsPausedAndIdle() {
+    fun backgroundMemoryTrimReleasesVulkanResidencyOnlyAtAnIdleWorkerBoundary() {
         assertFalse(
             shouldReleaseVulkanResidencyForMemoryPressure(
-                coreReady = false,
-                trainingManagerInitialized = true,
-                trainingPaused = true,
+                managerClosed = true,
                 hasCurrentItem = false,
                 hasActiveDocument = false,
                 hasQueuedWork = false
@@ -68,29 +67,7 @@ class ArgusAppRobolectricTest {
         )
         assertFalse(
             shouldReleaseVulkanResidencyForMemoryPressure(
-                coreReady = true,
-                trainingManagerInitialized = false,
-                trainingPaused = true,
-                hasCurrentItem = false,
-                hasActiveDocument = false,
-                hasQueuedWork = false
-            )
-        )
-        assertFalse(
-            shouldReleaseVulkanResidencyForMemoryPressure(
-                coreReady = true,
-                trainingManagerInitialized = true,
-                trainingPaused = false,
-                hasCurrentItem = false,
-                hasActiveDocument = false,
-                hasQueuedWork = false
-            )
-        )
-        assertFalse(
-            shouldReleaseVulkanResidencyForMemoryPressure(
-                coreReady = true,
-                trainingManagerInitialized = true,
-                trainingPaused = true,
+                managerClosed = false,
                 hasCurrentItem = true,
                 hasActiveDocument = false,
                 hasQueuedWork = false
@@ -98,9 +75,7 @@ class ArgusAppRobolectricTest {
         )
         assertFalse(
             shouldReleaseVulkanResidencyForMemoryPressure(
-                coreReady = true,
-                trainingManagerInitialized = true,
-                trainingPaused = true,
+                managerClosed = false,
                 hasCurrentItem = false,
                 hasActiveDocument = true,
                 hasQueuedWork = false
@@ -108,9 +83,7 @@ class ArgusAppRobolectricTest {
         )
         assertFalse(
             shouldReleaseVulkanResidencyForMemoryPressure(
-                coreReady = true,
-                trainingManagerInitialized = true,
-                trainingPaused = true,
+                managerClosed = false,
                 hasCurrentItem = false,
                 hasActiveDocument = false,
                 hasQueuedWork = true
@@ -118,9 +91,7 @@ class ArgusAppRobolectricTest {
         )
         assertTrue(
             shouldReleaseVulkanResidencyForMemoryPressure(
-                coreReady = true,
-                trainingManagerInitialized = true,
-                trainingPaused = true,
+                managerClosed = false,
                 hasCurrentItem = false,
                 hasActiveDocument = false,
                 hasQueuedWork = false
