@@ -155,6 +155,29 @@ class TrainingManagerPersistenceTest {
     }
 
     @Test
+    fun alreadyTrainingRoomRowReturnsQueuedWorkerTokenWithoutOptimizingTwice() = runBlocking {
+        withTrainingManager { _, repository, manager ->
+            manager.pauseTraining()
+            manager.enqueueData(
+                source = "persistence-test",
+                title = "Already active Room queue entry",
+                content = "Room has acknowledged the start, but this worker has not entered the optimizer."
+            )
+            awaitPersistence(manager)
+
+            val queuedItem = manager.nextQueue.value.single()
+            repository.saveTrainingItem(queuedItem.copy(status = TrainingStatus.TRAINING))
+
+            val claimedItem = manager.popNext()
+
+            assertEquals(TrainingStatus.QUEUED, claimedItem?.status)
+            assertEquals(queuedItem.id, claimedItem?.id)
+            assertTrue(manager.nextQueue.value.none { it.id == queuedItem.id })
+            assertEquals(0, manager.totalStepsExecuted.value)
+        }
+    }
+
+    @Test
     fun optimizerCommittedRoomItemIsReturnedForFinalizationWithoutRetraining() = runBlocking {
         withTrainingManager { _, repository, manager ->
             manager.pauseTraining()
