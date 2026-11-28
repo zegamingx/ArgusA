@@ -2921,7 +2921,16 @@ class TrainingManager internal constructor(
             val persistingItems = orderedItems.map { item ->
                 item.copy(status = TrainingStatus.PERSISTING)
             }
-            _nextQueue.value = persistingItems + _nextQueue.value
+            // An optimizer-committed row owns the single durable commit journal.
+            // Keep every committed item ahead of pre-commit retries so a requeued
+            // batch cannot start a new optimizer transaction before finalization.
+            val committedItems = _nextQueue.value.filter {
+                it.status == TrainingStatus.OPTIMIZER_COMMITTED
+            }
+            val remainingItems = _nextQueue.value.filterNot {
+                it.status == TrainingStatus.OPTIMIZER_COMMITTED
+            }
+            _nextQueue.value = committedItems + persistingItems + remainingItems
 
             val sendResult = persistenceOperations.trySend(
                 QueuePersistenceOperation.Save(
@@ -3576,6 +3585,42 @@ class TrainingManager internal constructor(
                             val nextItem = popNext(expectedStatus = TrainingStatus.QUEUED) ?: break
                             batchItems += nextItem
                         }
+
+                        if (_nextQueue.value.any { queued ->
+                                queued.status == TrainingStatus.OPTIMIZER_COMMITTED
+                            }
+                        ) {
+                            // A Room claim may discover that a later queue row already
+                            // owns the committed optimizer transaction. Do not write a
+                            // new PREPARED journal or optimizer update over that commit.
+                            // Return every item already reserved for this batch to the
+                            // queue, keeping committed items ahead of those retries.
+                            prependPersistingQueueItems(batchItems)
+                            val allItemsPreserved = synchronized(queueLock) {
+                                batchItems.all { batchItem ->
+                                    _nextQueue.value.any { queued -> queued.id == batchItem.id }
+                                }
+                            }
+                            _currentTrainingItem.value = null
+                            _activeDocument.value = null
+                            if (!allItemsPreserved) {
+                                _isTrainingPaused.value = true
+                                publishTrainingRecoveryStatus(
+                                    phase = TrainingRecoveryPhase.BLOCKED,
+                                    message = "Training batch was deferred but could not be restored to the queue.",
+                                    detail = "An optimizer-committed item must be finalized before another optimizer transaction can begin. One or more reserved queue items could not be durably returned."
+                                )
+                                logError(
+                                    "Training paused because a deferred batch could not be fully restored behind committed items."
+                                )
+                            } else {
+                                logWarning(
+                                    "Deferred a queued batch because an optimizer-committed item must be finalized first."
+                                )
+                            }
+                            continue
+                        }
+
                         val activeItems = batchItems
                             .map { item -> item.copy(status = TrainingStatus.TRAINING) }
                             .toMutableList()
