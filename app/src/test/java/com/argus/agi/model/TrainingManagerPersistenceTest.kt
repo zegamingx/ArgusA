@@ -203,6 +203,86 @@ class TrainingManagerPersistenceTest {
     }
 
     @Test
+    fun committedSecondItemIsDeferredFromQueuedOnlyBatchForSeparateFinalization() = runBlocking {
+        withTrainingManager { _, repository, manager ->
+            manager.pauseTraining()
+            manager.enqueueData(
+                source = "persistence-test",
+                title = "Ordinary first batch item",
+                content = "This item remains queued and is claimed before the committed second item."
+            )
+            manager.enqueueData(
+                source = "persistence-test",
+                title = "Committed second batch item",
+                content = "This item already has a durable optimizer commit and must never enter processBatch."
+            )
+            awaitPersistence(manager)
+
+            val queuedItems = manager.nextQueue.value.sortedBy(TrainingData::timestamp)
+            assertEquals(2, queuedItems.size)
+            val firstItem = queuedItems[0]
+            val committedItem = queuedItems[1]
+            repository.saveTrainingItem(
+                committedItem.copy(status = TrainingStatus.OPTIMIZER_COMMITTED)
+            )
+
+            val claimedFirstItem = manager.popNext()
+            assertEquals(firstItem.id, claimedFirstItem?.id)
+            assertEquals(TrainingStatus.QUEUED, claimedFirstItem?.status)
+
+            val batchClaim = manager.popNext(expectedStatus = TrainingStatus.QUEUED)
+
+            assertNull(
+                "A durable optimizer commit must not be returned to the QUEUED-only batch collector.",
+                batchClaim
+            )
+            assertEquals(
+                listOf(committedItem.id),
+                manager.nextQueue.value.map(TrainingData::id)
+            )
+            assertEquals(
+                TrainingStatus.OPTIMIZER_COMMITTED,
+                manager.nextQueue.value.single().status
+            )
+
+            val separateFinalizationClaim = manager.popNext()
+
+            assertEquals(committedItem.id, separateFinalizationClaim?.id)
+            assertEquals(
+                TrainingStatus.OPTIMIZER_COMMITTED,
+                separateFinalizationClaim?.status
+            )
+            assertTrue(manager.nextQueue.value.isEmpty())
+            assertEquals(0, manager.totalStepsExecuted.value)
+        }
+    }
+
+    @Test
+    fun staleQueueClaimCannotPauseWorkerAfterQueueGenerationChanges() = runBlocking {
+        withTrainingManager { _, _, manager ->
+            val staleItem = TrainingData(
+                source = "persistence-test",
+                title = "Stale claim from previous queue generation",
+                content = "A failed claim from before clearQueue must not block a replacement queue."
+            )
+
+            manager.clearQueue()
+
+            val blocked = manager.restoreQueueItemAndBlockTrainingAfterFailedStart(
+                item = staleItem,
+                reservationGeneration = 0L,
+                message = "Stale queue claim must be ignored.",
+                detail = "This message must not replace the current recovery state."
+            )
+
+            assertFalse(blocked)
+            assertFalse(manager.isTrainingPaused.value)
+            assertEquals(TrainingRecoveryPhase.IDLE, manager.trainingRecoveryStatus.value.phase)
+            assertTrue(manager.nextQueue.value.isEmpty())
+        }
+    }
+
+    @Test
     fun missingRoomItemIsRetiredInsteadOfBeingRetriedFromMemory() = runBlocking {
         withTrainingManager { _, repository, manager ->
             manager.pauseTraining()
