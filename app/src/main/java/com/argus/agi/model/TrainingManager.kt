@@ -3862,12 +3862,15 @@ class TrainingManager internal constructor(
     }
 
     /**
-     * Restores a failed queue claim only while its reservation generation is current.
-     * A concurrent queue clear must not be undone by an older failed start operation.
+     * Atomically restores a failed queue claim and blocks the worker only while the
+     * reservation still belongs to the current queue generation. clearQueue() uses
+     * the same lock, so an older Room failure cannot pause a replacement queue.
      */
-    private fun restoreQueueItemAfterFailedStart(
+    internal fun restoreQueueItemAndBlockTrainingAfterFailedStart(
         item: TrainingData,
-        reservationGeneration: Long
+        reservationGeneration: Long,
+        message: String,
+        detail: String
     ): Boolean = synchronized(queueLock) {
         if (closed || queueGeneration != reservationGeneration) {
             return@synchronized false
@@ -3875,6 +3878,12 @@ class TrainingManager internal constructor(
         if (_nextQueue.value.none { queued -> queued.id == item.id }) {
             _nextQueue.value = listOf(item) + _nextQueue.value
         }
+        _isTrainingPaused.value = true
+        publishTrainingRecoveryStatus(
+            phase = TrainingRecoveryPhase.BLOCKED,
+            message = message,
+            detail = detail
+        )
         true
     }
 
@@ -3960,19 +3969,20 @@ class TrainingManager internal constructor(
         if (persistenceError != null) {
             // A clear that happened while the Room update was pending must win.
             // Do not block a newer queue generation because an old claim failed.
-            if (!restoreQueueItemAfterFailedStart(item, reservationGeneration)) {
+            if (
+                !restoreQueueItemAndBlockTrainingAfterFailedStart(
+                    item = item,
+                    reservationGeneration = reservationGeneration,
+                    message = "Training queue persistence could not be verified.",
+                    detail = "Room could not confirm the durable state of the reserved item. Training is paused to prevent an unverified optimizer update."
+                )
+            ) {
                 logWarning(
                     "Ignored a stale training-start failure after the queue generation changed.",
                     persistenceError
                 )
                 return null
             }
-            _isTrainingPaused.value = true
-            publishTrainingRecoveryStatus(
-                phase = TrainingRecoveryPhase.BLOCKED,
-                message = "Training queue persistence could not be verified.",
-                detail = "Room could not confirm the durable state of the reserved item. Training is paused to prevent an unverified optimizer update."
-            )
             logError(
                 "Could not verify the durable Room state after a training-start claim failed.",
                 persistenceError
@@ -3982,15 +3992,16 @@ class TrainingManager internal constructor(
 
         val acknowledgement = persistenceResult.getOrNull()
         if (acknowledgement == null) {
-            if (!restoreQueueItemAfterFailedStart(item, reservationGeneration)) {
+            if (
+                !restoreQueueItemAndBlockTrainingAfterFailedStart(
+                    item = item,
+                    reservationGeneration = reservationGeneration,
+                    message = "Training queue claim returned no acknowledgement.",
+                    detail = "Room did not return a durable status for the reserved item. Training is paused to protect optimizer state."
+                )
+            ) {
                 return null
             }
-            _isTrainingPaused.value = true
-            publishTrainingRecoveryStatus(
-                phase = TrainingRecoveryPhase.BLOCKED,
-                message = "Training queue claim returned no acknowledgement.",
-                detail = "Room did not return a durable status for the reserved item. Training is paused to protect optimizer state."
-            )
             logError("Training queue claim returned an empty acknowledgement.")
             return null
         }
@@ -4033,6 +4044,19 @@ class TrainingManager internal constructor(
                     logError("Room reported OPTIMIZER_COMMITTED without returning the queue item.")
                     return null
                 }
+                if (
+                    expectedStatus != null &&
+                    expectedStatus != TrainingStatus.OPTIMIZER_COMMITTED
+                ) {
+                    // A batch collector requested QUEUED items only. Keep the durable
+                    // commit at the head of the queue and let the next worker iteration
+                    // finalize it through processCommittedItem(), never processBatch().
+                    prependCommittedQueueItems(listOf(committedItem))
+                    logWarning(
+                        "Deferred committed item '${item.id}' from a QUEUED-only batch so it can be finalized separately."
+                    )
+                    return null
+                }
                 logWarning(
                     "Room reports OPTIMIZER_COMMITTED for item '${item.id}'; routing it to finalization without another optimizer update."
                 )
@@ -4071,18 +4095,19 @@ class TrainingManager internal constructor(
 
             TrainingStatus.QUEUED,
             TrainingStatus.PERSISTING -> {
-                if (!restoreQueueItemAfterFailedStart(item, reservationGeneration)) {
+                if (
+                    !restoreQueueItemAndBlockTrainingAfterFailedStart(
+                        item = item,
+                        reservationGeneration = reservationGeneration,
+                        message = "Training queue claim was not acknowledged.",
+                        detail = "Room still reports ${acknowledgement.roomStatus} for the reserved item. Training is paused rather than retrying a non-durable queue transition indefinitely."
+                    )
+                ) {
                     logWarning(
                         "Ignored a stale Room queue status after the queue generation changed."
                     )
                     return null
                 }
-                _isTrainingPaused.value = true
-                publishTrainingRecoveryStatus(
-                    phase = TrainingRecoveryPhase.BLOCKED,
-                    message = "Training queue claim was not acknowledged.",
-                    detail = "Room still reports ${acknowledgement.roomStatus} for the reserved item. Training is paused rather than retrying a non-durable queue transition indefinitely."
-                )
                 logError(
                     "Training item '${item.id}' could not enter TRAINING; Room still reports ${acknowledgement.roomStatus}."
                 )
