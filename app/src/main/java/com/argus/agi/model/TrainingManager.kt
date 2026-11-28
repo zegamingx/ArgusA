@@ -3991,7 +3991,25 @@ class TrainingManager internal constructor(
             TrainingStatus.TRAINING -> {
                 // Room durably marks the item TRAINING, while the worker consumes
                 // its original QUEUED token for batch setup.
-                return persistedItem?.copy(status = TrainingStatus.QUEUED) ?: item
+                val workerItem = persistedItem?.copy(status = TrainingStatus.QUEUED) ?: item
+                if (
+                    workerItem.source.isScreenTrainingSource() &&
+                    workerItem.source.screenTrainingPackageName()
+                        ?.let(::isScreenTrainingConsentEnabled) != true
+                ) {
+                    try {
+                        persistenceOperations.send(
+                            QueuePersistenceOperation.DeleteItem(workerItem.id)
+                        )
+                    } catch (closedChannel: ClosedSendChannelException) {
+                        logError(
+                            "Could not queue deletion of screen item '${workerItem.id}' after consent was revoked.",
+                            closedChannel
+                        )
+                    }
+                    return null
+                }
+                return workerItem
             }
 
             TrainingStatus.OPTIMIZER_COMMITTED -> {
@@ -4064,24 +4082,6 @@ class TrainingManager internal constructor(
                 )
                 return null
             }
-        }
-
-        // Consent may be revoked while the durable QUEUED -> TRAINING transition
-        // is being persisted. Recheck at the final boundary before the worker can
-        // construct a batch or call the optimizer.
-        if (
-            item.source.isScreenTrainingSource() &&
-            item.source.screenTrainingPackageName()?.let(::isScreenTrainingConsentEnabled) != true
-        ) {
-            try {
-                persistenceOperations.send(QueuePersistenceOperation.DeleteItem(item.id))
-            } catch (closedChannel: ClosedSendChannelException) {
-                logError(
-                    "Could not queue deletion of screen item '${item.id}' after consent was revoked.",
-                    closedChannel
-                )
-            }
-            return null
         }
 
         return item
