@@ -250,6 +250,7 @@ class TrainingManagerPersistenceTest {
             )
             assertEquals(listOf(queuedItem.id), manager.nextQueue.value.map(TrainingData::id))
             assertEquals(TrainingStatus.QUEUED, manager.nextQueue.value.single().status)
+            assertEquals(TrainingRecoveryPhase.BLOCKED, manager.trainingRecoveryStatus.value.phase)
             assertEquals(0, manager.totalStepsExecuted.value)
         }
     }
