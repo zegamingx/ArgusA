@@ -3929,7 +3929,7 @@ class TrainingManager internal constructor(
         val persistenceResult = completion.await()
         val persistenceError = persistenceResult.exceptionOrNull()
         if (persistenceError != null) {
-            val persistedLookup = runCatching {
+            val persistedLookup = runSuspendCatching {
                 val repository = repo ?: throw IllegalStateException(
                     "Training queue persistence is unavailable.",
                     repositoryInitialization.exceptionOrNull()
