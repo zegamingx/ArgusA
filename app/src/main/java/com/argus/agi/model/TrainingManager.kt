@@ -250,6 +250,11 @@ class TrainingManager internal constructor(
     private val conversationalValidationPersistence =
         ConversationalValidationPersistence(validationFilesDirectory)
 
+    private data class TrainingQueueStartAcknowledgement(
+        val workerItem: TrainingData?,
+        val roomStatus: TrainingStatus?
+    )
+
     private sealed interface QueuePersistenceOperation {
         data class Save(
             val generation: Long,
@@ -263,7 +268,7 @@ class TrainingManager internal constructor(
 
         data class Start(
             val item: TrainingData,
-            val completion: CompletableDeferred<Result<TrainingData?>>
+            val completion: CompletableDeferred<Result<TrainingQueueStartAcknowledgement>>
         ) : QueuePersistenceOperation
 
         data class Barrier(
@@ -3753,9 +3758,16 @@ class TrainingManager internal constructor(
                     if (repository.markTrainingStarted(operation.item.id)) {
                         // Room owns the durable TRAINING state; the worker still
                         // consumes the original QUEUED in-memory item for batch setup.
-                        operation.item
+                        TrainingQueueStartAcknowledgement(
+                            workerItem = operation.item,
+                            roomStatus = TrainingStatus.TRAINING
+                        )
                     } else {
-                        repository.getTrainingItem(operation.item.id)
+                        val persistedItem = repository.getTrainingItem(operation.item.id)
+                        TrainingQueueStartAcknowledgement(
+                            workerItem = persistedItem,
+                            roomStatus = persistedItem?.status
+                        )
                     }
                 }
                 result.onFailure { error ->
@@ -3857,7 +3869,8 @@ class TrainingManager internal constructor(
     internal suspend fun popNext(
         expectedStatus: TrainingStatus? = null
     ): TrainingData? {
-        val startCompletion = CompletableDeferred<Result<TrainingData?>>()
+        val startCompletion =
+            CompletableDeferred<Result<TrainingQueueStartAcknowledgement>>()
         val reservation = synchronized(queueLock) {
             val list = _nextQueue.value
             if (screenTrainingPurgePending) {
@@ -3952,9 +3965,70 @@ class TrainingManager internal constructor(
             return null
         }
 
-        val persistedItem = persistenceResult.getOrNull()
-        when {
-            persistedItem == null -> {
+        val acknowledgement = persistenceResult.getOrNull()
+        if (acknowledgement == null) {
+            synchronized(queueLock) {
+                if (
+                    !closed &&
+                    queueGeneration == reservationGeneration &&
+                    _nextQueue.value.none { queued -> queued.id == item.id }
+                ) {
+                    _nextQueue.value = listOf(item) + _nextQueue.value
+                }
+            }
+            _isTrainingPaused.value = true
+            publishTrainingRecoveryStatus(
+                phase = TrainingRecoveryPhase.BLOCKED,
+                message = "Training queue claim returned no acknowledgement.",
+                detail = "Room did not return a durable status for the reserved item. Training is paused to protect optimizer state."
+            )
+            logError("Training queue claim returned an empty acknowledgement.")
+            return null
+        }
+
+        val persistedItem = acknowledgement.workerItem
+        when (acknowledgement.roomStatus) {
+            TrainingStatus.TRAINING -> {
+                // Room durably marks the item TRAINING, while the worker consumes
+                // its original QUEUED token for batch setup.
+                return persistedItem?.copy(status = TrainingStatus.QUEUED) ?: item
+            }
+
+            TrainingStatus.OPTIMIZER_COMMITTED -> {
+                val committedItem = persistedItem
+                if (committedItem == null) {
+                    _isTrainingPaused.value = true
+                    publishTrainingRecoveryStatus(
+                        phase = TrainingRecoveryPhase.BLOCKED,
+                        message = "Committed queue item could not be recovered.",
+                        detail = "Room reported OPTIMIZER_COMMITTED but did not return the durable item."
+                    )
+                    logError("Room reported OPTIMIZER_COMMITTED without returning the queue item.")
+                    return null
+                }
+                logWarning(
+                    "Room reports OPTIMIZER_COMMITTED for item '${item.id}'; routing it to finalization without another optimizer update."
+                )
+                return committedItem
+            }
+
+            TrainingStatus.COMPLETED,
+            TrainingStatus.FAILED -> {
+                synchronized(queueLock) {
+                    if (queueGeneration == reservationGeneration) {
+                        _nextQueue.value = _nextQueue.value.filterNot { queued ->
+                            queued.id == item.id
+                        }
+                    }
+                }
+                persistedItem?.let(::pushCompleted)
+                logWarning(
+                    "Retired stale in-memory training item '${item.id}'; Room already records ${acknowledgement.roomStatus}."
+                )
+                return null
+            }
+
+            null -> {
                 synchronized(queueLock) {
                     if (queueGeneration == reservationGeneration) {
                         _nextQueue.value = _nextQueue.value.filterNot { queued ->
@@ -3968,36 +4042,8 @@ class TrainingManager internal constructor(
                 return null
             }
 
-            persistedItem.status == TrainingStatus.TRAINING -> {
-                // The durable row is TRAINING, but the worker consumes the original
-                // in-memory QUEUED token and changes it to TRAINING at batch setup.
-                return item
-            }
-
-            persistedItem.status == TrainingStatus.OPTIMIZER_COMMITTED -> {
-                logWarning(
-                    "Room reports OPTIMIZER_COMMITTED for item '${item.id}'; routing it to finalization without another optimizer update."
-                )
-                return persistedItem
-            }
-
-            persistedItem.status == TrainingStatus.COMPLETED ||
-                persistedItem.status == TrainingStatus.FAILED -> {
-                synchronized(queueLock) {
-                    if (queueGeneration == reservationGeneration) {
-                        _nextQueue.value = _nextQueue.value.filterNot { queued ->
-                            queued.id == item.id
-                        }
-                    }
-                }
-                pushCompleted(persistedItem)
-                logWarning(
-                    "Retired stale in-memory training item '${item.id}'; Room already records ${persistedItem.status}."
-                )
-                return null
-            }
-
-            else -> {
+            TrainingStatus.QUEUED,
+            TrainingStatus.PERSISTING -> {
                 synchronized(queueLock) {
                     if (
                         !closed &&
@@ -4011,10 +4057,10 @@ class TrainingManager internal constructor(
                 publishTrainingRecoveryStatus(
                     phase = TrainingRecoveryPhase.BLOCKED,
                     message = "Training queue claim was not acknowledged.",
-                    detail = "Room still reports ${persistedItem.status} for the reserved item. Training is paused rather than retrying a non-durable queue transition indefinitely."
+                    detail = "Room still reports ${acknowledgement.roomStatus} for the reserved item. Training is paused rather than retrying a non-durable queue transition indefinitely."
                 )
                 logError(
-                    "Training item '${item.id}' could not enter TRAINING; Room still reports ${persistedItem.status}."
+                    "Training item '${item.id}' could not enter TRAINING; Room still reports ${acknowledgement.roomStatus}."
                 )
                 return null
             }
