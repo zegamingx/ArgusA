@@ -3866,6 +3866,19 @@ class TrainingManager internal constructor(
      * Internal visibility allows persistence-contract tests to exercise the same path
      * used by the worker without starting the optimizer loop.
      */
+    private fun restoreQueueItemAfterFailedStart(
+        item: TrainingData,
+        reservationGeneration: Long
+    ): Boolean = synchronized(queueLock) {
+        if (closed || queueGeneration != reservationGeneration) {
+            return@synchronized false
+        }
+        if (_nextQueue.value.none { queued -> queued.id == item.id }) {
+            _nextQueue.value = listOf(item) + _nextQueue.value
+        }
+        true
+    }
+
     internal suspend fun popNext(
         expectedStatus: TrainingStatus? = null
     ): TrainingData? {
@@ -3941,16 +3954,14 @@ class TrainingManager internal constructor(
         val persistenceResult = completion.await()
         val persistenceError = persistenceResult.exceptionOrNull()
         if (persistenceError != null) {
-            synchronized(queueLock) {
-                // A clear that happened while the Room update was pending must win.
-                // Never resurrect a queue item from an older generation.
-                if (
-                    !closed &&
-                    queueGeneration == reservationGeneration &&
-                    _nextQueue.value.none { queued -> queued.id == item.id }
-                ) {
-                    _nextQueue.value = listOf(item) + _nextQueue.value
-                }
+            // A clear that happened while the Room update was pending must win.
+            // Do not block a newer queue generation because an old claim failed.
+            if (!restoreQueueItemAfterFailedStart(item, reservationGeneration)) {
+                logWarning(
+                    "Ignored a stale training-start failure after the queue generation changed.",
+                    persistenceError
+                )
+                return null
             }
             _isTrainingPaused.value = true
             publishTrainingRecoveryStatus(
@@ -3967,14 +3978,8 @@ class TrainingManager internal constructor(
 
         val acknowledgement = persistenceResult.getOrNull()
         if (acknowledgement == null) {
-            synchronized(queueLock) {
-                if (
-                    !closed &&
-                    queueGeneration == reservationGeneration &&
-                    _nextQueue.value.none { queued -> queued.id == item.id }
-                ) {
-                    _nextQueue.value = listOf(item) + _nextQueue.value
-                }
+            if (!restoreQueueItemAfterFailedStart(item, reservationGeneration)) {
+                return null
             }
             _isTrainingPaused.value = true
             publishTrainingRecoveryStatus(
@@ -4062,14 +4067,11 @@ class TrainingManager internal constructor(
 
             TrainingStatus.QUEUED,
             TrainingStatus.PERSISTING -> {
-                synchronized(queueLock) {
-                    if (
-                        !closed &&
-                        queueGeneration == reservationGeneration &&
-                        _nextQueue.value.none { queued -> queued.id == item.id }
-                    ) {
-                        _nextQueue.value = listOf(item) + _nextQueue.value
-                    }
+                if (!restoreQueueItemAfterFailedStart(item, reservationGeneration)) {
+                    logWarning(
+                        "Ignored a stale Room queue status after the queue generation changed."
+                    )
+                    return null
                 }
                 _isTrainingPaused.value = true
                 publishTrainingRecoveryStatus(
