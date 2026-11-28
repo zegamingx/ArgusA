@@ -3760,8 +3760,13 @@ class TrainingManager internal constructor(
                     }
                 }
                 result.onFailure { error ->
+                    val detail = error.message
+                        ?.lineSequence()
+                        ?.firstOrNull()
+                        ?.take(180)
+                        ?: error.javaClass.simpleName
                     logError(
-                        "Failed to persist active training state for '${operation.itemId}'",
+                        "Failed to persist active training state for '${operation.itemId}': $detail",
                         error
                     )
                 }
@@ -3922,23 +3927,109 @@ class TrainingManager internal constructor(
         // A committed item is already durable and must go directly to finalization.
         // A queued item is not allowed to train until Room confirms TRAINING.
         val persistenceResult = completion.await()
-        if (persistenceResult.isFailure) {
-            synchronized(queueLock) {
-                // A clear that happened while the Room update was pending must win.
-                // Never resurrect a queue item from an older generation.
-                if (
-                    !closed &&
-                    queueGeneration == reservationGeneration &&
-                    _nextQueue.value.none { queued -> queued.id == item.id }
-                ) {
-                    _nextQueue.value = listOf(item) + _nextQueue.value
+        val persistenceError = persistenceResult.exceptionOrNull()
+        if (persistenceError != null) {
+            val persistedLookup = runCatching {
+                val repository = repo ?: throw IllegalStateException(
+                    "Training queue persistence is unavailable.",
+                    repositoryInitialization.exceptionOrNull()
+                )
+                repository.getTrainingItem(item.id)
+            }
+            if (persistedLookup.isFailure) {
+                synchronized(queueLock) {
+                    // A clear that happened while the Room update was pending must win.
+                    // Never resurrect a queue item from an older generation.
+                    if (
+                        !closed &&
+                        queueGeneration == reservationGeneration &&
+                        _nextQueue.value.none { queued -> queued.id == item.id }
+                    ) {
+                        _nextQueue.value = listOf(item) + _nextQueue.value
+                    }
+                }
+                _isTrainingPaused.value = true
+                publishTrainingRecoveryStatus(
+                    phase = TrainingRecoveryPhase.BLOCKED,
+                    message = "Training queue persistence could not be verified.",
+                    detail = "Room could not confirm the durable state of the reserved item. Training is paused to prevent an unverified optimizer update."
+                )
+                logError(
+                    "Could not verify the durable Room state after a training-start claim failed.",
+                    persistedLookup.exceptionOrNull() ?: persistenceError
+                )
+                return null
+            }
+
+            val persistedItem = persistedLookup.getOrNull()
+            when {
+                persistedItem == null -> {
+                    synchronized(queueLock) {
+                        if (queueGeneration == reservationGeneration) {
+                            _nextQueue.value = _nextQueue.value.filterNot { queued ->
+                                queued.id == item.id
+                            }
+                        }
+                    }
+                    logWarning(
+                        "Retired stale in-memory training item '${item.id}' because its Room row no longer exists."
+                    )
+                    return null
+                }
+
+                persistedItem.status == TrainingStatus.TRAINING -> {
+                    logWarning(
+                        "Room already confirms TRAINING for item '${item.id}'; accepting the durable claim."
+                    )
+                    return persistedItem
+                }
+
+                persistedItem.status == TrainingStatus.OPTIMIZER_COMMITTED -> {
+                    logWarning(
+                        "Room reports OPTIMIZER_COMMITTED for item '${item.id}'; routing it to finalization without another optimizer update."
+                    )
+                    return persistedItem
+                }
+
+                persistedItem.status == TrainingStatus.COMPLETED ||
+                    persistedItem.status == TrainingStatus.FAILED -> {
+                    synchronized(queueLock) {
+                        if (queueGeneration == reservationGeneration) {
+                            _nextQueue.value = _nextQueue.value.filterNot { queued ->
+                                queued.id == item.id
+                            }
+                        }
+                    }
+                    pushCompleted(persistedItem)
+                    logWarning(
+                        "Retired stale in-memory training item '${item.id}'; Room already records ${persistedItem.status}."
+                    )
+                    return null
+                }
+
+                else -> {
+                    synchronized(queueLock) {
+                        if (
+                            !closed &&
+                            queueGeneration == reservationGeneration &&
+                            _nextQueue.value.none { queued -> queued.id == item.id }
+                        ) {
+                            _nextQueue.value = listOf(item) + _nextQueue.value
+                        }
+                    }
+                    _isTrainingPaused.value = true
+                    publishTrainingRecoveryStatus(
+                        phase = TrainingRecoveryPhase.BLOCKED,
+                        message = "Training queue claim was not acknowledged.",
+                        detail = "Room still reports ${persistedItem.status} for the reserved item. Training is paused rather than retrying a non-durable queue transition indefinitely."
+                    )
+                    logError(
+                        "Training item '${item.id}' could not enter TRAINING; Room still reports ${persistedItem.status}.",
+                        persistenceError
+                    )
+                    return null
                 }
             }
-            logError(
-                "Training item '${item.id}' was returned to the queue because its start state was not persisted.",
-                persistenceResult.exceptionOrNull()
-            )
-            return null
         }
 
         // Consent may be revoked while the durable QUEUED -> TRAINING transition
