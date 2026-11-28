@@ -132,6 +132,76 @@ class TrainingManagerPersistenceTest {
     }
 
     @Test
+    fun completedRoomItemIsRetiredInsteadOfBeingRetriedFromMemory() = runBlocking {
+        withTrainingManager { _, repository, manager ->
+            manager.pauseTraining()
+            manager.enqueueData(
+                source = "persistence-test",
+                title = "Stale completed queue entry",
+                content = "This item is already completed durably before the worker claims it."
+            )
+            awaitPersistence(manager)
+
+            val queuedItem = manager.nextQueue.value.single()
+            repository.saveTrainingItem(queuedItem.copy(status = TrainingStatus.COMPLETED))
+
+            val claimedItem = manager.popNext()
+
+            assertNull(claimedItem)
+            assertTrue(manager.nextQueue.value.none { it.id == queuedItem.id })
+            assertTrue(manager.completedQueue.value.any { it.id == queuedItem.id })
+            assertEquals(0, manager.totalStepsExecuted.value)
+        }
+    }
+
+    @Test
+    fun optimizerCommittedRoomItemIsReturnedForFinalizationWithoutRetraining() = runBlocking {
+        withTrainingManager { _, repository, manager ->
+            manager.pauseTraining()
+            manager.enqueueData(
+                source = "persistence-test",
+                title = "Stale optimizer-committed queue entry",
+                content = "This item has a durable optimizer commit and must not be optimized twice."
+            )
+            awaitPersistence(manager)
+
+            val queuedItem = manager.nextQueue.value.single()
+            repository.saveTrainingItem(
+                queuedItem.copy(status = TrainingStatus.OPTIMIZER_COMMITTED)
+            )
+
+            val claimedItem = manager.popNext()
+
+            assertEquals(TrainingStatus.OPTIMIZER_COMMITTED, claimedItem?.status)
+            assertEquals(queuedItem.id, claimedItem?.id)
+            assertTrue(manager.nextQueue.value.none { it.id == queuedItem.id })
+            assertEquals(0, manager.totalStepsExecuted.value)
+        }
+    }
+
+    @Test
+    fun missingRoomItemIsRetiredInsteadOfBeingRetriedFromMemory() = runBlocking {
+        withTrainingManager { _, repository, manager ->
+            manager.pauseTraining()
+            manager.enqueueData(
+                source = "persistence-test",
+                title = "Missing Room queue entry",
+                content = "This in-memory item has no durable Room row when claimed."
+            )
+            awaitPersistence(manager)
+
+            val queuedItem = manager.nextQueue.value.single()
+            repository.deleteTrainingItem(queuedItem.id)
+
+            val claimedItem = manager.popNext()
+
+            assertNull(claimedItem)
+            assertTrue(manager.nextQueue.value.none { it.id == queuedItem.id })
+            assertEquals(0, manager.totalStepsExecuted.value)
+        }
+    }
+
+    @Test
     fun failedStartPersistenceRestoresItemWithoutTraining() = runBlocking {
         withTrainingManager { database, repository, manager ->
             manager.pauseTraining()
