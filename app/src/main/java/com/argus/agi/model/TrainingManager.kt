@@ -3969,7 +3969,9 @@ class TrainingManager internal constructor(
             }
 
             persistedItem.status == TrainingStatus.TRAINING -> {
-                return persistedItem
+                // The durable row is TRAINING, but the worker consumes the original
+                // in-memory QUEUED token and changes it to TRAINING at batch setup.
+                return item
             }
 
             persistedItem.status == TrainingStatus.OPTIMIZER_COMMITTED -> {
