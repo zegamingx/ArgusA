@@ -4083,8 +4083,6 @@ class TrainingManager internal constructor(
                 return null
             }
         }
-
-        return item
     }
 
     /**
