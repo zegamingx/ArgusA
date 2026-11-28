@@ -3862,9 +3862,8 @@ class TrainingManager internal constructor(
     }
 
     /**
-     * Reserves the next item only after Room confirms its TRAINING transition.
-     * Internal visibility allows persistence-contract tests to exercise the same path
-     * used by the worker without starting the optimizer loop.
+     * Restores a failed queue claim only while its reservation generation is current.
+     * A concurrent queue clear must not be undone by an older failed start operation.
      */
     private fun restoreQueueItemAfterFailedStart(
         item: TrainingData,
@@ -3879,6 +3878,11 @@ class TrainingManager internal constructor(
         true
     }
 
+    /**
+     * Reserves the next item only after Room confirms its TRAINING transition.
+     * Internal visibility allows persistence-contract tests to exercise the same path
+     * used by the worker without starting the optimizer loop.
+     */
     internal suspend fun popNext(
         expectedStatus: TrainingStatus? = null
     ): TrainingData? {
