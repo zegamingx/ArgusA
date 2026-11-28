@@ -4332,7 +4332,25 @@ class ArgusNeuralEngine private constructor(
             }
             verified
         } catch (t: Throwable) {
-            ArgusDiagnosticBridge.error(TAG, "Checkpoint save failed", t)
+            val rootCause = generateSequence(t) { error -> error.cause }
+                .take(4)
+                .last()
+            val rootDetail = rootCause.message
+                ?.lineSequence()
+                ?.firstOrNull()
+                ?.take(180)
+            val diagnostic = buildString {
+                append("Checkpoint save failed (")
+                append(t.javaClass.simpleName)
+                append("; root=")
+                append(rootCause.javaClass.simpleName)
+                append(')')
+                if (!rootDetail.isNullOrBlank()) {
+                    append(": ")
+                    append(rootDetail)
+                }
+            }
+            ArgusDiagnosticBridge.error(TAG, diagnostic, t)
             false
         }
     }

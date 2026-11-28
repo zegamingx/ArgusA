@@ -250,6 +250,11 @@ class TrainingManager internal constructor(
     private val conversationalValidationPersistence =
         ConversationalValidationPersistence(validationFilesDirectory)
 
+    private data class TrainingQueueStartAcknowledgement(
+        val workerItem: TrainingData?,
+        val roomStatus: TrainingStatus?
+    )
+
     private sealed interface QueuePersistenceOperation {
         data class Save(
             val generation: Long,
@@ -262,8 +267,8 @@ class TrainingManager internal constructor(
         ) : QueuePersistenceOperation
 
         data class Start(
-            val itemId: String,
-            val completion: CompletableDeferred<Result<Unit>>
+            val item: TrainingData,
+            val completion: CompletableDeferred<Result<TrainingQueueStartAcknowledgement>>
         ) : QueuePersistenceOperation
 
         data class Barrier(
@@ -2916,7 +2921,16 @@ class TrainingManager internal constructor(
             val persistingItems = orderedItems.map { item ->
                 item.copy(status = TrainingStatus.PERSISTING)
             }
-            _nextQueue.value = persistingItems + _nextQueue.value
+            // An optimizer-committed row owns the single durable commit journal.
+            // Keep every committed item ahead of pre-commit retries so a requeued
+            // batch cannot start a new optimizer transaction before finalization.
+            val committedItems = _nextQueue.value.filter {
+                it.status == TrainingStatus.OPTIMIZER_COMMITTED
+            }
+            val remainingItems = _nextQueue.value.filterNot {
+                it.status == TrainingStatus.OPTIMIZER_COMMITTED
+            }
+            _nextQueue.value = committedItems + persistingItems + remainingItems
 
             val sendResult = persistenceOperations.trySend(
                 QueuePersistenceOperation.Save(
@@ -3571,6 +3585,42 @@ class TrainingManager internal constructor(
                             val nextItem = popNext(expectedStatus = TrainingStatus.QUEUED) ?: break
                             batchItems += nextItem
                         }
+
+                        if (_nextQueue.value.any { queued ->
+                                queued.status == TrainingStatus.OPTIMIZER_COMMITTED
+                            }
+                        ) {
+                            // A Room claim may discover that a later queue row already
+                            // owns the committed optimizer transaction. Do not write a
+                            // new PREPARED journal or optimizer update over that commit.
+                            // Return every item already reserved for this batch to the
+                            // queue, keeping committed items ahead of those retries.
+                            prependPersistingQueueItems(batchItems)
+                            val allItemsPreserved = synchronized(queueLock) {
+                                batchItems.all { batchItem ->
+                                    _nextQueue.value.any { queued -> queued.id == batchItem.id }
+                                }
+                            }
+                            _currentTrainingItem.value = null
+                            _activeDocument.value = null
+                            if (!allItemsPreserved) {
+                                _isTrainingPaused.value = true
+                                publishTrainingRecoveryStatus(
+                                    phase = TrainingRecoveryPhase.BLOCKED,
+                                    message = "Training batch was deferred but could not be restored to the queue.",
+                                    detail = "An optimizer-committed item must be finalized before another optimizer transaction can begin. One or more reserved queue items could not be durably returned."
+                                )
+                                logError(
+                                    "Training paused because a deferred batch could not be fully restored behind committed items."
+                                )
+                            } else {
+                                logWarning(
+                                    "Deferred a queued batch because an optimizer-committed item must be finalized first."
+                                )
+                            }
+                            continue
+                        }
+
                         val activeItems = batchItems
                             .map { item -> item.copy(status = TrainingStatus.TRAINING) }
                             .toMutableList()
@@ -3750,18 +3800,29 @@ class TrainingManager internal constructor(
                         "Training queue persistence is unavailable.",
                         repositoryInitialization.exceptionOrNull()
                     )
-                    if (!repository.markTrainingStarted(operation.itemId)) {
-                        val persistedStatus = repository.getTrainingItem(operation.itemId)?.status?.name
-                            ?: "MISSING"
-                        throw IllegalStateException(
-                            "Training queue item '${operation.itemId}' could not enter TRAINING in Room " +
-                                "(persisted status: $persistedStatus)."
+                    if (repository.markTrainingStarted(operation.item.id)) {
+                        // Room owns the durable TRAINING state; the worker still
+                        // consumes the original QUEUED in-memory item for batch setup.
+                        TrainingQueueStartAcknowledgement(
+                            workerItem = operation.item,
+                            roomStatus = TrainingStatus.TRAINING
+                        )
+                    } else {
+                        val persistedItem = repository.getTrainingItem(operation.item.id)
+                        TrainingQueueStartAcknowledgement(
+                            workerItem = persistedItem,
+                            roomStatus = persistedItem?.status
                         )
                     }
                 }
                 result.onFailure { error ->
+                    val detail = error.message
+                        ?.lineSequence()
+                        ?.firstOrNull()
+                        ?.take(180)
+                        ?: error.javaClass.simpleName
                     logError(
-                        "Failed to persist active training state for '${operation.itemId}'",
+                        "Could not verify active training state for '${operation.item.id}': $detail",
                         error
                     )
                 }
@@ -3846,6 +3907,32 @@ class TrainingManager internal constructor(
     }
 
     /**
+     * Atomically restores a failed queue claim and blocks the worker only while the
+     * reservation still belongs to the current queue generation. clearQueue() uses
+     * the same lock, so an older Room failure cannot pause a replacement queue.
+     */
+    internal fun restoreQueueItemAndBlockTrainingAfterFailedStart(
+        item: TrainingData,
+        reservationGeneration: Long,
+        message: String,
+        detail: String
+    ): Boolean = synchronized(queueLock) {
+        if (closed || queueGeneration != reservationGeneration) {
+            return@synchronized false
+        }
+        if (_nextQueue.value.none { queued -> queued.id == item.id }) {
+            _nextQueue.value = listOf(item) + _nextQueue.value
+        }
+        _isTrainingPaused.value = true
+        publishTrainingRecoveryStatus(
+            phase = TrainingRecoveryPhase.BLOCKED,
+            message = message,
+            detail = detail
+        )
+        true
+    }
+
+    /**
      * Reserves the next item only after Room confirms its TRAINING transition.
      * Internal visibility allows persistence-contract tests to exercise the same path
      * used by the worker without starting the optimizer loop.
@@ -3853,7 +3940,8 @@ class TrainingManager internal constructor(
     internal suspend fun popNext(
         expectedStatus: TrainingStatus? = null
     ): TrainingData? {
-        val startCompletion = CompletableDeferred<Result<Unit>>()
+        val startCompletion =
+            CompletableDeferred<Result<TrainingQueueStartAcknowledgement>>()
         val reservation = synchronized(queueLock) {
             val list = _nextQueue.value
             if (screenTrainingPurgePending) {
@@ -3902,7 +3990,7 @@ class TrainingManager internal constructor(
 
             val sendResult = persistenceOperations.trySend(
                 QueuePersistenceOperation.Start(
-                    itemId = first.id,
+                    item = first,
                     completion = startCompletion
                 )
             )
@@ -3922,44 +4010,155 @@ class TrainingManager internal constructor(
         // A committed item is already durable and must go directly to finalization.
         // A queued item is not allowed to train until Room confirms TRAINING.
         val persistenceResult = completion.await()
-        if (persistenceResult.isFailure) {
-            synchronized(queueLock) {
-                // A clear that happened while the Room update was pending must win.
-                // Never resurrect a queue item from an older generation.
-                if (
-                    !closed &&
-                    queueGeneration == reservationGeneration &&
-                    _nextQueue.value.none { queued -> queued.id == item.id }
-                ) {
-                    _nextQueue.value = listOf(item) + _nextQueue.value
-                }
+        val persistenceError = persistenceResult.exceptionOrNull()
+        if (persistenceError != null) {
+            // A clear that happened while the Room update was pending must win.
+            // Do not block a newer queue generation because an old claim failed.
+            if (
+                !restoreQueueItemAndBlockTrainingAfterFailedStart(
+                    item = item,
+                    reservationGeneration = reservationGeneration,
+                    message = "Training queue persistence could not be verified.",
+                    detail = "Room could not confirm the durable state of the reserved item. Training is paused to prevent an unverified optimizer update."
+                )
+            ) {
+                logWarning(
+                    "Ignored a stale training-start failure after the queue generation changed.",
+                    persistenceError
+                )
+                return null
             }
             logError(
-                "Training item '${item.id}' was returned to the queue because its start state was not persisted.",
-                persistenceResult.exceptionOrNull()
+                "Could not verify the durable Room state after a training-start claim failed.",
+                persistenceError
             )
             return null
         }
 
-        // Consent may be revoked while the durable QUEUED -> TRAINING transition
-        // is being persisted. Recheck at the final boundary before the worker can
-        // construct a batch or call the optimizer.
-        if (
-            item.source.isScreenTrainingSource() &&
-            item.source.screenTrainingPackageName()?.let(::isScreenTrainingConsentEnabled) != true
-        ) {
-            try {
-                persistenceOperations.send(QueuePersistenceOperation.DeleteItem(item.id))
-            } catch (closedChannel: ClosedSendChannelException) {
-                logError(
-                    "Could not queue deletion of screen item '${item.id}' after consent was revoked.",
-                    closedChannel
+        val acknowledgement = persistenceResult.getOrNull()
+        if (acknowledgement == null) {
+            if (
+                !restoreQueueItemAndBlockTrainingAfterFailedStart(
+                    item = item,
+                    reservationGeneration = reservationGeneration,
+                    message = "Training queue claim returned no acknowledgement.",
+                    detail = "Room did not return a durable status for the reserved item. Training is paused to protect optimizer state."
                 )
+            ) {
+                return null
             }
+            logError("Training queue claim returned an empty acknowledgement.")
             return null
         }
 
-        return item
+        val persistedItem = acknowledgement.workerItem
+        when (acknowledgement.roomStatus) {
+            TrainingStatus.TRAINING -> {
+                // Room durably marks the item TRAINING, while the worker consumes
+                // its original QUEUED token for batch setup.
+                val workerItem = persistedItem?.copy(status = TrainingStatus.QUEUED) ?: item
+                if (
+                    workerItem.source.isScreenTrainingSource() &&
+                    workerItem.source.screenTrainingPackageName()
+                        ?.let(::isScreenTrainingConsentEnabled) != true
+                ) {
+                    try {
+                        persistenceOperations.send(
+                            QueuePersistenceOperation.DeleteItem(workerItem.id)
+                        )
+                    } catch (closedChannel: ClosedSendChannelException) {
+                        logError(
+                            "Could not queue deletion of screen item '${workerItem.id}' after consent was revoked.",
+                            closedChannel
+                        )
+                    }
+                    return null
+                }
+                return workerItem
+            }
+
+            TrainingStatus.OPTIMIZER_COMMITTED -> {
+                val committedItem = persistedItem
+                if (committedItem == null) {
+                    _isTrainingPaused.value = true
+                    publishTrainingRecoveryStatus(
+                        phase = TrainingRecoveryPhase.BLOCKED,
+                        message = "Committed queue item could not be recovered.",
+                        detail = "Room reported OPTIMIZER_COMMITTED but did not return the durable item."
+                    )
+                    logError("Room reported OPTIMIZER_COMMITTED without returning the queue item.")
+                    return null
+                }
+                if (
+                    expectedStatus != null &&
+                    expectedStatus != TrainingStatus.OPTIMIZER_COMMITTED
+                ) {
+                    // A batch collector requested QUEUED items only. Keep the durable
+                    // commit at the head of the queue and let the next worker iteration
+                    // finalize it through processCommittedItem(), never processBatch().
+                    prependCommittedQueueItems(listOf(committedItem))
+                    logWarning(
+                        "Deferred committed item '${item.id}' from a QUEUED-only batch so it can be finalized separately."
+                    )
+                    return null
+                }
+                logWarning(
+                    "Room reports OPTIMIZER_COMMITTED for item '${item.id}'; routing it to finalization without another optimizer update."
+                )
+                return committedItem
+            }
+
+            TrainingStatus.COMPLETED,
+            TrainingStatus.FAILED -> {
+                synchronized(queueLock) {
+                    if (queueGeneration == reservationGeneration) {
+                        _nextQueue.value = _nextQueue.value.filterNot { queued ->
+                            queued.id == item.id
+                        }
+                    }
+                }
+                persistedItem?.let(::pushCompleted)
+                logWarning(
+                    "Retired stale in-memory training item '${item.id}'; Room already records ${acknowledgement.roomStatus}."
+                )
+                return null
+            }
+
+            null -> {
+                synchronized(queueLock) {
+                    if (queueGeneration == reservationGeneration) {
+                        _nextQueue.value = _nextQueue.value.filterNot { queued ->
+                            queued.id == item.id
+                        }
+                    }
+                }
+                logWarning(
+                    "Retired stale in-memory training item '${item.id}' because its Room row no longer exists."
+                )
+                return null
+            }
+
+            TrainingStatus.QUEUED,
+            TrainingStatus.PERSISTING -> {
+                if (
+                    !restoreQueueItemAndBlockTrainingAfterFailedStart(
+                        item = item,
+                        reservationGeneration = reservationGeneration,
+                        message = "Training queue claim was not acknowledged.",
+                        detail = "Room still reports ${acknowledgement.roomStatus} for the reserved item. Training is paused rather than retrying a non-durable queue transition indefinitely."
+                    )
+                ) {
+                    logWarning(
+                        "Ignored a stale Room queue status after the queue generation changed."
+                    )
+                    return null
+                }
+                logError(
+                    "Training item '${item.id}' could not enter TRAINING; Room still reports ${acknowledgement.roomStatus}."
+                )
+                return null
+            }
+        }
     }
 
     /**
