@@ -3751,7 +3751,9 @@ class TrainingManager internal constructor(
                         repositoryInitialization.exceptionOrNull()
                     )
                     if (repository.markTrainingStarted(operation.item.id)) {
-                        operation.item.copy(status = TrainingStatus.TRAINING)
+                        // Room owns the durable TRAINING state; the worker still
+                        // consumes the original QUEUED in-memory item for batch setup.
+                        operation.item
                     } else {
                         repository.getTrainingItem(operation.item.id)
                     }
